@@ -1,0 +1,15 @@
+engine_name = 'qcop'
+program = 'xtb'
+path_min_method = 'neb'
+
+[optimizer_kwds]
+timestep = 0.1
+
+[chain_inputs]
+k = 0.01
+delta_k = 0.005
+[path_min_inputs]
+ts_spring_thre = 0.0001
+v = 1
+skip_identical_graphs = 0
+naive_grow = true

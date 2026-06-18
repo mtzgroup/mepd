@@ -1,0 +1,737 @@
+from __future__ import annotations
+
+import math
+
+# from openeye import oechem
+import warnings
+import re
+from pathlib import Path
+
+import numpy as np
+import scipy.sparse.linalg
+from openbabel import openbabel
+from pysmiles import write_smiles
+from rdkit import Chem
+from mepd.elements import ElementData
+
+
+warnings.filterwarnings("ignore")
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore", r"RuntimeWarning: invalid value encountered in divide"
+    )
+
+
+def pairwise(iterable):
+    """
+    from a list [a,b,c,d] to [(a,b),(b,c),(c,d)]
+    """
+    it = iter(iterable)
+    a = next(it, None)
+
+    for b in it:
+        yield (a, b)
+        a = b
+
+
+def get_mass(s: str):
+    """
+    return atomic mass from symbol
+    """
+    ed = ElementData()
+    return ed.from_symbol(s).mass_amu
+
+
+def qRMSD_distance(structure, reference):
+    return RMSD(structure, reference)[0]
+
+
+def RMSD(structure, reference):
+    c1 = np.array(structure)
+    c2 = np.array(reference)
+    bary1 = np.mean(c1, axis=0)  # barycenters
+    bary2 = np.mean(c2, axis=0)
+
+    c1 = c1 - bary1  # shift origins to barycenter
+    c2 = c2 - bary2
+
+    N = len(c1)
+    R = np.dot(np.transpose(c1), c2)  # correlation matrix
+
+    F = np.array(
+        [
+            [
+                (R[0, 0] + R[1, 1] + R[2, 2]),
+                (R[1, 2] - R[2, 1]),
+                (R[2, 0] - R[0, 2]),
+                (R[0, 1] - R[1, 0]),
+            ],
+            [
+                (R[1, 2] - R[2, 1]),
+                (R[0, 0] - R[1, 1] - R[2, 2]),
+                (R[1, 0] + R[0, 1]),
+                (R[2, 0] + R[0, 2]),
+            ],
+            [
+                (R[2, 0] - R[0, 2]),
+                (R[1, 0] + R[0, 1]),
+                (-R[0, 0] + R[1, 1] - R[2, 2]),
+                (R[1, 2] + R[2, 1]),
+            ],
+            [
+                (R[0, 1] - R[1, 0]),
+                (R[2, 0] + R[0, 2]),
+                (R[1, 2] + R[2, 1]),
+                (-R[0, 0] - R[1, 1] + R[2, 2]),
+            ],
+        ]
+    )  # Eq. 10 in Dill Quaternion RMSD paper (DOI:10.1002/jcc.20110)
+
+    eigen = scipy.sparse.linalg.eigs(
+        F, k=1, which="LR"
+    )  # find max eigenvalue and eigenvector
+    lmax = float(eigen[0][0])
+    qmax = np.array(eigen[1][0:4])
+    qmax = np.float64(qmax)
+    qmax = np.ndarray.flatten(qmax)
+    rmsd = math.sqrt(
+        abs((np.sum(np.square(c1)) + np.sum(np.square(c2)) - 2 * lmax) / N)
+    )  # square root of the minimum residual
+
+    rot = np.array(
+        [
+            [
+                (qmax[0] ** 2 + qmax[1] ** 2 - qmax[2] ** 2 - qmax[3] ** 2),
+                2 * (qmax[1] * qmax[2] - qmax[0] * qmax[3]),
+                2 * (qmax[1] * qmax[3] + qmax[0] * qmax[2]),
+            ],
+            [
+                2 * (qmax[1] * qmax[2] + qmax[0] * qmax[3]),
+                (qmax[0] ** 2 - qmax[1] ** 2 + qmax[2] ** 2 - qmax[3] ** 2),
+                2 * (qmax[2] * qmax[3] - qmax[0] * qmax[1]),
+            ],
+            [
+                2 * (qmax[1] * qmax[3] - qmax[0] * qmax[2]),
+                2 * (qmax[2] * qmax[3] + qmax[0] * qmax[1]),
+                (qmax[0] ** 2 - qmax[1] ** 2 - qmax[2] ** 2 + qmax[3] ** 2),
+            ],
+        ]
+    )  # rotation matrix based on eigenvector corresponding $
+    g_rmsd = (c1 - np.matmul(c2, rot)) / (N * rmsd)  # gradient of the rmsd
+
+    return rmsd, g_rmsd
+
+
+def linear_distance(coords1, coords2):
+    return np.linalg.norm(coords2 - coords1)
+
+
+def get_nudged_pe_grad(unit_tangent, gradient):
+    """
+    Returns the component of the gradient that acts perpendicular to the path tangent
+    """
+    pe_grad = gradient
+    pe_grad_nudged_const = np.dot(pe_grad.flatten(), unit_tangent.flatten())
+    pe_grad_nudged = pe_grad - pe_grad_nudged_const * unit_tangent
+    return pe_grad_nudged
+
+
+def get_seeding_chain(neb_obj, force_thre):
+    for c in neb_obj.chain_trajectory:
+        if c.get_maximum_grad_magnitude() <= force_thre:
+            return c
+    return neb_obj.chain_trajectory[-1]
+
+
+def make_copy(obmol):
+    copy_obmol = openbabel.OBMol()
+    for atom in openbabel.OBMolAtomIter(obmol):
+        copy_obmol.AddAtom(atom)
+
+    for bond in openbabel.OBMolBondIter(obmol):
+        copy_obmol.AddBond(bond)
+
+    copy_obmol.SetTotalCharge(obmol.GetTotalCharge())
+    copy_obmol.SetTotalSpinMultiplicity(obmol.GetTotalSpinMultiplicity())
+
+    return copy_obmol
+
+
+def load_obmol_from_fp(fp: Path) -> openbabel.OBMol:
+    """
+    takes in a pathlib file path as input and reads it in as an openbabel molecule
+    """
+    if not isinstance(fp, Path):
+        fp = Path(fp)
+
+    file_type = fp.suffix[1:]  # get what type of file this is
+
+    obmol = openbabel.OBMol()
+    obconversion = openbabel.OBConversion()
+    obconversion.SetInFormat(file_type)
+
+    obconversion.ReadFile(obmol, str(fp.resolve()))
+
+    return make_copy(obmol)
+
+
+def write_xyz(atoms, X, name=""):
+    natoms = len(atoms)
+    string = ""
+    string += f"{natoms}\n{name}\n"
+    for i in range(natoms):
+        string += f"{atoms[i]} {X[i,0]} {X[i,1]} {X[i,2]} \n"
+    return string
+
+
+def bond_ord_number_to_string(i):
+    bo2s = {1.0: "single", 1.5: "aromatic", 2.0: "double", 3.0: "triple"}
+    try:
+        st = bo2s[i]
+    except KeyError as e:
+        print(f"Bond order must be in [1, 1.5, 2, 3], received {i}")
+        raise e
+    return st
+
+
+def from_number_to_element(i):
+    return __ATOM_LIST__[i - 1].capitalize()
+
+
+def atomic_number_to_symbol(n):
+    ed = ElementData()
+    return ed.from_atomic_number(n).symbol
+
+
+def graph_to_smiles(mol):
+
+    if mol.is_empty():
+        smi2 = ""
+    else:
+        for e in mol.edges:
+            s = mol.edges[e]["bond_order"]
+            if s == "single":
+                i = 1
+            elif s == "double":
+                i = 2
+            elif s == "aromatic":
+                i = 1.5
+            elif s == "triple":
+                i = 3
+            mol.edges[e]["order"] = i
+
+        # if 'OE_LICENSE' in os.environ:
+        #     # Keiran oechem (this needs the license)
+        #     smi = write_smiles(mol)
+        #     oemol = oechem.OEGraphMol()
+        #     oechem.OESmilesToMol(oemol, smi)
+        #     smi2 = oechem.OEMolToSmiles(oemol)
+        # else:
+        try:
+            b = write_smiles(mol)
+            smi2 = Chem.CanonSmiles(b)
+        except Exception as e:
+            print(
+                "This run is without OECHEM license. A graph has failed to be converted in smiles.\
+                      Take note of the exception."
+            )
+            raise e
+    return smi2
+
+
+__ATOM_LIST__ = [
+    "h",
+    "he",
+    "li",
+    "be",
+    "b",
+    "c",
+    "n",
+    "o",
+    "f",
+    "ne",
+    "na",
+    "mg",
+    "al",
+    "si",
+    "p",
+    "s",
+    "cl",
+    "ar",
+    "k",
+    "ca",
+    "sc",
+    "ti",
+    "v",
+    "cr",
+    "mn",
+    "fe",
+    "co",
+    "ni",
+    "cu",
+    "zn",
+    "ga",
+    "ge",
+    "as",
+    "se",
+    "br",
+    "kr",
+    "rb",
+    "sr",
+    "y",
+    "zr",
+    "nb",
+    "mo",
+    "tc",
+    "ru",
+    "rh",
+    "pd",
+    "ag",
+    "cd",
+    "in",
+    "sn",
+    "sb",
+    "te",
+    "i",
+    "xe",
+    "cs",
+    "ba",
+    "la",
+    "ce",
+    "pr",
+    "nd",
+    "pm",
+    "sm",
+    "eu",
+    "gd",
+    "tb",
+    "dy",
+    "ho",
+    "er",
+    "tm",
+    "yb",
+    "lu",
+    "hf",
+    "ta",
+    "w",
+    "re",
+    "os",
+    "ir",
+    "pt",
+    "au",
+    "hg",
+    "tl",
+    "pb",
+    "bi",
+    "po",
+    "at",
+    "rn",
+    "fr",
+    "ra",
+    "ac",
+    "th",
+    "pa",
+    "u",
+    "np",
+    "pu",
+]
+
+
+def is_even(n):
+    return not np.mod(n, 2)
+
+
+# def steepest_descent(node, engine: Engine, ss=1, max_steps=10) -> list[Node]:
+#     history = []
+#     last_node = node.copy()
+#     # make sure the node isn't frozen so it returns a gradient
+#     last_node.converged = False
+#     try:
+#         for i in range(max_steps):
+#             grad = last_node.gradient
+#             new_coords = last_node.coords - 1*ss*grad
+#             node_new = last_node.update_coords(new_coords)
+#             engine.compute_gradients([node_new])
+#             history.append(node_new)
+#             last_node = node_new.copy()
+#     except Exception:
+#         raise ElectronicStructureError(
+#             trajectory=[], msg='Error while minimizing in early stop check.')
+#     return history
+
+
+def give_me_free_index(natural, graph):
+    """
+    Natural numbers that are not index in graph
+    """
+    for i in natural:
+        if i not in graph.nodes:
+            yield i
+
+
+def naturals(n):
+    """
+    Natural numbers
+    """
+    yield n
+    yield from naturals(n + 1)
+
+
+def _calculate_chain_distances(chain_traj):
+    distances = [None]  # None for the first chain
+    for i, chain in enumerate(chain_traj):
+        if i == 0:
+            continue
+
+        prev_chain = chain_traj[i - 1]
+        dist = prev_chain._distance_to_chain(chain)
+        distances.append(dist)
+    return np.array(distances)
+
+
+def get_fsm_tsg_from_chain(chain):
+    ind_guess = round(len(chain) / 2)
+    ind_guesses = [ind_guess-1, ind_guess, ind_guess+1]
+    enes_guess = [chain.energies[ind_guesses[0]],
+                  chain.energies[ind_guesses[1]], chain.energies[ind_guesses[2]]]
+    ind_tsg = ind_guesses[np.argmax(enes_guess)]
+    return chain[ind_tsg]
+
+
+def _is_qcop_engine(engine) -> bool:
+    engine_cls = type(engine)
+    return (
+        engine_cls.__name__ == "QCOPEngine"
+        and engine_cls.__module__ == "mepd.engines.qcop"
+    )
+
+
+def _is_missing_geometric_irc_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, RuntimeError)
+        and isinstance(getattr(exc, "__cause__", None), ImportError)
+        and "geometric" in str(exc).lower()
+    )
+
+
+def compute_irc_chain(ts_node, engine, use_bigchem: bool = False, keywords=None, **kwargs):
+    from mepd.chain import Chain
+    irc_kwds = dict(keywords or {})
+
+    engine.compute_energies([ts_node])
+    if hasattr(engine, "compute_sd_irc"):
+        irc_negative, irc_positive = engine.compute_sd_irc(
+            ts=ts_node,
+            use_bigchem=use_bigchem,
+            **kwargs)
+
+        min_negative = engine.compute_geometry_optimization(
+            irc_negative[-1], keywords=irc_kwds)[-1]
+        min_positive = engine.compute_geometry_optimization(
+            irc_positive[-1], keywords=irc_kwds)[-1]
+        irc_negative.append(min_negative)
+        irc_positive.append(min_positive)
+        irc_negative.reverse()
+        irc_nodes = irc_negative + \
+            [ts_node]+irc_positive
+        return Chain.model_validate({"nodes": irc_nodes})
+
+    if hasattr(engine, "compute_irc_chain"):
+        return engine.compute_irc_chain(ts_node=ts_node, keywords=irc_kwds)
+
+    raise NotImplementedError(
+        "Engine does not support IRC: expected `compute_sd_irc` or `compute_irc_chain`."
+    )
+
+
+def get_maxene_node(arr, engine):
+    """
+    Perform binary search to find the maximum value in a unimodal array.
+
+    :param arr: List of numbers where the values increase to a maximum and then decrease.
+    :return: The maximum value in the array.
+    """
+    ngcs = 0
+    left, right = 0, len(arr) - 1
+
+    while left < right:
+        mid = left + (right - left) // 2
+
+        # Check if the midpoint is the maximum
+        engine.compute_energies([arr[mid], arr[mid+1]])
+        ngcs += 2
+
+        if arr[mid].energy > arr[mid + 1].energy:
+            # The maximum is in the left half (including mid)
+            right = mid
+        else:
+            # The maximum is in the right half (excluding mid)
+            left = mid + 1
+
+    # When left == right, we've found the maximum
+    print("binary search cost: ", ngcs, ' grad calls')
+    return {
+        "node": arr[left],
+        "grad_calls": ngcs,
+        "index": left
+    }
+
+
+def parse_nma_freq_data(hessres):
+    def _coerce_files_mapping(files_obj):
+        if files_obj is None:
+            return {}
+        if isinstance(files_obj, dict):
+            return files_obj
+        model_dump = getattr(files_obj, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        return {}
+
+    def _as_text(file_payload):
+        if isinstance(file_payload, bytes):
+            return file_payload.decode("utf-8", errors="replace")
+        return str(file_payload)
+
+    def _resolve_mass_weighted_modes_text():
+        results = getattr(hessres, "results", None)
+        candidate_file_maps = [
+            _coerce_files_mapping(getattr(results, "files", None)),
+        ]
+
+        trajectory = getattr(results, "trajectory", None)
+        if isinstance(trajectory, list):
+            for traj_entry in trajectory:
+                traj_results = getattr(traj_entry, "results", None)
+                candidate_file_maps.append(
+                    _coerce_files_mapping(getattr(traj_results, "files", None))
+                )
+
+        preferred_keys = (
+            "scr.geometry/Mass.weighted.modes.dat",
+            "./scr.geometry/Mass.weighted.modes.dat",
+            "Mass.weighted.modes.dat",
+        )
+
+        available_keys = []
+        for files_map in candidate_file_maps:
+            if not files_map:
+                continue
+            available_keys.extend([str(k) for k in files_map.keys()])
+
+            for key in preferred_keys:
+                if key in files_map:
+                    return _as_text(files_map[key])
+
+            for key, payload in files_map.items():
+                normalized_key = str(key).replace("\\", "/").lower()
+                if normalized_key == "mass.weighted.modes.dat" or normalized_key.endswith(
+                    "/mass.weighted.modes.dat"
+                ):
+                    return _as_text(payload)
+
+        available_desc = ", ".join(sorted(set(available_keys))) or "<none>"
+        raise KeyError(
+            "Could not locate Mass.weighted.modes.dat in Hessian result files. "
+            f"Available file keys: {available_desc}"
+        )
+
+    def _extract_cartesian_hessian_matrix(natoms: int) -> np.ndarray | None:
+        ncart = 3 * int(natoms)
+        candidates = [
+            getattr(hessres, "return_result", None),
+        ]
+        results = getattr(hessres, "results", None)
+        if results is not None:
+            candidates.append(getattr(results, "hessian", None))
+            candidates.append(getattr(results, "return_result", None))
+        if isinstance(hessres, dict):
+            candidates.append(hessres.get("hessian"))
+            candidates.append(hessres.get("return_result"))
+            nested_results = hessres.get("results")
+            if isinstance(nested_results, dict):
+                candidates.append(nested_results.get("hessian"))
+                candidates.append(nested_results.get("return_result"))
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                arr = np.asarray(candidate, dtype=float)
+            except Exception:
+                continue
+            if arr.ndim == 1 and arr.size == ncart * ncart:
+                arr = arr.reshape((ncart, ncart))
+            if arr.ndim != 2 or arr.shape != (ncart, ncart):
+                continue
+            return arr
+        return None
+
+    def _fallback_modes_from_hessian_matrix() -> tuple[list[np.ndarray], list[float]] | None:
+        structure = getattr(getattr(hessres, "input_data", None), "structure", None)
+        geometry = getattr(structure, "geometry", None)
+        if geometry is None:
+            return None
+        geom = np.asarray(geometry, dtype=float)
+        if geom.ndim != 2 or geom.shape[1] != 3:
+            return None
+
+        natoms = int(geom.shape[0])
+        hessian = _extract_cartesian_hessian_matrix(natoms=natoms)
+        if hessian is None:
+            return None
+
+        hessian = 0.5 * (hessian + hessian.T)
+        eigvals, eigvecs = np.linalg.eigh(hessian)
+        order = np.argsort(eigvals)
+        eigvals = eigvals[order]
+        eigvecs = eigvecs[:, order]
+        modes = [eigvecs[:, i].reshape(geom.shape) for i in range(eigvecs.shape[1])]
+        freqs = [float(np.sign(v) * np.sqrt(abs(v))) for v in eigvals]
+        return modes, freqs
+
+    modes = []
+    freqs = []
+
+    coords = []
+    try:
+        mode_file_text = _resolve_mass_weighted_modes_text()
+    except KeyError:
+        fallback = _fallback_modes_from_hessian_matrix()
+        if fallback is not None:
+            return fallback
+        raise
+
+    for line in mode_file_text.split("\n"):
+        line = line.strip()
+        if len(line) == 0:
+            continue
+        if line[0] == '=':
+            if len(coords) > 0:
+                modes.append(coords)
+                coords = []
+            split_line = line.split()
+            try:
+                freqs.append(float(split_line[3]))
+            except (IndexError, ValueError):
+                freq_matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line)
+                if len(freq_matches) > 0:
+                    freqs.append(float(freq_matches[-1]))
+        else:
+            try:
+                coords.append(float(line))
+            except ValueError:
+                continue
+
+    if len(coords) > 0:
+        modes.append(coords)
+
+    if len(modes) == 0:
+        fallback = _fallback_modes_from_hessian_matrix()
+        if fallback is not None:
+            return fallback
+
+    refshape = hessres.input_data.structure.geometry.shape
+    reshaped_normal_modes = []
+    for mode in modes:
+        reshaped_normal_modes.append(np.array(mode).reshape(refshape))
+
+    return reshaped_normal_modes, freqs
+
+
+def project_rigid_body_forces(R, F, masses=None):
+    """
+    Remove net translation and rotation from forces.
+
+    Parameters
+    ----------
+    R : (N,3) ndarray
+        Cartesian coordinates of atoms in the image.
+    F : (N,3) ndarray
+        Forces on atoms (e.g., NEB effective forces).
+    masses : (N,) ndarray or None
+        Atomic masses. If None, assume equal masses.
+
+    Returns
+    -------
+    F_proj : (N,3) ndarray
+        Forces with rigid translations and rotations removed.
+    """
+    N = R.shape[0]
+    if masses is None:
+        masses = np.ones(N)
+    M = masses.sum()
+
+    # Center of mass
+    R_com = np.average(R, axis=0, weights=masses)
+    s = R - R_com  # positions relative to COM
+
+    # --- 1) Remove translation ---
+    F_net = F.sum(axis=0)
+    F = F - (masses[:, None] / M) * F_net
+
+    # --- 2) Remove rotation ---
+    # Torque from current forces
+    L = np.sum(np.cross(s, F), axis=0)
+
+    # Inertia tensor about COM
+    I = np.zeros((3, 3))
+    for a in range(N):
+        r = s[a]
+        m = masses[a]
+        I += m * ((np.dot(r, r) * np.eye(3)) - np.outer(r, r))
+
+    # Solve I ω = L
+    try:
+        omega = np.linalg.solve(I, L)
+    except np.linalg.LinAlgError:
+        # Handle singular inertia tensor (e.g., linear molecules)
+        omega = np.linalg.pinv(I) @ L
+
+    # Subtract rotational component
+    F = F - masses[:, None] * np.cross(omega, s)
+
+    return F
+
+
+def parse_hhtda_to_dict(stdout_text):
+    """
+    Parses hh-TDA output and returns a dictionary structured for qcio's 'extras'.
+    """
+    # Regex to find the hh-TDA table
+    table_pattern = r"Root\s+Mult\.\s+Total Energy \(a\.u\.\).*\n-+\n([\s\S]*?)\n\n"
+    match = re.search(table_pattern, stdout_text)
+
+    if not match:
+        return {}
+
+    rows = match.group(1).strip().split('\n')
+
+    # Root 1 is the ground state reference
+    ground_energy = float(rows[0].split()[2])
+
+    # Lists to hold the parsed values
+    ex_energies_au = []
+    ex_energies_ev = []
+    oscillators = []
+
+    print("rows: ", rows)
+
+    for row in rows[1:]:  # Skip Root 1
+        cols = row.split()
+        if len(cols) >= 7:
+            ex_energies_au.append(float(cols[2]))
+            ex_energies_ev.append(float(cols[4]))
+            oscillators.append(float(cols[6]))
+
+    return {
+        "excited_states": {
+            "energies_au": [ground_energy]+ex_energies_au,
+            # dont use me please
+            "energies_ev": [ground_energy]+ex_energies_ev,
+            "oscillator_strengths": oscillators,
+        },
+        "ground_state_energy": ground_energy
+    }

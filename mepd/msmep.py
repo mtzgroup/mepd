@@ -1,0 +1,1399 @@
+import traceback
+import logging
+import copy
+import os
+import time
+import concurrent.futures
+import contextlib
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import sys
+import numpy as np
+from mepd.helper_functions import pairwise
+from typing import Any, Tuple, List
+
+from mepd.nodes.node import Node, StructureNode
+from mepd.nodes.nodehelpers import _is_connectivity_identical
+from mepd.elementarystep import check_if_elem_step
+
+from mepd.chain import Chain
+import mepd.chainhelpers as ch
+from mepd.dynamics.chainbiaser import ChainBiaser
+from mepd.elementarystep import ElemStepResults
+from mepd.neb import NEB, NoneConvergedException
+from mepd.nodes.nodehelpers import is_identical
+
+from mepd.TreeNode import TreeNode
+from mepd.errors import (
+    ElectronicStructureError,
+    extract_electronic_structure_error_details,
+    format_exception_message,
+)
+from mepd.optimizers.cg import ConjugateGradient
+from mepd.optimizers.vpo import VelocityProjectedOptimizer
+from mepd.optimizers.lbfgs import LBFGS
+from mepd.optimizers.adam import AdamOptimizer
+from mepd.optimizers.amg import AdaptiveMomentumGradient
+from mepd.optimizers.fire import FIREOptimizer
+from mepd.optimizers.sgd import SGDOptimizer
+from mepd.optimizers.gd import DeterministicGradientDescentOptimizer
+from qcio import Structure
+
+from mepd.pathminimizers.fneb import FreezingNEB
+from mepd.pathminimizers.geometric_neb import GeometricNEB
+from mepd.pathminimizers.nebdlf import DLFindNEB
+from mepd.inputs import RunInputs
+from mepd.scripts.progress import (
+    get_progress_printer,
+    print_neb_step,
+    preserve_chain_snapshot,
+    progress_monitor,
+    start_status,
+    update_status,
+    stop_status,
+)
+
+
+def _get_verbose(inputs: RunInputs) -> bool:
+    """Get verbosity from RunInputs."""
+    return getattr(inputs.path_min_inputs, 'v', False)
+
+
+PATH_METHODS = ["NEB", "FNEB", "MLPGI", "NEB-DLF", "GEOMETRIC-NEB"]
+
+
+def _normalize_path_method(path_min_method: str) -> str:
+    method = str(path_min_method or "").strip().upper().replace("_", "-")
+    aliases = {
+        "NEBDLF": "NEB-DLF",
+        "DLFNEB": "NEB-DLF",
+        "DLFIND": "NEB-DLF",
+        "DL-FIND": "NEB-DLF",
+        "GEOMETRIC": "GEOMETRIC-NEB",
+        "GEOMETRICNEB": "GEOMETRIC-NEB",
+    }
+    return aliases.get(method, method)
+
+
+def _empty_leaf(index: int, status: str) -> TreeNode:
+    node = TreeNode(data=None, children=[], index=index)
+    setattr(node, "leaf_status", status)
+    return node
+
+
+def _failed_leaf(
+    index: int,
+    status: str,
+    exc: BaseException,
+    chain: Chain | None = None,
+) -> TreeNode:
+    node = _empty_leaf(index, status=status)
+    setattr(node, "leaf_error_type", type(exc).__name__)
+    setattr(node, "leaf_error", str(exc))
+    setattr(node, "leaf_traceback", traceback.format_exc())
+    if chain is not None:
+        setattr(node, "failed_chain", chain.copy())
+    return node
+
+
+def _to_plain_dict(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    if isinstance(value, SimpleNamespace):
+        return copy.deepcopy(vars(value))
+    if hasattr(value, "model_dump"):
+        try:
+            return copy.deepcopy(value.model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            return copy.deepcopy(value.dict())
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        return copy.deepcopy(vars(value))
+    return copy.deepcopy(value)
+
+
+def _clone_run_inputs_for_worker(run_inputs: RunInputs) -> RunInputs:
+    """Build an isolated RunInputs instance for a worker thread."""
+    payload = _run_inputs_payload_for_worker(run_inputs)
+    return RunInputs(**payload)
+
+
+def _run_inputs_payload_for_worker(run_inputs: RunInputs) -> dict:
+    """Build a serialization-safe RunInputs payload for workers."""
+    return {
+        "engine_name": getattr(run_inputs, "engine_name", "chemcloud"),
+        "program": getattr(run_inputs, "program", "xtb"),
+        "chemcloud_queue": getattr(run_inputs, "chemcloud_queue", None),
+        "write_qcio": bool(getattr(run_inputs, "write_qcio", False)),
+        "nanoreactor_inputs": _to_plain_dict(
+            getattr(run_inputs, "nanoreactor_inputs", None)
+        ),
+        "path_min_method": getattr(run_inputs, "path_min_method", "NEB"),
+        "path_min_inputs": _to_plain_dict(
+            getattr(run_inputs, "path_min_inputs", None)
+        ),
+        "chain_inputs": _to_plain_dict(getattr(run_inputs, "chain_inputs", None)),
+        "gi_inputs": _to_plain_dict(getattr(run_inputs, "gi_inputs", None)),
+        "network_inputs": _to_plain_dict(
+            getattr(run_inputs, "network_inputs", None)
+        ),
+        "program_kwds": _to_plain_dict(getattr(run_inputs, "program_kwds", None)),
+        "ase_engine_kwds": _to_plain_dict(getattr(run_inputs, "ase_engine_kwds", None)),
+        "gxtb_engine_kwds": _to_plain_dict(getattr(run_inputs, "gxtb_engine_kwds", None)),
+        "geometry_optimizer_kwds": _to_plain_dict(
+            getattr(run_inputs, "geometry_optimizer_kwds", None)
+        ),
+        "optimizer_kwds": _to_plain_dict(getattr(run_inputs, "optimizer_kwds", None)),
+    }
+
+
+def _chain_payload_for_worker(input_chain: Chain) -> dict:
+    return {
+        "nodes": [
+            node.to_serializable() if hasattr(node, "to_serializable") else copy.deepcopy(node)
+            for node in input_chain.nodes
+        ],
+        "parameters": _to_plain_dict(input_chain.parameters),
+    }
+
+
+def _chain_from_worker_payload(payload: dict) -> Chain:
+    nodes = []
+    for item in list(payload.get("nodes") or []):
+        if isinstance(item, dict) and "structure" in item:
+            nodes.append(StructureNode.from_serializable(copy.deepcopy(item)))
+        elif hasattr(item, "copy"):
+            nodes.append(item.copy())
+        else:
+            nodes.append(copy.deepcopy(item))
+    return Chain.model_validate(
+        {
+            "nodes": nodes,
+            "parameters": payload.get("parameters"),
+        }
+    )
+
+
+def _structure_node_from_attempt_payload(value: Any) -> StructureNode | None:
+    if isinstance(value, StructureNode):
+        return value.copy()
+    if isinstance(value, dict) and "structure" in value:
+        try:
+            return StructureNode.from_serializable(copy.deepcopy(value))
+        except Exception:
+            return None
+    if hasattr(value, "copy"):
+        try:
+            candidate = value.copy()
+            if isinstance(candidate, StructureNode):
+                return candidate
+        except Exception:
+            return None
+    return None
+
+
+def _leaf_chain_from_tree_node(node: TreeNode) -> Chain | None:
+    if node is None or getattr(node, "data", None) is None:
+        return None
+    data = node.data
+    chain_trajectory = getattr(data, "chain_trajectory", None) or []
+    if chain_trajectory:
+        return chain_trajectory[-1]
+    optimized = getattr(data, "optimized", None)
+    if optimized is not None:
+        return optimized
+    return None
+
+
+def _concat_leaf_chains(chains: list[Chain], parameters) -> Chain:
+    if len(chains) == 0:
+        raise ValueError("Cannot concatenate empty chain list.")
+    nodes = []
+    for i, chain in enumerate(chains):
+        chain_nodes = chain.nodes if i == 0 else chain.nodes[1:]
+        nodes.extend([node.copy() for node in chain_nodes])
+    return Chain.model_validate({"nodes": nodes, "parameters": parameters})
+
+
+@dataclass
+class MSMEP:
+    """Class for running autosplitting MEP minimizations."""
+
+    inputs: RunInputs
+    path_minimizer = None
+
+    def __post_init__(self):
+        assert (
+            self.inputs.path_min_method or self.path_minimizer is not None
+        ), "Need to input a path_min_method or path minimizer"
+        if self.path_minimizer is None:
+            normalized_method = _normalize_path_method(self.inputs.path_min_method)
+            assert (
+                normalized_method in PATH_METHODS
+            ), f"Invalid path method: {self.inputs.path_min_method}. Allowed are: {PATH_METHODS}"
+        self._attempted_pairs_payload_ref = None
+        self._attempted_pair_cache: list[tuple[StructureNode, StructureNode, bool]] = []
+
+    def _build_neb_optimizer(self):
+        kwds = dict(self.inputs.optimizer_kwds or {})
+        optimizer_name = kwds.pop("name", "cg").lower()
+        optimizer_map = {
+            "cg": ConjugateGradient,
+            "conjugate_gradient": ConjugateGradient,
+            "vpo": VelocityProjectedOptimizer,
+            "velocity_projected": VelocityProjectedOptimizer,
+            "lbfgs": LBFGS,
+            "adam": AdamOptimizer,
+            "sgd": SGDOptimizer,
+            "stochastic_gradient_descent": SGDOptimizer,
+            "gd": DeterministicGradientDescentOptimizer,
+            "gradient_descent": DeterministicGradientDescentOptimizer,
+            "deterministic_gradient_descent": DeterministicGradientDescentOptimizer,
+            "amg": AdaptiveMomentumGradient,
+            "adaptive_momentum": AdaptiveMomentumGradient,
+            "fire": FIREOptimizer,
+        }
+        if optimizer_name not in optimizer_map:
+            available = ", ".join(sorted(set(optimizer_map.keys())))
+            raise ValueError(
+                f"Unsupported optimizer '{optimizer_name}'. Supported values: {available}"
+            )
+        return optimizer_map[optimizer_name](**kwds)
+
+    def _should_disable_graphs(self) -> bool:
+        return bool(getattr(self.inputs.engine, "disable_molecular_graphs", False))
+
+    def _set_attempted_pairs_payload(self, payload: Any) -> None:
+        setattr(self.inputs.path_min_inputs, "attempted_pairs_payload", payload)
+        self._attempted_pairs_payload_ref = None
+        self._attempted_pair_cache = []
+
+    def _disable_molecular_graphs(self, chain: Chain) -> None:
+        if not self._should_disable_graphs():
+            return
+        for node in chain:
+            if hasattr(node, "has_molecular_graph"):
+                node.has_molecular_graph = False
+            if hasattr(node, "graph"):
+                node.graph = None
+
+    def _nodes_match_for_attempt_skip(self, a: StructureNode, b: StructureNode) -> bool:
+        if a is None or b is None:
+            return False
+        try:
+            if (
+                list(a.structure.symbols) == list(b.structure.symbols)
+                and np.allclose(a.coords, b.coords)
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            a_cmp = a.copy()
+            b_cmp = b.copy()
+            setattr(a_cmp, "disable_smiles", True)
+            setattr(b_cmp, "disable_smiles", True)
+            return bool(
+                is_identical(
+                    a_cmp,
+                    b_cmp,
+                    fragment_rmsd_cutoff=self.inputs.chain_inputs.node_rms_thre,
+                    kcal_mol_cutoff=self.inputs.chain_inputs.node_ene_thre,
+                    verbose=False,
+                )
+            )
+        except Exception:
+            return False
+
+    def _refresh_attempted_pair_cache(self) -> None:
+        payload = getattr(
+            getattr(self.inputs, "path_min_inputs", None),
+            "attempted_pairs_payload",
+            None,
+        )
+        if payload is self._attempted_pairs_payload_ref:
+            return
+        self._attempted_pairs_payload_ref = payload
+        self._attempted_pair_cache = []
+        if not isinstance(payload, list):
+            return
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            start_node = _structure_node_from_attempt_payload(item.get("start"))
+            end_node = _structure_node_from_attempt_payload(item.get("end"))
+            if start_node is None or end_node is None:
+                continue
+            directed = bool(item.get("directed", False))
+            self._attempted_pair_cache.append((start_node, end_node, directed))
+
+    def _skip_chain_due_to_attempted_history(self, input_chain: Chain) -> bool:
+        if len(input_chain) < 2:
+            return False
+        self._refresh_attempted_pair_cache()
+        if not self._attempted_pair_cache:
+            return False
+        start_node = input_chain[0]
+        end_node = input_chain[-1]
+        for attempted_start, attempted_end, directed in self._attempted_pair_cache:
+            forward_match = self._nodes_match_for_attempt_skip(
+                start_node, attempted_start
+            ) and self._nodes_match_for_attempt_skip(end_node, attempted_end)
+            if forward_match:
+                return True
+            if directed:
+                continue
+            reverse_match = self._nodes_match_for_attempt_skip(
+                start_node, attempted_end
+            ) and self._nodes_match_for_attempt_skip(end_node, attempted_start)
+            if reverse_match:
+                return True
+        return False
+
+    def _endpoint_connectivity_status(self, chain: Chain) -> str:
+        if len(chain) == 0:
+            return "Checking endpoint connectivity"
+        start = chain[0]
+        end = chain[-1]
+        src = getattr(start, "graph_atom_indices_source", None)
+        return "Checking endpoint connectivity"
+
+    def run_recursive_minimize(
+        self,
+        input_chain: Chain,
+        tree_node_index=0,
+        attempted_pairs_payload: list[dict[str, Any]] | None = None,
+    ) -> TreeNode:
+        """Will take a chain as an input and run NEB minimizations until it exits out.
+        NEB can exit due to the chain being converged, the chain needing to be split,
+        or the maximum number of alloted steps being met.
+
+        Args:
+            input_chain (Chain): _description_
+            tree_node_index (int, optional): index of node minimization. Root node is 0. Defaults to 0.
+
+        Returns:
+            TreeNode: Tree containing the history of NEB optimizations. First node is the initial
+            chain given and its corresponding neb minimization. Children are chains into which
+            the root chain was split.
+        """
+        import mepd.chainhelpers as ch
+        if isinstance(input_chain, list):
+            input_chain = Chain.model_validate(
+                {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
+        if attempted_pairs_payload is not None:
+            self._set_attempted_pairs_payload(attempted_pairs_payload)
+        self._disable_molecular_graphs(input_chain)
+        if self._skip_chain_due_to_attempted_history(input_chain):
+            msg = "Endpoints already attempted elsewhere. Skipping chain."
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            return _empty_leaf(tree_node_index, status="attempted_elsewhere")
+
+        if getattr(self.inputs.path_min_inputs, "skip_identical_graphs", True) and input_chain[0].has_molecular_graph:
+            if not _get_verbose(self.inputs):
+                update_status(self._endpoint_connectivity_status(input_chain))
+            if _is_connectivity_identical(
+                input_chain[0],
+                input_chain[-1],
+                verbose=_get_verbose(self.inputs),
+            ):
+                msg = "Endpoints are identical. Returning nothing"
+                if _get_verbose(self.inputs):
+                    print(msg)
+                else:
+                    update_status(msg)
+                return _empty_leaf(tree_node_index, status="identical_endpoints")
+
+        try:
+            ch._reset_node_convergence(input_chain)
+            self.inputs.engine.compute_gradients(input_chain)
+
+            if is_identical(
+                self=input_chain[0],
+                other=input_chain[-1],
+                fragment_rmsd_cutoff=self.inputs.chain_inputs.node_rms_thre,
+                kcal_mol_cutoff=self.inputs.chain_inputs.node_ene_thre,
+                verbose=False,
+            ):
+                msg = "Endpoints are identical. Returning nothing"
+                if _get_verbose(self.inputs):
+                    print(msg)
+                else:
+                    update_status(msg)
+                return _empty_leaf(tree_node_index, status="identical_endpoints")
+
+            root_neb_obj, elem_step_results = self.run_minimize_chain(
+                input_chain=input_chain
+            )
+            history = TreeNode(data=root_neb_obj,
+                               children=[], index=tree_node_index)
+
+            if elem_step_results.is_elem_step:
+                return history
+
+            else:
+                msg = f"Splitting chains based on: {elem_step_results.splitting_criterion}"
+                if _get_verbose(self.inputs):
+                    print(msg)
+                else:
+                    preserve_chain_snapshot(note=msg)
+
+                # the last chain in the minimization
+                chain = root_neb_obj.chain_trajectory[-1]
+                sequence_of_chains = self.make_sequence_of_chains(
+                    chain=chain,
+                    split_method=elem_step_results.splitting_criterion,
+                    minimization_results=elem_step_results.minimization_results,
+                )
+
+                new_tree_node_index = tree_node_index + 1
+                for i, chain_frag in enumerate(sequence_of_chains, start=1):
+                    msg = f"On chain {i} of {len(sequence_of_chains)}..."
+                    if _get_verbose(self.inputs):
+                        print(msg)
+                    else:
+                        update_status(msg)
+                    try:
+                        out_history = self.run_recursive_minimize(
+                            chain_frag, tree_node_index=new_tree_node_index
+                        )
+                    except Exception as child_exc:
+                        if _get_verbose(self.inputs):
+                            print(traceback.format_exc())
+                            print(
+                                f"Warning! Recursive branch {new_tree_node_index} failed "
+                                f"({type(child_exc).__name__}: {child_exc}). Continuing."
+                            )
+                        else:
+                            update_status(
+                                f"Branch {new_tree_node_index} failed; continuing recursive search."
+                            )
+                        out_history = _failed_leaf(
+                            new_tree_node_index,
+                            status="path_minimization_error",
+                            exc=child_exc,
+                            chain=chain_frag,
+                        )
+
+                    history.children.append(out_history)
+
+                    # increment the node indices
+                    new_tree_node_index = out_history.max_index + 1
+                return history
+
+        except ElectronicStructureError as e:
+            msg = (
+                f"Electronic structure error in recursive branch {tree_node_index}: "
+                f"{format_exception_message(e)}"
+            )
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            obj = getattr(e, "obj", None)
+            if hasattr(obj, "save"):
+                with contextlib.suppress(Exception):
+                    obj.save("/tmp/failed_output.qcio")
+            return _failed_leaf(
+                tree_node_index,
+                status="electronic_structure_error",
+                exc=e,
+                chain=input_chain,
+            )
+        except Exception as e:
+            if _get_verbose(self.inputs):
+                print(traceback.format_exc())
+                print(
+                    f"Warning! Recursive branch {tree_node_index} failed "
+                    f"({type(e).__name__}: {e}). Continuing."
+                )
+            else:
+                update_status(
+                    f"Branch {tree_node_index} failed with {type(e).__name__}; continuing recursive search."
+                )
+            return _failed_leaf(
+                tree_node_index,
+                status="path_minimization_error",
+                exc=e,
+                chain=input_chain,
+            )
+
+    def _run_recursive_step(self, input_chain: Chain, tree_node_index: int) -> tuple[TreeNode, list[Chain]]:
+        """Run a single recursive minimization step and return child fragments to continue."""
+        import mepd.chainhelpers as ch
+        if isinstance(input_chain, list):
+            input_chain = Chain.model_validate(
+                {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
+        self._disable_molecular_graphs(input_chain)
+        if self._skip_chain_due_to_attempted_history(input_chain):
+            return _empty_leaf(tree_node_index, status="attempted_elsewhere"), []
+
+        if getattr(self.inputs.path_min_inputs, "skip_identical_graphs", True) and input_chain[0].has_molecular_graph:
+            if not _get_verbose(self.inputs):
+                update_status(self._endpoint_connectivity_status(input_chain))
+            if _is_connectivity_identical(
+                input_chain[0],
+                input_chain[-1],
+                verbose=_get_verbose(self.inputs),
+            ):
+                return _empty_leaf(tree_node_index, status="identical_endpoints"), []
+
+        ch._reset_node_convergence(input_chain)
+        self.inputs.engine.compute_gradients(input_chain)
+
+        if is_identical(
+            self=input_chain[0],
+            other=input_chain[-1],
+            fragment_rmsd_cutoff=self.inputs.chain_inputs.node_rms_thre,
+            kcal_mol_cutoff=self.inputs.chain_inputs.node_ene_thre,
+            verbose=False,
+        ):
+            return _empty_leaf(tree_node_index, status="identical_endpoints"), []
+
+        root_neb_obj, elem_step_results = self.run_minimize_chain(
+            input_chain=input_chain
+        )
+        history_node = TreeNode(data=root_neb_obj, children=[], index=tree_node_index)
+
+        if elem_step_results.is_elem_step:
+            return history_node, []
+
+        chain_trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
+        if not chain_trajectory:
+            return history_node, []
+        split_chain = chain_trajectory[-1]
+        sequence_of_chains = self.make_sequence_of_chains(
+            chain=split_chain,
+            split_method=elem_step_results.splitting_criterion,
+            minimization_results=elem_step_results.minimization_results,
+        )
+        return history_node, sequence_of_chains
+
+    def run_parallel_recursive_minimize(
+        self,
+        input_chain: Chain,
+        tree_node_index: int = 0,
+        max_workers: int | None = None,
+        attempted_pairs_payload: list[dict[str, Any]] | None = None,
+    ) -> TreeNode:
+        """Recursively autosplit NEBs, evaluating split branches in parallel."""
+        if attempted_pairs_payload is not None:
+            self._set_attempted_pairs_payload(attempted_pairs_payload)
+        cpu_cap = max(1, int(os.cpu_count() or 1))
+        if max_workers is None:
+            bounded_workers = min(4, cpu_cap)
+        else:
+            # Honor explicit user-requested parallelism. `os.cpu_count()` can
+            # under-report available capacity in constrained launch contexts.
+            bounded_workers = max(1, int(max_workers))
+
+        progress_printer = get_progress_printer()
+        progress_printer.clear_path_so_far()
+        with progress_monitor(f"branch-{int(tree_node_index)}"):
+            root_history, root_children = self._run_recursive_step(
+                input_chain=input_chain, tree_node_index=tree_node_index
+            )
+        if not root_children:
+            setattr(root_history, "parallel_failures", [])
+            return root_history
+
+        next_tree_index = tree_node_index + 1
+        completed_leaf_chains_by_index: dict[int, Chain] = {}
+        pending: dict[
+            concurrent.futures.Future, tuple[TreeNode, int, int, Chain, int, float]
+        ] = {}
+        branch_failures: list[str] = []
+        max_worker_attempts = 2
+        engine_name = str(getattr(self.inputs, "engine_name", "") or "").strip().lower()
+        compute_program = str(
+            getattr(getattr(self.inputs, "engine", None), "compute_program", "") or ""
+        ).strip().lower()
+        use_process_workers = engine_name == "qcop" and compute_program == "qcop"
+        run_inputs_payload = (
+            _run_inputs_payload_for_worker(self.inputs) if use_process_workers else None
+        )
+
+        def _submit_children(
+            executor: concurrent.futures.Executor,
+            parent_node: TreeNode,
+            child_fragments: list[Chain],
+            attempt: int = 1,
+        ) -> None:
+            nonlocal next_tree_index
+            parent_node.children = [None] * len(child_fragments)
+            for child_position, child_chain in enumerate(child_fragments):
+                child_index = next_tree_index
+                next_tree_index += 1
+                progress_printer.mark_monitor_active(f"branch-{child_index}")
+                if hasattr(progress_printer, "set_monitor_status"):
+                    progress_printer.set_monitor_status(
+                        f"branch-{child_index}",
+                        "Running in worker process"
+                        if use_process_workers
+                        else "Running",
+                    )
+                if use_process_workers:
+                    child_payload = _chain_payload_for_worker(child_chain)
+                    future = executor.submit(
+                        _parallel_recursive_step_worker_from_payload,
+                        run_inputs_payload,
+                        child_payload,
+                        child_index,
+                    )
+                else:
+                    future = executor.submit(
+                        _parallel_recursive_step_worker,
+                        self.inputs,
+                        child_chain,
+                        child_index,
+                    )
+                pending[future] = (
+                    parent_node,
+                    child_position,
+                    child_index,
+                    child_chain,
+                    int(attempt),
+                    time.time(),
+                )
+
+        executor_cls = (
+            concurrent.futures.ProcessPoolExecutor
+            if use_process_workers
+            else concurrent.futures.ThreadPoolExecutor
+        )
+        with executor_cls(
+            max_workers=bounded_workers
+        ) as executor:
+            _submit_children(executor, root_history, root_children)
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    tuple(pending.keys()),
+                    timeout=1.0,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if not done:
+                    if use_process_workers and hasattr(progress_printer, "set_monitor_status"):
+                        now = time.time()
+                        for (
+                            _parent_node,
+                            _child_position,
+                            child_index,
+                            _child_chain,
+                            attempt,
+                            submitted_at,
+                        ) in pending.values():
+                            elapsed = max(0, int(now - float(submitted_at)))
+                            progress_printer.set_monitor_status(
+                                f"branch-{child_index}",
+                                f"Running in worker process (attempt {attempt}/{max_worker_attempts}, {elapsed}s)",
+                            )
+                    continue
+                for future in done:
+                    (
+                        parent_node,
+                        child_position,
+                        child_index,
+                        child_chain,
+                        attempt,
+                        _submitted_at,
+                    ) = pending.pop(
+                        future
+                    )
+                    try:
+                        child_history, child_children = future.result()
+                    except Exception as worker_exc:
+                        worker_trace = traceback.format_exc().strip()
+                        if attempt < max_worker_attempts:
+                            retry_attempt = attempt + 1
+                            if hasattr(progress_printer, "set_monitor_status"):
+                                progress_printer.set_monitor_status(
+                                    f"branch-{child_index}",
+                                    f"Retrying (attempt {retry_attempt}/{max_worker_attempts})",
+                                )
+                            if use_process_workers:
+                                retry_payload = _chain_payload_for_worker(child_chain)
+                                retry_future = executor.submit(
+                                    _parallel_recursive_step_worker_from_payload,
+                                    run_inputs_payload,
+                                    retry_payload,
+                                    child_index,
+                                )
+                            else:
+                                retry_future = executor.submit(
+                                    _parallel_recursive_step_worker,
+                                    self.inputs,
+                                    child_chain,
+                                    child_index,
+                                )
+                            pending[retry_future] = (
+                                parent_node,
+                                child_position,
+                                child_index,
+                                child_chain,
+                                retry_attempt,
+                                time.time(),
+                            )
+                            continue
+                        branch_failures.append(
+                            f"branch-{child_index}: worker failed after {attempt} attempt(s) "
+                            f"({type(worker_exc).__name__}: {worker_exc})\n"
+                            f"worker traceback:\n{worker_trace}"
+                        )
+                        child_history = _failed_leaf(
+                            child_index,
+                            status="worker_failure",
+                            exc=worker_exc,
+                            chain=child_chain,
+                        )
+                        child_children = []
+                    parent_node.children[child_position] = child_history
+                    progress_printer.mark_monitor_inactive(f"branch-{child_index}")
+                    if not child_children:
+                        leaf_chain = _leaf_chain_from_tree_node(child_history)
+                        if leaf_chain is not None:
+                            completed_leaf_chains_by_index[child_index] = leaf_chain
+                            ordered_leaf_chains = [
+                                completed_leaf_chains_by_index[idx]
+                                for idx in sorted(completed_leaf_chains_by_index.keys())
+                            ]
+                            path_so_far = _concat_leaf_chains(
+                                ordered_leaf_chains, self.inputs.chain_inputs
+                            )
+                            progress_printer.update_path_so_far(
+                                path_so_far,
+                                caption=f"{len(ordered_leaf_chains)} completed branch(es)",
+                            )
+                    if child_children:
+                        _submit_children(executor, child_history, child_children)
+
+        setattr(root_history, "parallel_failures", branch_failures)
+        return root_history
+
+    def _create_interpolation(self, chain: Chain):
+        import mepd.chainhelpers as ch
+        logger = logging.getLogger(
+            'mepd.geodesic_interpolation2.interpolation')
+        logger.propagate = False
+        # if chain.parameters.frozen_atom_indices:
+        #     chain_original = chain.copy()
+        #     all_indices = list(range(len(chain[0].coords)))
+
+        #     inds_frozen = np.array(
+        #         chain.parameters.frozen_atom_indices.split(), dtype=int
+        #     )
+        #     subsys_inds = np.setdiff1d(all_indices, inds_frozen)
+        #     subsys_coords = [node.coords[subsys_inds] for node in chain]
+
+        #     subsys_symbs = [chain[0].structure.symbols[i] for i in subsys_inds]
+        #     subsys_structs = [Structure(geometry=c, symbols=subsys_symbs,
+        #                                 charge=chain[0].structure.charge,
+        #                                 multiplicity=chain[0].structure.multiplicity) for c in subsys_coords]
+
+        #     subsys_nodes = [StructureNode(structure=s) for s in subsys_structs]
+
+        #     print(f"{all_indices=} {subsys_inds=} {inds_frozen=}")
+        #     chain = Chain.model_validate({
+        #         "nodes": subsys_nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
+
+        if self.inputs.chain_inputs.use_geodesic_interpolation:
+            if chain.parameters.frozen_atom_indices:
+                inds_frozen = chain.parameters.frozen_atom_indices
+                if _get_verbose(self.inputs):
+                    print("will be freezing inds:", inds_frozen,
+                          ' during geodesic interpolation')
+                    print(type(inds_frozen))
+            else:
+                inds_frozen = np.array([], dtype=int)
+
+            smoother = ch.sample_shortest_geodesic(
+                chain=chain,
+                chain_inputs=copy.deepcopy(self.inputs.chain_inputs),
+                nimages=self.inputs.gi_inputs.nimages,
+                friction=self.inputs.gi_inputs.friction,
+                nudge=self.inputs.gi_inputs.nudge,
+                align=self.inputs.gi_inputs.align,
+                ignore_atoms=inds_frozen,
+                **self.inputs.gi_inputs.extra_kwds,
+
+            )
+            interpolation = ch.gi_path_to_nodes(xyz_coords=smoother.path,
+                                                symbols=chain.symbols,
+                                                parameters=copy.deepcopy(
+                                                    self.inputs.chain_inputs),
+                                                charge=chain[0].structure.charge,
+                                                spinmult=chain[0].structure.multiplicity)
+            interpolation = Chain.model_validate({
+                "nodes": interpolation,
+                "parameters": copy.deepcopy(self.inputs.chain_inputs)})
+
+            interpolation._zero_velocity()
+
+        else:  # do a linear interpolation using numpy
+            start_point = chain[0].coords
+            end_point = chain[-1].coords
+            coords = np.linspace(
+                start=start_point, stop=end_point, num=self.inputs.gi_inputs.nimages
+            )
+            nodes = [
+                node.update_coords(c)
+                for node, c in zip([chain.nodes[0]] * len(coords), coords)
+            ]
+            interpolation = Chain.model_validate({
+                "nodes": nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
+
+        # if chain.parameters.frozen_atom_indices:
+        #     # need to reinsert the frozen atoms into the interpolation
+        #     new_nodes = []
+        #     for node in interpolation:
+        #         new_geom = np.zeros_like(chain_original[0].coords)
+        #         new_geom[subsys_inds] = node.coords
+        #         new_geom[inds_frozen] = chain_original[0].coords[inds_frozen]
+        #         new_node = chain_original[0].update_coords(new_geom)
+        #         new_nodes.append(new_node)
+
+        #     interpolation = Chain.model_validate({
+        #         "nodes": new_nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
+        #     interpolation._zero_velocity()
+        return interpolation
+
+    def _construct_path_minimizer(self, initial_chain: Chain):
+        path_method = _normalize_path_method(self.inputs.path_min_method)
+        if path_method == "NEB":
+
+            msg = "Using in-house NEB optimizer"
+            if _get_verbose(self.inputs):
+                print(msg)
+                sys.stdout.flush()
+            else:
+                update_status(msg)
+            optimizer = self._build_neb_optimizer()
+
+            n = NEB(
+                initial_chain=initial_chain,
+                parameters=self.inputs.path_min_inputs,
+                optimizer=optimizer,
+                engine=self.inputs.engine,
+            )
+        # elif self.inputs.path_min_method.upper() == "PYGSM":
+        #     print("Using PYGSM optimizer")
+        #     n = PYGSM(
+        #         initial_chain=initial_chain,
+        #         engine=self.inputs.engine,
+        #         pygsm_kwds=self.inputs.path_min_inputs,
+        #     )
+
+        elif path_method == "FNEB":
+            msg = "Using Freezing NEB optimizer"
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            optimizer = self._build_neb_optimizer()
+            n = FreezingNEB(
+                initial_chain=initial_chain,
+                engine=self.inputs.engine,
+                parameters=self.inputs.path_min_inputs,
+                optimizer=optimizer,
+                gi_inputs=self.inputs.gi_inputs
+            )
+
+        elif path_method == "MLPGI":
+            from mepd.pathminimizers.mlpgi import MLPGI
+            msg = "Using MLP Geodesic Optimizer"
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            n = MLPGI(
+                initial_chain=initial_chain,
+                engine=self.inputs.engine,
+                parameters=self.inputs.path_min_inputs,
+            )
+        elif path_method == "NEB-DLF":
+            msg = "Using DL-Find NEB optimizer via TeraChem/QCOP"
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            n = DLFindNEB(
+                initial_chain=initial_chain,
+                engine=self.inputs.engine,
+                parameters=self.inputs.path_min_inputs,
+            )
+        elif path_method == "GEOMETRIC-NEB":
+            msg = "Using geomeTRIC NEB optimizer"
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            n = GeometricNEB(
+                initial_chain=initial_chain,
+                engine=self.inputs.engine,
+                parameters=self.inputs.path_min_inputs,
+            )
+        else:
+            raise NotImplementedError(
+                "Invalid path minimization method. Select from NEB, FNEB, MLPGI, NEB-DLF, or GEOMETRIC-NEB.")
+
+        return n
+
+    def run_minimize_chain(self, input_chain: Chain) -> Tuple[NEB, ElemStepResults]:
+        if isinstance(input_chain, list):
+            input_chain = Chain.model_validate(
+                {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
+        self._disable_molecular_graphs(input_chain)
+
+        # make sure the chain parameters are reset
+        # if they come from a converged chain
+        if len(input_chain) != self.inputs.gi_inputs.nimages:
+            interpolation = self._create_interpolation(
+                input_chain,
+            )
+            assert (
+                len(interpolation) == self.inputs.gi_inputs.nimages
+            ), f"Geodesic interpolation wrong length.\
+                 Requested: {self.inputs.gi_inputs.nimages}. Given: {len(interpolation)}"
+
+        else:
+            interpolation = input_chain
+        self._disable_molecular_graphs(interpolation)
+
+        # Use spinner when v=0, print when v=1
+        verbose = _get_verbose(self.inputs)
+        if verbose:
+            print("Running path minimization...")
+        else:
+            start_status("Minimizing path...")
+
+        try:
+            n = self._construct_path_minimizer(initial_chain=interpolation)
+            elem_step_results = n.optimize_chain()
+            out_chain = n.optimized
+
+        except NoneConvergedException:
+            print(traceback.format_exc())
+
+            print(
+                "\nWarning! A chain did not converge.\
+                        Returning an unoptimized chain..."
+            )
+            out_chain = n.chain_trajectory[-1]
+            if self.inputs.path_min_inputs.do_elem_step_checks:
+                elem_step_results = check_if_elem_step(
+                    out_chain, engine=self.inputs.engine, verbose=_get_verbose(self.inputs))
+            else:
+                elem_step_results = ElemStepResults(
+                    is_elem_step=True,
+                    is_concave=None,
+                    splitting_criterion=None,
+                    minimization_results=None,
+                    number_grad_calls=0,
+                )
+
+        except ElectronicStructureError as e:
+            # print(traceback.format_exc())
+
+            print(
+                "\nWarning! A chain has electronic structure errors. \
+                    Returning an unoptimized chain..."
+            )
+            print(f"ElectronicStructureError message: {format_exception_message(e)}")
+            if e.__cause__ is not None:
+                print(f"ElectronicStructureError cause: {type(e.__cause__).__name__}: {e.__cause__}")
+            details = extract_electronic_structure_error_details(e.obj)
+            if details:
+                print("ElectronicStructureError details:")
+                for i, detail in enumerate(details, start=1):
+                    print(f"  [{i}] {detail}")
+            if e.obj is not None:
+                if isinstance(e.obj, (list, tuple)) and not details:
+                    print(
+                        f"ElectronicStructureError includes {len(e.obj)} result objects."
+                    )
+                elif not details:
+                    print(
+                        "ElectronicStructureError includes a result object "
+                        f"of type {type(e.obj).__name__}."
+                    )
+            out_chain = n.chain_trajectory[-1]
+            elem_step_results = ElemStepResults(
+                is_elem_step=True,
+                is_concave=None,
+                splitting_criterion=None,
+                minimization_results=None,
+                number_grad_calls=0,
+            )
+
+        finally:
+            if not verbose:
+                stop_status()
+
+        return n, elem_step_results
+
+    def _update_chain_dynamics(
+        self,
+        chain: Chain,
+        engine,
+        dt,
+        temperature: float,
+        mass=1.0,
+        biaser: ChainBiaser = None,
+        freeze_ends: bool = True
+    ) -> Chain:
+        import mepd.chainhelpers as ch
+
+        # R = 0.008314 / 627.5  # Hartree/mol.K
+        R = 1  # i'm not even sure what R means in this world.
+        _ = engine.compute_gradients(chain)
+        grads = ch.compute_NEB_gradient(chain)
+
+        new_vel = chain.velocity.copy()
+        current_temperature = (
+            np.dot(new_vel.flatten(), new_vel.flatten()) * mass / (3 * R)
+        )
+        thermostating_scaling = np.sqrt(temperature / current_temperature)
+        new_vel *= thermostating_scaling
+
+        new_vel += 0.5 * -1 * grads * dt / mass
+        print("/n", thermostating_scaling, current_temperature)
+
+        position = chain.coordinates
+        ref_start = position[0]
+        ref_end = position[-1]
+        new_position = position + new_vel * dt
+        # print(new_vel)
+        if biaser:
+            grad_bias = biaser.grad_chain_bias(chain)
+            # energy_weights = chain.energies_kcalmol[1:-1]
+            if freeze_ends:
+                new_position[1:-1] -= grad_bias
+        if freeze_ends:
+            new_position[0] = ref_start
+            new_position[-1] = ref_end
+        new_chain = chain.copy()
+        new_nodes = []
+        for coords, node in zip(new_position, new_chain):
+            new_nodes.append(node.update_coords(coords))
+        new_chain.nodes = new_nodes
+
+        grads = engine.compute_gradients(new_chain)
+
+        if freeze_ends:
+            grads[0] = np.zeros_like(grads[0])
+            grads[-1] = np.zeros_like(grads[0])
+        new_vel += 0.5 * -1 * grads * dt / mass
+        new_chain.velocity = new_vel
+
+        return new_chain
+
+    def run_dynamics(
+        self,
+        chain: Chain,
+        max_steps: int,
+        dt=0.1,
+        biaser: ChainBiaser = None,
+        temperature: float = 300.0,  # K
+        freeze_ends: bool = True
+    ):
+        """
+        Runs dynamics on the chain.
+        """
+        if np.all(chain.velocity == 0):
+            rand_vel = np.random.random(
+                size=len(chain.velocity.flatten())).reshape(chain.velocity.shape)
+            rand_vel /= np.linalg.norm(rand_vel)
+            rand_vel *= temperature
+            chain.velocity = rand_vel
+        chain_trajectory = [chain]
+        nsteps = 1
+        chain_previous = chain
+        img_weight = sum(ch._get_mass_weights(chain, False))
+        chain_weight = img_weight * len(chain)
+        while nsteps < max_steps + 1:
+            try:
+                new_chain = self._update_chain_dynamics(
+                    chain=chain_previous,
+                    engine=self.inputs.engine,
+                    dt=dt,
+                    biaser=biaser,
+                    mass=chain_weight,
+                    temperature=temperature,
+                    freeze_ends=freeze_ends
+                )
+            except Exception:
+                print(traceback.format_exc())
+                print("Electronic structure error")
+                return chain_trajectory
+
+            max_rms_grad_val = np.amax(new_chain.rms_gperps)
+            ind_ts_guess = np.argmax(new_chain.energies)
+            ts_guess_grad = np.amax(
+                np.abs(ch.get_g_perps(new_chain)[ind_ts_guess]))
+
+            print_neb_step(
+                step=nsteps,
+                ts_grad=np.amax(np.abs(ts_guess_grad)),
+                max_rms_grad=max_rms_grad_val,
+                ts_triplet_gspring=new_chain.ts_triplet_gspring_infnorm,
+                nodes_frozen=0,
+                timestep=np.linalg.norm(new_chain.velocity),
+                grad_corr="",
+                force_update=True
+            )
+            chain_trajectory.append(new_chain)
+            nsteps += 1
+            chain_previous = new_chain
+        return chain_trajectory
+
+    # def _make_chain_frag(self, chain: Chain, pair_of_inds):
+    def _make_chain_frag(self, chain: Chain, geom_pair, ind_pair):
+        start_ind, end_ind = ind_pair
+        opt_start, opt_end = geom_pair
+        # chain_frag_nodes = chain.nodes[start_ind: end_ind + 1]
+        # chain_frag = Chain(
+        #     nodes=[opt_start] + chain_frag_nodes + [opt_end],
+        #     parameters=self.inputs.chain_inputs,
+        # )
+
+        # JDEP 01132025: Going to not recycle fragment nodes. Want a fresh
+        # interpolation
+        chain_frag = chain.model_copy(update={
+            "nodes": [opt_start, opt_end],
+            "parameters": self.inputs.chain_inputs})
+        # opt_start = chain[start].do_geometry_optimization()
+        # opt_end = chain[end].do_geometry_optimization()
+
+        # chain_frag.insert(0, opt_start)
+        # chain_frag.append(opt_end)
+        # print(f"using a frag of {len(chain_frag)} nodes")
+        return chain_frag
+
+    def _make_chain_pair(self, chain: Chain, pair_of_inds):
+        start, end = pair_of_inds
+        start_opt = chain[start].do_geometry_optimization()
+        end_opt = chain[end].do_geometry_optimization()
+
+        chain_frag = Chain(
+            nodes=[start_opt, end_opt], parameters=self.inputs.chain_inputs
+        )
+
+        return chain_frag
+
+    def _do_minima_based_split(self, chain: Chain, minimization_results: List[Node]):
+        import mepd.chainhelpers as ch
+
+        ind_minima = list(ch._get_ind_minima(chain))
+        if len(ind_minima) == 0:
+            fallback = chain.copy()
+            fallback.nodes = [chain[0], chain[-1]]
+            return [fallback]
+
+        raw_min_nodes = [chain[int(i)] for i in ind_minima]
+
+        candidates = []
+        for node in list(minimization_results or []):
+            if node is None:
+                continue
+            if self._nodes_match_for_attempt_skip(node, chain[0]):
+                continue
+            if self._nodes_match_for_attempt_skip(node, chain[-1]):
+                continue
+            candidates.append(node)
+
+        if len(candidates) == len(raw_min_nodes):
+            split_nodes = candidates
+        elif len(candidates) == 0:
+            split_nodes = raw_min_nodes
+        else:
+            # Mismatch between apparent minima count and optimizer-returned minima.
+            # Keep splitting deterministic by falling back to path minima anchors.
+            split_nodes = raw_min_nodes
+
+        all_geometries = [chain[0], *split_nodes, chain[-1]]
+        pairs_geoms = list(pairwise(all_geometries))
+
+        chains = []
+        seen_pairs = set()
+        for geom_pair in pairs_geoms:
+            start_node, end_node = geom_pair
+            try:
+                same_endpoints = np.allclose(
+                    np.asarray(start_node.coords),
+                    np.asarray(end_node.coords),
+                    atol=1e-8,
+                    rtol=0.0,
+                )
+            except Exception:
+                same_endpoints = False
+            if same_endpoints:
+                continue
+
+            pair_key = (
+                tuple(np.round(np.asarray(start_node.coords).flatten(), 8).tolist()),
+                tuple(np.round(np.asarray(end_node.coords).flatten(), 8).tolist()),
+            )
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            chains.append(
+                self._make_chain_frag(
+                    chain=chain,
+                    geom_pair=geom_pair,
+                    ind_pair=(None, None),
+                )
+            )
+
+        if not chains:
+            fallback = chain.copy()
+            fallback.nodes = [chain[0], chain[-1]]
+            return [fallback]
+        return chains
+
+    def _do_maxima_based_split(
+        self, chain: Chain, minimization_results: List[Node]
+    ) -> List[Chain]:
+        """
+        Will take a chain that needs to be split based on 'maxima' criterion and outputs
+        a list of Chains to be minimized.
+        Args:
+            chain (Chain): _description_
+            minimization_results (List[Node]): a length-2 list containing the Reactant and Product
+            geometries found through the `elemetnarystep.pseudo_irc()`
+
+        Returns:
+            List[Chain]: list of chains to be minimized
+        """
+        r, p = minimization_results
+        segment_pairs = [
+            (chain[0], r),
+            (r, p),
+            (p, chain[len(chain) - 1]),
+        ]
+
+        def _pair_key(a: Node, b: Node):
+            a_coords = np.asarray(a.coords).flatten()
+            b_coords = np.asarray(b.coords).flatten()
+            return (
+                tuple(np.round(a_coords, 8).tolist()),
+                tuple(np.round(b_coords, 8).tolist()),
+            )
+
+        chains_list = []
+        seen_pairs = set()
+        for start_node, end_node in segment_pairs:
+            try:
+                same_endpoints = np.allclose(
+                    np.asarray(start_node.coords),
+                    np.asarray(end_node.coords),
+                    atol=1e-8,
+                    rtol=0.0,
+                )
+            except Exception:
+                same_endpoints = False
+            if same_endpoints:
+                continue
+
+            key = _pair_key(start_node, end_node)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+
+            chain_frag = chain.copy()
+            chain_frag.nodes = [start_node, end_node]
+            chains_list.append(chain_frag)
+
+        if not chains_list:
+            fallback = chain.copy()
+            fallback.nodes = [chain[0], chain[-1]]
+            return [fallback]
+
+        return chains_list
+
+    def make_sequence_of_chains(
+        self, chain: Chain, split_method: str, minimization_results: List[Node]
+    ) -> List[Chain]:
+        """
+        Takes an input chain, `chain`, that needs to be split accordint to `split_method` ("minima", "maxima")
+        Returns a list of Chain objects to be minimzed.
+        """
+        if split_method == "minima":
+            chains = self._do_minima_based_split(chain, minimization_results)
+
+        elif split_method == "maxima":
+            chains = self._do_maxima_based_split(chain, minimization_results)
+
+        return chains
+
+
+def _parallel_recursive_step_worker(
+    run_inputs: RunInputs,
+    input_chain: Chain,
+    tree_node_index: int,
+) -> tuple[TreeNode, list[Chain]]:
+    try:
+        local_inputs = _clone_run_inputs_for_worker(run_inputs)
+    except Exception:
+        try:
+            local_inputs = copy.deepcopy(run_inputs)
+        except Exception:
+            local_inputs = run_inputs
+
+    try:
+        # Keep branch workers in non-verbose mode so transient rich panels from
+        # elementary-step checks do not fight with the live ASCII monitors.
+        local_inputs.path_min_inputs.v = False
+    except Exception:
+        pass
+
+    # Isolate each branch worker from shared mutable endpoint/node state.
+    # Split builders can reuse node instances across child chains (e.g. maxima
+    # split middle points), which is safe in serial mode but can race in
+    # parallel mode.
+    try:
+        local_chain = input_chain.copy()
+    except Exception:
+        try:
+            local_chain = copy.deepcopy(input_chain)
+        except Exception:
+            local_chain = input_chain
+
+    with progress_monitor(f"branch-{int(tree_node_index)}"):
+        runner = MSMEP(inputs=local_inputs)
+        history, child_chains = runner._run_recursive_step(
+            input_chain=local_chain,
+            tree_node_index=tree_node_index,
+        )
+        try:
+            if getattr(history, "data", None) is not None:
+                history.data.engine = None
+        except Exception:
+            pass
+        return history, child_chains
+
+
+def _parallel_recursive_step_worker_from_payload(
+    run_inputs_payload: dict,
+    input_chain_payload: dict,
+    tree_node_index: int,
+) -> tuple[TreeNode, list[Chain]]:
+    local_inputs = RunInputs(**copy.deepcopy(run_inputs_payload))
+    local_chain = _chain_from_worker_payload(input_chain_payload)
+    # Subprocess workers should not write rich/live progress to the shared
+    # terminal; keep rendering centralized in the parent scheduler process.
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            return _parallel_recursive_step_worker(
+                run_inputs=local_inputs,
+                input_chain=local_chain,
+                tree_node_index=tree_node_index,
+            )

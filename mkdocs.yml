@@ -1,0 +1,40 @@
+site_name: MEPD Documentation
+site_url: https://mtzgroup.github.io/mepd/
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Key Concepts: concepts.md
+  - Engines: engines.md
+  - Input Parameters: inputs.md
+  - Tutorial: tutorial.md
+  - Elementary-Step Checks: elementarystep.md
+  - CLI Reference: cli.md
+  - API Reference: api.md
+  - About: about.md
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: blue
+      accent: orange
+  features:
+    - navigation.tabs
+    - search.suggest
+    - search.highlight
+    - navigation.instant
+    - navigation.expand
+  icon:
+    repo: fontawesome/brands/github-alt
+
+repo_url: https://github.com/mtzgroup/mepd
+edit_uri: edit/master/docs/
+site_author: Jan Estrada Pabón
+plugins:
+  - search
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.details
+  - admonition
+  - toc:
+      permalink: 🔗

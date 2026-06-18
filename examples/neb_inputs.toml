@@ -1,0 +1,62 @@
+engine_name = "chemcloud"
+program = "crest"
+write_qcio = false
+print_stdout = false
+path_min_method = "neb"
+
+[path_min_inputs]
+climb = false
+en_thre = 0.0001
+rms_grad_thre = 0.02
+max_rms_grad_thre = 0.05
+skip_identical_graphs = true
+disable_molecular_graphs = false
+ts_grad_thre = 0.05
+ts_spring_thre = 0.02
+barrier_thre = 0.1
+early_stop_force_thre = 0.0
+negative_steps_thre = 5
+positive_steps_thre = 10
+use_geodesic_tangent = false
+do_elem_step_checks = false
+adaptive_resolution = false
+adaptive_segment_ratio = 2.0
+adaptive_energy_ratio = 2.0
+adaptive_use_energy = true
+adaptive_max_images = 25
+adaptive_cooldown_steps = 2
+adaptive_plateau_window = 3
+adaptive_plateau_rtol = 0.05
+validate_minima_with_hessian = false
+hessian_minimum_frequency_cutoff = 0.0
+max_steps = 500
+v = false
+
+[chain_inputs]
+k = 0.1
+delta_k = 0.09
+do_parallel = true
+use_geodesic_interpolation = true
+friction_optimal_gi = true
+node_freezing = true
+fraction_freeze = 0.1
+node_rms_thre = 5.0
+node_ene_thre = 5.0
+frozen_atom_indices = ""
+
+[gi_inputs]
+nimages = 10
+friction = 0.001
+nudge = 0.1
+align = true
+
+[program_kwds.keywords]
+threads = 1
+
+[program_kwds.model]
+method = "gfn2"
+basis = "gfn2"
+
+[optimizer_kwds]
+name = "cg"
+timestep = 0.5

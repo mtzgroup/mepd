@@ -1,0 +1,237 @@
+[project]
+name = "mepd"
+version = "0.1.0"
+description = "Minimum energy path discovery tools for NEB, MLPGI, MSMEP, and elementary-step analysis"
+authors = [{name = "Jan", email = "janestrada7@gmail.com"}]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "asciimol>=1.2.0",
+    "ase>=3.26.0",
+    "chemcloud>=0.16.0",
+    "click>=8.2.1",
+    "fairchem-core>=2.6.0",
+    "geometric>=1.1",
+    "huggingface-hub>=0.35.3",
+    "ipython>=8.37.0",
+    "ipywidgets>=8.1.7",
+    "joblib>=1.5.2",
+    "jupyter>=1.1.1",
+    "jupytext>=1.17.3",
+    "lab>=8.9",
+    "matplotlib>=3.9.1",
+    "mkdocs>=1.6.1",
+    "networkx>=3.4.2",
+    "numpy>=2.2.6",
+    "openbabel-wheel>=3.1.1.22",
+    "pandas>=2.3.2",
+    "pydantic>=2.8.2",
+    "pysmiles>=2.0.0",
+    "pytest>=9.0.2",
+    "qccodec==0.9.1",
+    "qcinf>=0.2.0",
+    "qcio[view]>=0.14.0",
+    "qcop[qcengine]==0.12.1",
+    "rdkit>=2025.3.6",
+    "rich>=13.0.0",
+    "scipy>=1.15.3",
+    "sella>=2.3.4",
+    "timeout-timer>=0.2.0",
+    "tomli>=2.2.1",
+    "tomli-w>=1.2.0",
+    "tqdm>=4.67.1",
+    "typer>=0.17.4",
+]
+
+[project.optional-dependencies]
+elementarystep = [
+    "ase>=3.26.0",
+    "geometric>=1.1",
+    "ipython>=8.37.0",
+    "matplotlib>=3.9.1",
+    "networkx>=3.4.2",
+    "numpy>=2.2.6",
+    "openbabel-wheel>=3.1.1.22",
+    "pydantic>=2.8.2",
+    "pysmiles>=2.0.0",
+    "qccodec==0.9.1",
+    "qcinf>=0.2.0",
+    "qcio>=0.14.0",
+    "qcop[qcengine]==0.12.1",
+    "rdkit>=2025.3.6",
+    "rich>=13.0.0",
+    "scipy>=1.15.3",
+    "timeout-timer>=0.2.0",
+    "tomli>=2.2.1",
+    "tomli-w>=1.2.0",
+]
+full = [
+    "ase>=3.26.0",
+    "chemcloud>=0.16.0",
+    "click>=8.2.1",
+    "fairchem-core>=2.6.0; python_version < '3.14'",
+    "geometric>=1.1",
+    "ipython>=8.37.0",
+    "ipywidgets>=8.1.7",
+    "joblib>=1.5.2",
+    "jupyter>=1.1.1",
+    "jupytext>=1.17.3",
+    "matplotlib>=3.9.1",
+    "mkdocs>=1.6.1",
+    "networkx>=3.4.2",
+    "numpy>=2.2.6",
+    "openbabel-wheel>=3.1.1.22",
+    "pandas>=2.3.2",
+    "pydantic>=2.8.2",
+    "pysmiles>=2.0.0",
+    "qccodec==0.9.1",
+    "qcinf>=0.2.0",
+    "qcio[view]>=0.14.0",
+    "qcop[qcengine]==0.12.1",
+    "rdkit>=2025.3.6",
+    "rich>=13.0.0",
+    "asciimol>=1.2.0",
+    "scipy>=1.15.3",
+    "sella>=2.3.4",
+    "timeout-timer>=0.2.0",
+    "tomli>=2.2.1",
+    "tomli-w>=1.2.0",
+    "tqdm>=4.67.1",
+    "typer>=0.17.4",
+    "huggingface-hub>=0.35.3",
+    "pytest>=9.0.2",
+]
+
+[project.scripts]
+mepd = "mepd.scripts.main_cli:app"
+mepd-elementarystep = "mepd.elementarystep:main"
+
+[tool.poetry]
+name = "mepd"
+version = "0.1.0"
+description = "Minimum energy path discovery tools for NEB, MLPGI, MSMEP, and elementary-step analysis"
+authors = ["Jan <janestrada7@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.15"
+ase = {version = ">=3.26.0", optional = true}
+chemcloud = {version = ">=0.16.0", optional = true}
+click = {version = ">=8.2.1", optional = true}
+fairchem-core = {version = ">=2.6.0", markers = "python_version < '3.14'", optional = true}
+geometric = {version = ">=1.1", optional = true}
+ipython = {version = ">=8.37.0", optional = true}
+ipywidgets = {version = ">=8.1.7", optional = true}
+joblib = {version = ">=1.5.2", optional = true}
+jupyter = {version = ">=1.1.1", optional = true}
+jupytext = {version = ">=1.17.3", optional = true}
+matplotlib = {version = ">=3.9.1", optional = true}
+mkdocs = {version = ">=1.6.1", optional = true}
+networkx = {version = ">=3.4.2", optional = true}
+numpy = {version = ">=2.2.6", optional = true}
+openbabel-wheel = {version = ">=3.1.1.22", optional = true}
+pandas = {version = ">=2.3.2", optional = true}
+pydantic = {version = ">=2.8.2", optional = true}
+pysmiles = {version = ">=2.0.0", optional = true}
+qccodec = {version = "==0.9.1", optional = true}
+qcinf = {version = ">=0.2.0", optional = true}
+qcio = {extras = ["view"], version = ">=0.14.0", optional = true}
+qcop = {extras = ["qcengine"], version = "==0.12.1", optional = true}
+rdkit = {version = ">=2025.3.6", optional = true}
+rich = {version = ">=13.0.0", optional = true}
+asciimol = {version = ">=1.2.0", optional = true}
+scipy = {version = ">=1.15.3", optional = true}
+sella = {version = ">=2.3.4", optional = true}
+timeout-timer = {version = ">=0.2.0", optional = true}
+tomli = {version = ">=2.2.1", optional = true}
+tomli-w = {version = ">=1.2.0", optional = true}
+tqdm = {version = ">=4.67.1", optional = true}
+typer = {version = ">=0.17.4", optional = true}
+huggingface-hub = {version = ">=0.35.3", optional = true}
+pytest = {version = ">=9.0.2", optional = true}
+
+[tool.poetry.extras]
+elementarystep = [
+    "ase",
+    "geometric",
+    "ipython",
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "openbabel-wheel",
+    "pydantic",
+    "pysmiles",
+    "qccodec",
+    "qcinf",
+    "qcio",
+    "qcop",
+    "rdkit",
+    "rich",
+    "scipy",
+    "timeout-timer",
+    "tomli",
+    "tomli-w",
+]
+full = [
+    "ase",
+    "chemcloud",
+    "click",
+    "fairchem-core",
+    "geometric",
+    "ipython",
+    "ipywidgets",
+    "joblib",
+    "jupyter",
+    "jupytext",
+    "matplotlib",
+    "mkdocs",
+    "networkx",
+    "numpy",
+    "openbabel-wheel",
+    "pandas",
+    "pydantic",
+    "pysmiles",
+    "qccodec",
+    "qcinf",
+    "qcio",
+    "qcop",
+    "rdkit",
+    "rich",
+    "asciimol",
+    "scipy",
+    "sella",
+    "timeout-timer",
+    "tomli",
+    "tomli-w",
+    "tqdm",
+    "typer",
+    "huggingface-hub",
+    "pytest",
+]
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.4.2"
+autopep8 = "^2.3.1"
+torch = {version = ">=2.0.0, !=2.0.1, !=2.1.0", markers = "python_version < '3.14'"}
+tqdm = "^4.66.4"
+xtb = "^22.1"
+
+
+
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.6.0"
+mkdocs-material = "^9.5.29"
+markdown-include = "^0.8.1"
+pymdown-extensions = "^10.8.1"
+mkdocstrings = {extras = ["python"], version = "^0.25.1"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+mepd = "mepd.scripts.main_cli:app"
+mepd-elementarystep = "mepd.elementarystep:main"
