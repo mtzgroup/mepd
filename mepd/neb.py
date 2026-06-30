@@ -524,6 +524,9 @@ class NEB(PathMinimizer):
             hessian_minimum_frequency_cutoff=float(
                 getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
             ),
+            hessian_minima_rescue_displacement=float(
+                getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
+            ),
         )
 
         if not elem_step_results.is_elem_step:
@@ -565,7 +568,26 @@ class NEB(PathMinimizer):
             new_params.early_stop_force_thre = 0.0
             self.parameters = new_params
 
-            stop_early, elem_step_results = self._do_early_stop_check(chain)
+            try:
+                stop_early, elem_step_results = self._do_early_stop_check(chain)
+            except ElectronicStructureError as exc:
+                msg = (
+                    "Early elementary-step check was inconclusive because an "
+                    "auxiliary electronic-structure calculation failed; continuing "
+                    f"path minimization ({type(exc).__name__}: {exc})."
+                )
+                if self.parameters.v:
+                    print(f"\n{msg}")
+                else:
+                    update_status(msg)
+                stop_early = False
+                elem_step_results = ElemStepResults(
+                    is_elem_step=None,
+                    is_concave=None,
+                    splitting_criterion=None,
+                    minimization_results=[],
+                    number_grad_calls=0,
+                )
 
             self.parameters.early_stop_force_thre = (
                 0.0  # setting it to 0 so we don't check it over and over
@@ -819,6 +841,13 @@ class NEB(PathMinimizer):
                         hessian_minimum_frequency_cutoff=float(
                             getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
                         ),
+                        hessian_minima_rescue_displacement=float(
+                            getattr(
+                                self.parameters,
+                                "hessian_minima_rescue_displacement",
+                                0.1,
+                            )
+                        ),
                     )
                     self.geom_grad_calls_made += elem_step_results.number_grad_calls
                 else:
@@ -866,6 +895,13 @@ class NEB(PathMinimizer):
                     ),
                     hessian_minimum_frequency_cutoff=float(
                         getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
+                    ),
+                    hessian_minima_rescue_displacement=float(
+                        getattr(
+                            self.parameters,
+                            "hessian_minima_rescue_displacement",
+                            0.1,
+                        )
                     ),
                 )
                 self.geom_grad_calls_made += elem_step_results.number_grad_calls

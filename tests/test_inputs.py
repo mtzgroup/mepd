@@ -16,6 +16,30 @@ def test_runinputs_fsm_uses_empty_path_min_inputs():
     assert vars(inputs.path_min_inputs) == {}
 
 
+def test_runinputs_gi_random_seed_default_and_toml(tmp_path):
+    inputs = RunInputs(path_min_method="neb")
+    assert inputs.gi_inputs.random_seed == 0
+
+    fp = tmp_path / "inputs.toml"
+    fp.write_text(
+        """
+engine_name = "chemcloud"
+program = "xtb"
+path_min_method = "NEB"
+
+[gi_inputs]
+random_seed = 123
+
+[optimizer_kwds]
+name = "cg"
+""".lstrip()
+    )
+
+    loaded = RunInputs.open(fp)
+
+    assert loaded.gi_inputs.random_seed == 123
+
+
 def test_runinputs_fsm_can_save_defaults(tmp_path):
     inputs = RunInputs(path_min_method="fsm")
     out_fp = tmp_path / "default_inputs.toml"
@@ -52,6 +76,26 @@ name = "cg"
     inputs = RunInputs.open(fp)
 
     assert inputs.chain_inputs.fraction_freeze == pytest.approx(0.25)
+
+
+def test_runinputs_rejects_removed_friction_optimal_gi(tmp_path):
+    fp = tmp_path / "inputs.toml"
+    fp.write_text(
+        """
+engine_name = "chemcloud"
+program = "xtb"
+path_min_method = "NEB"
+
+[chain_inputs]
+friction_optimal_gi = true
+
+[optimizer_kwds]
+name = "cg"
+""".lstrip()
+    )
+
+    with pytest.raises(ValueError, match="friction_optimal_gi has been removed"):
+        RunInputs.open(fp)
 
 
 def test_runinputs_passes_geometry_optimizer_keywords_from_toml(tmp_path, monkeypatch):
@@ -111,6 +155,37 @@ def test_runinputs_neb_has_hessian_minima_validation_defaults():
     defaults = vars(inputs.path_min_inputs)
     assert defaults["validate_minima_with_hessian"] is False
     assert defaults["hessian_minimum_frequency_cutoff"] == pytest.approx(0.0)
+    assert defaults["hessian_minima_rescue_displacement"] == pytest.approx(0.1)
+    assert defaults["network_completion_max_followup_requests"] == 1000
+    assert defaults["recursive_split_max_depth"] == 200
+    assert defaults["recursive_same_pair_split_limit"] == 5
+
+
+def test_runinputs_reads_hessian_minima_rescue_displacement_from_toml(tmp_path):
+    fp = tmp_path / "inputs.toml"
+    fp.write_text(
+        """
+engine_name = "chemcloud"
+program = "xtb"
+path_min_method = "NEB"
+
+[path_min_inputs]
+hessian_minima_rescue_displacement = 0.025
+network_completion_max_followup_requests = 17
+recursive_split_max_depth = 9
+
+[optimizer_kwds]
+name = "cg"
+""".lstrip()
+    )
+
+    inputs = RunInputs.open(fp)
+
+    assert inputs.path_min_inputs.hessian_minima_rescue_displacement == pytest.approx(
+        0.025
+    )
+    assert inputs.path_min_inputs.network_completion_max_followup_requests == 17
+    assert inputs.path_min_inputs.recursive_split_max_depth == 9
 
 
 def test_runinputs_mlpgi_has_expected_defaults():

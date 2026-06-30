@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from qcio import Structure
 
 from mepd.elementarystep import _run_geom_opt
+from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
 
 
@@ -46,4 +48,13 @@ def test_run_geom_opt_geometric_engine_uses_geometric_defaults():
 
     traj = _run_geom_opt(_node(), _Engine())
     assert len(traj) == 1
-    assert captured["keywords"] == {"coord_sys": "cart", "maxiter": 1000}
+    assert captured["keywords"] == {"coordsys": "cart", "maxiter": 1000}
+
+
+def test_run_geom_opt_rejects_empty_failed_trajectory():
+    class _Engine:
+        def compute_geometry_optimization(self, node, keywords=None):
+            return []
+
+    with pytest.raises(ElectronicStructureError, match="did not produce a converged trajectory"):
+        _run_geom_opt(_node(), _Engine())

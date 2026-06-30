@@ -130,7 +130,7 @@ class Molecule(nx.Graph):
             start (int, optional): initial value for the reindexing. Defaults to 0.
 
         Returns:
-            Molecule: molecule-like graph object
+            Molecule: copied molecule object
         """
         if reindex:
             # if reindex is true, convert the node labels to integers starting with start
@@ -243,7 +243,7 @@ class Molecule(nx.Graph):
             other (int): how many molecules
 
         Returns:
-            Molecule: a molecule-like graph object
+            Molecule: combined molecule
         """
         assert isinstance(other, int)
         final = self.__class__()
@@ -740,7 +740,7 @@ class Molecule(nx.Graph):
             ValueError: when the smiles is not valid
 
         Returns:
-            Molecule: a molecule object
+            Molecule: a retropath molecule object
         """
 
         rdmol = Chem.MolFromSmiles(smi)

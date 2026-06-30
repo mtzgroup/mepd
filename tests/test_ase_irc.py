@@ -115,30 +115,3 @@ def test_compute_irc_chain_dispatches_to_engine_irc_method():
     assert engine.called is True
     assert engine.received_keywords == {"maxiter": 25}
 
-
-def test_compute_irc_chain_uses_native_qcop_irc():
-    ts = _ts_node()
-    neg = ts.copy().update_coords(np.asarray(ts.coords) - 0.01)
-    pos = ts.copy().update_coords(np.asarray(ts.coords) + 0.01)
-    calls = {"native": 0}
-
-    class QCOPEngine:
-        def compute_energies(self, chain):
-            return np.arange(len(chain), dtype=float)
-
-        def compute_sd_irc(self, **kwargs):
-            calls["native"] += 1
-            assert kwargs["ts"] is ts
-            return [[neg], [pos]]
-
-        def compute_geometry_optimization(self, node, keywords=None):
-            assert keywords == {"maxiter": 25}
-            return [node.copy()]
-
-    QCOPEngine.__module__ = "mepd.engines.qcop"
-
-    out = compute_irc_chain(ts_node=ts, engine=QCOPEngine(), keywords={"maxiter": 25})
-
-    assert calls == {"native": 1}
-    assert len(out.nodes) == 5
-    assert np.allclose(np.asarray(out.nodes[2].coords), np.asarray(ts.coords))

@@ -78,7 +78,7 @@ def test_chain_converged_uses_endpoint_padded_gperps_for_ts_index(monkeypatch):
 def test_chain_converged_handles_large_frozen_atom_indices(monkeypatch):
     chain_prev = _DummyChain(n_nodes=5, ts_index=2)
     chain_new = _DummyChain(n_nodes=5, ts_index=2)
-    # Simulate many frozen atom indices, all > n_nodes.
+    # Simulate large-system behavior: many frozen atom indices, all > n_nodes.
     chain_new.parameters = SimpleNamespace(
         frozen_atom_indices=list(range(100, 200)),
         node_freezing=False,

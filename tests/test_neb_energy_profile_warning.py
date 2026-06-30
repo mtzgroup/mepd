@@ -4,12 +4,13 @@ from qcio import Structure
 
 import mepd.neb as neb_module
 from mepd.chain import Chain
+from mepd.errors import ElectronicStructureError
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import StructureNode
 from mepd.neb import _endpoint_energy_inversion_warning_text, NEB
 
 
-def test_endpoint_energy_inversion_warning_triggers_for_endpoint_peak():
+def test_endpoint_energy_inversion_warning_triggers_for_endpoint_ts_guess():
     energies = np.array([0.020, 0.000, 0.005, 0.018])
     msg = _endpoint_energy_inversion_warning_text(energies=energies)
     assert msg is not None
@@ -46,6 +47,9 @@ def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch)
         }
     )
 
+    class DummyEngine:
+        pass
+
     params = SimpleNamespace(
         max_steps=2,
         v=False,
@@ -59,7 +63,7 @@ def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch)
         initial_chain=prepared_chain.copy(),
         optimizer=optimizer,
         parameters=params,
-        engine=SimpleNamespace(),
+        engine=DummyEngine(),
     )
 
     monkeypatch.setattr(NEB, "update_chain", lambda self, chain: prepared_chain.copy())
@@ -117,3 +121,37 @@ def test_early_stop_requires_both_ts_gperp_and_ts_triplet_spring(monkeypatch):
     stop_early, _ = neb._check_early_stop(_DummyChain(ts_triplet_spring=0.05))
     assert stop_early is True
     assert calls["count"] == 1
+
+
+def test_failed_early_elem_step_check_continues_path_minimization(monkeypatch):
+    class _DummyChain:
+        energies = np.array([0.0, 1.0, 0.2], dtype=float)
+        ts_triplet_gspring_infnorm = 0.01
+
+    monkeypatch.setattr(
+        neb_module.ch,
+        "get_g_perps",
+        lambda chain: [
+            np.zeros((2, 3), dtype=float),
+            np.full((2, 3), 0.01, dtype=float),
+            np.zeros((2, 3), dtype=float),
+        ],
+    )
+    messages = []
+    monkeypatch.setattr(neb_module, "update_status", messages.append)
+
+    neb = object.__new__(NEB)
+    neb.parameters = SimpleNamespace(early_stop_force_thre=0.1, v=False)
+    neb._do_early_stop_check = lambda chain: (_ for _ in ()).throw(
+        ElectronicStructureError(
+            msg="Pseudo-IRC endpoint optimization failed",
+        )
+    )
+
+    stop_early, result = neb._check_early_stop(_DummyChain())
+
+    assert stop_early is False
+    assert result.is_elem_step is None
+    assert result.number_grad_calls == 0
+    assert neb.parameters.early_stop_force_thre == 0.0
+    assert any("continuing path minimization" in message for message in messages)

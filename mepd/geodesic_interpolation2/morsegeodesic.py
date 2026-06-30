@@ -70,7 +70,8 @@ class MorseGeodesic(object):
         rij_list_external: Optional[List[Tuple[int, int]]] = None,
         eq_distances_external: Optional[np.ndarray] = None,
         align: bool = True,
-        ignore_atoms: list = None
+        ignore_atoms: list = None,
+        rng: Optional[np.random.Generator] = None,
     ):
         """
         Initializes the MorseGeodesic object.
@@ -150,7 +151,8 @@ class MorseGeodesic(object):
                 atoms=self.atoms,
                 threshold=threshold,
                 min_neighbors=min_neighbors,
-                ignore_atoms=ignore_atoms
+                ignore_atoms=ignore_atoms,
+                rng=rng,
             )
             logger.debug(
                 f"Generated internal rij_list ({len(rij_list_py)} pairs) and eq_distances."
@@ -1341,6 +1343,7 @@ def run_geodesic_get_smoother(
     input_object,
     tol=2e-3,
     nudge=0.1,
+    random_seed=0,
     ntries=1,
     scaling=1.7,
     dist_cutoff=3,
@@ -1353,6 +1356,7 @@ def run_geodesic_get_smoother(
     min_neighbors=4,
     align=True,
     ignore_atoms: list = [],
+    rng: Optional[np.random.Generator] = None,
     **kwargs
 ):
     from mepd.geodesic_interpolation2.interpolation import redistribute
@@ -1370,10 +1374,20 @@ def run_geodesic_get_smoother(
     if len(X) < 2:
         raise ValueError("Need at least two initial geometries.")
 
+    if rng is None:
+        rng = np.random.default_rng(random_seed)
+
     # First redistribute number of images.  Perform interpolation if too few and subsampling if too many
     # images are given
     raw = redistribute(
-        symbols, X, nimages=nimages, tol=tol * 5, align=align, ignore_atoms=ignore_atoms, nudge=nudge
+        symbols,
+        X,
+        nimages=nimages,
+        tol=tol * 5,
+        align=align,
+        ignore_atoms=ignore_atoms,
+        nudge=nudge,
+        rng=rng,
     )
     # Perform smoothing by minimizing distance in Cartesian coordinates with redundant internal metric
     # to find the appropriate geodesic curve on the hyperspace.
@@ -1385,7 +1399,8 @@ def run_geodesic_get_smoother(
         friction=friction,
         min_neighbors=min_neighbors,
         align=align,
-        ignore_atoms=ignore_atoms
+        ignore_atoms=ignore_atoms,
+        rng=rng,
     )
 
     # return smoother

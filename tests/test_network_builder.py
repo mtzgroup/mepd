@@ -165,6 +165,27 @@ def test_graph_equivalent_requires_matching_stereochemical_smiles(monkeypatch):
     assert builder._graph_equivalent(left, right) is False
 
 
+def test_add_all_nodes_persists_stereochemical_smiles(monkeypatch):
+    builder = NetworkBuilder(
+        data_dir=Path("."),
+        chain_inputs=ChainInputs(),
+        network_inputs=NetworkInputs(verbose=False),
+    )
+    node = _node(0.74, 0.0)
+    monkeypatch.setattr(
+        network_builder_module,
+        "_stereochemical_smiles_key",
+        lambda _node: "C[C@H](F)Cl",
+    )
+    monkeypatch.setattr(builder, "_get_relevant_conformers", lambda _index: [])
+
+    pot = Pot.model_validate({"root": node.graph})
+    pot.graph.clear()
+    pot = builder._add_all_nodes(pot, [node])
+
+    assert pot.graph.nodes[0]["stereochemical_smiles"] == "C[C@H](F)Cl"
+
+
 def test_create_rxn_network_raises_when_no_valid_structures(monkeypatch):
     builder = NetworkBuilder(
         data_dir=Path("."),

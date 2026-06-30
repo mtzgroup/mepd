@@ -4,6 +4,7 @@ import pytest
 from qcio import ProgramArgs, Structure
 
 from mepd.engines.qcop import QCOPEngine
+from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
 
 
@@ -176,3 +177,30 @@ H 0.0 0.0 0.2
 
     assert len(trajectory) == 2
     assert float(trajectory[-1].structure.geometry[0][2]) != float(trajectory[0].structure.geometry[0][2])
+
+
+def test_qcop_engine_rejects_failed_geometry_optimization_with_trajectory(monkeypatch):
+    engine = QCOPEngine(
+        program_args=ProgramArgs(model={"method": "ub3lyp", "basis": "3-21g"}, keywords={}),
+        program="terachem",
+        compute_program="chemcloud",
+    )
+    optim_xyz = """1
+frame0
+H 0.0 0.0 0.0
+1
+frame1
+H 0.0 0.0 5.0
+"""
+
+    monkeypatch.setattr(
+        engine,
+        "_compute_geom_opt_result",
+        lambda node, keywords=None: SimpleNamespace(
+            success=False,
+            files={"optim.xyz": optim_xyz},
+        ),
+    )
+
+    with pytest.raises(ElectronicStructureError, match="did not converge"):
+        engine.compute_geometry_optimization(_single_atom_node())

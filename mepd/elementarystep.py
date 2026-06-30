@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 from mepd.chain import Chain
 from mepd.nodes.node import Node
 import numpy as np
@@ -16,10 +16,11 @@ from mepd.nodes.nodehelpers import (
     _print_all_comparisons,
     _render_molecule_ascii,
     _reset_comparison_results,
+    displace_by_dr,
     is_identical,
 )
 from mepd.scripts.progress import stop_status, update_status, print_persistent
-from mepd.errors import EnergiesNotComputedError
+from mepd.errors import ElectronicStructureError, EnergiesNotComputedError
 from qcinf import structure_to_smiles
 
 # Rich imports for flashy CLI output
@@ -53,28 +54,6 @@ def _get_ts_neighbor_pair_indices(chain: Chain) -> tuple[int, int] | None:
 
     i_neighbor = int(max(neighs, key=lambda idx: energies[idx]))
     return min(i_high, i_neighbor), max(i_high, i_neighbor)
-
-
-def _get_maxima_split_pair_indices(
-    chain: Chain,
-    arg_max: int,
-) -> tuple[int, int] | None:
-    """Return an energy-aware maxima split pair, falling back to adjacent nodes."""
-    try:
-        pair_indices = _get_ts_neighbor_pair_indices(chain)
-    except EnergiesNotComputedError:
-        pair_indices = None
-
-    if pair_indices is not None:
-        return pair_indices
-    if len(chain) < 2:
-        return None
-
-    left = max(int(arg_max) - 1, 0)
-    right = min(int(arg_max) + 1, len(chain) - 1)
-    if left == right:
-        return None
-    return min(left, right), max(left, right)
 
 
 def _get_ind_minima(chain: Chain) -> np.ndarray:
@@ -127,6 +106,7 @@ class HessianMinimaValidation:
     min_frequency: float | None = None
     min_hessian_eigenvalue: float | None = None
     reason: str = ""
+    hessian_result: Any | None = None
 
 
 def _extract_hessian_matrix(hessian_result) -> np.ndarray | None:
@@ -150,19 +130,70 @@ def _extract_hessian_frequencies(hessian_result) -> list[float]:
     if freqs is not None:
         return [float(freq) for freq in freqs]
 
+    return []
+
+
+def _extract_hessian_modes_and_frequencies(
+    hessian_result,
+    node: Node,
+) -> tuple[list[np.ndarray], list[float]]:
+    results = getattr(hessian_result, "results", None)
+    modes = getattr(results, "normal_modes_cartesian", None)
+    freqs = getattr(results, "freqs_wavenumber", None)
+    if modes is not None and freqs is not None:
+        try:
+            return [np.asarray(mode, dtype=float) for mode in modes], [
+                float(freq) for freq in freqs
+            ]
+        except Exception:
+            pass
+
     try:
         from mepd.helper_functions import parse_nma_freq_data
 
-        _modes, parsed_freqs = parse_nma_freq_data(hessian_result)
-        return [float(freq) for freq in parsed_freqs]
+        parsed_modes, parsed_freqs = parse_nma_freq_data(hessian_result)
+        if parsed_modes and parsed_freqs:
+            return [np.asarray(mode, dtype=float) for mode in parsed_modes], [
+                float(freq) for freq in parsed_freqs
+            ]
     except Exception:
         pass
 
     hessian = _extract_hessian_matrix(hessian_result)
     if hessian is None:
-        return []
-    eigvals = np.linalg.eigvalsh(hessian)
-    return [float(np.sign(val) * np.sqrt(abs(val))) for val in eigvals]
+        return [], []
+    eigvals, eigvecs = np.linalg.eigh(hessian)
+    modes = []
+    for mode_index in range(eigvecs.shape[1]):
+        mode = np.asarray(eigvecs[:, mode_index], dtype=float)
+        try:
+            mode = mode.reshape(node.coords.shape)
+        except ValueError:
+            pass
+        modes.append(mode)
+    freqs = [float(np.sign(val) * np.sqrt(abs(val))) for val in eigvals]
+    return modes, freqs
+
+
+def _lowest_frequency_mode(
+    hessian_result,
+    node: Node,
+) -> tuple[np.ndarray | None, float | None]:
+    modes, freqs = _extract_hessian_modes_and_frequencies(hessian_result, node)
+    if not modes or not freqs:
+        return None, None
+    count = min(len(modes), len(freqs))
+    if count == 0:
+        return None, None
+    min_index = int(np.argmin(np.asarray(freqs[:count], dtype=float)))
+    mode = np.asarray(modes[min_index], dtype=float)
+    try:
+        mode = mode.reshape(node.coords.shape)
+    except ValueError:
+        return None, float(freqs[min_index])
+    if not np.all(np.isfinite(mode)) or np.linalg.norm(mode) == 0:
+        return None, float(freqs[min_index])
+    return mode, float(freqs[min_index])
 
 
 def _validate_hessian_minimum(
@@ -186,50 +217,198 @@ def _validate_hessian_minimum(
             reason=f"hessian calculation failed ({type(exc).__name__}: {exc})",
         )
 
-    hessian = _extract_hessian_matrix(hessian_result)
-    min_hessian_eigenvalue = None
-    if hessian is not None:
-        min_hessian_eigenvalue = float(np.min(np.linalg.eigvalsh(hessian)))
-
     frequencies = _extract_hessian_frequencies(hessian_result)
     if not frequencies:
         return HessianMinimaValidation(
             is_minimum=False,
-            reason="hessian calculation did not return frequencies or eigenvalues",
+            reason="hessian calculation did not return reported frequencies",
+            hessian_result=hessian_result,
         )
 
     min_frequency = float(min(frequencies))
-    has_negative_curvature = (
-        min_hessian_eigenvalue is not None and min_hessian_eigenvalue < -1e-8
-    )
-    is_minimum = min_frequency >= float(frequency_cutoff) and not has_negative_curvature
-    eigen_reason = (
-        f"; minimum Hessian eigenvalue {min_hessian_eigenvalue:.6g}"
-        if min_hessian_eigenvalue is not None
-        else ""
-    )
+    is_minimum = min_frequency >= float(frequency_cutoff)
     if is_minimum:
         reason = (
             f"minimum frequency {min_frequency:.3f} >= cutoff {float(frequency_cutoff):.3f}"
-            f"{eigen_reason}"
-        )
-    elif has_negative_curvature:
-        reason = (
-            f"negative Hessian curvature detected{eigen_reason}; "
-            f"minimum frequency {min_frequency:.3f}, cutoff {float(frequency_cutoff):.3f}"
         )
     else:
         reason = (
             f"minimum frequency {min_frequency:.3f} < cutoff {float(frequency_cutoff):.3f}"
-            f"{eigen_reason}"
         )
     return HessianMinimaValidation(
         is_minimum=is_minimum,
         frequencies=frequencies,
         min_frequency=min_frequency,
-        min_hessian_eigenvalue=min_hessian_eigenvalue,
+        min_hessian_eigenvalue=None,
         reason=reason,
+        hessian_result=hessian_result,
     )
+
+
+def _emit_hessian_validation_message(
+    msg: str,
+    *,
+    accepted: bool,
+    verbose: bool,
+):
+    if verbose:
+        if _rich_available:
+            _console.print(Panel.fit(
+                msg,
+                border_style="green" if accepted else "yellow",
+            ))
+        else:
+            print(msg)
+    elif not accepted:
+        stop_status()
+        print_persistent(msg)
+        update_status("Checking if elementary step")
+
+
+def _hessian_rescue_failed_candidate(
+    node: Node,
+    engine: Engine,
+    *,
+    validation: HessianMinimaValidation,
+    frequency_cutoff: float,
+    rescue_displacement: float,
+    verbose: bool,
+    label: str,
+) -> tuple[Node | None, HessianMinimaValidation | None, int]:
+    mode, mode_frequency = _lowest_frequency_mode(validation.hessian_result, node)
+    if mode is None:
+        msg = (
+            f"Could not rescue {label} split candidate after Hessian rejection: "
+            "no usable unstable normal mode was available."
+        )
+        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+        return None, None, 0
+
+    msg = (
+        f"Attempting Hessian rescue for {label} split candidate: displacing "
+        f"±{float(rescue_displacement):.3f} bohr along lowest-frequency "
+        f"mode ({mode_frequency:.3f} cm^-1) and reoptimizing."
+    )
+    _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+
+    rescue_grad_calls = 0
+    best_validation: HessianMinimaValidation | None = None
+    for signed_dr in (float(rescue_displacement), -float(rescue_displacement)):
+        try:
+            displaced = displace_by_dr(node=node, displacement=mode, dr=signed_dr)
+            opt_traj = _run_geom_opt(displaced, engine=engine)
+        except Exception as exc:
+            msg = (
+                f"Hessian rescue {label} candidate failed during "
+                f"{signed_dr:+.3f} bohr reoptimization "
+                f"({type(exc).__name__}: {exc})."
+            )
+            _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+            continue
+
+        rescue_grad_calls += len(opt_traj)
+        if not opt_traj:
+            continue
+        rescued = opt_traj[-1]
+        rescued_validation = _validate_hessian_minimum(
+            rescued,
+            engine=engine,
+            frequency_cutoff=frequency_cutoff,
+        )
+        if (
+            best_validation is None
+            or (
+                rescued_validation.min_frequency is not None
+                and (
+                    best_validation.min_frequency is None
+                    or rescued_validation.min_frequency > best_validation.min_frequency
+                )
+            )
+        ):
+            best_validation = rescued_validation
+        if rescued_validation.is_minimum:
+            msg = (
+                f"Hessian rescue accepted {label} split candidate after "
+                f"{signed_dr:+.3f} bohr displacement: {rescued_validation.reason}"
+            )
+            _emit_hessian_validation_message(msg, accepted=True, verbose=verbose)
+            return rescued, rescued_validation, rescue_grad_calls
+
+        msg = (
+            f"Hessian rescue rejected {label} split candidate after "
+            f"{signed_dr:+.3f} bohr displacement: {rescued_validation.reason}"
+        )
+        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+
+    return None, best_validation, rescue_grad_calls
+
+
+def _validate_hessian_split_candidates(
+    nodes: list[Node],
+    engine: Engine,
+    *,
+    frequency_cutoff: float,
+    rescue_displacement: float,
+    verbose: bool,
+    label: str,
+) -> tuple[list[Node], list[Node], int]:
+    accepted = []
+    rejected = []
+    rescue_grad_calls = 0
+    for node in nodes:
+        validation = _validate_hessian_minimum(
+            node,
+            engine=engine,
+            frequency_cutoff=frequency_cutoff,
+        )
+        if validation.is_minimum:
+            accepted.append(node)
+        else:
+            rescued, rescued_validation, grad_calls = _hessian_rescue_failed_candidate(
+                node,
+                engine=engine,
+                validation=validation,
+                frequency_cutoff=frequency_cutoff,
+                rescue_displacement=rescue_displacement,
+                verbose=verbose,
+                label=label,
+            )
+            rescue_grad_calls += grad_calls
+            if rescued is not None:
+                accepted.append(rescued)
+                continue
+            rejected.append(node)
+            if rescued_validation is not None:
+                validation = rescued_validation
+        if validation.is_minimum:
+            msg = (
+                f"Hessian minima validation accepted {label} split candidate: "
+                f"{validation.reason}"
+            )
+        elif label == "minima":
+            msg = (
+                "Rejecting minima split: apparent intermediate minimum failed "
+                f"Hessian validation ({validation.reason}). This candidate will "
+                "not be used for minima-based autosplitting; elementary-step "
+                "checks will continue and may still request a maxima split if "
+                "the path is non-elementary."
+            )
+        elif label == "maxima":
+            msg = (
+                "Rejecting maxima split: pseudo-IRC split candidate failed "
+                f"Hessian minima validation ({validation.reason})."
+            )
+        else:
+            msg = (
+                f"Hessian minima validation rejected {label} split candidate: "
+                f"{validation.reason}"
+            )
+        _emit_hessian_validation_message(
+            msg,
+            accepted=validation.is_minimum,
+            verbose=verbose,
+        )
+    return accepted, rejected, rescue_grad_calls
 
 
 @dataclass
@@ -458,6 +637,7 @@ def check_if_elem_step(
     verbose: bool = True,
     validate_minima_with_hessian: bool = False,
     hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
 ) -> ElemStepResults:
     """Calculates whether an input chain is an elementary step.
 
@@ -509,9 +689,16 @@ def check_if_elem_step(
             verbose=verbose,
             validate_minima_with_hessian=bool(validate_minima_with_hessian),
             hessian_minimum_frequency_cutoff=float(hessian_minimum_frequency_cutoff),
+            hessian_minima_rescue_displacement=float(
+                hessian_minima_rescue_displacement
+            ),
         )
     except TypeError as exc:
-        if "validate_minima_with_hessian" not in str(exc) and "hessian_minimum_frequency_cutoff" not in str(exc):
+        if (
+            "validate_minima_with_hessian" not in str(exc)
+            and "hessian_minimum_frequency_cutoff" not in str(exc)
+            and "hessian_minima_rescue_displacement" not in str(exc)
+        ):
             raise
         concavity_results = _chain_is_concave(
             chain=inp_chain, engine=engine, verbose=verbose
@@ -570,6 +757,14 @@ def check_if_elem_step(
 
     pseu_irc_results = pseudo_irc(chain=inp_chain, engine=engine)
     n_geom_opt_grad_calls += pseu_irc_results.number_grad_calls
+    if not bool(getattr(pseu_irc_results, "optimization_succeeded", True)):
+        raise ElectronicStructureError(
+            msg=(
+                "Pseudo-IRC endpoint optimization did not succeed; refusing to "
+                "use raw high-energy path images as minima for a maxima split."
+            ),
+            obj=pseu_irc_results,
+        )
 
     # Compare endpoints - results are collected for consolidated report
     found_r = is_identical(
@@ -604,13 +799,6 @@ def check_if_elem_step(
         verbose=False,  # Suppress individual prints, use consolidated report
     )
 
-    new_structures = _filter_new_structures(
-        nodes=[pseu_irc_results.found_reactant, pseu_irc_results.found_product],
-        reactant=chain[0],
-        product=chain[-1],
-        chain=inp_chain,
-    )
-
     if found_r and found_p:
         minimizing_gives_endpoints = True
     elif found_r and p_is_r:
@@ -635,21 +823,42 @@ def check_if_elem_step(
     else:
         minimizing_gives_endpoints = False
 
-    pseudo_irc_failed = not bool(
-        getattr(pseu_irc_results, "optimization_succeeded", True)
-    )
-    if pseudo_irc_failed:
-        if verbose:
-            if _rich_available:
-                _console.print(Panel.fit(
-                    "[bold yellow]pseudo-IRC optimization failed; forcing maxima split fallback[/bold yellow]",
-                    border_style="yellow",
-                ))
-            else:
-                print("pseudo-IRC optimization failed; forcing maxima split fallback")
+    validated_maxima_nodes: list[Node] = []
+    if (
+        validate_minima_with_hessian
+        and not minimizing_gives_endpoints
+    ):
+        validation_targets = []
+        if not (found_r or r_is_p):
+            validation_targets.append(pseu_irc_results.found_reactant)
+        if not (found_p or p_is_r):
+            validation_targets.append(pseu_irc_results.found_product)
+        if validation_targets:
+            accepted, rejected, rescue_grad_calls = _validate_hessian_split_candidates(
+                validation_targets,
+                engine=engine,
+                frequency_cutoff=hessian_minimum_frequency_cutoff,
+                rescue_displacement=hessian_minima_rescue_displacement,
+                verbose=verbose,
+                label="maxima",
+            )
+            n_geom_opt_grad_calls += rescue_grad_calls
+            validated_maxima_nodes = list(accepted)
+
+    if validated_maxima_nodes:
+        new_structures = _filter_new_structures(
+            nodes=validated_maxima_nodes,
+            reactant=chain[0],
+            product=chain[-1],
+            chain=inp_chain,
+        )
+    else:
+        new_structures = []
+
+    if validated_maxima_nodes:
         elem_step = False
     else:
-        elem_step = True if minimizing_gives_endpoints else False
+        elem_step = True
 
     if new_structures:
         if not verbose:
@@ -660,7 +869,7 @@ def check_if_elem_step(
             _print_new_structure(node, message=msg)
         if not verbose:
             update_status("Checking if elementary step")
-    elif not minimizing_gives_endpoints:
+    elif not minimizing_gives_endpoints and not validated_maxima_nodes:
         # We are splitting by maxima, but endpoint mapping did not produce explicit
         # new endpoint structures. Emit a clear notice so recursive runs still show
         # that a non-elementary path (possible new chemistry) was detected.
@@ -676,11 +885,12 @@ def check_if_elem_step(
     return ElemStepResults(
         is_elem_step=elem_step,
         is_concave=concavity_results.is_concave,
-        splitting_criterion="maxima",
-        minimization_results=[
-            pseu_irc_results.found_reactant,
-            pseu_irc_results.found_product,
-        ],
+        splitting_criterion=("maxima" if validated_maxima_nodes else None),
+        minimization_results=(
+            validated_maxima_nodes
+            if validated_maxima_nodes
+            else [pseu_irc_results.found_reactant, pseu_irc_results.found_product]
+        ),
         number_grad_calls=n_geom_opt_grad_calls,
         new_structures=new_structures,
     )
@@ -934,8 +1144,15 @@ def _run_geom_opt(node: Node, engine: Engine):
     # try:
     kwds = {}
     if getattr(engine, "geometry_optimizer", None) == "geometric":
-        kwds = {'coord_sys': "cart", 'maxiter': 1000}
+        kwds = {'coordsys': "cart", 'maxiter': 1000}
     opt_traj = engine.compute_geometry_optimization(node, keywords=kwds)
+    if not opt_traj:
+        raise ElectronicStructureError(
+            msg=(
+                "Geometry optimization did not produce a converged trajectory; "
+                "refusing to accept the input or a failed final frame as a minimum."
+            )
+        )
     # except AttributeError:
     #     opt_traj = engine.steepest_descent(node, max_steps=500, ss=0.001)
 
@@ -949,6 +1166,7 @@ def _chain_is_concave(
     verbose: bool = True,
     validate_minima_with_hessian: bool = False,
     hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
 ) -> ConcavityResults:
     """
     will assess+categorize the presence of minima on the chain.
@@ -1032,29 +1250,24 @@ def _chain_is_concave(
                     opt = opt_traj[-1]
                     hessian_validated = True
                     if validate_minima_with_hessian:
-                        validation = _validate_hessian_minimum(
-                            opt,
+                        (
+                            accepted,
+                            _rejected,
+                            rescue_grad_calls,
+                        ) = _validate_hessian_split_candidates(
+                            [opt],
                             engine=engine,
                             frequency_cutoff=hessian_minimum_frequency_cutoff,
+                            rescue_displacement=hessian_minima_rescue_displacement,
+                            verbose=verbose,
+                            label="minima",
                         )
-                        hessian_validated = validation.is_minimum
-                        if verbose:
-                            msg = (
-                                "Hessian minima validation accepted split candidate: "
-                                f"{validation.reason}"
-                                if hessian_validated
-                                else "Hessian minima validation rejected split candidate: "
-                                f"{validation.reason}"
-                            )
-                            if _rich_available:
-                                _console.print(Panel.fit(
-                                    msg,
-                                    border_style="green" if hessian_validated else "yellow",
-                                ))
-                            else:
-                                print(msg)
+                        n_grad_calls += rescue_grad_calls
+                        hessian_validated = bool(accepted)
                     if hessian_validated:
-                        opt_results.append(opt)
+                        opt_results.extend(
+                            accepted if validate_minima_with_hessian else [opt]
+                        )
                     else:
                         rejected_opt_results.append(opt)
                     is_r = is_identical(
@@ -1140,18 +1353,18 @@ def pseudo_irc(chain: Chain, engine: Engine):
 
     else:
         chain_for_opt = chain
-    try:
-        pair_indices = _get_ts_neighbor_pair_indices(chain_for_opt)
-        if pair_indices is None:
-            return IRCResults(
-                found_reactant=chain[0],
-                found_product=chain[len(chain) - 1],
-                number_grad_calls=n_grad_calls,
-            )
-        r_index, p_index = pair_indices
-        candidate_r = chain_for_opt[r_index]
-        candidate_p = chain_for_opt[p_index]
+    pair_indices = _get_ts_neighbor_pair_indices(chain_for_opt)
+    if pair_indices is None:
+        return IRCResults(
+            found_reactant=chain[0],
+            found_product=chain[len(chain) - 1],
+            number_grad_calls=n_grad_calls,
+        )
+    r_index, p_index = pair_indices
+    candidate_r = chain_for_opt[r_index]
+    candidate_p = chain_for_opt[p_index]
 
+    try:
         r_traj = _run_geom_opt(candidate_r, engine=engine)
         r = r_traj[-1]
         n_grad_calls += len(r_traj)
@@ -1163,30 +1376,15 @@ def pseudo_irc(chain: Chain, engine: Engine):
     except CachedElementaryStepRequiresEngineError:
         raise
     except Exception as e:
-        if _is_backend_execution_error(e):
-            if _is_backend_unavailable_error(e):
-                raise
-            print(_backend_probe_failed_msg(e))
-        else:
-            import traceback
-
-            print(traceback.format_exc())
-            print(
-                f"Error in geometry optimization: {e}. Falling back to maxima split candidates.")
-        pair_indices = _get_maxima_split_pair_indices(chain_for_opt, arg_max)
-        if pair_indices is None:
-            candidate_r = chain_for_opt[max(arg_max - 1, 0)]
-            candidate_p = chain_for_opt[min(arg_max + 1, len(chain_for_opt) - 1)]
-        else:
-            r_index, p_index = pair_indices
-            candidate_r = chain_for_opt[r_index]
-            candidate_p = chain_for_opt[p_index]
-        return IRCResults(
-            found_reactant=candidate_r,
-            found_product=candidate_p,
-            number_grad_calls=n_grad_calls,
-            optimization_succeeded=False,
-        )
+        if isinstance(e, ElectronicStructureError):
+            raise
+        raise ElectronicStructureError(
+            msg=(
+                "Pseudo-IRC endpoint optimization failed; no maxima split "
+                "endpoints were accepted."
+            ),
+            obj=e,
+        ) from e
 
     return IRCResults(
         found_reactant=r,

@@ -61,7 +61,8 @@ class _MidpointFinder:
                  threshold: float,
                  initial_enforced_pairs: Optional[Set[Tuple[int, int]]] = None,
                  ignore_atoms: Optional[Iterable[int]] = None,
-                 align: bool = True):
+                 align: bool = True,
+                 rng: Optional[np.random.Generator] = None):
         """
         Initializes the _MidpointFinder.
 
@@ -87,8 +88,9 @@ class _MidpointFinder:
         self.tol: float = tol
         self.nudge: float = nudge
         self.base_threshold: float = threshold # Base distance threshold for get_bond_list calls
-        self.ignore_atoms = ignore_atoms
+        self.ignore_atoms = [] if ignore_atoms is None else list(ignore_atoms)
         self.align = align
+        self.rng = rng if rng is not None else np.random.default_rng(0)
 
         # Set of atom pairs that must be included in the internal coordinate list.
         self.enforced_pairs: Set[Tuple[int, int]] = \
@@ -378,7 +380,7 @@ class _MidpointFinder:
                 # Generate initial guess as a linear combination of endpoints, plus a random nudge
                 initial_guess_cartesian = (self.geom1 * start_coef + (1.0 - start_coef) * self.geom2)
 
-                random_displacement = self.nudge * np.random.random_sample(initial_guess_cartesian.shape)
+                random_displacement = self.nudge * self.rng.random(initial_guess_cartesian.shape)
                 random_displacement[self.ignore_atoms if len(self.ignore_atoms) > 0 else [], :] = 0.0
 
                 initial_guess_nudged_flat = (
@@ -460,7 +462,8 @@ def mid_point(atoms: List[str],
               nudge: float = INTERPOLATION_DEFAULTS["midpoint_nudge"],
               threshold: float = INTERPOLATION_DEFAULTS["midpoint_threshold"],
               ignore_atoms: Optional[Iterable[int]] = None,
-              align: bool = True) -> np.ndarray:
+              align: bool = True,
+              rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """
     Finds an optimal Cartesian midpoint geometry between two given geometries (`geom1`, `geom2`).
 
@@ -499,7 +502,17 @@ def mid_point(atoms: List[str],
     geom2_f64 = geom2.astype(float, copy=False)
 
     # Create and use the _MidpointFinder
-    finder = _MidpointFinder(atoms, geom1_f64, geom2_f64, tol, nudge, threshold, ignore_atoms=ignore_atoms, align=align)
+    finder = _MidpointFinder(
+        atoms,
+        geom1_f64,
+        geom2_f64,
+        tol,
+        nudge,
+        threshold,
+        ignore_atoms=ignore_atoms,
+        align=align,
+        rng=rng,
+    )
     return finder.find()
 
 
@@ -509,7 +522,8 @@ def redistribute(atoms: List[str],
                  tol: float,
                  nudge: float = INTERPOLATION_DEFAULTS["midpoint_nudge"],
                  align: bool = True,
-                 ignore_atoms: Optional[Iterable[int]] = None) -> List[np.ndarray]:
+                 ignore_atoms: Optional[Iterable[int]] = None,
+                 rng: Optional[np.random.Generator] = None) -> List[np.ndarray]:
     """
     Redistributes images (geometries) along a reaction path to achieve a
     target number of images (`nimages`).
@@ -604,7 +618,16 @@ def redistribute(atoms: List[str],
         g2 = geoms_list[insert_idx+1]
 
         # Calculate the new midpoint to insert
-        insertion_geom = mid_point(atoms, g1, g2, tol=tol, ignore_atoms=ignore_atoms, nudge=nudge, align=align)
+        insertion_geom = mid_point(
+            atoms,
+            g1,
+            g2,
+            tol=tol,
+            ignore_atoms=ignore_atoms,
+            nudge=nudge,
+            align=align,
+            rng=rng,
+        )
         # Align the new midpoint with respect to its preceding image (g1)
         if align:
             _, aligned_insertion = align_geom(g1, insertion_geom.astype(float, copy=False))

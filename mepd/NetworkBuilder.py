@@ -484,6 +484,7 @@ class NetworkBuilder:
                 molecule=mol_to_add.graph,
                 converged=False,
                 td=mol_to_add,
+                stereochemical_smiles=_stereochemical_smiles_key(mol_to_add),
                 node_energy=mol_to_add.energy,
                 node_energies=[
                     conformer.energy for conformer in relevant_conformers],
@@ -535,9 +536,7 @@ class NetworkBuilder:
                     )
         return pot
 
-    def create_rxn_network(self, file_pattern="results*_msmep"):
-        msmep_paths = list(self.msmep_data_dir.glob(file_pattern))
-        msmep_paths = [p for p in msmep_paths if p.is_dir()]
+    def create_rxn_network_from_paths(self, msmep_paths: list[Path]):
         structures, edges = self._load_network_data(msmep_paths=msmep_paths)
         if not structures:
             raise ValueError(
@@ -547,6 +546,11 @@ class NetworkBuilder:
         pot = self._add_all_nodes(pot, structures=structures)
         pot = self._add_all_edges(pot, structures=structures, edges=edges)
         return pot
+
+    def create_rxn_network(self, file_pattern="results*_msmep"):
+        msmep_paths = list(self.msmep_data_dir.glob(file_pattern))
+        msmep_paths = [p for p in msmep_paths if p.is_dir()]
+        return self.create_rxn_network_from_paths(msmep_paths)
 
     def path_to_keys(self, path_indices):
         pairs = list(pairwise(path_indices))

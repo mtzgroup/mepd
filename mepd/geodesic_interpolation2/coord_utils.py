@@ -180,7 +180,8 @@ def get_bond_list(
     snapshots: int = COORD_UTILS_DEFAULTS["get_bond_list_snapshots"],
     bond_threshold: float = COORD_UTILS_DEFAULTS["get_bond_list_bond_threshold"],
     enforce: Iterable[Tuple[int, int]] = (),
-    ignore_atoms: Optional[Iterable[int]] = None
+    ignore_atoms: Optional[Iterable[int]] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[List[Tuple[int, int]], np.ndarray]:
     """
     Generates a list of "important" atom pairs (potential bonds or significant
@@ -252,7 +253,9 @@ def get_bond_list(
         num_additional_snapshots = actual_snapshots_to_consider - len(selected_indices_for_snapshots)
         if num_additional_snapshots > 0 and len(interior_indices_pool) > 0:
             num_to_sample = min(num_additional_snapshots, len(interior_indices_pool))
-            chosen_interior_indices = np.random.choice(interior_indices_pool, num_to_sample, replace=False)
+            if rng is None:
+                rng = np.random.default_rng(0)
+            chosen_interior_indices = rng.choice(interior_indices_pool, num_to_sample, replace=False)
             selected_indices_for_snapshots.update(chosen_interior_indices)
 
     image_indices_to_process = sorted(list(selected_indices_for_snapshots))
@@ -622,4 +625,3 @@ def morse_scaler(
         return wij, dw_drij
 
     return scaler
-

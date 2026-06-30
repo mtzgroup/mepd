@@ -48,10 +48,6 @@ _MLPGI_DEFAULT_PATH_MIN_INPUTS = {
 }
 
 _ASE_OMOL25_DEFAULT_MODEL_PATH = "/home/diptarka/fairchem/esen_sm_conserving_all.pt"
-_DEPRECATED_PATH_MIN_INPUT_KEYS = {
-    "plateau_exit_window",
-    "plateau_exit_rtol",
-}
 
 
 def _normalized_path_method(path_min_method: str) -> str:
@@ -197,6 +193,18 @@ class NEBInputs:
 
     `hessian_minimum_frequency_cutoff`: minimum allowed frequency, in cm^-1 when
         frequencies are available, for Hessian-validated minima
+
+    `hessian_minima_rescue_displacement`: displacement, in bohr, applied along the
+        lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
+
+    `network_completion_max_followup_requests`: maximum number of follow-up recursive
+        network-split requests queued after the initial request_0 run
+
+    `recursive_split_max_depth`: maximum recursive split depth allowed before
+        stopping further subdivision, even if a branch is still non-elementary
+
+    `recursive_same_pair_split_limit`: maximum number of consecutive recursive
+        splits allowed for the same endpoint pair along one branch
     """
 
     climb: bool = False
@@ -228,6 +236,10 @@ class NEBInputs:
     plateau_exit_rtol: float = 0.05
     validate_minima_with_hessian: bool = False
     hessian_minimum_frequency_cutoff: float = 0.0
+    hessian_minima_rescue_displacement: float = 0.1
+    network_completion_max_followup_requests: int = 1000
+    recursive_split_max_depth: int = 200
+    recursive_same_pair_split_limit: int = 5
 
     max_steps: float = 500
 
@@ -265,8 +277,6 @@ class ChainInputs:
     `node_class`: type of node to use
     `do_parallel`: whether to compute gradients and energies in parallel
     `use_geodesic_interpolation`: whether to use GI in interpolations
-    `friction_optimal_gi`: whether to optimize 'friction' parameter when running GI
-
     `do_chain_biasing`: whether to use chain biasing (Under Development, not ready for use)
     `cb`: Chain biaser object (Under Development, not ready for use)
 
@@ -286,7 +296,6 @@ class ChainInputs:
 
     do_parallel: bool = True
     use_geodesic_interpolation: bool = True
-    friction_optimal_gi: bool = True
 
     node_freezing: bool = True
     fraction_freeze: float = 0.1
@@ -318,6 +327,8 @@ class GIInputs:
 
     `nudge`: value for nudge parameter. (default: 0.1)
 
+    `random_seed`: NumPy seed for deterministic geodesic interpolation nudges. (default: 0)
+
     `extra_kwds`: dictionary containing other keywords geodesic interpolation might use.
 
     !Protip: run multiple geodesic interpolations with high nudge values and select the path
@@ -327,6 +338,7 @@ class GIInputs:
     nimages: int = 10
     friction: float = 0.001
     nudge: float = 0.1
+    random_seed: int = 0
     extra_kwds: dict = field(default_factory=dict)
     align: bool = True
 
@@ -372,6 +384,7 @@ class RunInputs:
     chemcloud_queue: str = None
     write_qcio: bool = False
     print_stdout: bool = False
+    qcop_local_parallel_workers: int = 12
     nanoreactor_inputs: dict = None
 
     path_min_method: str = 'NEB'
@@ -546,6 +559,11 @@ class RunInputs:
             self.chain_inputs = ChainInputs()
 
         else:
+            if "friction_optimal_gi" in self.chain_inputs:
+                raise ValueError(
+                    "chain_inputs.friction_optimal_gi has been removed. "
+                    "Set gi_inputs.friction directly instead."
+                )
             self.chain_inputs = ChainInputs(**self.chain_inputs)
 
         if self.optimizer_kwds is None:
@@ -561,6 +579,9 @@ class RunInputs:
                              chemcloud_queue=self.chemcloud_queue,
                              write_qcio=self.write_qcio,
                              print_stdout=self.print_stdout,
+                             local_parallel_workers=max(
+                                 1, int(self.qcop_local_parallel_workers)
+                             ),
                              geometry_optimizer_kwds=self.geometry_optimizer_kwds,
                              )
         elif self.engine_name == 'ase':
@@ -665,23 +686,17 @@ class RunInputs:
                     normalized = _toml_safe(sub_val)
                     if normalized is not None:
                         cleaned[sub_key] = normalized
-                return cleaned or None
+                return cleaned
             if isinstance(value, (list, tuple)):
-                cleaned = [_toml_safe(item) for item in value]
-                cleaned = [item for item in cleaned if item is not None]
-                return cleaned or None
+                return [_toml_safe(item) for item in value]
             return value
 
         json_dict = self.__dict__.copy()
         del json_dict['engine']
         del json_dict['optimizer']
-        json_dict.pop("network_inputs", None)
         for key, val in json_dict.items():
             if 'input' in key:
                 json_dict[key] = _serialize_input_value(val)
-                if key == "path_min_inputs" and isinstance(json_dict[key], dict):
-                    for deprecated_key in _DEPRECATED_PATH_MIN_INPUT_KEYS:
-                        json_dict[key].pop(deprecated_key, None)
             elif 'program_kwds' in key:
                 d = val.json()
 

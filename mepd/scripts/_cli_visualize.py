@@ -389,6 +389,76 @@ def _best_path_by_apparent_barrier(
     return path, best_peak[int(target_idx)]
 
 
+def _greedy_path_by_local_barrier(
+    pot,
+    root_idx: int,
+    target_idx: int,
+    deps: VisualizationDeps,
+) -> list[int] | None:
+    """Choose the lowest local activation barrier that can still reach the target."""
+    root_idx = int(root_idx)
+    target_idx = int(target_idx)
+    if root_idx == target_idx:
+        return [root_idx]
+    if root_idx not in pot.graph.nodes or target_idx not in pot.graph.nodes:
+        return None
+
+    def _usable_neighbors(node_idx: int, blocked: set[int]) -> list[int]:
+        return sorted(
+            nbr
+            for nbr in _pair_neighbors(pot, node_idx)
+            if nbr not in blocked
+        )
+
+    def _has_usable_path(source: int, blocked: set[int]) -> bool:
+        if source == target_idx:
+            return True
+        seen = set(blocked)
+        seen.discard(source)
+        frontier = [source]
+        while frontier:
+            current = frontier.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for nbr in _usable_neighbors(current, seen):
+                try:
+                    _best_chain_between_nodes(pot, current, nbr, deps)
+                except Exception:
+                    continue
+                if nbr == target_idx:
+                    return True
+                frontier.append(nbr)
+        return False
+
+    path = [root_idx]
+    visited = {root_idx}
+    while path[-1] != target_idx:
+        current = path[-1]
+        current_td = pot.graph.nodes[current].get("td")
+        if current_td is None:
+            return None
+        current_energy = float(current_td.energy)
+        candidates: list[tuple[float, int]] = []
+        for nbr in _usable_neighbors(current, visited):
+            try:
+                edge_chain = _best_chain_between_nodes(pot, current, nbr, deps)
+                local_barrier = _chain_peak_energy(edge_chain, deps) - current_energy
+            except Exception:
+                continue
+            if not deps.np.isfinite(local_barrier):
+                continue
+            if not _has_usable_path(nbr, visited):
+                continue
+            candidates.append((float(local_barrier), int(nbr)))
+        if not candidates:
+            return None
+        _, next_node = min(candidates, key=lambda item: (item[0], item[1]))
+        path.append(next_node)
+        visited.add(next_node)
+    return path
+
+
 def _find_pot_root_node_index(pot) -> int | None:
     for node_idx, data in pot.graph.nodes(data=True):
         if data.get("root"):
@@ -457,10 +527,10 @@ def _load_network_endpoint_structures(
     start_candidates = []
     end_candidates = []
     for variant in name_variants:
-        start_candidates.append(f"start_{variant}.xyz")
-        end_candidates.append(f"end_{variant}.xyz")
-    start_candidates.append("start.xyz")
-    end_candidates.append("end.xyz")
+        start_candidates.extend([f"start_{variant}.xyz", f"start_{variant}.rst7"])
+        end_candidates.extend([f"end_{variant}.xyz", f"end_{variant}.rst7"])
+    start_candidates.extend(["start.xyz", "start.rst7"])
+    end_candidates.extend(["end.xyz", "end.rst7"])
 
     def _load_first(root_candidates, names):
         for root in root_candidates:
@@ -598,8 +668,18 @@ def _path_chain_from_pot(pot, path: list[int], deps: VisualizationDeps):
 
 
 def _parse_visualize_atom_indices(
+    qminds_fp: str | None = None,
     atom_indices: str | None = None,
 ) -> list[int] | None:
+    if qminds_fp and atom_indices:
+        raise ValueError("Provide either --qminds-fp or --atom-indices, not both.")
+    if qminds_fp:
+        values = []
+        for raw in Path(qminds_fp).read_text().splitlines():
+            token = raw.strip()
+            if token:
+                values.append(int(token))
+        return sorted(set(values))
     if atom_indices:
         tokens = atom_indices.replace(",", " ").split()
         return sorted(set(int(v) for v in tokens))
@@ -674,25 +754,6 @@ def _subset_tree_layers_for_visualization(
     return subset_layers
 
 
-def _resolve_network_json(result_dir: Path) -> Path | None:
-    result_dir = Path(result_dir)
-    if not result_dir.is_dir():
-        return None
-
-    has_workspace_marker = (result_dir / "workspace.json").exists()
-    network_candidates = [
-        result_dir / "neb_pot_annotated.json",
-        result_dir / "neb_pot.json",
-    ]
-    if not has_workspace_marker and not any(fp.exists() for fp in network_candidates):
-        return None
-
-    for fp in network_candidates:
-        if fp.exists():
-            return fp
-    return None
-
-
 def _load_visualization_data(
     result_path: Path,
     deps: VisualizationDeps,
@@ -740,25 +801,11 @@ def _load_visualization_data(
                 chain_trajectory=None,
                 tree_layers=collect_tree_layers(tree),
             )
-        network_fp = _resolve_network_json(result_path)
-        if network_fp is not None:
-            result_path = network_fp
-        else:
-            raise ValueError(
-                "Directory input must be a TreeNode folder containing adj_matrix.txt "
-                "or a network directory containing neb_pot_annotated.json or neb_pot.json."
-            )
+        raise ValueError(
+            "Directory input must be a TreeNode folder containing adj_matrix.txt."
+        )
 
     if result_path.suffix.lower() == ".json":
-        if result_path.name == "workspace.json":
-            network_fp = _resolve_network_json(result_path.parent)
-            if network_fp is None:
-                raise ValueError(
-                    "workspace.json input did not resolve to a network file. "
-                    "Expected neb_pot_annotated.json or neb_pot.json "
-                    f"in {result_path.parent}."
-                )
-            result_path = network_fp
         try:
             pot = deps.Pot.read_from_disk(result_path)
             endpoint_hints = load_network_endpoint_hints(result_path) or {}
@@ -1005,15 +1052,66 @@ def _build_network_visualization_payload(
             }
         )
 
-    def _edge_barrier(source: int, target: int) -> float | None:
-        if not pot.graph.has_edge(source, target):
-            return None
-        raw = pot.graph.edges[(source, target)].get("barrier")
+    def _float_edge_attr(attrs: dict, name: str) -> float | None:
+        raw = attrs.get(name)
         if raw is None:
             return None
         with contextlib.suppress(Exception):
             return float(raw)
         return None
+
+    def _directional_barriers(
+        source: int, target: int
+    ) -> tuple[float, float | None, float]:
+        direct_attrs = (
+            pot.graph.edges[(source, target)]
+            if pot.graph.has_edge(source, target)
+            else {}
+        )
+        reverse_attrs = (
+            pot.graph.edges[(target, source)]
+            if pot.graph.has_edge(target, source)
+            else {}
+        )
+
+        direct_forward = _float_edge_attr(direct_attrs, "barrier")
+        direct_reverse = _float_edge_attr(direct_attrs, "reverse_barrier")
+        reverse_forward = _float_edge_attr(reverse_attrs, "barrier")
+        reverse_reverse = _float_edge_attr(reverse_attrs, "reverse_barrier")
+
+        if direct_forward is not None:
+            forward = direct_forward
+            reverse = (
+                direct_reverse
+                if direct_reverse is not None
+                else reverse_forward
+            )
+            stored_pair_sum = _float_edge_attr(
+                direct_attrs, "pair_barrier_sum"
+            )
+        elif reverse_forward is not None:
+            # The NEB is stored on the opposite graph orientation. Its
+            # reverse barrier is the forward barrier for the displayed edge.
+            forward = (
+                reverse_reverse
+                if reverse_reverse is not None
+                else reverse_forward
+            )
+            reverse = reverse_forward
+            stored_pair_sum = _float_edge_attr(
+                reverse_attrs, "pair_barrier_sum"
+            )
+        else:
+            forward = 0.0
+            reverse = None
+            stored_pair_sum = None
+
+        pair_sum = (
+            stored_pair_sum
+            if stored_pair_sum is not None
+            else forward + (reverse if reverse is not None else 0.0)
+        )
+        return forward, reverse, pair_sum
 
     nodes_payload = []
     for node_idx, coords in layout.items():
@@ -1044,21 +1142,13 @@ def _build_network_visualization_payload(
             fallback = True
             if best_chain is None:
                 continue
-        forward_barrier = _edge_barrier(source, target)
-        if forward_barrier is None:
-            forward_barrier = _edge_barrier(target, source)
-        if forward_barrier is None:
-            forward_barrier = 0.0
+        forward_barrier, reverse_barrier, pair_sum = _directional_barriers(
+            source, target
+        )
         if atom_indices is not None:
             best_chain = _subset_chain_for_visualization(
                 best_chain, atom_indices, deps
             )
-        reverse_barrier = _edge_barrier(target, source)
-        pair_sum = (
-            forward_barrier + reverse_barrier
-            if reverse_barrier is not None
-            else forward_barrier
-        )
         edges_payload.append(
             {
                 "id": f"{source}->{target}",
@@ -1139,7 +1229,7 @@ def _build_chain_visualizer_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>MEPD Visualizer</title>
+  <title>NEB Dynamics Visualizer</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 16px; }}
     .row {{ display: flex; gap: 16px; align-items: flex-start; }}
@@ -1185,7 +1275,7 @@ def _build_chain_visualizer_html(
   </style>
 </head>
 <body>
-  <h2>MEPD Interactive Viewer</h2>
+  <h2>NEB Dynamics Interactive Viewer</h2>
   <div class="controls">
     <div id="treePanel" style="{tree_panel_style} margin-bottom: 12px;">
       <div style="font-weight: 600; margin-bottom: 6px;">Optimization Tree</div>

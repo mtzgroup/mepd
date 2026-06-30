@@ -99,13 +99,19 @@ def test_non_terachem_geomopt_default_keywords_use_coordsys():
     kw = captured["input"].keywords
     assert kw["coordsys"] == "cart"
     assert kw["maxit"] == 500
+    assert kw["convergence_set"] == "GAU_TIGHT"
 
 
 def test_non_terachem_geomopt_uses_engine_geometry_optimizer_keywords():
     engine = QCOPEngine(
         program="xtb",
         compute_program="chemcloud",
-        geometry_optimizer_kwds={"coordsys": "tric", "maxit": 120, "convergence_energy": 1e-6},
+        geometry_optimizer_kwds={
+            "coordsys": "tric",
+            "maxit": 120,
+            "convergence_set": "GAU_VERYTIGHT",
+            "convergence_energy": 1e-6,
+        },
         program_args=ProgramArgs(
             model={"method": "gfn2xtb"},
             keywords={},
@@ -124,6 +130,7 @@ def test_non_terachem_geomopt_uses_engine_geometry_optimizer_keywords():
     kw = captured["input"].keywords
     assert kw["coordsys"] == "tric"
     assert kw["maxit"] == 120
+    assert kw["convergence_set"] == "GAU_VERYTIGHT"
     assert kw["convergence_energy"] == pytest.approx(1e-6)
 
 
@@ -173,3 +180,4 @@ def test_non_terachem_geomopt_partial_engine_keywords_keep_defaults():
     kw = captured["input"].keywords
     assert kw["coordsys"] == "cart"
     assert kw["maxit"] == 80
+    assert kw["convergence_set"] == "GAU_TIGHT"

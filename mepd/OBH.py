@@ -106,7 +106,7 @@ def obmol_to_symbs(obmol):
 
 def add_charges(input_mol, charges_list):
     """
-    this adds charge-change annotations to the openbabel molecule
+    this adds formal charge changes to the openbabel molecule
     """
     for val in charges_list:
         atom_ind, charge = val

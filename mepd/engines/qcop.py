@@ -37,7 +37,19 @@ AVAIL_PROGRAMS = ["qcop", "chemcloud"]
 DEFAULT_GEOMETRY_OPTIMIZER_KWDS: dict[str, Any] = {
     "coordsys": "cart",
     "maxit": 500,
+    "convergence_set": "GAU_TIGHT",
 }
+
+
+def _compute_local_qcop_input(
+    payload: tuple[str, ProgramInput, bool, bool],
+):
+    """Run one local qcop calculation in an isolated worker process."""
+    program, program_input, collect_files, print_stdout = payload
+    call_kwargs = {"collect_files": bool(collect_files)}
+    if print_stdout:
+        call_kwargs["print_stdout"] = True
+    return qcop.compute(program, program_input, **call_kwargs)
 
 
 TERACHEM_NANOREACTOR_PRESETS: dict[str, dict[str, object]] = {
@@ -197,6 +209,7 @@ class QCOPEngine(Engine):
     collect_files: bool = False
     write_qcio: bool = False
     print_stdout: bool = False
+    local_parallel_workers: int = 12
 
     def __post_init__(self):
         self.chemcloud_queue = _resolve_chemcloud_queue(self.chemcloud_queue)
@@ -424,16 +437,34 @@ class QCOPEngine(Engine):
             pi for i, pi in enumerate(all_prog_inps) if i not in inds_frozen
         ]
 
-        # only compute the nonfrozen structures
-        if any([self.program == 'xtb']) and self.compute_program == "qcop":
+        # qcop changes the process-wide current working directory while using each
+        # calculation's scratch directory. Use processes, not threads, so concurrent
+        # images cannot cross-contaminate one another's CREST/xTB files.
+        chain_parameters = getattr(chain, "parameters", None)
+        do_parallel = bool(getattr(chain_parameters, "do_parallel", True))
+        if (
+            self.compute_program == "qcop"
+            and do_parallel
+            and len(non_frozen_prog_inps) > 1
+        ):
 
-            def helper(inp):
-                prog, prog_inp = inp
-                return self.compute_func(prog, prog_inp, collect_files=self.collect_files)
-
-            iterables = [(self.program, inp) for inp in non_frozen_prog_inps]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-                non_frozen_results = list(executor.map(helper, iterables))
+            iterables = [
+                (
+                    self.program,
+                    inp,
+                    self.collect_files,
+                    self.print_stdout,
+                )
+                for inp in non_frozen_prog_inps
+            ]
+            max_workers = min(
+                max(1, int(self.local_parallel_workers)),
+                len(iterables),
+            )
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                non_frozen_results = list(
+                    executor.map(_compute_local_qcop_input, iterables)
+                )
 
         elif self.compute_program == "chemcloud":
             batch_or_single = (
@@ -783,6 +814,14 @@ class QCOPEngine(Engine):
         a list of Node objects
         """
         output = self._compute_geom_opt_result(node=node, keywords=keywords)
+        if getattr(output, "success", None) is False:
+            raise ElectronicStructureError(
+                msg=(
+                    "Geometry optimization did not converge; refusing to use "
+                    "the final trajectory frame as an optimized structure."
+                ),
+                obj=output,
+            )
         trajectory = self._extract_optimization_trajectory(
             output,
             reference_structure=node.structure,
@@ -860,6 +899,13 @@ class QCOPEngine(Engine):
 
         trajectories: list[list[StructureNode]] = []
         for output, node in zip(outputs, nodes):
+            if getattr(output, "success", None) is False:
+                logging.warning(
+                    "ChemCloud batch optimization did not converge for one candidate; "
+                    "keeping an empty trajectory placeholder and continuing."
+                )
+                trajectories.append([])
+                continue
             trajectory = self._extract_optimization_trajectory(
                 output,
                 reference_structure=node.structure,

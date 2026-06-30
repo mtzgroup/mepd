@@ -30,7 +30,9 @@ from mepd.nodes.nodehelpers import (
     _is_connectivity_identical,
     is_identical,
 )
+from mepd.elementarystep import check_if_elem_step, _write_nodes_xyz
 from mepd.inputs import RunInputs
+from mepd.irc_network import build_irc_network
 from mepd.constants import ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROMS
 from mepd.geodesic_interpolation2.fileio import write_xyz
 
@@ -222,7 +224,22 @@ def _visualization_deps() -> _cli_visualize.VisualizationDeps:
 
 
 def _ascii_profile_for_chain(chain: Chain):
-    return _cli_visualize._ascii_profile_for_chain(chain, console)
+    try:
+        energies = chain.energies_kcalmol
+    except Exception as exc:
+        message = _cli_visualize.format_exception_message(exc)
+        console.print(f"[yellow]⚠ Could not compute energy profile: {message}[/yellow]")
+        details = _cli_visualize.extract_electronic_structure_error_details(
+            getattr(exc, "obj", None)
+        )
+        for detail in details:
+            console.print(f"[yellow]  • {detail}[/yellow]")
+        return
+
+    labels = [str(i) for i, _ in enumerate(chain.nodes)]
+    plot = _build_ascii_energy_profile(energies, labels)
+    console.print("\nASCII Reaction Profile (Energy vs Node)")
+    console.print(plot, markup=False)
 
 
 def _write_neb_results_with_history(
@@ -2168,6 +2185,7 @@ def _build_recursive_split_network_summary(
     target_index: int | None = None,
     root_node: StructureNode | None = None,
     target_node: StructureNode | None = None,
+    source_tree_dir: Path | None = None,
     verbose: bool = False,
 ) -> Path | None:
     nb = NetworkBuilder(
@@ -2180,11 +2198,23 @@ def _build_recursive_split_network_summary(
     nb.msmep_data_dir = output_dir
 
     msmep_paths = [p for p in output_dir.glob("*_msmep") if p.is_dir()]
+    if source_tree_dir is None:
+        sibling_source = output_dir.parent / base_name
+        if sibling_source.is_dir():
+            source_tree_dir = sibling_source
+    if source_tree_dir is not None and source_tree_dir.is_dir():
+        resolved_source = source_tree_dir.resolve()
+        if all(p.resolve() != resolved_source for p in msmep_paths):
+            msmep_paths.insert(0, source_tree_dir)
     if not msmep_paths:
         return None
 
     try:
-        pot = nb.create_rxn_network(file_pattern="*_msmep")
+        create_from_paths = getattr(nb, "create_rxn_network_from_paths", None)
+        if callable(create_from_paths):
+            pot = create_from_paths(msmep_paths)
+        else:
+            pot = nb.create_rxn_network(file_pattern="*_msmep")
     except (ValueError, IndexError) as exc:
         console.print(f"[yellow]⚠ Skipping network summary: {exc}[/yellow]")
         return None
@@ -2274,6 +2304,7 @@ def _run_recursive_network_completion(
     output_dir: Path,
     base_name: str,
     status_fp: Path | None = None,
+    source_tree_dir: Path | None = None,
     parallel_recursive: bool = False,
     parallel_workers: int | None = None,
     overwrite: bool = False,
@@ -2391,6 +2422,7 @@ def _run_recursive_network_completion(
         target_index=end_index,
         root_node=initial_start,
         target_node=initial_end,
+        source_tree_dir=source_tree_dir,
     )
     manifest_fp = _write_recursive_split_manifest(
         output_dir=output_dir,
@@ -2699,6 +2731,7 @@ def _run_recursive_network_completion(
             target_index=end_index,
             root_node=initial_start,
             target_node=initial_end,
+            source_tree_dir=source_tree_dir,
         )
         manifest_fp = _write_recursive_split_manifest(
             output_dir=output_dir,
@@ -2727,6 +2760,7 @@ def _run_recursive_network_completion(
         target_index=end_index,
         root_node=initial_start,
         target_node=initial_end,
+        source_tree_dir=source_tree_dir,
     )
     manifest_fp = _write_recursive_split_manifest(
         output_dir=output_dir,
@@ -2925,6 +2959,175 @@ def _snap_assign_endpoint_nodes(nodes: list[StructureNode]) -> list[StructureNod
         "[green]✓ Applied qcinf snap_assign to reorder the end endpoint onto the start endpoint atom mapping.[/green]"
     )
     return [start_node, reordered_end]
+
+
+def _elem_step_result_payload(result, chain: Chain) -> dict[str, Any]:
+    try:
+        energies = [float(energy) for energy in chain.energies]
+    except Exception:
+        energies = []
+    try:
+        energies_kcalmol = [float(energy) for energy in chain.energies_kcalmol]
+    except Exception:
+        energies_kcalmol = []
+
+    minimization_results = list(getattr(result, "minimization_results", None) or [])
+    new_structures = list(getattr(result, "new_structures", None) or [])
+    return {
+        "is_elem_step": bool(getattr(result, "is_elem_step", False)),
+        "is_concave": bool(getattr(result, "is_concave", False)),
+        "splitting_criterion": getattr(result, "splitting_criterion", None),
+        "number_grad_calls": int(getattr(result, "number_grad_calls", 0) or 0),
+        "minimization_result_count": len(minimization_results),
+        "new_structure_count": len(new_structures),
+        "chain_node_count": len(chain.nodes),
+        "chain_energies_hartree": energies,
+        "chain_relative_energies_kcalmol": energies_kcalmol,
+    }
+
+
+def _geometry_optimizer_keywords(program_input: RunInputs, *, default_maxiter: int = 500) -> dict[str, Any]:
+    keywords = {"coordsys": "cart", "maxiter": int(default_maxiter)}
+    user_keywords = dict(getattr(program_input, "geometry_optimizer_kwds", {}) or {})
+    keywords.update(user_keywords)
+    return keywords
+
+
+@app.command("check-elem-step")
+def check_elem_step_cli(
+    geometries: Annotated[
+        str,
+        typer.Argument(
+            help="XYZ path containing the chain to classify as elementary or non-elementary."
+        ),
+    ],
+    inputs: Annotated[
+        str | None,
+        typer.Option("--inputs", "-i", help="Path to RunInputs TOML file."),
+    ] = None,
+    output: Annotated[
+        str,
+        typer.Option("--output", "-o", help="Path for the JSON elementary-step result."),
+    ] = "elem_step_result.json",
+    new_structures_output: Annotated[
+        str | None,
+        typer.Option(
+            "--new-structures-output",
+            help="Optional XYZ path for newly discovered structures in the result.",
+        ),
+    ] = None,
+    charge: Annotated[int, typer.Option(help="Charge used when reading XYZ geometries.")] = 0,
+    multiplicity: Annotated[
+        int,
+        typer.Option(help="Spin multiplicity used when reading XYZ geometries."),
+    ] = 1,
+    validate_minima_with_hessian: Annotated[
+        bool,
+        typer.Option(
+            "--validate-minima-with-hessian",
+            help="Hessian-check minima split candidates before accepting them.",
+        ),
+    ] = False,
+    hessian_minimum_frequency_cutoff: Annotated[
+        float,
+        typer.Option(
+            "--hessian-minimum-frequency-cutoff",
+            help="Minimum frequency cutoff for --validate-minima-with-hessian.",
+        ),
+    ] = 0.0,
+    hessian_minima_rescue_displacement: Annotated[
+        float | None,
+        typer.Option(
+            "--hessian-minima-rescue-displacement",
+            help=(
+                "Rescue displacement in bohr applied along the lowest-frequency "
+                "mode when a Hessian-validated minimum is rejected."
+            ),
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose/--quiet", help="Show detailed elementary-step diagnostics."),
+    ] = True,
+):
+    console.print(BANNER)
+    geom_fp = Path(geometries).expanduser().resolve()
+    if not geom_fp.exists():
+        console.print(f"[bold red]x ERROR:[/bold red] Geometry file not found: {geom_fp}")
+        raise typer.Exit(1)
+
+    with console.status("[bold cyan]Loading input parameters...[/bold cyan]"):
+        program_input = (
+            RunInputs.open(inputs)
+            if inputs is not None
+            else RunInputs(program="xtb", engine_name="qcop")
+        )
+
+    with console.status(f"[bold cyan]Loading chain from {geom_fp}...[/bold cyan]"):
+        try:
+            chain = Chain.from_xyz(
+                fp=geom_fp,
+                parameters=program_input.chain_inputs,
+                charge=charge,
+                spinmult=multiplicity,
+            )
+        except ValueError:
+            chain = Chain.from_xyz(
+                fp=geom_fp,
+                parameters=program_input.chain_inputs,
+                charge=None,
+                spinmult=None,
+            )
+
+    if not chain._energies_already_computed:
+        with console.status("[bold cyan]Computing chain energies...[/bold cyan]"):
+            program_input.engine.compute_energies(chain)
+    if hessian_minima_rescue_displacement is not None:
+        program_input.path_min_inputs.hessian_minima_rescue_displacement = float(
+            hessian_minima_rescue_displacement
+        )
+
+    result = check_if_elem_step(
+        inp_chain=chain,
+        engine=program_input.engine,
+        verbose=verbose,
+        validate_minima_with_hessian=bool(validate_minima_with_hessian),
+        hessian_minimum_frequency_cutoff=float(hessian_minimum_frequency_cutoff),
+        hessian_minima_rescue_displacement=float(
+            program_input.path_min_inputs.hessian_minima_rescue_displacement
+        ),
+    )
+    payload = _elem_step_result_payload(result, chain)
+
+    new_structures = list(getattr(result, "new_structures", None) or [])
+    if new_structures_output is not None and new_structures:
+        new_structures_fp = _write_nodes_xyz(new_structures, new_structures_output)
+        payload["new_structures_xyz"] = str(new_structures_fp)
+
+    output_fp = Path(output).expanduser().resolve()
+    output_fp.parent.mkdir(parents=True, exist_ok=True)
+    output_fp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    table = Table(box=box.SIMPLE, show_header=False)
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Elementary step", str(payload["is_elem_step"]))
+    table.add_row("Splitting criterion", str(payload["splitting_criterion"]))
+    table.add_row("Geometry opt grad calls", str(payload["number_grad_calls"]))
+    table.add_row("New structures", str(payload["new_structure_count"]))
+    table.add_row("Result JSON", str(output_fp))
+    if "new_structures_xyz" in payload:
+        table.add_row("New structures XYZ", str(payload["new_structures_xyz"]))
+    console.print(
+        Panel(
+            table,
+            title="[bold cyan]Elementary Step Result[/bold cyan]",
+            border_style="cyan",
+        )
+    )
 
 
 def _single_frame_xyz_text(structure: Structure) -> str:
@@ -3393,6 +3596,7 @@ def run(
         console.print("[bold cyan]⟳ Minimizing input endpoints...[/bold cyan]")
         batch_optimizer = getattr(
             program_input.engine, "compute_geometry_optimizations", None)
+        endpoint_opt_keywords = _geometry_optimizer_keywords(program_input)
         endpoint_labels = ("start", "end")
         requested_endpoints = [all_nodes[0], all_nodes[-1]]
 
@@ -3420,7 +3624,7 @@ def run(
                 try:
                     trajectories = batch_optimizer(
                         [all_nodes[0], all_nodes[-1]],
-                        keywords={'coordsys': 'cart', 'maxiter': 500},
+                        keywords=endpoint_opt_keywords,
                     )
                 except TypeError:
                     trajectories = batch_optimizer([all_nodes[0], all_nodes[-1]])
@@ -3440,7 +3644,7 @@ def run(
             console.print("[dim]Minimizing start endpoint...[/dim]")
             try:
                 start_tr = program_input.engine.compute_geometry_optimization(
-                    all_nodes[0], keywords={'coordsys': 'cart', 'maxiter': 500})
+                    all_nodes[0], keywords=endpoint_opt_keywords)
                 if start_tr:
                     all_nodes[0] = start_tr[-1]
                 else:
@@ -3454,7 +3658,7 @@ def run(
             console.print("[dim]Minimizing end endpoint...[/dim]")
             try:
                 end_tr = program_input.engine.compute_geometry_optimization(
-                    all_nodes[-1], keywords={'coordsys': 'cart', 'maxiter': 500})
+                    all_nodes[-1], keywords=endpoint_opt_keywords)
                 if end_tr:
                     all_nodes[-1] = end_tr[-1]
                 else:
@@ -3691,6 +3895,7 @@ def run(
                 output_dir=network_dir,
                 base_name=filename.stem,
                 status_fp=status_fp,
+                source_tree_dir=foldername,
                 parallel_recursive=True,
                 parallel_workers=parallel_workers,
                 overwrite=overwrite,
@@ -3969,6 +4174,7 @@ def run(
                 output_dir=network_dir,
                 base_name=split_base_name,
                 status_fp=status_fp,
+                source_tree_dir=foldername,
                 overwrite=overwrite,
                 overwrite_followups_only=source_network_dir is not None,
                 split_mode=network_completion_mode,
@@ -5075,6 +5281,7 @@ def run_refine(
             output_dir=network_dir,
             base_name=f"{base_name}_cheap",
             status_fp=None,
+            source_tree_dir=cheap_tree_dir,
             split_mode=network_completion_mode,
         )
         if mode_normalized == "ts-irc" and ts_irc_edge_scope == "all-source-edges":
@@ -5871,6 +6078,95 @@ def visualize(
     if not no_open:
         webbrowser.open(out_fp.resolve().as_uri())
         console.print("[dim]Opened in default browser.[/dim]")
+
+
+@app.command("irc-network")
+def irc_network(
+    directory: Annotated[
+        str,
+        typer.Argument(help="Directory containing IRC XYZ trajectories and matching .energies files"),
+    ] = ".",
+    output_json: Annotated[
+        str | None,
+        typer.Option("--output-json", help="Output MEPD network JSON path"),
+    ] = None,
+    output_html: Annotated[
+        str | None,
+        typer.Option("--output-html", "-o", help="Output interactive HTML path"),
+    ] = None,
+    pattern: Annotated[
+        str,
+        typer.Option("--pattern", help="XYZ glob to scan"),
+    ] = "*.xyz",
+    recursive: Annotated[
+        bool,
+        typer.Option("--recursive", "-r", help="Scan subdirectories recursively"),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Fail instead of skipping malformed XYZ/energy pairs"),
+    ] = False,
+    charge: Annotated[
+        int,
+        typer.Option(help="Molecular charge used while reading XYZ files"),
+    ] = 0,
+    multiplicity: Annotated[
+        int,
+        typer.Option(help="Spin multiplicity used while reading XYZ files"),
+    ] = 1,
+    no_open: Annotated[
+        bool,
+        typer.Option("--no-open", help="Do not auto-open the HTML viewer"),
+    ] = False,
+):
+    """Build a connectivity-detected network from IRC trajectory files."""
+    console.print(BANNER)
+    source_dir = Path(directory).expanduser().resolve()
+    with console.status("[bold cyan]Scanning IRC trajectories...[/bold cyan]"):
+        scan = build_irc_network(
+            source_dir,
+            pattern=pattern,
+            recursive=recursive,
+            charge=charge,
+            multiplicity=multiplicity,
+            strict=strict,
+        )
+
+    json_fp = (
+        Path(output_json).expanduser().resolve()
+        if output_json
+        else source_dir / f"{source_dir.name}_network.json"
+    )
+    html_fp = (
+        Path(output_html).expanduser().resolve()
+        if output_html
+        else source_dir / f"{source_dir.name}_network.html"
+    )
+    json_fp.parent.mkdir(parents=True, exist_ok=True)
+    html_fp.parent.mkdir(parents=True, exist_ok=True)
+    scan.pot.write_to_disk(json_fp)
+
+    with console.status("[bold cyan]Building interactive HTML...[/bold cyan]"):
+        payload = _build_network_visualization_payload(scan.pot)
+        first_chain = next(
+            chain
+            for _, _, attrs in scan.pot.graph.edges(data=True)
+            for chain in attrs.get("list_of_nebs", [])
+        )
+        html = _build_chain_visualizer_html(
+            chain=first_chain,
+            network_payload=payload,
+        )
+        html_fp.write_text(html, encoding="utf-8")
+
+    console.print(f"[bold green]✓ Network JSON:[/bold green] {json_fp}")
+    console.print(f"[bold green]✓ Interactive HTML:[/bold green] {html_fp}")
+    console.print(
+        f"[dim]Loaded {len(scan.xyz_files)} IRC pair(s); "
+        f"skipped {len(scan.skipped_xyz_files)} XYZ file(s).[/dim]"
+    )
+    if not no_open:
+        webbrowser.open(html_fp.as_uri())
 
 
 @app.command("extract-best-path")

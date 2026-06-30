@@ -88,7 +88,13 @@ class FreezingNEB(PathMinimizer):
         if self.parameters.distance_metric.upper() == "RMSD":
             return RMSD(node1.coords, node2.coords)[0]
         elif self.parameters.distance_metric.upper() == "GEODESIC":
-            return ch.calculate_geodesic_distance(node1, node2, nudge=self.gi_inputs.nudge, nimages=self.gi_inputs.nimages)
+            return ch.calculate_geodesic_distance(
+                node1,
+                node2,
+                nudge=self.gi_inputs.nudge,
+                nimages=self.gi_inputs.nimages,
+                random_seed=self.gi_inputs.random_seed,
+            )
         elif self.parameters.distance_metric.upper() == "LINEAR":
             return np.linalg.norm(node1.coords - node2.coords)
         elif self.parameters.distance_metric.upper() == "XTBGI":
@@ -245,6 +251,13 @@ class FreezingNEB(PathMinimizer):
                 hessian_minimum_frequency_cutoff=float(
                     getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
                 ),
+                hessian_minima_rescue_displacement=float(
+                    getattr(
+                        self.parameters,
+                        "hessian_minima_rescue_displacement",
+                        0.1,
+                    )
+                ),
             )
             # elem_step_results = check_if_elem_step(chain, engine=self.engine)
             self.geom_grad_calls_made += elem_step_results.number_grad_calls
@@ -277,10 +290,11 @@ class FreezingNEB(PathMinimizer):
         init_d2 = self._distance_function(
             raw_chain[ind_node], raw_chain[ind_node+1])
 
-        smoother1 = ch.sample_shortest_geodesic(
+        _, smoother1 = ch.run_geodesic(
             [raw_chain[ind_node], raw_chain[ind_node-1]
              ], nimages=nimg1, return_smoother=True,
-            align=self.gi_inputs.align)
+            align=self.gi_inputs.align,
+            random_seed=self.gi_inputs.random_seed)
         gi1 = ch.gi_path_to_nodes(
             xyz_coords=smoother1.path,
             symbols=raw_chain[0].symbols,
@@ -288,10 +302,11 @@ class FreezingNEB(PathMinimizer):
             spinmult=raw_chain[0].structure.multiplicity,
         )
 
-        smoother2 = ch.sample_shortest_geodesic(
+        _, smoother2 = ch.run_geodesic(
             [raw_chain[ind_node], raw_chain[ind_node+1]
              ], nimages=nimg2, return_smoother=True,
-            align=self.gi_inputs.align)
+            align=self.gi_inputs.align,
+            random_seed=self.gi_inputs.random_seed)
         gi2 = ch.gi_path_to_nodes(
             xyz_coords=smoother2.path,
             symbols=raw_chain[0].symbols,
@@ -1103,11 +1118,13 @@ class FreezingNEB(PathMinimizer):
 
         if self.parameters.distance_metric.upper() == "GEODESIC":
 
-            smoother = ch.sample_shortest_geodesic(
-                sub_chain, nsamples=5, nimages=nimg,
+            _, smoother = ch.run_geodesic(
+                sub_chain, nimages=nimg,
                 nudge=self.gi_inputs.nudge,
                 friction=self.gi_inputs.friction,
-                align=self.gi_inputs.align
+                align=self.gi_inputs.align,
+                random_seed=self.gi_inputs.random_seed,
+                return_smoother=True,
             )
 
             d0 = smoother.length
@@ -1203,9 +1220,11 @@ class FreezingNEB(PathMinimizer):
         """
         smoother = None
         if last_grown_ind == 0:  # initial case
-            smoother = ch.sample_shortest_geodesic([chain[0], chain[-1]],
-                                                   nimages=nimg, nudge=nudge, nsamples=5,
-                                                   align=self.gi_inputs.align)
+            _, smoother = ch.run_geodesic([chain[0], chain[-1]],
+                                          nimages=nimg, nudge=nudge,
+                                          align=self.gi_inputs.align,
+                                          random_seed=self.gi_inputs.random_seed,
+                                          return_smoother=True)
             gi = ch.gi_path_to_nodes(
                 xyz_coords=smoother.path,
                 symbols=chain[0].symbols,
@@ -1250,20 +1269,24 @@ class FreezingNEB(PathMinimizer):
             new_ind = 1
 
         else:
-            smoother1 = ch.sample_shortest_geodesic([chain[last_grown_ind-1],
-                                                     chain[last_grown_ind]],
-                                                    nimages=nimg, nudge=nudge, nsamples=5,
-                                                    align=self.gi_inputs.align)
+            _, smoother1 = ch.run_geodesic([chain[last_grown_ind-1],
+                                            chain[last_grown_ind]],
+                                           nimages=nimg, nudge=nudge,
+                                           align=self.gi_inputs.align,
+                                           random_seed=self.gi_inputs.random_seed,
+                                           return_smoother=True)
             gi1 = ch.gi_path_to_nodes(
                 xyz_coords=smoother1.path,
                 symbols=chain[0].symbols,
                 charge=chain[0].structure.charge,
                 spinmult=chain[0].structure.multiplicity,
             )
-            smoother2 = ch.sample_shortest_geodesic([chain[last_grown_ind],
-                                                     chain[last_grown_ind+1]],
-                                                    nimages=nimg, nudge=nudge, nsamples=5,
-                                                    align=self.gi_inputs.align)
+            _, smoother2 = ch.run_geodesic([chain[last_grown_ind],
+                                            chain[last_grown_ind+1]],
+                                           nimages=nimg, nudge=nudge,
+                                           align=self.gi_inputs.align,
+                                           random_seed=self.gi_inputs.random_seed,
+                                           return_smoother=True)
             gi2 = ch.gi_path_to_nodes(
                 xyz_coords=smoother2.path,
                 symbols=chain[0].symbols,

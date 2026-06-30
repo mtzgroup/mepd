@@ -1,4 +1,4 @@
-"""Progress printing utilities for MEPD."""
+"""Progress printing utilities for NEB Dynamics."""
 
 import json
 import math
@@ -36,6 +36,11 @@ try:
     from qcinf import structure_to_smiles
 except Exception:
     structure_to_smiles = None
+
+try:
+    from rdkit import Chem
+except Exception:
+    Chem = None
 
 
 _progress_monitor_id: ContextVar[str] = ContextVar(
@@ -1086,22 +1091,24 @@ def _endpoint_smiles_for_chain(chain):
     def _safe_node_smiles(node) -> str:
         if bool(getattr(node, "disable_smiles", False)):
             return "N/A"
+        try:
+            natom = len(node.coords)
+        except Exception:
+            natom = 0
+        if natom < 100:
+            try:
+                smiles = str(structure_to_smiles(node.structure))
+                if smiles:
+                    return smiles
+            except Exception:
+                pass
         graph = getattr(node, "graph", None)
         if graph is not None:
             try:
                 return str(graph.force_smiles())
             except Exception:
                 pass
-        try:
-            natom = len(node.coords)
-        except Exception:
-            natom = 0
-        if natom >= 100:
-            return "N/A"
-        try:
-            return structure_to_smiles(node.structure)
-        except Exception:
-            return "N/A"
+        return "N/A"
 
     start = _safe_node_smiles(start_node)
     end = _safe_node_smiles(end_node)
@@ -1172,7 +1179,34 @@ def _format_optional_float(value: float | None, precision: int = 4) -> str:
         return "N/A"
 
 
-def _endpoint_difference_summary(start_node, end_node) -> str:
+def _connectivity_smiles(smiles: str | None) -> str | None:
+    """Return canonical SMILES without stereochemistry for connectivity comparison."""
+    if Chem is None or not smiles or smiles == "N/A":
+        return None
+    try:
+        mol = Chem.MolFromSmiles(str(smiles))
+        if mol is None:
+            return None
+        return str(Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False))
+    except Exception:
+        return None
+
+
+def _endpoint_difference_summary(
+    start_node,
+    end_node,
+    *,
+    start_smiles: str | None = None,
+    end_smiles: str | None = None,
+) -> str:
+    start_connectivity = _connectivity_smiles(start_smiles)
+    end_connectivity = _connectivity_smiles(end_smiles)
+    if start_connectivity is not None and end_connectivity is not None:
+        if start_connectivity != end_connectivity:
+            return "different connectivity"
+        if start_smiles != end_smiles:
+            return "different stereoconformers"
+
     graph_start = getattr(start_node, "graph", None)
     graph_end = getattr(end_node, "graph", None)
     if graph_start is not None and graph_end is not None:
@@ -1185,14 +1219,9 @@ def _endpoint_difference_summary(start_node, end_node) -> str:
         except Exception:
             pass
 
-    if structure_to_smiles is not None:
-        try:
-            start_stereo = str(structure_to_smiles(start_node.structure))
-            end_stereo = str(structure_to_smiles(end_node.structure))
-            if start_stereo and end_stereo and start_stereo != end_stereo:
-                return "different stereoconformers"
-        except Exception:
-            pass
+    if start_connectivity is None or end_connectivity is None:
+        if start_smiles != "N/A" and end_smiles != "N/A" and start_smiles != end_smiles:
+            return "different stereoconformers"
 
     delta_e = _endpoint_energy_kcal_delta(start_node, end_node)
     rmsd = _endpoint_rmsd(start_node, end_node)
@@ -1227,7 +1256,12 @@ def ascii_profile_for_chain(chain, width: int = 60, height: int = 12) -> str:
     plot = _build_ascii_energy_profile(energies, labels, width=width, height=height)
     start_smi, end_smi = _endpoint_smiles_for_chain(chain)
     if len(getattr(chain, "nodes", []) or []) >= 2:
-        endpoint_difference = _endpoint_difference_summary(chain.nodes[0], chain.nodes[-1])
+        endpoint_difference = _endpoint_difference_summary(
+            chain.nodes[0],
+            chain.nodes[-1],
+            start_smiles=start_smi,
+            end_smiles=end_smi,
+        )
     else:
         endpoint_difference = "N/A"
     endpoint_lines = endpoint_difference.splitlines() or ["N/A"]

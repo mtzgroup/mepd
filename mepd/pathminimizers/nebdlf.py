@@ -710,6 +710,9 @@ class DLFindNEB(PathMinimizer):
                     hessian_minimum_frequency_cutoff=float(
                         self._params.get("hessian_minimum_frequency_cutoff", 0.0)
                     ),
+                    hessian_minima_rescue_displacement=float(
+                        self._params.get("hessian_minima_rescue_displacement", 0.1)
+                    ),
                 )
                 self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)
                 if not elem_step_results.is_elem_step:
@@ -751,6 +754,9 @@ class DLFindNEB(PathMinimizer):
                 ),
                 hessian_minimum_frequency_cutoff=float(
                     self._params.get("hessian_minimum_frequency_cutoff", 0.0)
+                ),
+                hessian_minima_rescue_displacement=float(
+                    self._params.get("hessian_minima_rescue_displacement", 0.1)
                 ),
             )
             self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)

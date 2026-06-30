@@ -585,7 +585,8 @@ def _is_connectivity_identical(
     )
 
     # Stereochemical SMILES generation is unsafe/too expensive for very large systems.
-    # Keep this gate on full system size to avoid hard exits in OpenBabel/RDKit.
+    # Keep this gate on full system size (not active-atom subset size) to avoid
+    # hard exits in OpenBabel/RDKit for protein-scale structures.
     if (not disable_smiles) and full_natom_self < 100 and full_natom_other < 100:
         try:
 

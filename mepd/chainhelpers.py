@@ -11,7 +11,6 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from numpy.typing import NDArray
 from mepd.elements import ElementData
-from qcop.exceptions import ExternalProgramError
 from qcio.view import generate_structure_viewer_html
 from scipy.signal import argrelextrema
 
@@ -28,7 +27,7 @@ from mepd.geodesic_interpolation2.morsegeodesic import (
 
 from mepd.errors import ElectronicStructureError
 from mepd.helper_functions import get_mass
-from mepd.inputs import ChainInputs, GIInputs
+from mepd.inputs import ChainInputs
 from mepd.helper_functions import (
     linear_distance,
     qRMSD_distance,
@@ -523,29 +522,6 @@ def _coords_reordered_to_reference_symbols(
     return np.array(coords, copy=False)[np.array(reordered_indices, dtype=int)]
 
 
-def sample_shortest_geodesic(chain: Union[Chain, List[StructureNode]],
-                             nsamples: int = 5, **kwargs):
-
-    shortest_path = 1000
-    best_smoother = None
-    for i in range(nsamples):
-        smoother = run_geodesic_get_smoother(
-            input_object=[
-                chain[0].symbols,
-                [chain[0].coords, chain[-1].coords],
-            ],
-            **kwargs,
-        )
-        # if smoother.length < shortest_path:
-        if np.std(smoother.segment_lengths) < shortest_path:
-            # best_smoother = smoother
-            # shortest_path = smoother.length
-            best_smoother = smoother
-            shortest_path = np.std(smoother.segment_lengths)
-
-    return best_smoother
-
-
 def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, return_smoother: bool = False, **kwargs):
     if isinstance(chain, list) and chain_inputs is None:
         # print(
@@ -585,13 +561,14 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
 
 def calculate_geodesic_distance(
     node1: StructureNode, node2: StructureNode, nimages=12, nudge=1.0,
-    nsamples=5
+    nsamples=5, random_seed=0
 ):
-    smoother = sample_shortest_geodesic(
-        Chain.model_validate({'nodes': [node1, node2]}),
+    _, smoother = run_geodesic(
+        [node1, node2],
         nudge=nudge,
         nimages=nimages,
-        nsamples=nsamples
+        random_seed=random_seed,
+        return_smoother=True,
     )
     return smoother.length
 
@@ -639,38 +616,6 @@ def _update_cache(self, chain: Chain, gradients: NDArray, energies: NDArray) -> 
         node._cached_result = outp
         node._cached_energy = ene
         node._cached_gradient = grad
-
-
-def create_friction_optimal_gi(
-    chain: Chain, gi_inputs: GIInputs, chain_inputs: ChainInputs
-):
-    from mepd.engines.qcop import QCOPEngine
-    print("GI: Optimizing friction parameter")
-    eng = QCOPEngine()
-    frics = [0.0001, 0.001, 0.01, 0.1, 1]
-    all_gis = [
-        run_geodesic(
-            chain=chain,
-            nimages=gi_inputs.nimages,
-            friction=fric,
-            nudge=gi_inputs.nudge,
-            chain_inputs=chain_inputs,
-            **gi_inputs.extra_kwds,
-        )
-        for fric in frics
-    ]
-    eAs = []
-    for gi in all_gis:
-        try:
-            _ = eng.compute_energies(gi)
-            eAs.append(gi.get_eA_chain())
-        except ExternalProgramError:
-            eAs.append(10000000)
-    ind_best = np.argmin(eAs)
-    gi = all_gis[ind_best]
-    _reset_cache(gi)
-    print(f"GI: Chose friction: {frics[ind_best]}")
-    return gi
 
 
 def _calculate_chain_distances(chain_traj: List[Chain]):
@@ -1136,14 +1081,11 @@ def calculate_geodesic_tangent(
         f"Using nimg1: {nimg1} nimg2: {nimg2} for the tangent"
     )
 
-    smoother1 = sample_shortest_geodesic(segment1, nimages=nimg1)
+    _, smoother1 = run_geodesic(segment1, nimages=nimg1, return_smoother=True)
     gi1 = gi_path_to_nodes(smoother1.path, symbols=ref_node.symbols,
                            charge=ref_node.structure.charge, spinmult=ref_node.structure.multiplicity)
 
-    smoother2 = sample_shortest_geodesic(
-        segment2, nimages=nimg2)
-    # smoother2 = sample_shortest_geodesic(
-    #     list_of_nodes[ref_node_ind:], nimages=nimages)
+    _, smoother2 = run_geodesic(segment2, nimages=nimg2, return_smoother=True)
 
     gi2 = gi_path_to_nodes(smoother2.path, symbols=ref_node.symbols,
                            charge=ref_node.structure.charge, spinmult=ref_node.structure.multiplicity)

@@ -15,7 +15,7 @@ from mepd.elementarystep import (
     is_approx_elem_step,
     pseudo_irc,
 )
-from mepd.errors import EnergiesNotComputedError
+from mepd.errors import ElectronicStructureError, EnergiesNotComputedError
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import StructureNode
 
@@ -111,7 +111,7 @@ def test_pseudo_irc_minimizes_highest_image_and_highest_energy_neighbor(monkeypa
     assert result.found_product is chain[4]
 
 
-def test_pseudo_irc_fallback_handles_missing_chain_for_opt_energies(monkeypatch):
+def test_pseudo_irc_does_not_fallback_to_raw_images_when_energies_are_missing(monkeypatch):
     chain = _make_chain_with_energies([0.0, 1.0, 5.0, 4.0, 0.0])
 
     def fake_get_ts_neighbor_pair_indices(_chain):
@@ -122,11 +122,50 @@ def test_pseudo_irc_fallback_handles_missing_chain_for_opt_energies(monkeypatch)
         fake_get_ts_neighbor_pair_indices,
     )
 
-    result = pseudo_irc(chain=chain, engine=SimpleNamespace())
+    with pytest.raises(EnergiesNotComputedError):
+        pseudo_irc(chain=chain, engine=SimpleNamespace())
 
-    assert result.optimization_succeeded is False
-    assert result.found_reactant is chain[1]
-    assert result.found_product is chain[3]
+
+def test_pseudo_irc_does_not_accept_raw_images_when_endpoint_optimization_fails(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([0.0, 1.0, 5.0, 4.0, 0.0])
+    calls = {"count": 0}
+
+    def fake_run_geom_opt(node, engine):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return [node]
+        raise ElectronicStructureError(msg="optimization did not converge")
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._run_geom_opt",
+        fake_run_geom_opt,
+    )
+
+    with pytest.raises(ElectronicStructureError, match="did not converge"):
+        pseudo_irc(chain=chain, engine=SimpleNamespace())
+
+    assert calls["count"] == 2
+
+
+def test_pseudo_irc_wraps_untyped_endpoint_optimization_failure(monkeypatch):
+    chain = _make_chain_with_energies([0.0, 1.0, 5.0, 4.0, 0.0])
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._run_geom_opt",
+        lambda node, engine: (_ for _ in ()).throw(
+            RuntimeError("optimizer stopped before convergence")
+        ),
+    )
+
+    with pytest.raises(
+        ElectronicStructureError,
+        match="no maxima split endpoints were accepted",
+    ) as exc_info:
+        pseudo_irc(chain=chain, engine=SimpleNamespace())
+
+    assert isinstance(exc_info.value.obj, RuntimeError)
 
 
 def test_check_if_elem_step_runs_pseudo_irc_for_chemcloud(monkeypatch):
@@ -213,6 +252,45 @@ def test_chain_is_concave_rejects_hessian_saddle_minima_split(monkeypatch):
     assert result.rejected_minimization_results == [chain[1]]
 
 
+def test_rejected_hessian_minima_split_reports_maxima_fallback_path(
+    monkeypatch, capsys
+):
+    chain = _make_chain_with_energies([1.0, 0.0, 1.0])
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._converges_to_an_endpoints",
+        lambda **kwargs: (False, [chain[kwargs["node_index"]]]),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: False,
+    )
+
+    class FakeEngine:
+        compute_program = "qcop"
+
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+        def _compute_hessian_result(self, node):
+            return SimpleNamespace(
+                results=SimpleNamespace(freqs_wavenumber=[-250.0, 100.0, 150.0])
+            )
+
+    result = _chain_is_concave(
+        chain=chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
+
+    captured = " ".join(capsys.readouterr().out.split())
+
+    assert result.is_concave is True
+    assert "Rejecting minima split" in captured
+    assert "may still request a maxima split" in captured
+
+
 def test_chain_is_concave_accepts_hessian_true_minimum_split(monkeypatch):
     chain = _make_chain_with_energies([1.0, 0.0, 1.0])
 
@@ -248,7 +326,96 @@ def test_chain_is_concave_accepts_hessian_true_minimum_split(monkeypatch):
     assert result.rejected_minimization_results == []
 
 
-def test_hessian_minimum_validation_rejects_negative_matrix_curvature():
+def test_chain_is_concave_rescues_hessian_saddle_by_displacing_unstable_mode(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([1.0, 0.0, 1.0])
+    mode = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._converges_to_an_endpoints",
+        lambda **kwargs: (False, [chain[kwargs["node_index"]]]),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: False,
+    )
+
+    class FakeEngine:
+        compute_program = "qcop"
+        geometry_optimizer = "geometric"
+
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+        def _compute_hessian_result(self, node):
+            x = float(node.coords[1][0])
+            freqs = [25.0, 100.0, 150.0] if x > 1.0 else [-250.0, 100.0, 150.0]
+            return SimpleNamespace(
+                results=SimpleNamespace(
+                    normal_modes_cartesian=[mode],
+                    freqs_wavenumber=freqs,
+                )
+            )
+
+    result = _chain_is_concave(
+        chain=chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
+
+    assert result.is_concave is False
+    assert len(result.minimization_results) == 1
+    assert result.minimization_results[0].coords[1][0] == pytest.approx(1.1)
+    assert result.rejected_minimization_results == []
+    assert result.number_grad_calls == 2
+
+
+def test_chain_is_concave_uses_custom_hessian_rescue_displacement(monkeypatch):
+    chain = _make_chain_with_energies([1.0, 0.0, 1.0])
+    mode = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._converges_to_an_endpoints",
+        lambda **kwargs: (False, [chain[kwargs["node_index"]]]),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: False,
+    )
+
+    class FakeEngine:
+        compute_program = "qcop"
+        geometry_optimizer = "geometric"
+
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+        def _compute_hessian_result(self, node):
+            x = float(node.coords[1][0])
+            freqs = [25.0, 100.0, 150.0] if x > 1.0 else [-250.0, 100.0, 150.0]
+            return SimpleNamespace(
+                results=SimpleNamespace(
+                    normal_modes_cartesian=[mode],
+                    freqs_wavenumber=freqs,
+                )
+            )
+
+    result = _chain_is_concave(
+        chain=chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+        hessian_minima_rescue_displacement=0.05,
+    )
+
+    assert result.is_concave is False
+    assert len(result.minimization_results) == 1
+    assert result.minimization_results[0].coords[1][0] == pytest.approx(1.05)
+
+
+def test_hessian_minimum_validation_uses_reported_frequencies_only():
     node = _make_chain_with_energies([0.0])[0]
 
     class FakeEngine:
@@ -267,10 +434,11 @@ def test_hessian_minimum_validation_rejects_negative_matrix_curvature():
     )
 
     assert result.is_minimum is False
-    assert result.min_hessian_eigenvalue == pytest.approx(-1.0)
+    assert result.min_frequency == pytest.approx(-1.0)
+    assert result.min_hessian_eigenvalue is None
 
 
-def test_check_if_elem_step_forces_maxima_split_when_pseudo_irc_optimization_fails(
+def test_check_if_elem_step_rejects_failed_pseudo_irc_endpoints(
     monkeypatch,
 ):
     chain = Chain.model_validate(
@@ -313,10 +481,272 @@ def test_check_if_elem_step_forces_maxima_split_when_pseudo_irc_optimization_fai
         lambda a, b, **kwargs: np.allclose(a.coords, b.coords),
     )
 
-    result = check_if_elem_step(chain, engine=SimpleNamespace(), verbose=False)
+    with pytest.raises(
+        ElectronicStructureError,
+        match="refusing to use raw high-energy path images",
+    ):
+        check_if_elem_step(chain, engine=SimpleNamespace(), verbose=False)
+
+
+def test_check_if_elem_step_can_maxima_split_after_hessian_rejects_minima(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([0.0, 3.0, 0.0])
+    pseudo_reactant = StructureNode(
+        structure=_structure_at_x(10.0), has_molecular_graph=False
+    )
+    pseudo_product = StructureNode(
+        structure=_structure_at_x(20.0), has_molecular_graph=False
+    )
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._chain_is_concave",
+        lambda chain, engine, verbose=True, **kwargs: SimpleNamespace(
+            is_not_concave=False,
+            is_concave=True,
+            minimization_results=[],
+            number_grad_calls=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep._converges_to_an_endpoints",
+        lambda **kwargs: (False, [chain[kwargs["node_index"]]]),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_approx_elem_step",
+        lambda chain, engine, slope_thresh=0.1, verbose=True: (False, 0),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.pseudo_irc",
+        lambda chain, engine: SimpleNamespace(
+            found_reactant=pseudo_reactant,
+            found_product=pseudo_product,
+            number_grad_calls=0,
+            optimization_succeeded=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: False,
+    )
+
+    class FakeEngine:
+        compute_program = "qcop"
+
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+        def _compute_hessian_result(self, node):
+            if np.isclose(float(node.coords[1][0]), 10.0):
+                freqs = [-250.0, 100.0, 150.0]
+            else:
+                freqs = [25.0, 100.0, 150.0]
+            return SimpleNamespace(results=SimpleNamespace(freqs_wavenumber=freqs))
+
+    result = check_if_elem_step(
+        chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
 
     assert result.is_elem_step is False
     assert result.splitting_criterion == "maxima"
+    assert result.minimization_results == [pseudo_product]
+    assert result.new_structures == [pseudo_product]
+
+
+def test_check_if_elem_step_rejects_maxima_split_when_hessian_rejects_candidate(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([0.0, 3.0, 0.0])
+    pseudo_reactant = StructureNode(
+        structure=_structure_at_x(10.0), has_molecular_graph=False
+    )
+    pseudo_product = StructureNode(
+        structure=_structure_at_x(20.0), has_molecular_graph=False
+    )
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._chain_is_concave",
+        lambda chain, engine, verbose=True, **kwargs: SimpleNamespace(
+            is_not_concave=False,
+            is_concave=True,
+            minimization_results=[],
+            number_grad_calls=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_approx_elem_step",
+        lambda chain, engine, slope_thresh=0.1, verbose=True: (False, 0),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.pseudo_irc",
+        lambda chain, engine: SimpleNamespace(
+            found_reactant=pseudo_reactant,
+            found_product=pseudo_product,
+            number_grad_calls=0,
+            optimization_succeeded=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: np.allclose(a.coords, b.coords),
+    )
+
+    class FakeEngine:
+        def __init__(self):
+            self.hessian_nodes = []
+
+        def _compute_hessian_result(self, node):
+            self.hessian_nodes.append(node)
+            return SimpleNamespace(
+                results=SimpleNamespace(freqs_wavenumber=[-100.0, 50.0, 80.0])
+            )
+
+    engine = FakeEngine()
+    result = check_if_elem_step(
+        chain,
+        engine=engine,
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
+
+    assert engine.hessian_nodes == [pseudo_reactant, pseudo_product]
+    assert result.is_elem_step is True
+    assert result.splitting_criterion is None
+    assert result.new_structures == []
+
+
+def test_check_if_elem_step_rescues_maxima_candidates_by_displacing_unstable_mode(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([0.0, 3.0, 0.0])
+    pseudo_reactant = StructureNode(
+        structure=_structure_at_x(10.0), has_molecular_graph=False
+    )
+    pseudo_product = StructureNode(
+        structure=_structure_at_x(20.0), has_molecular_graph=False
+    )
+    mode = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._chain_is_concave",
+        lambda chain, engine, verbose=True, **kwargs: SimpleNamespace(
+            is_not_concave=False,
+            is_concave=True,
+            minimization_results=[],
+            number_grad_calls=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_approx_elem_step",
+        lambda chain, engine, slope_thresh=0.1, verbose=True: (False, 0),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.pseudo_irc",
+        lambda chain, engine: SimpleNamespace(
+            found_reactant=pseudo_reactant,
+            found_product=pseudo_product,
+            number_grad_calls=0,
+            optimization_succeeded=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: np.allclose(a.coords, b.coords),
+    )
+
+    class FakeEngine:
+        compute_program = "qcop"
+        geometry_optimizer = "geometric"
+
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+        def _compute_hessian_result(self, node):
+            x = float(node.coords[1][0])
+            if np.isclose(x, 10.0) or np.isclose(x, 20.0):
+                freqs = [-100.0, 50.0, 80.0]
+            else:
+                freqs = [15.0, 50.0, 80.0]
+            return SimpleNamespace(
+                results=SimpleNamespace(
+                    normal_modes_cartesian=[mode],
+                    freqs_wavenumber=freqs,
+                )
+            )
+
+    result = check_if_elem_step(
+        chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
+
+    assert result.is_elem_step is False
+    assert result.splitting_criterion == "maxima"
+    assert result.minimization_results[0].coords[1][0] == pytest.approx(10.1)
+    assert result.minimization_results[1].coords[1][0] == pytest.approx(20.1)
+    assert result.number_grad_calls == 2
+    assert result.new_structures == result.minimization_results
+
+
+def test_check_if_elem_step_accepts_hessian_validated_maxima_candidates(
+    monkeypatch,
+):
+    chain = _make_chain_with_energies([0.0, 3.0, 0.0])
+    pseudo_reactant = StructureNode(
+        structure=_structure_at_x(10.0), has_molecular_graph=False
+    )
+    pseudo_product = StructureNode(
+        structure=_structure_at_x(20.0), has_molecular_graph=False
+    )
+
+    monkeypatch.setattr(
+        "mepd.elementarystep._chain_is_concave",
+        lambda chain, engine, verbose=True, **kwargs: SimpleNamespace(
+            is_not_concave=False,
+            is_concave=True,
+            minimization_results=[],
+            number_grad_calls=0,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_approx_elem_step",
+        lambda chain, engine, slope_thresh=0.1, verbose=True: (False, 0),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.pseudo_irc",
+        lambda chain, engine: SimpleNamespace(
+            found_reactant=pseudo_reactant,
+            found_product=pseudo_product,
+            number_grad_calls=0,
+            optimization_succeeded=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "mepd.elementarystep.is_identical",
+        lambda a, b, **kwargs: np.allclose(a.coords, b.coords),
+    )
+
+    class FakeEngine:
+        def _compute_hessian_result(self, node):
+            return SimpleNamespace(
+                results=SimpleNamespace(freqs_wavenumber=[10.0, 50.0, 80.0])
+            )
+
+    result = check_if_elem_step(
+        chain,
+        engine=FakeEngine(),
+        verbose=False,
+        validate_minima_with_hessian=True,
+    )
+
+    assert result.is_elem_step is False
+    assert result.splitting_criterion == "maxima"
+    assert result.minimization_results == [pseudo_reactant, pseudo_product]
+    assert result.new_structures == [pseudo_reactant, pseudo_product]
 
 
 def test_chain_is_concave_runs_endpoint_check_for_engines_without_compute_program(
