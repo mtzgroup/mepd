@@ -55,8 +55,6 @@ def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch)
         v=False,
         climb=False,
         do_elem_step_checks=False,
-        negative_steps_thre=10,
-        positive_steps_thre=10,
     )
     optimizer = SimpleNamespace(timestep=0.1, g_old=None, reset=lambda: None)
     neb = NEB(

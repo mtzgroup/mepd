@@ -155,10 +155,6 @@ class NEBInputs:
         TS-guess |g_perp| and TS-triplet spring-force inf-norm must be below it \
         (default: 0.0 | i.e. no early stop check)
 
-    `negative_steps_thre`: number of steps chain can oscillate until the step size is halved (default: 2)
-
-    `positive_steps_thre`: number of stable steps before increasing the step size (default: 2)
-
     `max_steps`: maximum number of NEB steps allowed (default: 1000)
 
     `v`: whether to be verbose (default: True)
@@ -207,7 +203,7 @@ class NEBInputs:
         splits allowed for the same endpoint pair along one branch
     """
 
-    climb: bool = False
+    climb: bool = True
     en_thre: float = None
     rms_grad_thre: float = None
     max_rms_grad_thre: float = None
@@ -218,18 +214,16 @@ class NEBInputs:
     ts_spring_thre: float = None
     barrier_thre: float = .1  # kcal/mol
 
-    early_stop_force_thre: float = 0.0
+    early_stop_force_thre: float = 0.01
 
-    negative_steps_thre: int = 2
-    positive_steps_thre: int = 2
     use_geodesic_tangent: bool = False
-    do_elem_step_checks: bool = False
-    adaptive_resolution: bool = False
+    do_elem_step_checks: bool = True
+    adaptive_resolution: bool = True
     adaptive_segment_ratio: float = 2.0
     adaptive_energy_ratio: float = 2.0
     adaptive_use_energy: bool = True
-    adaptive_max_images: int = 25
-    adaptive_cooldown_steps: int = 2
+    adaptive_max_images: int = 50
+    adaptive_cooldown_steps: int = 5
     adaptive_plateau_window: int = 3
     adaptive_plateau_rtol: float = 0.05
     plateau_exit_window: int = 50
@@ -241,9 +235,9 @@ class NEBInputs:
     recursive_split_max_depth: int = 200
     recursive_same_pair_split_limit: int = 5
 
-    max_steps: float = 500
+    max_steps: float = 1000
 
-    v: bool = False
+    v: bool = True
 
     def __post_init__(self):
 
@@ -251,16 +245,16 @@ class NEBInputs:
             self.en_thre = 1e-4
 
         if self.rms_grad_thre is None:
-            self.rms_grad_thre = 0.02
+            self.rms_grad_thre = 0.005
 
         if self.ts_grad_thre is None:
-            self.ts_grad_thre = 0.05
+            self.ts_grad_thre = 0.001
 
         if self.ts_spring_thre is None:
-            self.ts_spring_thre = 0.02
+            self.ts_spring_thre = 0.01
 
         if self.max_rms_grad_thre is None:
-            self.max_rms_grad_thre = 0.05
+            self.max_rms_grad_thre = 0.03
 
     def copy(self) -> NEBInputs:
         return NEBInputs(**self.__dict__)
@@ -291,8 +285,8 @@ class ChainInputs:
     `tc_kwds`: keyword arguments for electronic structure calculations
     """
 
-    k: float = 0.1
-    delta_k: float = 0.09
+    k: float = 0.05
+    delta_k: float = 0.0
 
     do_parallel: bool = True
     use_geodesic_interpolation: bool = True
@@ -335,8 +329,8 @@ class GIInputs:
     with the shortest length.
     """
 
-    nimages: int = 10
-    friction: float = 0.001
+    nimages: int = 7
+    friction: float = 0.01
     nudge: float = 0.1
     random_seed: int = 0
     extra_kwds: dict = field(default_factory=dict)
@@ -380,8 +374,8 @@ class NetworkInputs:
 @dataclass
 class RunInputs:
     engine_name: str = "chemcloud"
-    program: str = "xtb"
-    chemcloud_queue: str = None
+    program: str = "crest"
+    chemcloud_queue: str = "cpu"
     write_qcio: bool = False
     print_stdout: bool = False
     qcop_local_parallel_workers: int = 12
@@ -510,17 +504,21 @@ class RunInputs:
         if self.program_kwds is None:
             if self.engine_name == "gxtb":
                 program_args = None
-            elif self.program == "xtb":
+            elif self.program in {"xtb", "crest"}:
                 if shutil.which("crest") is not None:
                     self.program = 'crest'
                     program_args = ProgramArgs(
                         model={"method": "gfn2",
                                "basis": "gfn2"},
                         keywords={"threads": 1})
-                else:
+                elif self.program == "xtb":
                     program_args = ProgramArgs(
                         model={"method": "GFN2xTB", "basis": "GFN2xTB"},
                         keywords={})
+                else:
+                    program_args = ProgramArgs(
+                        model={"method": "gfn2", "basis": "gfn2"},
+                        keywords={"threads": 1})
 
             elif "terachem" in self.program:
                 program_args = ProgramArgs(
@@ -567,7 +565,11 @@ class RunInputs:
             self.chain_inputs = ChainInputs(**self.chain_inputs)
 
         if self.optimizer_kwds is None:
-            self.optimizer_kwds = {"name": "cg"}
+            self.optimizer_kwds = {
+                "name": "gd",
+                "timestep": 1.0,
+                "max_step_norm": 2.0,
+            }
         elif "name" not in self.optimizer_kwds:
             self.optimizer_kwds["name"] = "cg"
 
@@ -694,9 +696,17 @@ class RunInputs:
         json_dict = self.__dict__.copy()
         del json_dict['engine']
         del json_dict['optimizer']
+        json_dict.pop("network_inputs", None)
+        deprecated_path_min_keys = {
+            "plateau_exit_window",
+            "plateau_exit_rtol",
+        }
         for key, val in json_dict.items():
             if 'input' in key:
                 json_dict[key] = _serialize_input_value(val)
+                if key == "path_min_inputs" and isinstance(json_dict[key], dict):
+                    for deprecated_key in deprecated_path_min_keys:
+                        json_dict[key].pop(deprecated_key, None)
             elif 'program_kwds' in key:
                 d = val.json()
 

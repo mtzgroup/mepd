@@ -14,7 +14,7 @@ def _load_toml(path: Path) -> dict:
 @pytest.mark.parametrize(
     "method,expected_method,expected_key,expected_value",
     [
-        ("neb", "neb", "max_steps", 500),
+        ("neb", "neb", "max_steps", 1000),
         ("fneb", "fneb", "max_min_iter", 100),
         ("fsm", "fneb", "max_min_iter", 100),
         ("mlpgi", "mlpgi", "fire_conv_geolen_tol", 0.25),

@@ -413,8 +413,6 @@ def test_optimize_chain_raises_explicit_plateau_exit_message(monkeypatch):
             adaptive_plateau_window=1,
             max_steps=5,
             do_elem_step_checks=False,
-            negative_steps_thre=10,
-            positive_steps_thre=10,
         ),
         engine=engine,
     )
@@ -445,9 +443,8 @@ def test_optimize_chain_status_includes_timestep_for_conjugate_gradient(monkeypa
         optimizer=ConjugateGradient(timestep=0.25),
         parameters=NEBInputs(
             max_steps=2,
+            v=False,
             do_elem_step_checks=False,
-            negative_steps_thre=10,
-            positive_steps_thre=10,
             adaptive_resolution=False,
             adaptive_plateau_window=0,
         ),

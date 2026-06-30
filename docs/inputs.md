@@ -23,7 +23,6 @@ k = 0.1
 delta_k = 0.09
 do_parallel = true
 use_geodesic_interpolation = true
-friction_optimal_gi = true
 node_freezing = true
 fraction_freeze = 0.1
 node_rms_thre = 5.0
@@ -93,8 +92,6 @@ These keys are accepted when `path_min_method = "NEB"`.
 | `ts_spring_thre` | `float` | `0.02` |
 | `barrier_thre` | `float` | `0.1` |
 | `early_stop_force_thre` | `float` | `0.0` |
-| `negative_steps_thre` | `int` | `5` |
-| `positive_steps_thre` | `int` | `10` |
 | `use_geodesic_tangent` | `bool` | `false` |
 | `do_elem_step_checks` | `bool` | `false` |
 | `max_steps` | `float` | `500` |
@@ -114,8 +111,6 @@ ts_grad_thre = 0.05
 ts_spring_thre = 0.02
 barrier_thre = 0.1
 early_stop_force_thre = 0.03
-negative_steps_thre = 5
-positive_steps_thre = 10
 use_geodesic_tangent = false
 do_elem_step_checks = false
 max_steps = 500
@@ -262,7 +257,6 @@ alpha_climb = 0.5
 | `delta_k` | `float` | `0.09` | Energy-weighted spring parameter |
 | `do_parallel` | `bool` | `true` | Parallel gradient/energy computation |
 | `use_geodesic_interpolation` | `bool` | `true` | Use geodesic interpolation for initial path generation |
-| `friction_optimal_gi` | `bool` | `true` | Optimize GI friction parameter |
 | `node_freezing` | `bool` | `true` | Freeze converged nodes |
 | `fraction_freeze` | `float` | `0.1` | Multiplier for node-freezing convergence thresholds |
 | `node_rms_thre` | `float` | `5.0` | Node RMS threshold |
@@ -277,7 +271,6 @@ k = 0.1
 delta_k = 0.09
 do_parallel = true
 use_geodesic_interpolation = true
-friction_optimal_gi = true
 node_freezing = true
 fraction_freeze = 0.1
 node_rms_thre = 5.0

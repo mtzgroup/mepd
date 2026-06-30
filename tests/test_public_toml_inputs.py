@@ -19,9 +19,15 @@ def test_bundled_tomls_only_use_active_public_input_keys():
         "path_min_inputs": _field_names(NEBInputs),
         "chain_inputs": _field_names(ChainInputs),
         "gi_inputs": _field_names(GIInputs),
-        "optimizer_kwds": {"name", "timestep"},
+        "optimizer_kwds": {"name", "timestep", "max_step_norm"},
     }
-    allowed_program_kwds_sections = {"keywords", "model"}
+    allowed_program_kwds_sections = {
+        "cmdline_args",
+        "extras",
+        "files",
+        "keywords",
+        "model",
+    }
 
     toml_paths = [
         ROOT / "mepd" / "default_inputs.toml",
@@ -42,7 +48,11 @@ def test_bundled_tomls_only_use_active_public_input_keys():
 
         if "program_kwds" in data:
             assert set(data["program_kwds"]) <= allowed_program_kwds_sections, fp
-            assert set(data["program_kwds"].get("model", {})) <= {"method", "basis"}, fp
+            assert set(data["program_kwds"].get("model", {})) <= {
+                "method",
+                "basis",
+                "extras",
+            }, fp
 
 
 def test_runinputs_save_omits_deprecated_path_min_inputs(tmp_path):

@@ -158,8 +158,6 @@ def test_climbing_neb_checks_elementary_step_before_ci_and_not_after(monkeypatch
         v=False,
         climb=True,
         do_elem_step_checks=True,
-        negative_steps_thre=10,
-        positive_steps_thre=10,
     )
     neb = NEB(
         initial_chain=chain.copy(),
@@ -170,7 +168,7 @@ def test_climbing_neb_checks_elementary_step_before_ci_and_not_after(monkeypatch
 
     events = []
 
-    def fake_check_if_elem_step(inp_chain, engine, verbose=False):
+    def fake_check_if_elem_step(inp_chain, engine, verbose=False, **kwargs):
         events.append(("elem", len(inp_chain)))
         return ElemStepResults(
             is_elem_step=True,
@@ -224,7 +222,7 @@ def test_climbing_neb_refines_when_unconverged_chain_is_elementary(monkeypatch):
 
     events = []
 
-    def fake_check_if_elem_step(inp_chain, engine, verbose=False):
+    def fake_check_if_elem_step(inp_chain, engine, verbose=False, **kwargs):
         events.append(("elem", len(inp_chain)))
         return ElemStepResults(
             is_elem_step=True,
