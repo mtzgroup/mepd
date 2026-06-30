@@ -1,14 +1,13 @@
 # MEPD
 
-Minimum Energy Path Discovery tools for reaction-path calculations.
+Minimum Energy Path Discovery tools for efficient reaction path calculations. 
 
-This public repository contains:
+This repository contains:
 
 - NEB and related path minimizers
 - MLPGI path support
 - MSMEP recursive path splitting
 - elementary-step analysis utilities
-- engine, chain, node, optimizer, and visualization helpers needed by those workflows
 
 ## Installation
 
@@ -76,4 +75,3 @@ Use the Python API for lower-level NEB, MLPGI, MSMEP, and elementary-step workfl
 For questions, contact:
 
 - [Jan](mailto:jdep@stanford.edu)
-- [Alessio](mailto:alevale@stanford.edu)
