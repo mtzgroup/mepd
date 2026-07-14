@@ -206,6 +206,10 @@ class StructureNode(Node):
         new_struct_dict["multiplicity"] = copy_node.structure.multiplicity
 
         copy_node.structure = Structure(**new_struct_dict)
+        if copy_node.has_molecular_graph and not copy_node._global_disable_molecular_graphs:
+            copy_node.graph = structure_to_molecule(copy_node.structure)
+        else:
+            copy_node.graph = None
         return copy_node
 
     @property
