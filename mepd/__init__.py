@@ -7,34 +7,35 @@ if TYPE_CHECKING:
         ChainInputs,
         GIInputs,
         NEBInputs,
-        NetworkInputs,
         PathMinInputs,
         RunInputs,
     )
-    from mepd.msmep import MSMEP
     from mepd.neb import NEB
-    from mepd.nodes.node import Node, StructureNode
+    from mepd.nodes.node import Node, StructureNode, XYNode
 
-_EXPORTS = {
+_CORE_EXPORTS = {
     "Node": ("mepd.nodes.node", "Node"),
     "StructureNode": ("mepd.nodes.node", "StructureNode"),
+    "XYNode": ("mepd.nodes.node", "XYNode"),
     "Chain": ("mepd.chain", "Chain"),
     "NEB": ("mepd.neb", "NEB"),
-    "MSMEP": ("mepd.msmep", "MSMEP"),
     "PathMinInputs": ("mepd.inputs", "PathMinInputs"),
     "NEBInputs": ("mepd.inputs", "NEBInputs"),
     "ChainInputs": ("mepd.inputs", "ChainInputs"),
     "GIInputs": ("mepd.inputs", "GIInputs"),
-    "NetworkInputs": ("mepd.inputs", "NetworkInputs"),
     "RunInputs": ("mepd.inputs", "RunInputs"),
 }
 
-__all__ = sorted(_EXPORTS)
+__all__ = sorted([*_CORE_EXPORTS, "engines"])
 
 
 def __getattr__(name: str):
-    if name in _EXPORTS:
-        module_name, attr_name = _EXPORTS[name]
+    if name == "engines":
+        import mepd.engines as engines_module
+        globals()["engines"] = engines_module
+        return engines_module
+    if name in _CORE_EXPORTS:
+        module_name, attr_name = _CORE_EXPORTS[name]
         module = importlib.import_module(module_name)
         attr = getattr(module, attr_name)
         globals()[name] = attr

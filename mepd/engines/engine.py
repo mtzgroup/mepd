@@ -15,7 +15,7 @@ import numpy as np
 from mepd.nodes.node import Node
 from mepd.fakeoutputs import FakeQCIOOutput
 from mepd.helper_functions import get_mass
-from qcio import ProgramOutput
+from qcdata import ProgramOutput
 
 
 @dataclass

@@ -11,7 +11,7 @@ import numpy as np
 from mepd.convergence_helpers import chain_converged
 from numpy.typing import NDArray
 from openbabel import pybel
-from qcop.exceptions import ExternalProgramError
+from mepd.errors import ExternalProgramError
 
 import mepd.chainhelpers as ch
 from mepd.chain import Chain
@@ -20,17 +20,16 @@ from mepd.engines import Engine
 from mepd.engines.ase import ASEEngine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
 # from mepd.gsm_helper import minimal_wrapper_de_gsm, gsm_to_ase_atoms
-from mepd.dynamics.chainbiaser import ChainBiaser
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs
 from mepd.nodes.node import StructureNode, Node
 from mepd.optimizers.optimizer import Optimizer
 from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.optimizers.vpo import VelocityProjectedOptimizer
-from mepd.qcio_structure_helpers import (
+from mepd.qcdata_structure_helpers import (
     structure_to_ase_atoms,
     ase_atoms_to_structure,
 )
-from mepd.scripts.progress import print_chain_step, format_neb_caption, update_status
+from mepd.progress import print_chain_step, format_neb_caption, update_status
 
 # Rich imports for flashy CLI output
 try:
@@ -113,7 +112,6 @@ class NEB(PathMinimizer):
     optimizer: Optimizer
     parameters: NEBInputs
     engine: Engine
-    biaser: ChainBiaser = None
 
     optimized: Chain = None
     chain_trajectory: list[Chain] = field(default_factory=list)
@@ -527,6 +525,9 @@ class NEB(PathMinimizer):
             hessian_minima_rescue_displacement=float(
                 getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
             ),
+            disregard_stereochem=bool(
+                getattr(self.parameters, "disregard_stereochem", False)
+            ),
         )
 
         if not elem_step_results.is_elem_step:
@@ -760,7 +761,7 @@ class NEB(PathMinimizer):
                 #     )
                 # else:
                 #     elem_step_results = IS_ELEM_STEP
-                # raise ElectronicStructureError(msg="QCOP failed.",
+                # raise ElectronicStructureError(msg="QCCompute failed.",
                 #                                obj=e.program_output)
 
             max_rms_grad_val = np.amax(new_chain.rms_gradients)
@@ -848,6 +849,9 @@ class NEB(PathMinimizer):
                                 0.1,
                             )
                         ),
+                        disregard_stereochem=bool(
+                            getattr(self.parameters, "disregard_stereochem", False)
+                        ),
                     )
                     self.geom_grad_calls_made += elem_step_results.number_grad_calls
                 else:
@@ -903,6 +907,9 @@ class NEB(PathMinimizer):
                             0.1,
                         )
                     ),
+                    disregard_stereochem=bool(
+                        getattr(self.parameters, "disregard_stereochem", False)
+                    ),
                 )
                 self.geom_grad_calls_made += elem_step_results.number_grad_calls
                 if elem_step_results.is_elem_step:
@@ -950,15 +957,9 @@ class NEB(PathMinimizer):
         self._update_cache(chain, grads, enes)
 
         try:
-            additional_gradients = None
-            if self.biaser:
-                additional_gradients = np.zeros_like(grads)
-                additional_gradients[1:-
-                                     1] = self.biaser.gradient_chain_bias(chain)
             grad_step = ch.compute_NEB_gradient(
                 chain,
                 geodesic_tangent=self.parameters.use_geodesic_tangent,
-                additional_gradients=additional_gradients,
             )
             converged_mask = np.array([node.converged for node in chain.nodes], dtype=bool)
             if converged_mask.any():

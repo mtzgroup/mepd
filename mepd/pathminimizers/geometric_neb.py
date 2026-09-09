@@ -8,16 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from qcio import Structure
+from qcdata import Structure
 
 from mepd.chain import Chain
-from mepd.constants import ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROMS
+from qcconst.constants import ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM
 from mepd.elementarystep import ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
 from mepd.pathminimizers.pathminimizer import PathMinimizer
-from mepd.scripts.progress import print_persistent, update_status
+from mepd.progress import print_persistent, update_status
 
 IS_ELEM_STEP = ElemStepResults(
     is_elem_step=True,
@@ -230,7 +230,7 @@ class GeometricNEB(PathMinimizer):
 
         molecule = geometric.molecule.Molecule()
         molecule.elem = symbols
-        molecule.xyzs = [np.asarray(node.coords, dtype=float) * BOHR_TO_ANGSTROMS for node in work_chain]
+        molecule.xyzs = [np.asarray(node.coords, dtype=float) * BOHR_TO_ANGSTROM for node in work_chain]
 
         # Build simple topology metadata when possible; geomeTRIC can proceed in Cartesian
         # mode without this, but some molecule operations use this attribute when available.
@@ -250,7 +250,7 @@ class GeometricNEB(PathMinimizer):
 
             def __deepcopy__(self, memo):
                 # geomeTRIC NEB deep-copies Chain objects during trust-step updates.
-                # Base engines (for example QCOPEngine) can contain thread locks that
+                # Base engines (for example QCComputeEngine) can contain thread locks that
                 # are not deepcopy/pickle safe, so keep a shared base engine reference.
                 from copy import deepcopy
 
@@ -297,7 +297,7 @@ class GeometricNEB(PathMinimizer):
                 return {
                     "energy": energy,
                     # geomeTRIC expects gradient in Hartree/Angstrom.
-                    "gradient": gradient.reshape(-1) * BOHR_TO_ANGSTROMS,
+                    "gradient": gradient.reshape(-1) * BOHR_TO_ANGSTROM,
                 }
 
         kwargs = self._build_geometric_kwargs(nimages=len(work_chain))
@@ -366,7 +366,7 @@ class GeometricNEB(PathMinimizer):
                             eval_nodes[idx]._cached_energy = float(ene)
 
                     for i, struct in enumerate(chain_self.Structures):
-                        grad_cart = gradients[i].reshape(-1) * BOHR_TO_ANGSTROMS
+                        grad_cart = gradients[i].reshape(-1) * BOHR_TO_ANGSTROM
                         ene = float(getattr(eval_nodes[i], "_cached_energy"))
                         struct.ComputeEnergyGradient(
                             result={"energy": ene, "gradient": grad_cart}
@@ -437,6 +437,9 @@ class GeometricNEB(PathMinimizer):
                 ),
                 hessian_minima_rescue_displacement=float(
                     self._params.get("hessian_minima_rescue_displacement", 0.1)
+                ),
+                disregard_stereochem=bool(
+                    self._params.get("disregard_stereochem", False)
                 ),
             )
             self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)

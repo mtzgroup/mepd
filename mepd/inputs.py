@@ -1,6 +1,6 @@
 from __future__ import annotations
 import shutil
-from qcio import ProgramArgs
+from qcdata import ProgramArgs
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from dataclasses import is_dataclass, asdict
@@ -21,6 +21,7 @@ import warnings
 _MLPGI_DEFAULT_PATH_MIN_INPUTS = {
     # Generic MSMEP behavior flags
     "skip_identical_graphs": True,
+    "disregard_stereochem": False,
     "do_elem_step_checks": True,
     "v": False,
     # Backend/model options
@@ -151,9 +152,16 @@ class NEBInputs:
 
     `skip_identical_graphs`: whether to skip minimizations where endpoints have identical graphs
 
+    `disregard_stereochem`: whether connectivity comparisons ignore the
+        stereochemical SMILES equality check after graph isomorphism succeeds
+
     `early_stop_force_thre`: threshold used for early elementary-step checks; both
         TS-guess |g_perp| and TS-triplet spring-force inf-norm must be below it \
         (default: 0.0 | i.e. no early stop check)
+
+    `negative_steps_thre`: number of steps chain can oscillate until the step size is halved (default: 2)
+
+    `positive_steps_thre`: number of stable steps before increasing the step size (default: 2)
 
     `max_steps`: maximum number of NEB steps allowed (default: 1000)
 
@@ -193,7 +201,7 @@ class NEBInputs:
     `hessian_minima_rescue_displacement`: displacement, in bohr, applied along the
         lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
 
-    `network_completion_max_followup_requests`: maximum number of follow-up recursive
+    `network_splits_max_followup_requests`: maximum number of follow-up recursive
         network-split requests queued after the initial request_0 run
 
     `recursive_split_max_depth`: maximum recursive split depth allowed before
@@ -203,27 +211,30 @@ class NEBInputs:
         splits allowed for the same endpoint pair along one branch
     """
 
-    climb: bool = True
+    climb: bool = False
     en_thre: float = None
     rms_grad_thre: float = None
     max_rms_grad_thre: float = None
     skip_identical_graphs: bool = True
     disable_molecular_graphs: bool = False
+    disregard_stereochem: bool = False
 
     ts_grad_thre: float = None
     ts_spring_thre: float = None
     barrier_thre: float = .1  # kcal/mol
 
-    early_stop_force_thre: float = 0.01
+    early_stop_force_thre: float = 0.0
 
+    negative_steps_thre: int = 2
+    positive_steps_thre: int = 2
     use_geodesic_tangent: bool = False
-    do_elem_step_checks: bool = True
-    adaptive_resolution: bool = True
+    do_elem_step_checks: bool = False
+    adaptive_resolution: bool = False
     adaptive_segment_ratio: float = 2.0
     adaptive_energy_ratio: float = 2.0
     adaptive_use_energy: bool = True
-    adaptive_max_images: int = 50
-    adaptive_cooldown_steps: int = 5
+    adaptive_max_images: int = 25
+    adaptive_cooldown_steps: int = 2
     adaptive_plateau_window: int = 3
     adaptive_plateau_rtol: float = 0.05
     plateau_exit_window: int = 50
@@ -231,13 +242,13 @@ class NEBInputs:
     validate_minima_with_hessian: bool = False
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
-    network_completion_max_followup_requests: int = 1000
+    network_splits_max_followup_requests: int = 1000
     recursive_split_max_depth: int = 200
     recursive_same_pair_split_limit: int = 5
 
-    max_steps: float = 1000
+    max_steps: float = 500
 
-    v: bool = True
+    v: bool = False
 
     def __post_init__(self):
 
@@ -245,16 +256,16 @@ class NEBInputs:
             self.en_thre = 1e-4
 
         if self.rms_grad_thre is None:
-            self.rms_grad_thre = 0.005
+            self.rms_grad_thre = 0.02
 
         if self.ts_grad_thre is None:
-            self.ts_grad_thre = 0.001
+            self.ts_grad_thre = 0.05
 
         if self.ts_spring_thre is None:
-            self.ts_spring_thre = 0.01
+            self.ts_spring_thre = 0.02
 
         if self.max_rms_grad_thre is None:
-            self.max_rms_grad_thre = 0.03
+            self.max_rms_grad_thre = 0.05
 
     def copy(self) -> NEBInputs:
         return NEBInputs(**self.__dict__)
@@ -271,8 +282,6 @@ class ChainInputs:
     `node_class`: type of node to use
     `do_parallel`: whether to compute gradients and energies in parallel
     `use_geodesic_interpolation`: whether to use GI in interpolations
-    `do_chain_biasing`: whether to use chain biasing (Under Development, not ready for use)
-    `cb`: Chain biaser object (Under Development, not ready for use)
 
     `node_freezing`: whether to freeze nodes in NEB convergence
     `fraction_freeze`: multiplier applied to convergence thresholds when deciding
@@ -285,8 +294,8 @@ class ChainInputs:
     `tc_kwds`: keyword arguments for electronic structure calculations
     """
 
-    k: float = 0.05
-    delta_k: float = 0.0
+    k: float = 0.1
+    delta_k: float = 0.09
 
     do_parallel: bool = True
     use_geodesic_interpolation: bool = True
@@ -329,8 +338,8 @@ class GIInputs:
     with the shortest length.
     """
 
-    nimages: int = 7
-    friction: float = 0.01
+    nimages: int = 10
+    friction: float = 0.001
     nudge: float = 0.1
     random_seed: int = 0
     extra_kwds: dict = field(default_factory=dict)
@@ -341,44 +350,12 @@ class GIInputs:
 
 
 @dataclass
-class NetworkInputs:
-    n_max_conformers: int = 10  # maximum number of conformers to keep of each endpoint
-    subsample_confs: bool = True
-
-    conf_rmsd_cutoff: float = 0.5
-    # minimum distance to be considered new conformer
-    # given that the graphs are identical
-
-    network_nodes_are_conformers: bool = False
-    # whether each conformer should be a separate node in the network
-
-    maximum_barrier_height: float = 1000  # kcal/mol
-    # will only populate edges with a barrier lower than this input
-
-    use_slurm: bool = False
-    # whether to submit minimization jobs to slurm queue
-
-    verbose: bool = True
-
-    tolerate_kinks: bool = True
-    # whether to include chains with a minimum apparently present in the
-    # network construction
-
-    CREST_temp: float = 298.15  # Kelvin
-    CREST_ewin: float = 6.0  # kcal/mol
-    # crest inputs for conformer generation. Incomplete list.
-    collapse_node_rms_thre: float = 5.0  # Bohr
-    collapse_node_ene_thre: float = 5.0  # kcal/mol
-
-
-@dataclass
 class RunInputs:
     engine_name: str = "chemcloud"
-    program: str = "crest"
-    chemcloud_queue: str = "cpu"
+    program: str = "xtb"
+    chemcloud_queue: str = None
     write_qcio: bool = False
     print_stdout: bool = False
-    qcop_local_parallel_workers: int = 12
     nanoreactor_inputs: dict = None
 
     path_min_method: str = 'NEB'
@@ -386,7 +363,6 @@ class RunInputs:
 
     chain_inputs: dict = None
     gi_inputs: dict = None
-    network_inputs: dict = None
 
     program_kwds: ProgramArgs = None
     ase_engine_kwds: dict = None
@@ -408,6 +384,7 @@ class RunInputs:
                 "max_grow_iter": 20,
                 "verbosity": 1,
                 "skip_identical_graphs": True,
+                "disregard_stereochem": False,
                 "do_elem_step_checks": True,
                 "grad_tol": 0.05,  # Hartree/Bohr,
                 "barrier_thre": 5,  # kcal/mol,
@@ -418,6 +395,8 @@ class RunInputs:
                 "min_images": 10,
                 "todd_way": True,
                 "dist_err": 0.1,
+                "phi": 0.5,
+                "drstep": 0.1,
 
             }
         elif path_method == "NEB-DLF":
@@ -428,6 +407,7 @@ class RunInputs:
                 "max_nebk": None,
                 "new_minimizer": "no",
                 "skip_identical_graphs": True,
+                "disregard_stereochem": False,
                 "do_elem_step_checks": True,
                 "early_stop_stage": False,
                 "early_stop_loose_overrides": {},
@@ -441,6 +421,7 @@ class RunInputs:
                 "rms_grad_thre": 0.02,
                 "max_rms_grad_thre": 0.05,
                 "skip_identical_graphs": True,
+                "disregard_stereochem": False,
                 "do_elem_step_checks": True,
                 "batch_engine_calls": True,
                 "align": True,
@@ -496,29 +477,20 @@ class RunInputs:
         else:
             self.gi_inputs = GIInputs(**self.gi_inputs)
 
-        if self.network_inputs is None:
-            self.network_inputs = NetworkInputs()
-        else:
-            self.network_inputs = NetworkInputs(**self.network_inputs)
-
         if self.program_kwds is None:
             if self.engine_name == "gxtb":
                 program_args = None
-            elif self.program in {"xtb", "crest"}:
+            elif self.program == "xtb":
                 if shutil.which("crest") is not None:
                     self.program = 'crest'
                     program_args = ProgramArgs(
                         model={"method": "gfn2",
                                "basis": "gfn2"},
                         keywords={"threads": 1})
-                elif self.program == "xtb":
+                else:
                     program_args = ProgramArgs(
                         model={"method": "GFN2xTB", "basis": "GFN2xTB"},
                         keywords={})
-                else:
-                    program_args = ProgramArgs(
-                        model={"method": "gfn2", "basis": "gfn2"},
-                        keywords={"threads": 1})
 
             elif "terachem" in self.program:
                 program_args = ProgramArgs(
@@ -527,9 +499,9 @@ class RunInputs:
             else:
                 raise ValueError("Need to specify program arguments")
 
-            if self.engine_name in ['qcop', 'chemcloud']:
+            if self.engine_name in {'chemcloud', 'qccompute'}:
                 self.program_kwds = program_args
-        elif self.program_kwds is not None and self.engine_name in ['qcop', 'chemcloud']:
+        elif self.program_kwds is not None and self.engine_name in {'chemcloud', 'qccompute'}:
             program_args = ProgramArgs(**self.program_kwds)
             self.program_kwds = program_args
 
@@ -565,26 +537,20 @@ class RunInputs:
             self.chain_inputs = ChainInputs(**self.chain_inputs)
 
         if self.optimizer_kwds is None:
-            self.optimizer_kwds = {
-                "name": "gd",
-                "timestep": 1.0,
-                "max_step_norm": 2.0,
-            }
+            self.optimizer_kwds = {"name": "cg"}
         elif "name" not in self.optimizer_kwds:
             self.optimizer_kwds["name"] = "cg"
 
-        if self.engine_name == 'qcop' or self.engine_name == 'chemcloud':
-            from mepd.engines.qcop import QCOPEngine
-            eng = QCOPEngine(program_args=self.program_kwds,
+        if self.engine_name in {'chemcloud', 'qccompute'}:
+            from mepd.engines.qccompute import QCComputeEngine
+            eng = QCComputeEngine(program_args=self.program_kwds,
                              program=self.program,
                              compute_program=self.engine_name,
                              chemcloud_queue=self.chemcloud_queue,
                              write_qcio=self.write_qcio,
                              print_stdout=self.print_stdout,
-                             local_parallel_workers=max(
-                                 1, int(self.qcop_local_parallel_workers)
-                             ),
                              geometry_optimizer_kwds=self.geometry_optimizer_kwds,
+                             frozen_atom_indices=self.chain_inputs.frozen_atom_indices,
                              )
         elif self.engine_name == 'ase':
             from mepd.engines.ase import ASEEngine
@@ -696,17 +662,9 @@ class RunInputs:
         json_dict = self.__dict__.copy()
         del json_dict['engine']
         del json_dict['optimizer']
-        json_dict.pop("network_inputs", None)
-        deprecated_path_min_keys = {
-            "plateau_exit_window",
-            "plateau_exit_rtol",
-        }
         for key, val in json_dict.items():
             if 'input' in key:
                 json_dict[key] = _serialize_input_value(val)
-                if key == "path_min_inputs" and isinstance(json_dict[key], dict):
-                    for deprecated_key in deprecated_path_min_keys:
-                        json_dict[key].pop(deprecated_key, None)
             elif 'program_kwds' in key:
                 d = val.json()
 

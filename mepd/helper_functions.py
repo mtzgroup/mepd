@@ -12,7 +12,7 @@ import scipy.sparse.linalg
 from openbabel import openbabel
 from pysmiles import write_smiles
 from rdkit import Chem
-from mepd.elements import ElementData
+from qcconst import periodic_table
 
 
 warnings.filterwarnings("ignore")
@@ -38,8 +38,14 @@ def get_mass(s: str):
     """
     return atomic mass from symbol
     """
-    ed = ElementData()
-    return ed.from_symbol(s).mass_amu
+    return float(getattr(periodic_table, s.strip().capitalize()).mass)
+
+
+def symbol_to_atomic_number(s: str) -> int:
+    """
+    return atomic number from element symbol
+    """
+    return int(getattr(periodic_table, s.strip().capitalize()).number)
 
 
 def qRMSD_distance(structure, reference):
@@ -199,8 +205,7 @@ def from_number_to_element(i):
 
 
 def atomic_number_to_symbol(n):
-    ed = ElementData()
-    return ed.from_atomic_number(n).symbol
+    return periodic_table.number(int(n)).symbol
 
 
 def graph_to_smiles(mol):
@@ -377,6 +382,114 @@ def naturals(n):
     yield from naturals(n + 1)
 
 
+def _load_info_from_tcin(file_path):
+    parsed = parse_terachem_input_file(file_path)
+    return (
+        parsed["method"],
+        parsed["basis"],
+        parsed["charge"],
+        parsed["spinmult"],
+        parsed["keywords"],
+    )
+
+
+def parse_terachem_input_file(file_path: str | Path) -> dict:
+    """
+    Parse a TeraChem input file into a dict of run settings.
+
+    Returns a dictionary with:
+    - method, basis, charge, spinmult
+    - run_type, min_coordinates
+    - prmtop, coordinates, qmindices
+    - keywords: additional key/value pairs
+    - frozen_atom_indices: 0-based atom indices parsed from $constraints
+    """
+    fp = Path(file_path)
+    lines = fp.read_text().splitlines()
+    if len(lines) < 2:
+        raise ValueError("TeraChem input must have at least two lines.")
+
+    parsed = {
+        "method": None,
+        "basis": None,
+        "charge": None,
+        "spinmult": None,
+        "run_type": "gradient",
+        "min_coordinates": "cartesian",
+        "prmtop": None,
+        "coordinates": None,
+        "qmindices": None,
+        "keywords": {},
+        "frozen_atom_indices": [],
+    }
+
+    in_constraints = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        if lower.startswith("$constraints"):
+            in_constraints = True
+            continue
+        if in_constraints and lower.startswith("$end"):
+            in_constraints = False
+            continue
+        if in_constraints and lower.startswith("$"):
+            in_constraints = False
+
+        if in_constraints:
+            tokens = line.split()
+            if tokens and tokens[0].lower() == "atom" and len(tokens) >= 2:
+                m = re.search(r"-?\d+", tokens[1])
+                if m:
+                    parsed["frozen_atom_indices"].append(int(m.group()) - 1)
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        key = parts[0].lower()
+        val = " ".join(parts[1:])
+
+        if key == "method":
+            parsed["method"] = val
+        elif key == "basis":
+            parsed["basis"] = val
+        elif key == "charge":
+            parsed["charge"] = int(val)
+        elif key == "spinmult":
+            parsed["spinmult"] = int(val)
+        elif key == "run":
+            parsed["run_type"] = val
+        elif key == "min_coordinates":
+            parsed["min_coordinates"] = val
+        elif key == "prmtop":
+            parsed["prmtop"] = val
+        elif key == "coordinates":
+            parsed["coordinates"] = val
+        elif key == "qmindices":
+            parsed["qmindices"] = val
+        elif key != "scrdir":
+            parsed["keywords"][parts[0]] = val
+
+    if parsed["method"] is None or parsed["basis"] is None:
+        raise ValueError(
+            "TeraChem input must include both 'method' and 'basis'.")
+    if parsed["charge"] is None:
+        parsed["charge"] = 0
+    if parsed["spinmult"] is None:
+        parsed["spinmult"] = 1
+
+    parsed["frozen_atom_indices"] = sorted(set(parsed["frozen_atom_indices"]))
+    return parsed
+
+
 def _calculate_chain_distances(chain_traj):
     distances = [None]  # None for the first chain
     for i, chain in enumerate(chain_traj):
@@ -398,11 +511,11 @@ def get_fsm_tsg_from_chain(chain):
     return chain[ind_tsg]
 
 
-def _is_qcop_engine(engine) -> bool:
+def _is_qccompute_engine(engine) -> bool:
     engine_cls = type(engine)
     return (
-        engine_cls.__name__ == "QCOPEngine"
-        and engine_cls.__module__ == "mepd.engines.qcop"
+        engine_cls.__name__ == "QCComputeEngine"
+        and engine_cls.__module__ == "mepd.engines.qccompute"
     )
 
 
@@ -417,6 +530,33 @@ def _is_missing_geometric_irc_error(exc: Exception) -> bool:
 def compute_irc_chain(ts_node, engine, use_bigchem: bool = False, keywords=None, **kwargs):
     from mepd.chain import Chain
     irc_kwds = dict(keywords or {})
+
+    if _is_qccompute_engine(engine):
+        try:
+            from mepd.irc import compute_irc_chain_with_geometric as _compute_irc_chain_with_geometric
+
+            irc_chain = _compute_irc_chain_with_geometric(
+                engine=engine,
+                ts_node=ts_node,
+                keywords=irc_kwds,
+                use_bigchem=use_bigchem,
+            )
+            energies = np.asarray(engine.compute_energies(irc_chain), dtype=float).reshape(-1)
+            if len(energies) != len(irc_chain.nodes):
+                raise ValueError(
+                    "Engine returned a different number of energies than IRC chain nodes "
+                    f"({len(energies)} vs {len(irc_chain.nodes)})."
+                )
+            for node, energy in zip(irc_chain.nodes, energies):
+                node._cached_energy = float(energy)
+            return irc_chain
+        except Exception as exc:
+            if not _is_missing_geometric_irc_error(exc):
+                raise
+            warnings.warn(
+                "geomeTRIC is unavailable for QCComputeEngine IRC; falling back to native MEPD IRC.",
+                RuntimeWarning,
+            )
 
     engine.compute_energies([ts_node])
     if hasattr(engine, "compute_sd_irc"):
@@ -696,9 +836,76 @@ def project_rigid_body_forces(R, F, masses=None):
     return F
 
 
+def rst7_to_coords_and_indices(data):
+    """
+
+    Args:
+        data (str): rst7 text file, opened
+
+    Returns:
+        tuple(np.array, list): coordinates and indices of atoms in the rst7 file
+    """
+    coords = []
+    indices_coordinates = []
+
+    ind = 0
+    for line in data.split("\n"):
+        if ind == 0:
+            ind += 1
+            continue
+        if ind == 1:
+            natom = int(line.split()[0])
+        if (len(line.split()) == 6) or (len(line.split()) == 3):
+            if len(coords) == natom:
+                break
+            # if ind in qmindices:
+            c = line.split()[:3]
+            c = [float(x) for x in c]
+            coords.append(c)
+
+            c = line.split()[3:]
+            c = [float(x) for x in c]
+            if len(c) > 0:
+                coords.append(c)
+            indices_coordinates.append(ind)
+
+        ind += 1
+    # print(coords)
+    return np.array(coords), indices_coordinates
+
+
+def parse_symbols_from_prmtop(data):
+    """
+
+    Args:
+        data (str): prmtop text file, opened
+
+    Returns:
+        list: symbols of atoms in the prmtop file
+    """
+    symbols = []
+
+    begin = False
+    skipped1line = 0
+    for line in data.split("\n"):
+        if line.strip() == '%FLAG ATOMIC_NUMBER':
+            begin = True
+            continue
+        if begin:
+            if skipped1line:
+                if line[0] == '%':
+                    break
+                symbols.extend(line.split())
+            else:
+                skipped1line = 1
+
+    symbols = [atomic_number_to_symbol(int(n)) for n in symbols]
+    return symbols
+
+
 def parse_hhtda_to_dict(stdout_text):
     """
-    Parses hh-TDA output and returns a dictionary structured for qcio's 'extras'.
+    Parses hh-TDA output and returns a dictionary structured for qcdata's 'extras'.
     """
     # Regex to find the hh-TDA table
     table_pattern = r"Root\s+Mult\.\s+Total Energy \(a\.u\.\).*\n-+\n([\s\S]*?)\n\n"

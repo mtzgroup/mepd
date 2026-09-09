@@ -1,7 +1,7 @@
 import numpy as np
 from mepd.nodes.node import Node, XYNode
 from mepd.helper_functions import parse_hhtda_to_dict
-from mepd.qcio_structure_helpers import split_structure_into_frags
+from mepd.qcdata_structure_helpers import split_structure_into_frags
 from mepd.geodesic_interpolation2.coord_utils import align_geom
 from mepd.errors import EnergiesNotComputedError
 
@@ -53,7 +53,7 @@ def _print_all_comparisons():
     # Pause any active rich Live monitor before printing wide tables to avoid
     # interleaved/overwritten output in verbose mode.
     try:
-        from mepd.scripts.progress import stop_status
+        from mepd.progress import stop_status
         stop_status()
     except Exception:
         pass
@@ -345,6 +345,7 @@ def is_identical(
     kcal_mol_cutoff: float = 1.0,
     verbose: bool = True,
     collect_comparison: bool = True,
+    disregard_stereochem: bool = False,
 ) -> bool:
     """
     computes whether two nodes are identical.
@@ -364,7 +365,11 @@ def is_identical(
             print("elemsteps: Using graph and distance based comparison")
         conditions = [
             _is_connectivity_identical(
-                self, other, verbose=verbose, collect_comparison=collect_comparison
+                self,
+                other,
+                verbose=verbose,
+                collect_comparison=collect_comparison,
+                disregard_stereochem=disregard_stereochem,
             ),
             _is_conformer_identical(
                 self,
@@ -373,6 +378,7 @@ def is_identical(
                 fragment_rmsd_cutoff=fragment_rmsd_cutoff,
                 kcal_mol_cutoff=kcal_mol_cutoff,
                 verbose=verbose,
+                disregard_stereochem=disregard_stereochem,
             ),
         ]
     else:
@@ -405,6 +411,7 @@ def _is_conformer_identical(
     fragment_rmsd_cutoff: float = 0.5,
     kcal_mol_cutoff: float = 1.0,
     verbose: bool = True,
+    disregard_stereochem: bool = False,
 ) -> bool:
 
     def _comparison_coords(node_a: Node, node_b: Node):
@@ -449,7 +456,11 @@ def _is_conformer_identical(
     per_frag_dists = []
     if self.has_molecular_graph:
         if not _is_connectivity_identical(
-            self, other, verbose=verbose, collect_comparison=False
+            self,
+            other,
+            verbose=verbose,
+            collect_comparison=False,
+            disregard_stereochem=disregard_stereochem,
         ):
             if verbose:
                 if _rich_available:
@@ -566,6 +577,7 @@ def _is_connectivity_identical(
     other: Node,
     verbose: bool = True,
     collect_comparison: bool = True,
+    disregard_stereochem: bool = False,
 ) -> bool:
     """
     checks graphs of both nodes and returns whether they are isomorphic
@@ -580,13 +592,15 @@ def _is_connectivity_identical(
     smi1 = ""
     smi2 = ""
     stereochem_identical = True
-    disable_smiles = bool(getattr(self, "disable_smiles", False)) or bool(
-        getattr(other, "disable_smiles", False)
+    disable_smiles = (
+        bool(disregard_stereochem)
+        or bool(getattr(self, "disable_smiles", False))
+        or bool(getattr(other, "disable_smiles", False))
     )
 
     # Stereochemical SMILES generation is unsafe/too expensive for very large systems.
     # Keep this gate on full system size (not active-atom subset size) to avoid
-    # hard exits in OpenBabel/RDKit for protein-scale structures.
+    # hard exits in OpenBabel/RDKit for protein-scale QMMM structures.
     if (not disable_smiles) and full_natom_self < 100 and full_natom_other < 100:
         try:
 
@@ -599,7 +613,7 @@ def _is_connectivity_identical(
                 print("Constructing smiles failed. Pretending this check succeeded.")
             stereochem_identical = True
     else:
-        if verbose:
+        if verbose and not bool(disregard_stereochem):
             print("System too large. Not checking stereochemistry.")
         stereochem_identical = True
 

@@ -7,19 +7,19 @@ from typing import List, Tuple, Union
 
 import numpy as np
 from openbabel import openbabel, pybel
-from qcio.models.inputs import ProgramInput
-from qcio.models.structure import Structure
+from qcdata.models.inputs import ProgramInput
+from qcdata.models.structure import Structure
 from ase import Atoms
 
 
-from mepd.constants import ANGSTROM_TO_BOHR
+from qcconst.constants import ANGSTROM_TO_BOHR
 from mepd.geodesic_interpolation2.fileio import read_xyz
 from mepd.helper_functions import (
     bond_ord_number_to_string,
     from_number_to_element,
     atomic_number_to_symbol,
+    symbol_to_atomic_number,
 )
-from mepd.elements import symbol_to_atomic_number
 
 from mepd.molecule import Molecule
 
@@ -147,7 +147,7 @@ def load_obmol_from_fp(fp: Path) -> openbabel.OBMol:
 
 
 def molecule_to_structure(rp_mol: Molecule, charge: int = 0, spinmult: int = 1):
-    """Instantiate object from `Molecule` object. see [link](https://mtzgroup.github.io/mepd/molecule/)
+    """Instantiate object from `Molecule` object. see [link](https://mtzgroup.github.io/neb-dynamics/molecule/)
 
     Args:
         rp_mol (Molecule): Molecule object to build Structure from

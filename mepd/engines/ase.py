@@ -7,7 +7,7 @@ from ase.calculators.calculator import Calculator
 from ase.units import Hartree
 from numpy.typing import NDArray
 from qcconst.constants import ANGSTROM_TO_BOHR
-from mepd.qcio_structure_helpers import (
+from mepd.qcdata_structure_helpers import (
     structure_to_ase_atoms,
     ase_atoms_to_structure,
 )
@@ -34,7 +34,6 @@ except Exception:
     SellaOptimizer = None
     SellaIRC = None
 
-from mepd.dynamics.chainbiaser import ChainBiaser
 
 
 from ase.io import Trajectory
@@ -67,7 +66,6 @@ class ASEEngine(Engine):
     ase_optimizer: Optimizer = None
     geometry_optimizer: str = "LBFGSLineSearch"
     transition_state_optimizer: str = "SELLA"
-    biaser: ChainBiaser = None
 
     def __post_init__(self):
         if self.ase_optimizer is None:
@@ -169,12 +167,12 @@ class ASEEngine(Engine):
         if isinstance(chain, Chain):
             assert isinstance(
                 chain.nodes[0], StructureNode
-            ), "input Chain has nodes incompatible with QCOPEngine."
+            ), "input Chain has nodes incompatible with QCComputeEngine."
             node_list = chain.nodes
         elif isinstance(chain, list):
             assert isinstance(
                 chain[0], StructureNode
-            ), "input list has nodes incompatible with QCOPEngine."
+            ), "input list has nodes incompatible with QCComputeEngine."
             node_list = chain
         else:
             raise ValueError(
@@ -202,14 +200,6 @@ class ASEEngine(Engine):
             else:
                 all_results.append(non_frozen_results.pop(0))
         update_node_cache(node_list=node_list, results=all_results)
-
-        # compute bias if relevant
-        if self.biaser:
-            for node in node_list:
-                ene_bias = self.biaser.energy_node_bias(node=node)
-                grad_bias = self.biaser.gradient_node_bias(node=node)
-                node._cached_energy += ene_bias
-                node._cached_gradient += grad_bias
 
         return node_list
 
@@ -418,5 +408,12 @@ class ASEEngine(Engine):
 
         left_branch = list(reversed(_strip_initial_ts(reverse_nodes)))
         right_branch = _strip_initial_ts(forward_nodes)
+        if len(left_branch) == 0 and len(right_branch) == 0:
+            raise ElectronicStructureError(
+                msg=(
+                    "ASE IRC completed but produced no non-TS trajectory points. "
+                    "Check that the input is a first-order saddle and increase IRC steps if needed."
+                )
+            )
         irc_nodes = left_branch + [ts_node.copy()] + right_branch
         return Chain.model_validate({"nodes": irc_nodes})

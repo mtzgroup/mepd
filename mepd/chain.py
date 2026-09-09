@@ -12,10 +12,10 @@ from mepd.geodesic_interpolation2.fileio import write_xyz
 
 
 from mepd.nodes.node import Node, StructureNode
-from mepd.constants import BOHR_TO_ANGSTROMS
+from qcconst.constants import BOHR_TO_ANGSTROM
 from mepd.inputs import ChainInputs
 from mepd.fakeoutputs import FakeQCIOResults, FakeQCIOOutput
-from qcio import ProgramOutput
+from qcdata import ProgramOutput
 from dataclasses import field
 from mepd.helper_functions import (
     linear_distance,
@@ -67,7 +67,7 @@ class Chain(BaseModel):
         """
         Reads in a chain from an xyz file containing a list of structures.
         """
-        from mepd.qcio_structure_helpers import (
+        from mepd.qcdata_structure_helpers import (
             read_multiple_structure_from_file,
         )
 
@@ -376,7 +376,7 @@ class Chain(BaseModel):
 
     def write_to_disk(self, fp: Path, write_qcio: bool = False):
         fp = Path(fp)
-        xyz_arr = self.coordinates * BOHR_TO_ANGSTROMS
+        xyz_arr = self.coordinates * BOHR_TO_ANGSTROM
         symbs = self.symbols
         write_xyz(filename=fp, atoms=symbs, coords=xyz_arr)
 

@@ -7,13 +7,13 @@ from typing import Union, ClassVar
 
 import numpy as np
 from numpy.typing import NDArray
-from qcio import ProgramOutput, Structure
+from qcdata import ProgramOutput, Structure
 
 from mepd.errors import (EnergiesNotComputedError,
                                  GradientsNotComputedError)
 from mepd.fakeoutputs import FakeQCIOOutput, FakeQCIOResults
 from mepd.molecule import Molecule
-from mepd.qcio_structure_helpers import structure_to_molecule
+from mepd.qcdata_structure_helpers import structure_to_molecule
 
 
 def _json_safe(value):

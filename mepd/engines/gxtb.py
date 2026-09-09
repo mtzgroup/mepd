@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any, List, Union
 
 import numpy as np
+from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
+from ase.units import Hartree
 from numpy.typing import NDArray
 
 from mepd.chain import Chain
-from mepd.constants import ANGSTROM_TO_BOHR
-from mepd.engines.engine import Engine
+from qcconst.constants import ANGSTROM_TO_BOHR
+from mepd.engines.engine import Engine, build_hessian_result_from_matrix
 from mepd.errors import (
     ElectronicStructureError,
     EnergiesNotComputedError,
@@ -23,9 +26,55 @@ from mepd.errors import (
 from mepd.fakeoutputs import FakeQCIOOutput, FakeQCIOResults
 from mepd.nodes.node import StructureNode
 from mepd.nodes.nodehelpers import update_node_cache
+from mepd.qcdata_structure_helpers import ase_atoms_to_structure
 
 
 _TOTAL_ENERGY_RE = re.compile(r"TOTAL ENERGY\s+(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+Eh")
+
+
+class _GXTBASEResultsCalculator(Calculator):
+    implemented_properties = ["energy", "forces"]
+
+    def __init__(
+        self,
+        engine: "GXTBCalculator",
+        *,
+        charge: int = 0,
+        multiplicity: int = 1,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.charge = int(charge)
+        self.multiplicity = int(multiplicity)
+
+    def calculate(
+        self,
+        atoms: Atoms | None = None,
+        properties=("energy",),
+        system_changes=all_changes,
+    ) -> None:
+        super().calculate(atoms, list(properties), system_changes)
+        if self.atoms is None:
+            raise ElectronicStructureError(
+                msg="ASE did not provide atoms for g-xTB calculation."
+            )
+
+        charge = int(self.atoms.info.get("charge", self.charge))
+        multiplicity = int(self.atoms.info.get("spin", self.multiplicity))
+        structure = ase_atoms_to_structure(
+            atoms=self.atoms,
+            charge=charge,
+            multiplicity=multiplicity,
+        )
+        node = StructureNode(structure=structure)
+
+        energy_hartree = float(self.engine.compute_energies([node])[0])
+        gradient_hartree_bohr = np.asarray(
+            self.engine.compute_gradients([node])[0], dtype=float
+        )
+        self.results["energy"] = energy_hartree * Hartree
+        # ASE forces are -dE/dx in eV/Angstrom.
+        self.results["forces"] = -gradient_hartree_bohr * Hartree * ANGSTROM_TO_BOHR
 
 
 @dataclass
@@ -38,7 +87,6 @@ class GXTBCalculator(Engine):
     keep_workdirs: bool = False
     add_gxtb_flag: bool = True
     n_threads: int = 1
-    biaser: Any = None
 
     def __post_init__(self) -> None:
         if self.executable is None:
@@ -54,10 +102,6 @@ class GXTBCalculator(Engine):
             node_list = self._run_calc(chain=chain)
             grads = np.array([node.gradient for node in node_list])
 
-        if self.biaser:
-            grads = grads.copy()
-            for i, node in enumerate(chain):
-                grads[i] += self.biaser.gradient_node_bias(node=node)
         return grads
 
     def compute_energies(self, chain: Union[Chain, List]) -> NDArray:
@@ -67,10 +111,6 @@ class GXTBCalculator(Engine):
             node_list = self._run_calc(chain=chain)
             enes = np.array([node.energy for node in node_list])
 
-        if self.biaser:
-            enes = enes.copy()
-            for i, node in enumerate(chain):
-                enes[i] += self.biaser.energy_node_bias(node=node)
         return enes
 
     def _run_calc(self, chain: Union[Chain, List]) -> list[StructureNode]:
@@ -187,6 +227,89 @@ class GXTBCalculator(Engine):
             )
         return completed
 
+    def compute_hessian(
+        self,
+        node: StructureNode,
+        step_size: float | None = None,
+    ) -> NDArray:
+        with tempfile.TemporaryDirectory(prefix="gxtb-hess-") as tmp:
+            workdir = Path(tmp)
+            xyz_path = workdir / "structure.xyz"
+            xyz_path.write_text(node.structure.to_xyz())
+            completed = self._run_gxtb_hessian(
+                xyz_path=xyz_path,
+                charge=int(node.structure.charge),
+                multiplicity=int(node.structure.multiplicity),
+                cwd=workdir,
+            )
+            try:
+                hessian = self._parse_hessian(workdir / "hessian", natoms=len(node.symbols))
+            except Exception as exc:
+                raise ElectronicStructureError(
+                    msg="Failed to parse g-xTB Hessian output.",
+                    obj=completed.stdout + completed.stderr,
+                ) from exc
+
+            if self.keep_workdirs:
+                persistent = Path.cwd() / "gxtb-workdirs"
+                persistent.mkdir(exist_ok=True)
+                shutil.copytree(workdir, persistent / workdir.name, dirs_exist_ok=True)
+
+        return hessian
+
+    def _compute_hessian_result(self, node: StructureNode, **kwargs):
+        hessian = self.compute_hessian(node=node)
+        return build_hessian_result_from_matrix(node=node, hessian=hessian)
+
+    def _run_gxtb_hessian(
+        self,
+        *,
+        xyz_path: Path,
+        charge: int,
+        multiplicity: int,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            self.executable,
+            str(xyz_path.name),
+            "--silent",
+            "--chrg",
+            str(charge),
+            "--hess",
+        ]
+        uhf = max(0, int(multiplicity) - 1)
+        if uhf:
+            cmd.extend(["--uhf", str(uhf)])
+        if self.add_gxtb_flag and Path(self.executable).name != "gxtb":
+            cmd.append("--gxtb")
+        cmd.extend(self.extra_args)
+
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(int(self.n_threads))
+        env.update(self.env)
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise ElectronicStructureError(
+                msg=(
+                    f"g-xTB executable `{self.executable}` was not found. "
+                    "Set `GXTB_EXECUTABLE` or pass `executable` to GXTBCalculator."
+                )
+            ) from exc
+        if completed.returncode != 0:
+            raise ElectronicStructureError(
+                msg=f"g-xTB Hessian calculation failed with exit code {completed.returncode}.",
+                obj=completed.stdout + completed.stderr,
+            )
+        return completed
+
     def compute_geometry_optimization(
         self,
         node: StructureNode,
@@ -251,6 +374,38 @@ class GXTBCalculator(Engine):
             for node in nodes
         ]
 
+    def _as_ase_engine_for_node(self, node: StructureNode):
+        from mepd.engines.ase import ASEEngine
+
+        calculator = _GXTBASEResultsCalculator(
+            self,
+            charge=int(node.structure.charge),
+            multiplicity=int(node.structure.multiplicity),
+        )
+        return ASEEngine(calculator=calculator)
+
+    def compute_transition_state(
+        self,
+        node: StructureNode,
+        keywords: dict[str, Any] | None = None,
+    ) -> StructureNode:
+        """Optimize a TS guess through ASE/Sella using local g-xTB energies/gradients."""
+        return self._as_ase_engine_for_node(node).compute_transition_state(
+            node=node,
+            keywords=keywords,
+        )
+
+    def compute_irc_chain(
+        self,
+        ts_node: StructureNode,
+        keywords: dict[str, Any] | None = None,
+    ) -> Chain:
+        """Compute an IRC through ASE/Sella using local g-xTB energies/gradients."""
+        return self._as_ase_engine_for_node(ts_node).compute_irc_chain(
+            ts_node=ts_node,
+            keywords=keywords,
+        )
+
     @staticmethod
     def _parse_energy(*, workdir: Path, stdout: str) -> float:
         energy_fp = workdir / "energy"
@@ -281,6 +436,40 @@ class GXTBCalculator(Engine):
         if len(rows) < natoms:
             raise ValueError(f"Expected at least {natoms} gradient rows, found {len(rows)}.")
         return np.asarray(rows[-natoms:], dtype=float)
+
+    @staticmethod
+    def _parse_hessian(fp: Path, natoms: int) -> NDArray:
+        if not fp.exists():
+            raise FileNotFoundError(f"g-xTB Hessian file not found: {fp}")
+        ndof = int(natoms) * 3
+        values: list[float] = []
+        in_block = False
+        for raw_line in fp.read_text().splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if lower.startswith("$hessian"):
+                in_block = True
+                continue
+            if lower.startswith("$end"):
+                break
+            if not in_block and stripped.startswith("$"):
+                continue
+            if not in_block:
+                continue
+            for field in stripped.split():
+                try:
+                    values.append(float(field.replace("D", "E")))
+                except ValueError:
+                    continue
+        expected = ndof * ndof
+        if len(values) < expected:
+            raise ValueError(
+                f"Expected {expected} Hessian values for {natoms} atoms, found {len(values)}."
+            )
+        hessian = np.asarray(values[:expected], dtype=float).reshape((ndof, ndof))
+        return 0.5 * (hessian + hessian.T)
 
     @staticmethod
     def _parse_optimized_node(node: StructureNode, fp: Path) -> StructureNode:

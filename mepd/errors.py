@@ -40,6 +40,28 @@ class ElectronicStructureError(Exception):
         super().__init__(self.msg)
 
 
+class ExternalProgramError(ElectronicStructureError):
+    program: str
+    original_exception: Exception | None
+    logs: str | None
+
+    def __init__(
+        self,
+        program: str,
+        message: str | None = None,
+        obj: Any = None,
+        original_exception: Exception | None = None,
+        logs: str | None = None,
+    ):
+        self.program = program
+        self.original_exception = original_exception
+        self.logs = logs
+        super().__init__(
+            msg=message or f"External program '{program}' failed.",
+            obj=obj,
+        )
+
+
 @dataclass
 class CriticalNEBError(Exception):
 

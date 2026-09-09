@@ -3,16 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import networkx as nx
-from IPython.core.display import HTML
-from IPython.display import SVG
 
 # from openeye import oechem, oedepict
 from mepd.isomorphism_tools import SubGraphMatcher
-from mepd.rdkit_draw import moldrawsvg
-from mepd.d3_tools import draw_d3, molecule_to_d3json
 from mepd.helper_functions import (
     graph_to_smiles,
     from_number_to_element,
@@ -130,7 +125,7 @@ class Molecule(nx.Graph):
             start (int, optional): initial value for the reindexing. Defaults to 0.
 
         Returns:
-            Molecule: copied molecule object
+            Molecule: retropaths molecule object
         """
         if reindex:
             # if reindex is true, convert the node labels to integers starting with start
@@ -243,130 +238,13 @@ class Molecule(nx.Graph):
             other (int): how many molecules
 
         Returns:
-            Molecule: combined molecule
+            Molecule: a retropaths molecule
         """
         assert isinstance(other, int)
         final = self.__class__()
         for _ in range(other):
             final += self
         return final
-
-    def draw(
-        self,
-        mode="rdkit",
-        size=None,
-        string_mode=False,
-        node_index=True,
-        percentage=None,
-        force=None,
-        fixed_bond_length=None,
-        fixedScale=None,
-        fontSize=None,
-        lineWidth=None,
-        charges=True,
-        neighbors=False,
-    ):
-        """
-        Draw the graph, mode can be 'd3' for interactive force directed graphs or 'rdkit' or 'oe' for chemdraw style images
-        """
-
-        if mode == "d3":
-            size = size or (500, 500)
-            G = self.copy()
-            # G = nx.convert_node_labels_to_integers(G)
-            nodes, links = molecule_to_d3json(
-                G, node_index, charges=charges, neighbors=neighbors
-            )
-            return draw_d3(
-                nodes,
-                links,
-                size=size,
-                string_mode=string_mode,
-                percentage=percentage,
-                force_layout_charge=force,
-            )
-
-        elif mode == "rdkit":
-            size = size or (300, 300)
-            d = {
-                "Sg": "R1",
-                "Rf": "R2",
-                "Ne": "R3",
-                "Ar": "R4",
-                "Kr": "R5",
-                "Ru": "R6",
-                "Rn": "R7",
-                "Og": "R8",
-                "Fr": "R9",
-                "At": "R10",
-                "Db": "R11",
-                "Hs": "R12",
-                "Bh": "R13",
-                "Mt": "R14",
-                "Rg": "R15",
-                "Cn": "R16",
-                "Hf": "R17",
-                "U": "R18",
-                "W": "R19",
-                "Pu": "R20",
-                "Am": "R21",
-                "Cm": "R22",
-            }
-            smiles = self.force_smiles()
-            svg_str = moldrawsvg(
-                smiles,
-                d,
-                molSize=size,
-                fixed_bond_length=fixed_bond_length,
-                fixedScale=fixedScale,
-                fontSize=fontSize,
-                lineWidth=lineWidth,
-            )
-            if string_mode:
-                return svg_str
-            else:
-                return SVG(svg_str)
-
-            # elif mode == "oe":
-            #     width, height = 400, 400
-
-            #     mol = oechem.OEGraphMol()
-            #     oechem.OESmilesToMol(mol, self.smiles)
-            #     oedepict.OEPrepareDepiction(mol)
-
-            #     opts = oedepict.OE2DMolDisplayOptions(width, height, oedepict.OEScale_AutoScale)
-            #     opts.SetMargins(10)
-            #     disp = oedepict.OE2DMolDisplay(mol, opts)
-
-            #     font = oedepict.OEFont(oedepict.OEFontFamily_Default, oedepict.OEFontStyle_Default, 12,
-            #                            oedepict.OEAlignment_Center, oechem.OEDarkRed)
-
-            #     for adisp in disp.GetAtomDisplays():
-            #         atom = adisp.GetAtom()
-            #         toggletext = f"{atom.GetIdx()}"
-            #         oedepict.OEDrawSVGToggleText(disp, adisp, toggletext, font)
-
-            #     ofs = oechem.oeosstream()
-            #     oedepict.OERenderMolecule(ofs, "svg", disp)
-            #     string = ofs.str()
-
-            #     sss = f'<div style="width: {100}%; display: table;"> <div style="display: table-row;">'
-            #     sss += f'{string.decode()}</div></div>'
-            if string_mode:
-                return sss
-            else:
-                return HTML(sss)
-        else:
-            raise ValueError(
-                f'mode must be one of "oe", "d3" or "rdkit", received {mode}'
-            )
-
-    def to_svg(self, folder=Path("."), file_name=None):
-        if file_name is None:
-            file_name = f"{self.force_smiles()}.svg"
-        full_path = folder / file_name
-        with open(full_path, "w") as f:
-            f.write(self.draw(mode="rdkit", string_mode=True))
 
     @classmethod
     def from_rdmol(cls, rdmol, smi, name=None):
@@ -415,73 +293,6 @@ class Molecule(nx.Graph):
         new_mol._smiles = new_mol.create_smiles()
 
         return new_mol
-
-    @staticmethod
-    def draw_list_smiles(smis, **kwargs):
-        mols = [Molecule.from_smiles(smi) for smi in smis]
-        return Molecule.draw_list(mols, names=smis, **kwargs)
-
-    @staticmethod
-    def draw_list(
-        molecule_list,
-        names=[],
-        mode="rdkit",
-        title="",
-        charges=False,
-        size=(650, 650),
-        width=100,
-        columns=5,
-        string_mode=False,
-        node_index=True,
-        neighbors=False,
-        arrows=False,
-        borders=False,
-    ):
-        """
-        Draws a list of molecules
-        """
-        if len(molecule_list) == 0:
-            print("This list is empty")
-            molecule_list.append(Molecule())
-            names.append("")
-
-        true_mol_len = len(molecule_list)
-        while len(molecule_list) < columns:
-            molecule_list.append(Molecule())
-            names.append("")
-
-        if columns <= len(molecule_list):
-            how_many_columns = columns
-        else:
-            how_many_columns = len(molecule_list)
-
-        cell_width = 100.0 / how_many_columns
-
-        borders_string = "border: 1px solid black;" if borders else ""
-
-        sstring = f'<h2>{title}</h2><div style="width: {width}%; display: table;"> <div style="display: table-row;">'
-
-        for i, mol in enumerate(molecule_list):
-            if i % how_many_columns == 0:
-                sstring += '</div><div style="display: table-row;">'
-
-            try:
-                name = f'<p style="text-align: center;">{names[i]}</p>'
-            except IndexError:
-                name = ""
-            this_border_string = (
-                borders_string if not mol.is_empty() else ""
-            )  # I do not want to draw border on empty molecules.
-            sstring += f'<div style="width: {cell_width}%; display: table-cell;{this_border_string}"> \
-                {mol.draw(mode=mode, string_mode=True, size=size, charges=charges, neighbors=neighbors, node_index=node_index,percentage=0.8)} {name} </div>'
-            if arrows and i < true_mol_len - 1:
-                sstring += '<div style="width: 0%; display: table-cell; vertical-align: middle;"><font size="+2">⟶</font></div>'
-
-        sstring += "</div></div>"
-        if string_mode:
-            return sstring
-        else:
-            return HTML(sstring)
 
     def renumber_indexes(self, swaps):
         """

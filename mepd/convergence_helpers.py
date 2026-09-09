@@ -3,7 +3,7 @@ from numpy.typing import NDArray
 from typing import Tuple
 from mepd.chain import Chain
 from mepd.inputs import NEBInputs
-from mepd.scripts.progress import set_monitor_details, update_status
+from mepd.progress import set_monitor_details, update_status
 
 # Try to use rich for pretty printing, fall back to regular print
 try:

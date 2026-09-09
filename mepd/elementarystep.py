@@ -19,7 +19,7 @@ from mepd.nodes.nodehelpers import (
     displace_by_dr,
     is_identical,
 )
-from mepd.scripts.progress import stop_status, update_status, print_persistent
+from mepd.progress import stop_status, update_status, print_persistent
 from mepd.errors import ElectronicStructureError, EnergiesNotComputedError
 from qcinf import structure_to_smiles
 
@@ -478,7 +478,7 @@ def check_cached_xyz_elem_step(
 
     This entry point is for users who already have a saved chain and want the
     elementary-step classification without installing the whole NEB workflow.
-    By default it uses a qcop-backed engine for any geometry optimizations that
+    By default it uses a qccompute-backed engine for any geometry optimizations that
     the elementary-step report needs.
     """
     from mepd.inputs import ChainInputs
@@ -494,18 +494,18 @@ def check_cached_xyz_elem_step(
             raise CachedElementaryStepRequiresEngineError(
                 "This XYZ file does not have cached energies. Expected sidecar "
                 "files next to the XYZ (`.energies`, `.gradients`, and "
-                "`_grad_shapes.txt`) or run without --cached-only so qcop can "
+                "`_grad_shapes.txt`) or run without --cached-only so qccompute can "
                 "compute the chain energies."
             )
         engine = _CachedOnlyEngine()
     else:
-        from qcio.models.inputs import ProgramArgs
-        from mepd.engines.qcop import QCOPEngine
+        from qcdata.models.inputs import ProgramArgs
+        from mepd.engines.qccompute import QCComputeEngine
 
-        engine = QCOPEngine(
+        engine = QCComputeEngine(
             program=program,
             geometry_optimizer=geometry_optimizer,
-            compute_program="qcop",
+            compute_program="qccompute",
             program_args=ProgramArgs(
                 model={"method": method, "basis": basis},
                 keywords={"threads": 1},
@@ -543,7 +543,13 @@ def _print_new_structure(node: Node, message: str = "new structure found!") -> N
     print_persistent(message=message, ascii_block=ascii_art)
 
 
-def _classify_new_structure(node: Node, reactant: Node, product: Node) -> str:
+def _classify_new_structure(
+    node: Node,
+    reactant: Node,
+    product: Node,
+    *,
+    disregard_stereochem: bool = False,
+) -> str:
     """Classify a discovered structure relative to endpoint molecular graphs."""
     graphs_available = all(
         getattr(x, "has_molecular_graph", False)
@@ -553,9 +559,18 @@ def _classify_new_structure(node: Node, reactant: Node, product: Node) -> str:
         return "new structure found!"
 
     same_as_reactant = _is_connectivity_identical(
-        node, reactant, verbose=False, collect_comparison=False)
+        node,
+        reactant,
+        verbose=False,
+        collect_comparison=False,
+        disregard_stereochem=disregard_stereochem,
+    )
     same_as_product = _is_connectivity_identical(
-        node, product, verbose=False, collect_comparison=False
+        node,
+        product,
+        verbose=False,
+        collect_comparison=False,
+        disregard_stereochem=disregard_stereochem,
     )
 
     if same_as_reactant and not same_as_product:
@@ -567,7 +582,13 @@ def _classify_new_structure(node: Node, reactant: Node, product: Node) -> str:
     return "new structure found!"
 
 
-def _deduplicate_discoveries(nodes: list[Node], reactant: Node, product: Node) -> list[tuple[Node, str]]:
+def _deduplicate_discoveries(
+    nodes: list[Node],
+    reactant: Node,
+    product: Node,
+    *,
+    disregard_stereochem: bool = False,
+) -> list[tuple[Node, str]]:
     """
     Collapse duplicate discovery reports.
     If both endpoint minimizations converge to connectivity-equivalent
@@ -580,12 +601,21 @@ def _deduplicate_discoveries(nodes: list[Node], reactant: Node, product: Node) -
     )
     for node in nodes:
         msg = _classify_new_structure(
-            node=node, reactant=reactant, product=product)
+            node=node,
+            reactant=reactant,
+            product=product,
+            disregard_stereochem=disregard_stereochem,
+        )
         duplicate = False
         for seen_node, seen_msg in unique:
             if seen_msg != msg:
                 continue
-            if graphs_available and _is_connectivity_identical(node, seen_node, verbose=False):
+            if graphs_available and _is_connectivity_identical(
+                node,
+                seen_node,
+                verbose=False,
+                disregard_stereochem=disregard_stereochem,
+            ):
                 duplicate = True
                 break
         if not duplicate:
@@ -606,7 +636,14 @@ def _write_nodes_xyz(nodes: list[Node], fp: str | Path) -> Path:
     return path
 
 
-def _filter_new_structures(nodes: list[Node], reactant: Node, product: Node, chain: Chain) -> list[Node]:
+def _filter_new_structures(
+    nodes: list[Node],
+    reactant: Node,
+    product: Node,
+    chain: Chain,
+    *,
+    disregard_stereochem: bool = False,
+) -> list[Node]:
     """Keep only nodes that are not identical to either endpoint."""
     new_nodes: list[Node] = []
     for node in nodes:
@@ -617,6 +654,7 @@ def _filter_new_structures(nodes: list[Node], reactant: Node, product: Node, cha
             kcal_mol_cutoff=chain.parameters.node_ene_thre,
             verbose=False,
             collect_comparison=False,
+            disregard_stereochem=disregard_stereochem,
         )
         is_p = is_identical(
             node,
@@ -625,10 +663,28 @@ def _filter_new_structures(nodes: list[Node], reactant: Node, product: Node, cha
             kcal_mol_cutoff=chain.parameters.node_ene_thre,
             verbose=False,
             collect_comparison=False,
+            disregard_stereochem=disregard_stereochem,
         )
         if not (is_r or is_p):
             new_nodes.append(node)
     return new_nodes
+
+
+def _comparison_preparer(engine: Engine):
+    prepare_node = getattr(engine, "prepare_node_for_comparison", None)
+    return prepare_node if callable(prepare_node) else None
+
+
+def _prepare_node_for_comparison(node: Node, prepare_node):
+    if prepare_node is None:
+        return node
+    return prepare_node(node)
+
+
+def _prepare_nodes_for_comparison(nodes: list[Node], prepare_node) -> list[Node]:
+    if prepare_node is None:
+        return nodes
+    return [_prepare_node_for_comparison(node, prepare_node) for node in nodes]
 
 
 def check_if_elem_step(
@@ -638,6 +694,8 @@ def check_if_elem_step(
     validate_minima_with_hessian: bool = False,
     hessian_minimum_frequency_cutoff: float = 0.0,
     hessian_minima_rescue_displacement: float = 0.1,
+    geodesic_kwargs: dict | None = None,
+    disregard_stereochem: bool = False,
 ) -> ElemStepResults:
     """Calculates whether an input chain is an elementary step.
 
@@ -664,6 +722,12 @@ def check_if_elem_step(
 
     n_geom_opt_grad_calls = 0
     chain = inp_chain.copy()
+    prepare_node = _comparison_preparer(engine)
+    if prepare_node is not None:
+        chain = chain.model_copy(
+            update={"nodes": [prepare_node(node) for node in chain.nodes]}
+        )
+        inp_chain = chain
     if len(inp_chain) <= 1:
         if verbose:
             if _rich_available:
@@ -682,6 +746,10 @@ def check_if_elem_step(
             number_grad_calls=0,
         )
 
+    stereochem_kwargs = (
+        {"disregard_stereochem": True} if disregard_stereochem else {}
+    )
+
     try:
         concavity_results = _chain_is_concave(
             chain=inp_chain,
@@ -692,6 +760,7 @@ def check_if_elem_step(
             hessian_minima_rescue_displacement=float(
                 hessian_minima_rescue_displacement
             ),
+            **stereochem_kwargs,
         )
     except TypeError as exc:
         if (
@@ -701,22 +770,33 @@ def check_if_elem_step(
         ):
             raise
         concavity_results = _chain_is_concave(
-            chain=inp_chain, engine=engine, verbose=verbose
+            chain=inp_chain,
+            engine=engine,
+            verbose=verbose,
+            **stereochem_kwargs,
         )
     n_geom_opt_grad_calls += concavity_results.number_grad_calls
 
     if concavity_results.is_not_concave:
+        minimization_results = _prepare_nodes_for_comparison(
+            list(concavity_results.minimization_results or []),
+            prepare_node,
+        )
         new_structures = _filter_new_structures(
-            nodes=concavity_results.minimization_results,
+            nodes=minimization_results,
             reactant=chain[0],
             product=chain[-1],
             chain=inp_chain,
+            disregard_stereochem=disregard_stereochem,
         )
         if new_structures:
             if not verbose:
                 stop_status()
             for node, msg in _deduplicate_discoveries(
-                nodes=new_structures, reactant=chain[0], product=chain[-1]
+                nodes=new_structures,
+                reactant=chain[0],
+                product=chain[-1],
+                disregard_stereochem=disregard_stereochem,
             ):
                 _print_new_structure(node, message=msg)
             if not verbose:
@@ -727,13 +807,16 @@ def check_if_elem_step(
             is_elem_step=False,
             is_concave=concavity_results.is_concave,
             splitting_criterion="minima",
-            minimization_results=concavity_results.minimization_results,
+            minimization_results=minimization_results,
             number_grad_calls=n_geom_opt_grad_calls,
             new_structures=new_structures,
         )
 
     crude_irc_passed, ngc_approx_elem_step = is_approx_elem_step(
-        chain=inp_chain, engine=engine, verbose=verbose
+        chain=inp_chain,
+        engine=engine,
+        verbose=verbose,
+        **stereochem_kwargs,
     )
     if verbose:
         if _rich_available:
@@ -755,7 +838,11 @@ def check_if_elem_step(
             number_grad_calls=n_geom_opt_grad_calls,
         )
 
-    pseu_irc_results = pseudo_irc(chain=inp_chain, engine=engine)
+    if geodesic_kwargs is None:
+        pseu_irc_results = pseudo_irc(chain=inp_chain, engine=engine)
+    else:
+        pseu_irc_results = pseudo_irc(
+            chain=inp_chain, engine=engine, geodesic_kwargs=geodesic_kwargs)
     n_geom_opt_grad_calls += pseu_irc_results.number_grad_calls
     if not bool(getattr(pseu_irc_results, "optimization_succeeded", True)):
         raise ElectronicStructureError(
@@ -765,38 +852,50 @@ def check_if_elem_step(
             ),
             obj=pseu_irc_results,
         )
+    found_reactant = _prepare_node_for_comparison(
+        pseu_irc_results.found_reactant,
+        prepare_node,
+    )
+    found_product = _prepare_node_for_comparison(
+        pseu_irc_results.found_product,
+        prepare_node,
+    )
 
     # Compare endpoints - results are collected for consolidated report
     found_r = is_identical(
-        pseu_irc_results.found_reactant,
+        found_reactant,
         chain[0],
         fragment_rmsd_cutoff=inp_chain.parameters.node_rms_thre,
         kcal_mol_cutoff=inp_chain.parameters.node_ene_thre,
         verbose=False,  # Suppress individual prints, use consolidated report
+        disregard_stereochem=disregard_stereochem,
     )
 
     found_p = is_identical(
-        pseu_irc_results.found_product,
+        found_product,
         chain[-1],
         fragment_rmsd_cutoff=inp_chain.parameters.node_rms_thre,
         kcal_mol_cutoff=inp_chain.parameters.node_ene_thre,
         verbose=False,  # Suppress individual prints, use consolidated report
+        disregard_stereochem=disregard_stereochem,
     )
 
     p_is_r = is_identical(
-        pseu_irc_results.found_product,
+        found_product,
         chain[0],
         fragment_rmsd_cutoff=inp_chain.parameters.node_rms_thre,
         kcal_mol_cutoff=inp_chain.parameters.node_ene_thre,
         verbose=False,  # Suppress individual prints, use consolidated report
+        disregard_stereochem=disregard_stereochem,
     )
 
     r_is_p = is_identical(
-        pseu_irc_results.found_reactant,
+        found_reactant,
         chain[-1],
         fragment_rmsd_cutoff=inp_chain.parameters.node_rms_thre,
         kcal_mol_cutoff=inp_chain.parameters.node_ene_thre,
         verbose=False,  # Suppress individual prints, use consolidated report
+        disregard_stereochem=disregard_stereochem,
     )
 
     if found_r and found_p:
@@ -823,17 +922,14 @@ def check_if_elem_step(
     else:
         minimizing_gives_endpoints = False
 
-    validated_maxima_nodes: list[Node] = []
-    if (
-        validate_minima_with_hessian
-        and not minimizing_gives_endpoints
-    ):
-        validation_targets = []
+    maxima_split_nodes: list[Node] = []
+    if not minimizing_gives_endpoints:
+        validation_targets: list[Node] = []
         if not (found_r or r_is_p):
-            validation_targets.append(pseu_irc_results.found_reactant)
+            validation_targets.append(found_reactant)
         if not (found_p or p_is_r):
-            validation_targets.append(pseu_irc_results.found_product)
-        if validation_targets:
+            validation_targets.append(found_product)
+        if validate_minima_with_hessian and validation_targets:
             accepted, rejected, rescue_grad_calls = _validate_hessian_split_candidates(
                 validation_targets,
                 engine=engine,
@@ -843,19 +939,22 @@ def check_if_elem_step(
                 label="maxima",
             )
             n_geom_opt_grad_calls += rescue_grad_calls
-            validated_maxima_nodes = list(accepted)
+            maxima_split_nodes = list(accepted)
+        else:
+            maxima_split_nodes = validation_targets
 
-    if validated_maxima_nodes:
+    if maxima_split_nodes:
         new_structures = _filter_new_structures(
-            nodes=validated_maxima_nodes,
+            nodes=maxima_split_nodes,
             reactant=chain[0],
             product=chain[-1],
             chain=inp_chain,
+            disregard_stereochem=disregard_stereochem,
         )
     else:
         new_structures = []
 
-    if validated_maxima_nodes:
+    if maxima_split_nodes:
         elem_step = False
     else:
         elem_step = True
@@ -864,12 +963,15 @@ def check_if_elem_step(
         if not verbose:
             stop_status()
         for node, msg in _deduplicate_discoveries(
-            nodes=new_structures, reactant=chain[0], product=chain[-1]
+            nodes=new_structures,
+            reactant=chain[0],
+            product=chain[-1],
+            disregard_stereochem=disregard_stereochem,
         ):
             _print_new_structure(node, message=msg)
         if not verbose:
             update_status("Checking if elementary step")
-    elif not minimizing_gives_endpoints and not validated_maxima_nodes:
+    elif not minimizing_gives_endpoints and not maxima_split_nodes:
         # We are splitting by maxima, but endpoint mapping did not produce explicit
         # new endpoint structures. Emit a clear notice so recursive runs still show
         # that a non-elementary path (possible new chemistry) was detected.
@@ -885,30 +987,40 @@ def check_if_elem_step(
     return ElemStepResults(
         is_elem_step=elem_step,
         is_concave=concavity_results.is_concave,
-        splitting_criterion=("maxima" if validated_maxima_nodes else None),
+        splitting_criterion=("maxima" if maxima_split_nodes else None),
         minimization_results=(
-            validated_maxima_nodes
-            if validated_maxima_nodes
-            else [pseu_irc_results.found_reactant, pseu_irc_results.found_product]
+            maxima_split_nodes
+            if maxima_split_nodes
+            else [found_reactant, found_product]
         ),
         number_grad_calls=n_geom_opt_grad_calls,
         new_structures=new_structures,
     )
 
 
-def _upsample_around_ts_guess(chain, ts_index):
+def _upsample_around_ts_guess(chain, ts_index, geodesic_kwargs: dict | None = None):
     import mepd.chainhelpers as ch
 
+    geodesic_kwargs = geodesic_kwargs or {}
     tang = ch.calculate_geodesic_tangent(
-        list_of_nodes=chain, ref_node_ind=ts_index, dr=0.1)
+        list_of_nodes=chain, ref_node_ind=ts_index, dr=0.1, **geodesic_kwargs)
     tang[0].converged = False
     tang[2].converged = False
 
-    nodes = chain.nodes
+    nodes = list(chain.nodes)
     nodes.insert(ts_index, tang[0])
     nodes.insert(ts_index+2, tang[2])
     chain_for_opt = chain.model_copy(update={"nodes": nodes})
     return chain_for_opt
+
+
+def _cache_returned_energies(nodes: list[Node], energies) -> None:
+    """Keep generated nodes usable when an engine returns energies without mutating."""
+    if energies is None:
+        return
+    for node, energy in zip(nodes, energies):
+        if getattr(node, "_cached_energy", None) is None:
+            node._cached_energy = float(energy)
 
 
 def is_approx_elem_step(
@@ -916,6 +1028,7 @@ def is_approx_elem_step(
     engine: Engine,
     slope_thresh=SLOPE_THRESH,
     verbose: bool = True,
+    disregard_stereochem: bool = False,
 ) -> Tuple[bool, int]:
     """Will do at most 50 steepest descent steps  on geometries neighboring the transition state guess
     and check whether they are approaching the chain endpoints. If function returns False, the geoms
@@ -1000,9 +1113,17 @@ def is_approx_elem_step(
     # (which is bad!!)
     if nodes_have_graph:
         r_passes = r_passes_opt and _is_connectivity_identical(
-            r_traj[-1], chain[0], verbose=verbose)
+            r_traj[-1],
+            chain[0],
+            verbose=verbose,
+            disregard_stereochem=disregard_stereochem,
+        )
         p_passes = p_passes_opt and _is_connectivity_identical(
-            p_traj[-1], chain[-1], verbose=verbose)
+            p_traj[-1],
+            chain[-1],
+            verbose=verbose,
+            disregard_stereochem=disregard_stereochem,
+        )
     else:
         r_passes = r_passes_opt
         p_passes = p_passes_opt
@@ -1159,6 +1280,25 @@ def _run_geom_opt(node: Node, engine: Engine):
     return opt_traj
 
 
+def _run_geom_opts(nodes: list[Node], engine: Engine) -> list[list[Node]]:
+    kwds = {}
+    if getattr(engine, "geometry_optimizer", None) == "geometric":
+        kwds = {'coordsys': "cart", 'maxiter': 1000}
+    if hasattr(engine, "compute_geometry_optimizations"):
+        trajectories = engine.compute_geometry_optimizations(nodes, keywords=kwds)
+    else:
+        trajectories = [_run_geom_opt(node, engine=engine) for node in nodes]
+    if len(trajectories) != len(nodes) or any(not traj for traj in trajectories):
+        raise ElectronicStructureError(
+            msg=(
+                "Geometry optimization did not produce converged trajectories; "
+                "refusing to accept the input or failed final frames as minima."
+            ),
+            obj=trajectories,
+        )
+    return trajectories
+
+
 def _chain_is_concave(
     chain: Chain,
     engine: Engine,
@@ -1167,6 +1307,7 @@ def _chain_is_concave(
     validate_minima_with_hessian: bool = False,
     hessian_minimum_frequency_cutoff: float = 0.0,
     hessian_minima_rescue_displacement: float = 0.1,
+    disregard_stereochem: bool = False,
 ) -> ConcavityResults:
     """
     will assess+categorize the presence of minima on the chain.
@@ -1181,6 +1322,7 @@ def _chain_is_concave(
 
     n_grad_calls = 0
     ind_minima = _get_ind_minima(chain=chain)
+    prepare_node = _comparison_preparer(engine)
     if verbose and _rich_available:
         _console.print(Panel.fit(
             f"[bold green]✓ Found {len(ind_minima)} minima on chain[/bold green]",
@@ -1265,24 +1407,33 @@ def _chain_is_concave(
                         n_grad_calls += rescue_grad_calls
                         hessian_validated = bool(accepted)
                     if hessian_validated:
-                        opt_results.extend(
-                            accepted if validate_minima_with_hessian else [opt]
+                        prepared_results = _prepare_nodes_for_comparison(
+                            list(accepted) if validate_minima_with_hessian else [opt],
+                            prepare_node,
                         )
+                        opt_results.extend(prepared_results)
+                        opt_for_comparison = prepared_results[0]
                     else:
                         rejected_opt_results.append(opt)
+                        opt_for_comparison = _prepare_node_for_comparison(
+                            opt,
+                            prepare_node,
+                        )
                     is_r = is_identical(
-                        opt,
+                        opt_for_comparison,
                         chain[0],
                         fragment_rmsd_cutoff=chain.parameters.node_rms_thre,
                         kcal_mol_cutoff=chain.parameters.node_ene_thre,
                         verbose=False,
+                        disregard_stereochem=disregard_stereochem,
                     )
                     is_p = is_identical(
-                        opt,
+                        opt_for_comparison,
                         chain[-1],
                         fragment_rmsd_cutoff=chain.parameters.node_rms_thre,
                         kcal_mol_cutoff=chain.parameters.node_ene_thre,
                         verbose=False,
+                        disregard_stereochem=disregard_stereochem,
                     )
                 minimas_is_r_or_p.append(is_r or is_p)
         except CachedElementaryStepRequiresEngineError:
@@ -1333,7 +1484,7 @@ def _chain_is_concave(
         )
 
 
-def pseudo_irc(chain: Chain, engine: Engine):
+def pseudo_irc(chain: Chain, engine: Engine, geodesic_kwargs: dict | None = None):
     n_grad_calls = 0
     arg_max = np.argmax(chain.energies)
 
@@ -1344,12 +1495,17 @@ def pseudo_irc(chain: Chain, engine: Engine):
             number_grad_calls=n_grad_calls,
         )
     elif len(chain) == 3 or arg_max == 1 or arg_max == len(chain)-2:
+        update_status("Preparing pseudo-IRC tangent around TS guess")
         chain_for_opt = _upsample_around_ts_guess(
-            chain=chain, ts_index=arg_max)
-        engine.compute_energies(
-            [chain_for_opt.nodes[arg_max-1], chain_for_opt.nodes[arg_max+1]]
-        )
+            chain=chain, ts_index=arg_max, geodesic_kwargs=geodesic_kwargs)
         arg_max = arg_max+1
+        inserted_neighbors = [
+            chain_for_opt.nodes[arg_max-1],
+            chain_for_opt.nodes[arg_max+1],
+        ]
+        update_status("Computing pseudo-IRC neighbor energies")
+        energies = engine.compute_energies(inserted_neighbors)
+        _cache_returned_energies(inserted_neighbors, energies)
 
     else:
         chain_for_opt = chain
@@ -1365,11 +1521,19 @@ def pseudo_irc(chain: Chain, engine: Engine):
     candidate_p = chain_for_opt[p_index]
 
     try:
-        r_traj = _run_geom_opt(candidate_r, engine=engine)
+        if (
+            getattr(engine, "compute_program", "").lower() == "chemcloud"
+            and hasattr(engine, "compute_geometry_optimizations")
+        ):
+            update_status("Submitting pseudo-IRC endpoint optimizations to Chemcloud")
+            r_traj, p_traj = _run_geom_opts([candidate_r, candidate_p], engine=engine)
+        else:
+            update_status("Optimizing pseudo-IRC reactant endpoint")
+            r_traj = _run_geom_opt(candidate_r, engine=engine)
+            update_status("Optimizing pseudo-IRC product endpoint")
+            p_traj = _run_geom_opt(candidate_p, engine=engine)
         r = r_traj[-1]
         n_grad_calls += len(r_traj)
-
-        p_traj = _run_geom_opt(candidate_p, engine=engine)
         n_grad_calls += len(p_traj)
         p = p_traj[-1]
 
@@ -1407,12 +1571,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--program",
         default="crest",
-        help="qcop subprogram used for energies/gradients. Default: crest.",
+        help="qccompute subprogram used for energies/gradients. Default: crest.",
     )
     parser.add_argument(
         "--geometry-optimizer",
         default="geometric",
-        help="qcop program used for geometry optimizations. Default: geometric.",
+        help="qccompute program used for geometry optimizations. Default: geometric.",
     )
     parser.add_argument("--method", default="gfn2")
     parser.add_argument("--basis", default="gfn2")

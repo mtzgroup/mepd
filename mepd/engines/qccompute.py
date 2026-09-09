@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import concurrent
 import inspect
 import contextlib
 from dataclasses import dataclass, field
-from typing import Any, List, TYPE_CHECKING, Union
+from typing import Any, List, Union
 import os
 import threading
 from pathlib import Path
@@ -15,41 +14,33 @@ from numpy.typing import NDArray
 import numpy as np
 from pydantic import ValidationError
 
-import qcop
-from qcop.exceptions import ExternalProgramError
-from qcio.models.inputs import DualProgramInput, ProgramInput, ProgramArgs, FileInput
-from qcio import ProgramOutput, Structure
+from chemcloud import compute as cc_compute
+from chemcloud import configure_client as cc_configure_client
+from qccompute import compute as qccompute_compute
+from qcdata.models.inputs import DualProgramInput, ProgramInput, ProgramArgs, FileInput
+from qcdata import ProgramOutput, Structure
 import shutil
 
 from mepd.chain import Chain
 from mepd.engines.engine import Engine
-from mepd.errors import GradientsNotComputedError, ElectronicStructureError
+from mepd.errors import (
+    GradientsNotComputedError,
+    ElectronicStructureError,
+    ExternalProgramError,
+)
 from mepd.nodes.node import StructureNode
 from mepd.nodes.nodehelpers import update_node_cache, displace_by_dr
-from mepd.qcio_structure_helpers import _change_prog_input_property
+from mepd.qcdata_structure_helpers import _change_prog_input_property
+from mepd.qcdata_structure_helpers import structure_to_molecule
 import copy
 
-if TYPE_CHECKING:
-    from mepd.dynamics.chainbiaser import ChainBiaser
-
-AVAIL_PROGRAMS = ["qcop", "chemcloud"]
+AVAIL_PROGRAMS = ["qccompute", "chemcloud"]
 
 DEFAULT_GEOMETRY_OPTIMIZER_KWDS: dict[str, Any] = {
     "coordsys": "cart",
     "maxit": 500,
     "convergence_set": "GAU_TIGHT",
 }
-
-
-def _compute_local_qcop_input(
-    payload: tuple[str, ProgramInput, bool, bool],
-):
-    """Run one local qcop calculation in an isolated worker process."""
-    program, program_input, collect_files, print_stdout = payload
-    call_kwargs = {"collect_files": bool(collect_files)}
-    if print_stdout:
-        call_kwargs["print_stdout"] = True
-    return qcop.compute(program, program_input, **call_kwargs)
 
 
 TERACHEM_NANOREACTOR_PRESETS: dict[str, dict[str, object]] = {
@@ -134,8 +125,6 @@ def _env_float(name: str, default: float) -> float:
 
 def _configure_chemcloud_client(queue: str) -> None:
     """Handle ChemCloud client API drift across installed versions."""
-    from chemcloud import configure_client as cc_configure_client
-
     cc_configure_client(**_chemcloud_client_kwargs(queue))
 
 
@@ -195,7 +184,7 @@ def _resolve_nanoreactor_inputs(nanoreactor_inputs: dict[str, object] | None) ->
 
 
 @dataclass
-class QCOPEngine(Engine):
+class QCComputeEngine(Engine):
     program_args: ProgramArgs = ProgramArgs(
         model={"method": "gfn2", "basis": "gfn2"},)
     program: str = "crest"
@@ -203,22 +192,25 @@ class QCOPEngine(Engine):
     geometry_optimizer_kwds: dict[str, Any] = field(
         default_factory=lambda: dict(DEFAULT_GEOMETRY_OPTIMIZER_KWDS)
     )
-    compute_program: str = "qcop"
+    compute_program: str = "qccompute"
     chemcloud_queue: str | None = None
-    biaser: "ChainBiaser | None" = None
     collect_files: bool = False
     write_qcio: bool = False
     print_stdout: bool = False
     local_parallel_workers: int = 12
+    frozen_atom_indices: list[int] | str | None = None
 
     def __post_init__(self):
         self.chemcloud_queue = _resolve_chemcloud_queue(self.chemcloud_queue)
         self._chemcloud_client_lock = threading.Lock()
         self._chemcloud_clients_by_thread: dict[int, CCClient] = {}
         self._chemcloud_client_params: dict[str, Any] = {}
+        self.frozen_atom_indices = self._coerce_frozen_atom_indices(
+            self.frozen_atom_indices
+        )
         if self.write_qcio:
             logging.warning(
-                "QCOPEngine write_qcio=True: cached qcio.ProgramOutput objects will be "
+                "QCComputeEngine write_qcio=True: cached qcdata.ProgramOutput objects will be "
                 "written when results are saved to disk. This can consume substantial disk space."
             )
         if self.compute_program == "chemcloud":
@@ -234,6 +226,116 @@ class QCOPEngine(Engine):
         if keywords is not None:
             kwds.update(dict(keywords))
         return kwds
+
+    @staticmethod
+    def _coerce_frozen_atom_indices(raw: list[int] | tuple[int, ...] | str | None) -> list[int]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [
+                int(tok)
+                for tok in raw.replace(",", " ").split()
+                if tok.strip()
+            ]
+        return [int(v) for v in raw]
+
+    @staticmethod
+    def _tc_value(value: Any) -> str:
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        return str(value)
+
+    def _build_terachem_geomopt_file_input(
+        self,
+        node: StructureNode,
+        *,
+        tc_keywords: dict[str, Any],
+        optimizer_keywords: dict[str, Any],
+        frozen_atom_indices: list[int],
+    ) -> FileInput:
+        model = dict(getattr(self.program_args, "model", {}) or {})
+        lines = [
+            "coordinates geometry.xyz",
+            f"charge {int(node.structure.charge)}",
+            f"spinmult {int(node.structure.multiplicity)}",
+            f"basis {model.get('basis', '3-21g')}",
+            f"method {model.get('method', 'ub3lyp')}",
+            "run minimize",
+        ]
+        for key in sorted(tc_keywords.keys()):
+            lines.append(f"{key} {self._tc_value(tc_keywords[key])}")
+        for key in sorted(optimizer_keywords.keys()):
+            normalized_key = str(key).strip().lower()
+            if normalized_key == "frozen_atom_indices":
+                continue
+            if normalized_key in {"convergence_set", "convergence_energy"}:
+                continue
+            if normalized_key in {"maxiter", "max_iter"}:
+                lines.append(f"maxit {self._tc_value(optimizer_keywords[key])}")
+                continue
+            if normalized_key in {"coordsys", "coord_sys", "coordinates", "coordinate_system"}:
+                coord_val = str(optimizer_keywords[key]).strip().lower()
+                min_coordinates = "cartesian" if coord_val == "cart" else optimizer_keywords[key]
+                lines.append(f"min_coordinates {self._tc_value(min_coordinates)}")
+                continue
+            lines.append(f"{key} {self._tc_value(optimizer_keywords[key])}")
+        if frozen_atom_indices:
+            lines.append("")
+            lines.append("$constraints")
+            lines.extend(
+                f"atom {idx + 1}"
+                for idx in sorted({int(idx) for idx in frozen_atom_indices if int(idx) >= 0})
+            )
+            lines.append("$end")
+        return FileInput(
+            files={
+                "tc.in": "\n".join(lines).rstrip() + "\n",
+                "geometry.xyz": node.structure.to_xyz(),
+            },
+            cmdline_args=["tc.in"],
+        )
+
+    @staticmethod
+    def _subset_structure(structure: Structure, atom_indices: list[int]) -> Structure:
+        idx = np.array(atom_indices, dtype=int)
+        return Structure(
+            symbols=np.array(structure.symbols)[idx],
+            geometry=np.array(structure.geometry)[idx],
+            charge=structure.charge,
+            multiplicity=structure.multiplicity,
+        )
+
+    def _active_atom_indices_for_structure(self, structure: Structure) -> list[int]:
+        frozen = {int(idx) for idx in (self.frozen_atom_indices or []) if int(idx) >= 0}
+        return [idx for idx in range(len(structure.symbols)) if idx not in frozen]
+
+    def prepare_node_for_comparison(self, node: StructureNode) -> StructureNode:
+        active_indices = self._active_atom_indices_for_structure(node.structure)
+        if len(active_indices) == 0 or len(active_indices) == len(node.structure.symbols):
+            return node
+
+        try:
+            active_structure = self._subset_structure(node.structure, active_indices)
+            graph = structure_to_molecule(active_structure)
+            has_graph = True
+        except Exception:
+            graph = None
+            has_graph = False
+
+        payload = node.__dict__.copy()
+        payload.update(
+            {
+                "has_molecular_graph": has_graph,
+                "graph": graph,
+                "comparison_atom_indices": active_indices,
+                "disable_smiles": True,
+            }
+        )
+        prepared = StructureNode(**payload)
+        setattr(prepared, "graph_atom_indices_source", "qccompute_non_frozen_atoms")
+        setattr(prepared, "graph_subset_atom_count", len(active_indices))
+        setattr(prepared, "graph_total_atom_count", len(node.structure.symbols))
+        return prepared
 
     def _get_thread_chemcloud_client(self) -> CCClient:
         from chemcloud import CCClient
@@ -290,7 +392,7 @@ class QCOPEngine(Engine):
         delay_sec = 5.0
         for attempt in range(1, max_attempts + 1):
             try:
-                return self._get_thread_chemcloud_client().compute(*args, **kwargs)
+                return cc_compute(*args, **kwargs)
             except Exception as exc:
                 if self._is_chemcloud_output_fetch_error(exc):
                     # A fetch failure means the job was already submitted; retrying here
@@ -304,7 +406,7 @@ class QCOPEngine(Engine):
                 if attempt >= max_attempts or not retryable:
                     raise
                 logging.warning(
-                    "QCOP ChemCloud call failed on attempt %d/%d (%s). Retrying in %.1fs...",
+                    "QCCompute ChemCloud call failed on attempt %d/%d (%s). Retrying in %.1fs...",
                     attempt,
                     max_attempts,
                     exc,
@@ -327,35 +429,28 @@ class QCOPEngine(Engine):
                     msg="Gradient calculation failed.", obj=failed_results)
             grads = np.array([node.gradient for node in node_list])
 
-        if self.biaser:
-            new_grads = grads.copy()
-            for i, node in enumerate(chain):
-                new_grads[i] += self.biaser.gradient_node_bias(node=node)
-            grads = new_grads
         return grads
 
     def compute_energies(self, chain: Chain) -> NDArray:
         self.compute_gradients(chain)
         enes = np.array([node.energy for node in chain])
 
-        if self.biaser:
-            new_enes = enes.copy()
-            for i, node in enumerate(chain):
-                new_enes[i] += self.biaser.energy_node_bias(node=node)
-            enes = new_enes
         return enes
 
     def compute_func(self, *args, **kwargs):
-        if self.compute_program == "qcop":
+        if self.compute_program == "qccompute":
             call_kwargs = dict(kwargs)
             if self.print_stdout:
-                call_kwargs.setdefault("print_stdout", True)
-            return qcop.compute(*args, **call_kwargs)
+                call_kwargs.setdefault("print_logs", self.print_stdout)
+            return qccompute_compute(*args, **call_kwargs)
         elif self.compute_program == "chemcloud":
             try:
+                call_args = list(args)
+                if len(call_args) >= 2:
+                    call_args[1] = self._chemcloud_input_payload(call_args[1])
                 call_kwargs = dict(kwargs)
                 call_kwargs.setdefault("queue", self.chemcloud_queue)
-                return self._chemcloud_compute_with_retries(*args, **call_kwargs)
+                return self._chemcloud_compute_with_retries(*call_args, **call_kwargs)
             except ValidationError as exc:
                 message = str(exc)
                 if "ProgramOutput" not in message:
@@ -365,9 +460,9 @@ class QCOPEngine(Engine):
                     program=program,
                     message=(
                         "ChemCloud returned a response that is incompatible with the installed "
-                        "qcio/chemcloud ProgramOutput schema. This usually happens when ChemCloud "
+                        "qcdata/chemcloud ProgramOutput schema. This usually happens when ChemCloud "
                         "tries to materialize a failed task using an older ProgramOutput layout. "
-                        "Check the remote task failure details and align the chemcloud/qcio versions."
+                        "Check the remote task failure details and align the chemcloud/qcdata versions."
                     ),
                     original_exception=exc,
                 ) from exc
@@ -404,18 +499,28 @@ class QCOPEngine(Engine):
                 f"Invalid compute program: {self.compute_program}. Must be one of: {AVAIL_PROGRAMS}"
             )
 
+    @classmethod
+    def _chemcloud_input_payload(cls, value: Any) -> Any:
+        """Return a JSON-compatible payload accepted by ChemCloud >=0.17."""
+        if isinstance(value, list):
+            return [cls._chemcloud_input_payload(item) for item in value]
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump(mode="json")
+        return value
+
     def _run_calc(
         self, calctype: str, chain: Union[Chain, List]
     ) -> List[StructureNode]:
         if isinstance(chain, Chain):
             assert isinstance(
                 chain.nodes[0], StructureNode
-            ), "input Chain has nodes incompatible with QCOPEngine."
+            ), "input Chain has nodes incompatible with QCComputeEngine."
             node_list = chain.nodes
         elif isinstance(chain, list):
             assert isinstance(
                 chain[0], StructureNode
-            ), f"input list has nodes incompatible with QCOPEngine: {chain[0]}"
+            ), f"input list has nodes incompatible with QCComputeEngine: {chain[0]}"
             node_list = chain
         else:
             raise ValueError(
@@ -437,36 +542,7 @@ class QCOPEngine(Engine):
             pi for i, pi in enumerate(all_prog_inps) if i not in inds_frozen
         ]
 
-        # qcop changes the process-wide current working directory while using each
-        # calculation's scratch directory. Use processes, not threads, so concurrent
-        # images cannot cross-contaminate one another's CREST/xTB files.
-        chain_parameters = getattr(chain, "parameters", None)
-        do_parallel = bool(getattr(chain_parameters, "do_parallel", True))
-        if (
-            self.compute_program == "qcop"
-            and do_parallel
-            and len(non_frozen_prog_inps) > 1
-        ):
-
-            iterables = [
-                (
-                    self.program,
-                    inp,
-                    self.collect_files,
-                    self.print_stdout,
-                )
-                for inp in non_frozen_prog_inps
-            ]
-            max_workers = min(
-                max(1, int(self.local_parallel_workers)),
-                len(iterables),
-            )
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                non_frozen_results = list(
-                    executor.map(_compute_local_qcop_input, iterables)
-                )
-
-        elif self.compute_program == "chemcloud":
+        if self.compute_program == "chemcloud":
             batch_or_single = (
                 non_frozen_prog_inps
                 if len(non_frozen_prog_inps) > 1
@@ -481,9 +557,13 @@ class QCOPEngine(Engine):
                 non_frozen_results = [non_frozen_results]
 
         else:
-            non_frozen_results = [
-                self.compute_func(self.program, pi, collect_files=self.collect_files) for pi in non_frozen_prog_inps
-            ]
+            raise ExternalProgramError(
+                program=self.program,
+                message=(
+                    f"Unsupported compute_program={self.compute_program!r}. "
+                    "Only 'chemcloud' is supported."
+                ),
+            )
 
         # merge the results
         all_results = []
@@ -498,9 +578,14 @@ class QCOPEngine(Engine):
 
     def _compute_geom_opt_result(self, node: StructureNode, keywords=None):
         """
-        this will return a ProgramOutput from qcio geom opt call.
+        this will return a ProgramOutput from qcdata geom opt call.
         """
         keywords = self._geometry_optimizer_keywords(keywords)
+        frozen_override = self._coerce_frozen_atom_indices(
+            keywords.pop("frozen_atom_indices", None)
+        )
+        if len(frozen_override) == 0:
+            frozen_override = list(self.frozen_atom_indices or [])
         if "terachem" not in self.program:
 
             dpi = DualProgramInput(
@@ -527,17 +612,27 @@ class QCOPEngine(Engine):
                 }
             )
 
-            prog_input = ProgramInput(
-                structure=node.structure,
-                # Can be "energy", "gradient", "hessian", "optimization", "transition_state"
-                calctype="optimization",  # type: ignore
-                model=self.program_args.model,
-                # Preserve user-provided TeraChem keywords while enforcing required flags.
-                keywords=tc_keywords,
-            )
+            if frozen_override:
+                prog_input = self._build_terachem_geomopt_file_input(
+                    node,
+                    tc_keywords=tc_keywords,
+                    optimizer_keywords=keywords,
+                    frozen_atom_indices=frozen_override,
+                )
+                output = self.compute_func(
+                    "terachem", prog_input, collect_files=True)
+            else:
+                prog_input = ProgramInput(
+                    structure=node.structure,
+                    # Can be "energy", "gradient", "hessian", "optimization", "transition_state"
+                    calctype="optimization",  # type: ignore
+                    model=self.program_args.model,
+                    # Preserve user-provided TeraChem keywords while enforcing required flags.
+                    keywords=tc_keywords,
+                )
 
-            output = self.compute_func(
-                "terachem", prog_input, collect_files=self.collect_files)
+                output = self.compute_func(
+                    "terachem", prog_input, collect_files=self.collect_files)
 
         return output
 
@@ -662,7 +757,7 @@ class QCOPEngine(Engine):
 
                             waiter = threading.Thread(
                                 target=_get_result_without_timeout,
-                                name="qcop-bigchem-hessian-get",
+                                name="qccompute-bigchem-hessian-get",
                                 daemon=True,
                             )
                             waiter.start()
@@ -855,6 +950,12 @@ class QCOPEngine(Engine):
         if self.compute_program != "chemcloud":
             return [self.compute_geometry_optimization(node=node, keywords=keywords) for node in nodes]
 
+        frozen_override = self._coerce_frozen_atom_indices(
+            keywords.pop("frozen_atom_indices", None)
+        )
+        if len(frozen_override) == 0:
+            frozen_override = list(self.frozen_atom_indices or [])
+
         program_inputs = []
         for node in nodes:
             if "terachem" not in self.program:
@@ -879,20 +980,30 @@ class QCOPEngine(Engine):
                         "new_minimizer": "yes",
                     }
                 )
-                program_inputs.append(
-                    ProgramInput(
-                        structure=node.structure,
-                        calctype="optimization",  # type: ignore
-                        model=self.program_args.model,
-                        # Preserve user-provided TeraChem keywords while enforcing required flags.
-                        keywords=tc_keywords,
+                if frozen_override:
+                    program_inputs.append(
+                        self._build_terachem_geomopt_file_input(
+                            node,
+                            tc_keywords=tc_keywords,
+                            optimizer_keywords=keywords,
+                            frozen_atom_indices=frozen_override,
+                        )
                     )
-                )
+                else:
+                    program_inputs.append(
+                        ProgramInput(
+                            structure=node.structure,
+                            calctype="optimization",  # type: ignore
+                            model=self.program_args.model,
+                            # Preserve user-provided TeraChem keywords while enforcing required flags.
+                            keywords=tc_keywords,
+                        )
+                    )
 
         outputs = self.compute_func(
             self.geometry_optimizer if "terachem" not in self.program else "terachem",
             program_inputs if len(program_inputs) > 1 else program_inputs[0],
-            collect_files=self.collect_files,
+            collect_files=True if ("terachem" in self.program and frozen_override) else self.collect_files,
         )
         if len(program_inputs) == 1:
             outputs = [outputs]
@@ -958,9 +1069,8 @@ class QCOPEngine(Engine):
             return str(data)
         return None
 
-    @classmethod
     def _extract_optimization_trajectory(
-        cls,
+        self,
         output: ProgramOutput,
         *,
         reference_structure: Structure,
@@ -976,7 +1086,9 @@ class QCOPEngine(Engine):
                     struct = getattr(
                         getattr(entry, "input_data", None), "structure", None)
                     if struct is not None:
-                        node = StructureNode(structure=struct)
+                        node = self.prepare_node_for_comparison(
+                            StructureNode(structure=struct)
+                        )
                         results = getattr(entry, "results", None)
                         with contextlib.suppress(Exception):
                             node._cached_energy = results.energy
@@ -988,7 +1100,7 @@ class QCOPEngine(Engine):
                 if nodes:
                     return nodes
 
-        files = cls._extract_output_files(output)
+        files = self._extract_output_files(output)
         for file_name, contents in files.items():
             file_name = str(file_name)
             if not (file_name.endswith("optim.xyz") or file_name == "optim.xyz"):
@@ -1006,7 +1118,7 @@ class QCOPEngine(Engine):
                 )
             if structures:
                 return [
-                    StructureNode(structure=struct)
+                    self.prepare_node_for_comparison(StructureNode(structure=struct))
                     for struct in structures
                 ]
 
@@ -1045,7 +1157,7 @@ class QCOPEngine(Engine):
             graph = None
             if not graphs_disabled:
                 try:
-                    from mepd.qcio_structure_helpers import structure_to_molecule
+                    from mepd.qcdata_structure_helpers import structure_to_molecule
                     graph = structure_to_molecule(structure)
                 except Exception:
                     graph = None

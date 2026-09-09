@@ -1,7 +1,7 @@
 from .engine import Engine
 
 _ENGINE_EXPORTS = {
-    "QCOPEngine": ("mepd.engines.qcop", "QCOPEngine"),
+    "QCComputeEngine": ("mepd.engines.qccompute", "QCComputeEngine"),
     "ASEEngine": ("mepd.engines.ase", "ASEEngine"),
     "GXTBCalculator": ("mepd.engines.gxtb", "GXTBCalculator"),
     "ThreeWellPotential": ("mepd.engines.threewell", "ThreeWellPotential"),

@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from openbabel import openbabel, pybel
-from mepd.elements import ElementData
+from mepd.helper_functions import atomic_number_to_symbol, symbol_to_atomic_number
 
 
 def get_bond_between_atoms(mol, atom1_id, atom2_id):
@@ -41,13 +41,12 @@ def load_obmol_from_fp(fp: Path) -> openbabel.OBMol:
 
 
 def from_xyz(coords, symbols):
-    ed = ElementData()
     obmol = openbabel.OBMol()
     for i in range(len(coords)):
         x, y, z = coords[i]
 
         symbol = symbols[i]
-        atomic_num = ed.from_symbol(symbol).atomic_num
+        atomic_num = symbol_to_atomic_number(symbol)
         atom = openbabel.OBAtom()
         atom.SetVector(x, y, z)
         atom.SetAtomicNum(atomic_num)
@@ -84,16 +83,6 @@ def make_copy(obmol):
     return copy_obmol
 
 
-def atomic_number_to_symbol(n):
-    ed = ElementData()
-    return ed.from_atomic_number(n).symbol
-
-
-def symbol_to_atomic_number(str):
-    ed = ElementData()
-    return ed.from_symbol(str).atomic_num
-
-
 def obmol_to_coords(obmol):
     return [atom.coords for atom in pybel.Molecule(obmol).atoms]
 
@@ -106,7 +95,7 @@ def obmol_to_symbs(obmol):
 
 def add_charges(input_mol, charges_list):
     """
-    this adds formal charge changes to the openbabel molecule
+    this adds the charge change from retropaths to the openbabel molecule
     """
     for val in charges_list:
         atom_ind, charge = val

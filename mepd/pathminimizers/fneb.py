@@ -15,7 +15,7 @@ from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.optimizers.optimizer import Optimizer
 from mepd.elementarystep import check_if_elem_step, ElemStepResults
 from mepd.inputs import RunInputs
-from mepd.scripts.progress import get_progress_printer
+from mepd.progress import get_progress_printer, print_chain_step
 
 import traceback
 
@@ -44,6 +44,20 @@ IS_ELEM_STEP = ElemStepResults(
     splitting_criterion=None,
     minimization_results=None,
     number_grad_calls=0,)
+
+
+def _valid_tangent(tangent: np.ndarray | None) -> bool:
+    if tangent is None:
+        return False
+    return bool(np.all(np.isfinite(tangent)) and np.linalg.norm(tangent) > 0)
+
+
+def _linear_tangent(chain: Chain, ind_node: int) -> np.ndarray:
+    return chain[ind_node + 1].coords - chain[ind_node - 1].coords
+
+
+def _geodesic_drstep(parameters: SimpleNamespace) -> float:
+    return float(getattr(parameters, "drstep", DRSTEP))
 
 
 
@@ -84,6 +98,11 @@ class FreezingNEB(PathMinimizer):
         else:
             printer.update_status(message)
 
+    def _append_chain_snapshot(self, chain: Chain, caption: str) -> None:
+        snapshot = chain.copy()
+        self.chain_trajectory.append(snapshot)
+        print_chain_step(snapshot, caption, force_update=True)
+
     def _distance_function(self, node1: StructureNode, node2: StructureNode):
         if self.parameters.distance_metric.upper() == "RMSD":
             return RMSD(node1.coords, node2.coords)[0]
@@ -99,7 +118,7 @@ class FreezingNEB(PathMinimizer):
             return np.linalg.norm(node1.coords - node2.coords)
         elif self.parameters.distance_metric.upper() == "XTBGI":
             return abs(ch.calculate_geodesic_xtb_barrier(node1, node2))
-            # xtbeng = QCOPEngine()
+            # xtbeng = QCComputeEngine()
             # enes = xtbeng.compute_energies([node1, node2])
             # print((enes[1] - enes[0])*627.5)
             # return abs(enes[1] - enes[0])*627.5
@@ -151,7 +170,9 @@ class FreezingNEB(PathMinimizer):
                 grown_chain, tangents, idx_grown, dr = self.grow_nodes(
                     chain, dr=dr, indices=(last_grown_ind, last_grown_ind+1)
                 )
-                self.chain_trajectory.append(grown_chain.copy())
+                self._append_chain_snapshot(
+                    grown_chain, f"FNEB grow step {nsteps}"
+                )
                 self._log(grown_chain.energies, verbose=2)
 
                 # this section will stop opt if grown nodes are too low in energy
@@ -173,7 +194,9 @@ class FreezingNEB(PathMinimizer):
                         )
                         # idx_grown[1] = None
                         idx_grown = (idx_grown[0], None)
-                        self.chain_trajectory.append(grown_chain.copy())
+                        self._append_chain_snapshot(
+                            grown_chain, f"FNEB max-energy grow step {nsteps}"
+                        )
                     else:
                         self._log(
                             "Grown nodes are lower in energy than TS guess. Stopping optimization.",
@@ -221,7 +244,9 @@ class FreezingNEB(PathMinimizer):
                     min_chain = grown_chain.copy()
                 else:
 
-                    self.chain_trajectory.append(grown_chain.copy())
+                    self._append_chain_snapshot(
+                        grown_chain, f"FNEB max-energy grow step {nsteps}"
+                    )
 
                     # minimize nodes
                     self._log("Minimizing nodes")
@@ -229,7 +254,9 @@ class FreezingNEB(PathMinimizer):
                         chain=grown_chain, node_ind=node_ind,
                         ind_ts_gi=ind_ts_gi, smoother=smoother)
 
-                    self.chain_trajectory.append(min_chain.copy())
+                    self._append_chain_snapshot(
+                        min_chain, f"FNEB minimize step {nsteps}"
+                    )
                     last_grown_ind = node_ind
                     self._log(f"Last grown index: {last_grown_ind}")
 
@@ -258,6 +285,16 @@ class FreezingNEB(PathMinimizer):
                         0.1,
                     )
                 ),
+                disregard_stereochem=bool(
+                    getattr(self.parameters, "disregard_stereochem", False)
+                ),
+                geodesic_kwargs={
+                    "nimages": self.gi_inputs.nimages,
+                    "nudge": self.gi_inputs.nudge,
+                    "friction": self.gi_inputs.friction,
+                    "align": self.gi_inputs.align,
+                    "random_seed": self.gi_inputs.random_seed,
+                },
             )
             # elem_step_results = check_if_elem_step(chain, engine=self.engine)
             self.geom_grad_calls_made += elem_step_results.number_grad_calls
@@ -328,8 +365,6 @@ class FreezingNEB(PathMinimizer):
         d2_neighbor = sm2_len
 
         if self.parameters.tangent == 'geodesic':
-            geoms = ch.calculate_geodesic_tangent()
-
             fwd_tang = gi2[1].coords.flatten() - \
                 gi2[0].coords.flatten()
             fwd_tang /= np.linalg.norm(fwd_tang)
@@ -379,8 +414,7 @@ class FreezingNEB(PathMinimizer):
 
                 node_to_opt = raw_chain[ind_node]
                 # grad1 = node_to_opt.gradient
-                # should already be cached, doing this so it spits out the biased gradienet
-                # in cases where it should be biased
+                # should already be cached, doing this so it recomputes if needed
                 grad1 = self.engine.compute_gradients([node_to_opt])[0]
                 self._log([node.converged for node in raw_chain], verbose=2)
                 assert not node_to_opt.converged, "Trying to minimize a node that was already converged!"
@@ -497,7 +531,9 @@ class FreezingNEB(PathMinimizer):
                 self.grad_calls_made += 1
 
                 raw_chain.nodes[ind_node] = new_node1
-                self.chain_trajectory.append(raw_chain.copy())
+                self._append_chain_snapshot(
+                    raw_chain, f"FNEB node minimize step {nsteps}"
+                )
                 fwd_tang_old = fwd_tang
                 back_tang_old = back_tang
                 nsteps += 1
@@ -596,15 +632,31 @@ class FreezingNEB(PathMinimizer):
 
         # if TESTING_GI_TANG:
         if self.parameters.tangent == 'geodesic':
-            drstep = DRSTEP
+            drstep = _geodesic_drstep(self.parameters)
             self._log("drstep:", drstep, verbose=2)
             geoms1 = ch.calculate_geodesic_tangent(
-                raw_chain, ind_node1, dr=drstep, nimages=self.gi_inputs.nimages)
+                raw_chain, ind_node1, dr=drstep,
+                nimages=self.gi_inputs.nimages,
+                nudge=self.gi_inputs.nudge,
+                friction=self.gi_inputs.friction,
+                align=self.gi_inputs.align,
+                random_seed=self.gi_inputs.random_seed)
             tangent1 = (geoms1[2].coords - geoms1[0].coords)/2
+            if not _valid_tangent(tangent1):
+                self._log("Invalid geodesic tangent for left node; using linear tangent.", level="warning")
+                tangent1 = _linear_tangent(raw_chain, ind_node1)
 
             geoms2 = ch.calculate_geodesic_tangent(
-                raw_chain, ind_node2, dr=drstep, nimages=self.gi_inputs.nimages)
+                raw_chain, ind_node2, dr=drstep,
+                nimages=self.gi_inputs.nimages,
+                nudge=self.gi_inputs.nudge,
+                friction=self.gi_inputs.friction,
+                align=self.gi_inputs.align,
+                random_seed=self.gi_inputs.random_seed)
             tangent2 = (geoms2[2].coords - geoms2[0].coords)/2
+            if not _valid_tangent(tangent2):
+                self._log("Invalid geodesic tangent for right node; using linear tangent.", level="warning")
+                tangent2 = _linear_tangent(raw_chain, ind_node2)
 
         elif self.parameters.tangent == 'linear':
             # linear tangent
@@ -686,9 +738,10 @@ class FreezingNEB(PathMinimizer):
 
                 # Check for maximum iterations
 
-                if new_d >= init_d + PHI * dr:
+                phi = float(getattr(self.parameters, "phi", PHI))
+                if new_d >= init_d + phi * dr:
                     self._log(
-                        f"Nodes fell by {PHI} times dr. Stopping minimization.",
+                        f"Nodes fell by {phi} times dr. Stopping minimization.",
                         level="warning",
                     )
                     converged = True
@@ -741,6 +794,10 @@ class FreezingNEB(PathMinimizer):
                 unit_tan2 = None
                 if tangent2 is not None:
                     unit_tan2 = tangent2 / np.linalg.norm(tangent2)
+
+                if not _valid_tangent(unit_tan1) or not _valid_tangent(unit_tan2):
+                    self._log("Invalid tangent after fallback; stopping node-pair minimization.", level="warning")
+                    return raw_chain
 
                 # --- Compute Gradients for Both Nodes ---
                 grad1 = node1_opt.gradient
@@ -858,25 +915,43 @@ class FreezingNEB(PathMinimizer):
                 raw_chain.nodes[ind_node1] = new_node1
                 raw_chain.nodes[ind_node2] = new_node2
                 # Record the state of the chain for trajectory tracking.
-                self.chain_trajectory.append(raw_chain.copy())
+                self._append_chain_snapshot(
+                    raw_chain, f"FNEB node-pair minimize step {nsteps}"
+                )
                 nsteps += 1
 
 
 
                 # Update tangents for the next iteration.
                 if TESTING_GI_TANG:
-                    drstep = DRSTEP
+                    drstep = _geodesic_drstep(self.parameters)
                     # drstep = max(dr/5, 0.008)
                     self._log("drstep:", drstep, verbose=2)
                     # drstep = dr / 5
                     # drstep = dr / 2
                     geoms1 = ch.calculate_geodesic_tangent(
-                        raw_chain, ind_node1, dr=drstep, nimages=self.gi_inputs.nimages)
+                        raw_chain, ind_node1, dr=drstep,
+                        nimages=self.gi_inputs.nimages,
+                        nudge=self.gi_inputs.nudge,
+                        friction=self.gi_inputs.friction,
+                        align=self.gi_inputs.align,
+                        random_seed=self.gi_inputs.random_seed)
                     tangent1 = (geoms1[2].coords - geoms1[0].coords)/2
+                    if not _valid_tangent(tangent1):
+                        self._log("Invalid geodesic tangent for left node; using linear tangent.", level="warning")
+                        tangent1 = _linear_tangent(raw_chain, ind_node1)
 
                     geoms2 = ch.calculate_geodesic_tangent(
-                        raw_chain, ind_node2, dr=drstep, nimages=self.gi_inputs.nimages)
+                        raw_chain, ind_node2, dr=drstep,
+                        nimages=self.gi_inputs.nimages,
+                        nudge=self.gi_inputs.nudge,
+                        friction=self.gi_inputs.friction,
+                        align=self.gi_inputs.align,
+                        random_seed=self.gi_inputs.random_seed)
                     tangent2 = (geoms2[2].coords - geoms2[0].coords)/2
+                    if not _valid_tangent(tangent2):
+                        self._log("Invalid geodesic tangent for right node; using linear tangent.", level="warning")
+                        tangent2 = _linear_tangent(raw_chain, ind_node2)
 
             except Exception:
                 # Catch any exceptions during the minimization process and print traceback.
@@ -955,19 +1030,30 @@ class FreezingNEB(PathMinimizer):
 
                 if self.parameters.tangent == 'geodesic':
                     # drstep = max(dr/5, 0.008)
-                    drstep = DRSTEP
+                    drstep = _geodesic_drstep(self.parameters)
                     self._log("drstep:", drstep, verbose=2)
                     # drstep = dr / 2
                     # drstep = dr / 5
-                    geoms = ch.calculate_geodesic_tangent(raw_chain[node1_ind-1:node1_ind+2], ref_node_ind=1,
-                                                          dr=drstep,
-                                                          nimages=self.gi_inputs.nimages)
+                    geoms = ch.calculate_geodesic_tangent(
+                        raw_chain[node1_ind-1:node1_ind+2], ref_node_ind=1,
+                        dr=drstep,
+                        nimages=self.gi_inputs.nimages,
+                        nudge=self.gi_inputs.nudge,
+                        friction=self.gi_inputs.friction,
+                        align=self.gi_inputs.align,
+                        random_seed=self.gi_inputs.random_seed)
                     tangent = geoms[2].coords - geoms[0].coords
+                    if not _valid_tangent(tangent):
+                        self._log("Invalid geodesic tangent; using linear tangent.", level="warning")
+                        tangent = _linear_tangent(raw_chain, ind_node)
                 elif self.parameters.tangent == 'linear':
                     self._log("Using linear tangent", verbose=2)
                     # linear tangent
                     tangent = raw_chain[ind_node+1].coords - raw_chain[ind_node-1].coords
 
+                if not _valid_tangent(tangent):
+                    self._log("Invalid tangent after fallback; stopping node minimization.", level="warning")
+                    return raw_chain
                 unit_tan = tangent / np.linalg.norm(tangent)
 
                 # grad1 = self.engine.compute_gradients([node_to_opt])
@@ -1046,7 +1132,9 @@ class FreezingNEB(PathMinimizer):
                     # opp_node = node1
 
                 raw_chain.nodes[node_to_opt_ind] = new_node1
-                self.chain_trajectory.append(raw_chain.copy())
+                self._append_chain_snapshot(
+                    raw_chain, f"FNEB max-energy node minimize step {nsteps}"
+                )
                 nsteps += 1
 
                 grad_inf_norm = np.amax(abs(gperp1))

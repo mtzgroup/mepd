@@ -6,16 +6,16 @@ import re
 from typing import Any
 
 import numpy as np
-from qcio import FileInput, Structure
+from qcdata import FileInput, Structure
 
 from mepd.chain import Chain
-from mepd.constants import ANGSTROM_TO_BOHR
+from qcconst.constants import ANGSTROM_TO_BOHR
 from mepd.elementarystep import ElemStepResults, check_if_elem_step
-from mepd.engines.qcop import QCOPEngine
+from mepd.engines.qccompute import QCComputeEngine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
 from mepd.pathminimizers.pathminimizer import PathMinimizer
-from mepd.scripts.progress import print_persistent, update_status
+from mepd.progress import print_persistent, update_status
 
 
 IS_ELEM_STEP = ElemStepResults(
@@ -392,7 +392,7 @@ def _parse_path_from_neb_image_files(
 @dataclass
 class DLFindNEB(PathMinimizer):
     initial_chain: Chain
-    engine: QCOPEngine
+    engine: QCComputeEngine
     parameters: object | None = None
 
     optimized: Chain | None = None
@@ -401,9 +401,9 @@ class DLFindNEB(PathMinimizer):
     geom_grad_calls_made: int = 0
 
     def __post_init__(self):
-        if not isinstance(self.engine, QCOPEngine):
+        if not isinstance(self.engine, QCComputeEngine):
             raise ValueError(
-                "DLFindNEB requires QCOPEngine so TeraChem can be invoked via QCOP/ChemCloud."
+                "DLFindNEB requires QCComputeEngine so TeraChem can be invoked via QCCompute/ChemCloud."
             )
         if "terachem" not in str(self.engine.program).lower():
             raise ValueError(
@@ -713,6 +713,9 @@ class DLFindNEB(PathMinimizer):
                     hessian_minima_rescue_displacement=float(
                         self._params.get("hessian_minima_rescue_displacement", 0.1)
                     ),
+                    disregard_stereochem=bool(
+                        self._params.get("disregard_stereochem", False)
+                    ),
                 )
                 self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)
                 if not elem_step_results.is_elem_step:
@@ -757,6 +760,9 @@ class DLFindNEB(PathMinimizer):
                 ),
                 hessian_minima_rescue_displacement=float(
                     self._params.get("hessian_minima_rescue_displacement", 0.1)
+                ),
+                disregard_stereochem=bool(
+                    self._params.get("disregard_stereochem", False)
                 ),
             )
             self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)

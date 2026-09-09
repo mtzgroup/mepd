@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
 from numpy.typing import NDArray
-from mepd.elements import ElementData
-from qcio.view import generate_structure_viewer_html
+from mepd.helper_functions import get_mass
+from qcdata.view import generate_structure_viewer_html
 from scipy.signal import argrelextrema
 
 from mepd.chain import Chain
@@ -33,8 +33,7 @@ from mepd.helper_functions import (
     qRMSD_distance,
     project_rigid_body_forces
 )
-from mepd.scripts.progress import get_progress_printer
-from ipywidgets import IntSlider, interact
+from mepd.progress import get_progress_printer
 
 
 def _distance_to_chain(chain1: Chain, chain2: Chain) -> float:
@@ -284,8 +283,7 @@ def compute_NEB_gradient(
 
     # remove rotations and translations for molecular chains only
     if chain[0].has_molecular_graph:
-        ed = ElementData()
-        masses = np.array([ed.from_symbol(n).mass_amu for n in chain[0].symbols])
+        masses = np.array([get_mass(n) for n in chain[0].symbols])
         grads = np.array([
             project_rigid_body_forces(
                 node.coords, g, masses=masses) for (node, g) in zip(chain[1:-1], grads)]
@@ -471,7 +469,7 @@ def get_nudged_pe_grad(unit_tangent: np.array, gradient: np.array):
 def gi_path_to_nodes(
     xyz_coords: np.array, symbols: list, charge=0, spinmult=1, parameters: ChainInputs = None
 ):
-    from qcio import Structure
+    from qcdata import Structure
     if parameters is None:
         parameters = ChainInputs()
 
@@ -561,13 +559,14 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
 
 def calculate_geodesic_distance(
     node1: StructureNode, node2: StructureNode, nimages=12, nudge=1.0,
-    nsamples=5, random_seed=0
+    nsamples=5, random_seed=0, **geodesic_kwargs
 ):
     _, smoother = run_geodesic(
         [node1, node2],
         nudge=nudge,
         nimages=nimages,
         random_seed=random_seed,
+        **geodesic_kwargs,
         return_smoother=True,
     )
     return smoother.length
@@ -831,46 +830,6 @@ def get_projections(c: Chain, eigvec, ts_geom=None):
     return all_dists
 
 
-def visualize_chain(chain: List[StructureNode]):
-    """
-    returns an interactive visualizer for a chain
-    """
-
-    def wrap(frame):
-        final_html = []
-        image_base64 = generate_neb_plot(chain, ind_node=frame)
-        structure_html = generate_structure_viewer_html(chain[frame].structure)
-        img_html = (
-            f'<img src="data:image/png;base64,{image_base64}" alt="Energy Optimization by '
-            'Cycle" style="width: 100%; max-width: 600px;">'
-        )
-
-        final_html.append(
-            f"""
-        <div style="text-align: center;">
-            <div style="display: flex; align-items: center; justify-content: space-around;">
-                <div style="text-align: center; margin-right: 20px; flex: 1;">
-                    <div style="display: inline-block; text-align: center;">
-                        {structure_html}
-                    </div>
-                </div>
-                <div style="text-align: center; margin-left: 20px; flex: 1;">
-                    {img_html}
-                </div>
-            </div>
-        </div>
-                """
-        )
-
-        return HTML("".join(final_html))
-
-    return interact(
-        wrap,
-        frame=IntSlider(
-            min=0, max=len(chain) - 1, step=1, description="Trajectory frames"
-        ),
-    )
-
 
 def plot_opt_history(chain_trajectory: List[Chain], do_3d=False):
 
@@ -1059,44 +1018,78 @@ def _select_node_at_dist(
     return best_node
 
 
+def _node_at_geodesic_arclength(
+    template_node: StructureNode,
+    smoother: MorseGeodesic,
+    dist: float,
+) -> StructureNode:
+    path = np.asarray(smoother.path, dtype=float)
+    segment_lengths = np.asarray(smoother.segment_lengths, dtype=float)
+
+    if path.ndim != 3 or len(path) == 0:
+        return template_node
+    if len(path) == 1 or len(segment_lengths) == 0:
+        return template_node.update_coords(path[-1])
+    if dist <= 0:
+        return template_node.update_coords(path[0])
+
+    cumulative = 0.0
+    for segment_index, segment_length in enumerate(segment_lengths):
+        if not np.isfinite(segment_length) or segment_length <= 0:
+            continue
+
+        next_cumulative = cumulative + float(segment_length)
+        if dist <= next_cumulative:
+            alpha = (float(dist) - cumulative) / float(segment_length)
+            coords = (1.0 - alpha) * path[segment_index] + alpha * path[segment_index + 1]
+            return template_node.update_coords(coords)
+        cumulative = next_cumulative
+
+    return template_node.update_coords(path[-1])
+
+
 def calculate_geodesic_tangent(
         list_of_nodes, ref_node_ind: int,
         dr: float,
-        nimages=20, min_nimages=5):
+        nimages=20, min_nimages=5, **geodesic_kwargs):
 
+    distance_kwargs = geodesic_kwargs.copy()
     ref_node = list_of_nodes[ref_node_ind]
     segment1 = list_of_nodes[ref_node_ind-1:ref_node_ind+1].copy()
     segment1.reverse()
     d1 = calculate_geodesic_distance(
-        segment1[0], segment1[1], nimages=nimages)
+        segment1[0], segment1[1], nimages=nimages, **distance_kwargs)
 
     segment2 = list_of_nodes[ref_node_ind:ref_node_ind+2].copy()
     d2 = calculate_geodesic_distance(
-        segment2[0], segment2[1], nimages=nimages)
+        segment2[0], segment2[1], nimages=nimages, **distance_kwargs)
 
     dtot = d1 + d2
-    nimg1 = max(int(nimages * (d1 / dtot)), min_nimages)
-    nimg2 = max(int(nimages * (d2 / dtot)), min_nimages)
+    if not np.isfinite(dtot) or dtot <= 0:
+        nimg1 = nimg2 = max(int(nimages), min_nimages)
+    else:
+        nimg1 = max(int(nimages * (d1 / dtot)), min_nimages)
+        nimg2 = max(int(nimages * (d2 / dtot)), min_nimages)
     get_progress_printer().update_status(
         f"Using nimg1: {nimg1} nimg2: {nimg2} for the tangent"
     )
 
-    _, smoother1 = run_geodesic(segment1, nimages=nimg1, return_smoother=True)
+    _, smoother1 = run_geodesic(
+        segment1, nimages=nimg1, return_smoother=True, **geodesic_kwargs)
     gi1 = gi_path_to_nodes(smoother1.path, symbols=ref_node.symbols,
                            charge=ref_node.structure.charge, spinmult=ref_node.structure.multiplicity)
 
-    _, smoother2 = run_geodesic(segment2, nimages=nimg2, return_smoother=True)
+    _, smoother2 = run_geodesic(
+        segment2, nimages=nimg2, return_smoother=True, **geodesic_kwargs)
 
     gi2 = gi_path_to_nodes(smoother2.path, symbols=ref_node.symbols,
                            charge=ref_node.structure.charge, spinmult=ref_node.structure.multiplicity)
 
-    new0 = _select_node_at_dist(
-        gi1, dist=dr, direction=1, smoother=smoother1)
-
-    new0 = new0.update_coords(align_geom(ref_node.coords, new0.coords)[1])
-    new2 = _select_node_at_dist(
-        gi2, dist=dr, direction=1, smoother=smoother2)
-    new2 = new2.update_coords(align_geom(ref_node.coords, new2.coords)[1])
+    new0 = _node_at_geodesic_arclength(gi1[0], smoother1, dr)
+    new2 = _node_at_geodesic_arclength(gi2[0], smoother2, dr)
+    if geodesic_kwargs.get("align", True):
+        new0 = new0.update_coords(align_geom(ref_node.coords, new0.coords)[1])
+        new2 = new2.update_coords(align_geom(ref_node.coords, new2.coords)[1])
 
     return [new0, ref_node, new2]
 

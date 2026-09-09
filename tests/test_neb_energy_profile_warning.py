@@ -1,26 +1,13 @@
 import numpy as np
 from types import SimpleNamespace
-from qcio import Structure
+from qcdata import Structure
 
 import mepd.neb as neb_module
 from mepd.chain import Chain
 from mepd.errors import ElectronicStructureError
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import StructureNode
-from mepd.neb import _endpoint_energy_inversion_warning_text, NEB
-
-
-def test_endpoint_energy_inversion_warning_triggers_for_endpoint_ts_guess():
-    energies = np.array([0.020, 0.000, 0.005, 0.018])
-    msg = _endpoint_energy_inversion_warning_text(energies=energies)
-    assert msg is not None
-    assert "Endpoint energies are higher" in msg
-
-
-def test_endpoint_energy_inversion_warning_not_triggered_when_ts_interior():
-    energies = np.array([0.000, 0.020, 0.005, 0.001])
-    msg = _endpoint_energy_inversion_warning_text(energies=energies)
-    assert msg is None
+from mepd.neb import NEB
 
 
 def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch):
@@ -47,7 +34,7 @@ def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch)
         }
     )
 
-    class DummyEngine:
+    class _UnrecognizedEngine:
         pass
 
     params = SimpleNamespace(
@@ -55,13 +42,15 @@ def test_neb_warning_path_handles_parameters_without_frozen_indices(monkeypatch)
         v=False,
         climb=False,
         do_elem_step_checks=False,
+        negative_steps_thre=10,
+        positive_steps_thre=10,
     )
     optimizer = SimpleNamespace(timestep=0.1, g_old=None, reset=lambda: None)
     neb = NEB(
         initial_chain=prepared_chain.copy(),
         optimizer=optimizer,
         parameters=params,
-        engine=DummyEngine(),
+        engine=_UnrecognizedEngine(),
     )
 
     monkeypatch.setattr(NEB, "update_chain", lambda self, chain: prepared_chain.copy())

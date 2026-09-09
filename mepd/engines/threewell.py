@@ -6,16 +6,11 @@ from typing import Union, List
 from mepd.nodes.node import Node
 from mepd.chain import Chain
 from mepd.engines import Engine
-from mepd.nodes.node import XYNode
-from mepd.dynamics.chainbiaser import ChainBiaser
-
-
 import numpy as np
 
 
 @dataclass
 class ThreeWellPotential(Engine):
-    biaser: ChainBiaser = None
 
     def _en_func(self, xy: np.array) -> float:
         """
@@ -23,8 +18,6 @@ class ThreeWellPotential(Engine):
         """
         x, y = xy
         ene = (x**2 + y - 11) ** 2 + (x + y**2 - 7) ** 2
-        if self.biaser:
-            ene += self.biaser.energy_node_bias(node=XYNode(structure=xy))
         return ene
 
     def _grad_func(self, xy: np.array) -> NDArray:
@@ -35,9 +28,6 @@ class ThreeWellPotential(Engine):
         dx = 2 * (x**2 + y - 11) * (2 * x) + 2 * (x + y**2 - 7)
         dy = 2 * (x**2 + y - 11) + 2 * (x + y**2 - 7) * (2 * y)
         grad = np.array([dx, dy])
-        if self.biaser:
-            g_bias = self.biaser.gradient_node_bias(node=XYNode(structure=xy))
-            grad += g_bias
         return grad
 
     def _compute_ene_grads(self, chain: Union[Chain, List[Node]]):
