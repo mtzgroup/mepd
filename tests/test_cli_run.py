@@ -115,6 +115,9 @@ def _call_run(**overrides):
         network_completion=False,
         network_completion_mode="linear",
         network_max_followups=25,
+        validate_minima_with_hessian=True,
+        hessian_minimum_frequency_cutoff=0.0,
+        hessian_minima_rescue_displacement=0.1,
         output=None,
     )
     kwargs.update(overrides)

@@ -338,6 +338,22 @@ def run(
         help="Cap on the number of follow-up pairs --network-completion will run "
         "(guards against combinatorial blowup, especially with --network-completion-mode all-to-all).",
     ),
+    validate_minima_with_hessian: bool = typer.Option(
+        True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian",
+        help="When a minima-based autosplit is proposed during MSMEP, compute "
+        "Hessians for optimized split candidates and reject candidates with "
+        "significant imaginary modes. On by default -- this is a correctness "
+        "check, not a convenience.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff",
+        help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="Displacement (bohr) applied along the lowest-frequency mode when "
+        "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
+    ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
         help="Directory to write the optimized trajectory/energies into.",
@@ -360,6 +376,9 @@ def run(
         recursive = True
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
+    run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
+    run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
 
     start_structure = _load_endpoint(start, charge, multiplicity)
     end_structure = _load_endpoint(end, charge, multiplicity)
