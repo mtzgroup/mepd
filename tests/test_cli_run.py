@@ -112,6 +112,9 @@ def _call_run(**overrides):
         recursive=False,
         parallel=False,
         parallel_workers=None,
+        network_completion=False,
+        network_completion_mode="linear",
+        network_max_followups=25,
         output=None,
     )
     kwargs.update(overrides)
@@ -275,6 +278,17 @@ def test_cli_run_rejects_recursive_and_parallel_together(tmp_path):
             output=tmp_path / "out",
             recursive=True,
             parallel=True,
+        )
+
+
+def test_cli_run_rejects_invalid_network_completion_mode(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_run(
+            start=tmp_path / "start.xyz",
+            end=tmp_path / "end.xyz",
+            output=tmp_path / "out",
+            network_completion=True,
+            network_completion_mode="bogus",
         )
 
 

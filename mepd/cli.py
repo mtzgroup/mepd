@@ -18,7 +18,7 @@ import typer
 from qcdata import Structure
 
 from mepd.chain import Chain
-from mepd.inputs import RunInputs
+from mepd.inputs import NetworkInputs, RunInputs
 
 app = typer.Typer(help="mepd: minimum-energy-path discovery tools.")
 
@@ -171,6 +171,123 @@ def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
     return endpoints[0], endpoints[1]
 
 
+def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
+    if not completion_dir.is_dir():
+        return []
+    return sorted(
+        p / "tree" for p in completion_dir.iterdir()
+        if (p / "tree" / "adj_matrix.txt").exists()
+    )
+
+
+def _run_network_completion(
+    *,
+    output: Path,
+    initial_tree: Path,
+    start_node,
+    end_node,
+    run_inputs: RunInputs,
+    mode: str,
+    max_followups: int,
+    parallel: bool,
+    parallel_workers: Optional[int],
+) -> None:
+    """Auto-generate and run follow-up NEB/MSMEP requests connecting
+    newly-discovered intermediates, then build the completed reaction network.
+
+    Resumable with no separate manifest/state file: each follow-up pair's
+    MSMEP output lives at a deterministic path
+    (<output>/network_completion/pair_<i>_<j>/tree/), and a pair is skipped
+    if that directory already holds a completed tree. Re-running the exact
+    same command against the same --output therefore picks up wherever a
+    prior run left off -- the directory tree on disk IS the resume state.
+    """
+    from mepd.msmep import MSMEP
+    from mepd.NetworkBuilder import NetworkBuilder
+    import mepd.chainhelpers as ch
+
+    completion_dir = output / "network_completion"
+    completion_dir.mkdir(parents=True, exist_ok=True)
+
+    def _tree_dirs() -> list[Path]:
+        return [initial_tree, *_completed_tree_dirs(completion_dir)]
+
+    builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
+    structures, edges = builder._load_network_data(_tree_dirs())
+    start_ind = int(builder._get_ind_td(ref_list=structures, td=start_node))
+    end_ind = int(builder._get_ind_td(ref_list=structures, td=end_node))
+
+    def _has_edge(i: int, j: int) -> bool:
+        return f"{i}-{j}" in edges or f"{j}-{i}" in edges
+
+    if mode == "linear":
+        others = [k for k in range(len(structures)) if k not in (start_ind, end_ind)]
+        candidates = [(start_ind, k) for k in others] + [(k, end_ind) for k in others]
+    else:  # all-to-all
+        candidates = [
+            (i, j) for i in range(len(structures)) for j in range(i + 1, len(structures))
+        ]
+    candidates = [(i, j) for i, j in candidates if not _has_edge(i, j)]
+
+    if len(candidates) > max_followups:
+        typer.echo(
+            f"{len(candidates)} candidate follow-up pairs found, capping at "
+            f"--network-max-followups={max_followups}."
+        )
+        candidates = candidates[:max_followups]
+    if not candidates:
+        typer.echo("No new candidate pairs for --network-completion.")
+
+    for i, j in candidates:
+        pair_dir = completion_dir / f"pair_{i}_{j}"
+        tree_dir = pair_dir / "tree"
+        if (tree_dir / "adj_matrix.txt").exists():
+            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
+            continue
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Running follow-up NEB/MSMEP for pair ({i}, {j})...")
+        try:
+            seed_chain = Chain.model_validate({
+                "nodes": [structures[i], structures[j]],
+                "parameters": copy.deepcopy(run_inputs.chain_inputs),
+            })
+            pair_chain = ch.run_geodesic(
+                chain=seed_chain,
+                chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
+                nimages=run_inputs.gi_inputs.nimages,
+                friction=run_inputs.gi_inputs.friction,
+                nudge=run_inputs.gi_inputs.nudge,
+                random_seed=run_inputs.gi_inputs.random_seed,
+                align=run_inputs.gi_inputs.align,
+                **(run_inputs.gi_inputs.extra_kwds or {}),
+            )
+            msmep = MSMEP(inputs=run_inputs)
+            if parallel:
+                pair_history = msmep.run_parallel_recursive_minimize(
+                    pair_chain, max_workers=parallel_workers
+                )
+            else:
+                pair_history = msmep.run_recursive_minimize(pair_chain)
+            pair_history.write_to_disk(tree_dir)
+        except Exception as exc:
+            typer.echo(f"Follow-up pair ({i}, {j}) failed ({type(exc).__name__}: {exc}); skipping.")
+            continue
+
+    builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
+    try:
+        pot = builder.create_rxn_network_from_paths(_tree_dirs())
+    except Exception as exc:
+        typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    network_path = output / "network.json"
+    pot.write_to_disk(network_path)
+    typer.echo(
+        f"Wrote completed network to {network_path} "
+        f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
+    )
+
+
 @app.command("run")
 def run(
     start: Path = typer.Option(..., "--start", exists=True, help="Path to the start-structure xyz file."),
@@ -203,6 +320,24 @@ def run(
         help="Maximum number of concurrent workers for --parallel. Defaults to "
         "min(4, cpu count).",
     ),
+    network_completion: bool = typer.Option(
+        False, "--network-completion",
+        help="After the recursive MSMEP run, auto-generate and run follow-up "
+        "NEB/MSMEP requests connecting newly-discovered intermediates, then "
+        "build the completed reaction network (archaically: --network-splits). "
+        "Implies --recursive if neither --recursive nor --parallel is given.",
+    ),
+    network_completion_mode: str = typer.Option(
+        "linear", "--network-completion-mode",
+        help="Follow-up pair strategy: 'linear' connects each discovered "
+        "intermediate to the original start/end only; 'all-to-all' also "
+        "connects every other non-adjacent pair of discovered structures.",
+    ),
+    network_max_followups: int = typer.Option(
+        25, "--network-max-followups",
+        help="Cap on the number of follow-up pairs --network-completion will run "
+        "(guards against combinatorial blowup, especially with --network-completion-mode all-to-all).",
+    ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
         help="Directory to write the optimized trajectory/energies into.",
@@ -216,6 +351,13 @@ def run(
         raise typer.BadParameter(
             "--parallel cannot be combined with --recursive. Use one mode."
         )
+    if network_completion_mode not in ("linear", "all-to-all"):
+        raise typer.BadParameter(
+            "--network-completion-mode must be 'linear' or 'all-to-all'."
+        )
+    if network_completion and not recursive and not parallel:
+        typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
+        recursive = True
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
 
@@ -250,19 +392,36 @@ def run(
     if recursive or parallel:
         from mepd.msmep import MSMEP
 
-        msmep = MSMEP(inputs=run_inputs)
-        if parallel:
-            typer.echo("Running parallel recursive autosplitting (MSMEP)...")
-            history = msmep.run_parallel_recursive_minimize(
-                initial_chain, max_workers=parallel_workers
-            )
-        else:
-            typer.echo("Running recursive autosplitting (MSMEP)...")
-            history = msmep.run_recursive_minimize(initial_chain)
-
         tree_path = output / "tree"
-        history.write_to_disk(tree_path)
-        typer.echo(f"Wrote split-tree history to {tree_path}")
+        if network_completion and (tree_path / "adj_matrix.txt").exists():
+            typer.echo(f"Skipping initial MSMEP run: {tree_path} already complete.")
+        else:
+            msmep = MSMEP(inputs=run_inputs)
+            if parallel:
+                typer.echo("Running parallel recursive autosplitting (MSMEP)...")
+                history = msmep.run_parallel_recursive_minimize(
+                    initial_chain, max_workers=parallel_workers
+                )
+            else:
+                typer.echo("Running recursive autosplitting (MSMEP)...")
+                history = msmep.run_recursive_minimize(initial_chain)
+
+            history.write_to_disk(tree_path)
+            typer.echo(f"Wrote split-tree history to {tree_path}")
+
+        if network_completion:
+            _run_network_completion(
+                output=output,
+                initial_tree=tree_path,
+                start_node=start_node,
+                end_node=end_node,
+                run_inputs=run_inputs,
+                mode=network_completion_mode,
+                max_followups=network_max_followups,
+                parallel=parallel,
+                parallel_workers=parallel_workers,
+            )
+            return
 
         try:
             final_chain = history.output_chain
