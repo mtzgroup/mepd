@@ -812,31 +812,12 @@ def check_if_elem_step(
             new_structures=new_structures,
         )
 
-    crude_irc_passed, ngc_approx_elem_step = is_approx_elem_step(
-        chain=inp_chain,
-        engine=engine,
-        verbose=verbose,
-        **stereochem_kwargs,
-    )
-    if verbose:
-        if _rich_available:
-            status = "[bold green]✓ Passed[/bold green]" if crude_irc_passed else "[bold red]✗ Failed[/bold red]"
-            _console.print(Panel.fit(
-                f"[bold]CrudeIRC:[/bold] {status}",
-                border_style="green" if crude_irc_passed else "red",
-            ))
-        else:
-            print("CrudeIRC: ", crude_irc_passed)
-    n_geom_opt_grad_calls += ngc_approx_elem_step
-
-    if crude_irc_passed:
-        return ElemStepResults(
-            is_elem_step=True,
-            is_concave=concavity_results.is_concave,
-            splitting_criterion=None,
-            minimization_results=[inp_chain[0], inp_chain[-1]],
-            number_grad_calls=n_geom_opt_grad_calls,
-        )
+    # NOTE: the CrudeIRC shortcut (`is_approx_elem_step`) is disabled -- it was
+    # found to be unreliable (e.g. it silently assumes "elementary step" on
+    # any internal error) and could short-circuit the elem-step decision
+    # before the full pseudo-IRC-based check below ever ran. Always fall
+    # through to the full check instead. `is_approx_elem_step` itself is left
+    # in place, just unused here, in case it's revisited later.
 
     if geodesic_kwargs is None:
         pseu_irc_results = pseudo_irc(chain=inp_chain, engine=engine)
