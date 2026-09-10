@@ -16,6 +16,18 @@ from mepd.nodes.node import Node
 from mepd.fakeoutputs import FakeQCIOOutput
 from mepd.helper_functions import get_mass
 from qcdata import ProgramOutput
+import qcconst.constants as _qcconst_constants
+
+# Hartree/(bohr^2 * amu) -> (cm^-1)^2, derived from CODATA constants (matches
+# the standard ~5140.487 cm^-1 per sqrt(Hartree/(bohr^2*amu)) conversion used
+# throughout quantum chemistry). Needed to turn mass-weighted Hessian
+# eigenvalues into physically meaningful wavenumbers -- see
+# build_hessian_result_from_matrix.
+_HESSIAN_EIGENVALUE_TO_CM2 = (
+    float(_qcconst_constants.phys["Hartree energy"])
+    / float(_qcconst_constants.phys["Bohr radius"]) ** 2
+    / float(_qcconst_constants.phys["atomic mass constant"])
+) / (2 * np.pi * float(_qcconst_constants.phys["speed of light in vacuum"]) * 100) ** 2
 
 
 @dataclass
@@ -65,15 +77,59 @@ def build_hessian_result_from_matrix(node: Node, hessian: np.ndarray) -> FiniteD
 
     # Numerical finite differences are not exactly symmetric; enforce symmetry.
     hessian_arr = 0.5 * (hessian_arr + hessian_arr.T)
-    eigvals, eigvecs = np.linalg.eigh(hessian_arr)
+
+    refshape = np.asarray(node.coords).shape
+    natoms = refshape[0]
+
+    # Mass-weighting is required before these eigenvalues mean anything as
+    # vibrational frequencies. Without it: (a) the 6 (5 for linear molecules)
+    # translation/rotation eigenvalues -- which should be exactly zero -- come
+    # out as small positive *or negative* numerical noise, indistinguishable
+    # from a genuine imaginary mode, so any minima-validation check comparing
+    # against a frequency_cutoff near zero rejects virtually every real
+    # minimum; (b) the remaining eigenvalues aren't in real cm^-1 units at
+    # all. Confirmed directly: an unweighted Hessian on a relaxed water
+    # molecule (an unambiguous minimum) reported min "frequency" -9.7e-6 and
+    # vibrational "frequencies" of 0.4/0.9/1.0 (real values: ~1600/3650/3750
+    # cm^-1). After mass-weighting, only the first 6 modes are near-zero
+    # (trans/rot) and are excluded from `freqs_wavenumber`, so a
+    # `frequency_cutoff` in cm^-1 is now comparing against a genuine
+    # vibrational spectrum, not translation/rotation noise.
+    try:
+        symbols = list(node.symbols)
+        masses_amu = np.array([get_mass(s) for s in symbols], dtype=float)
+        sqrt_mass = np.repeat(np.sqrt(masses_amu), 3)
+        mass_weighted = hessian_arr / np.outer(sqrt_mass, sqrt_mass)
+    except Exception:
+        # No atomic masses available (e.g. a non-molecular toy-potential
+        # node) -- fall back to the raw Hessian; frequencies won't be
+        # physically meaningful, but this keeps non-molecular engines working.
+        mass_weighted = hessian_arr
+
+    eigvals, eigvecs = np.linalg.eigh(mass_weighted)
     order = np.argsort(eigvals)
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
 
-    refshape = np.asarray(node.coords).shape
     modes = [eigvecs[:, i].reshape(refshape) for i in range(eigvecs.shape[1])]
-    # Keep sign information while producing compact "frequency-like" values.
-    freqs = [float(np.sign(v) * np.sqrt(abs(v))) for v in eigvals]
+    freqs_cm = [
+        float(np.sign(v) * np.sqrt(abs(v) * _HESSIAN_EIGENVALUE_TO_CM2)) for v in eigvals
+    ]
+
+    # Drop the lowest-magnitude modes as translation/rotation rather than
+    # genuine vibrations -- they're the smallest in magnitude by construction
+    # (true zero modes plus noise), while real vibrational force constants
+    # are much larger. Diatomics (5 trans/rot dof) are special-cased; other
+    # linear molecules (also 5, not 6) aren't detected, so one genuine very
+    # low-frequency bending mode would be discarded alongside rotation for
+    # a linear polyatomic -- a known limitation, not exercised by anything
+    # this package currently targets.
+    n_trans_rot = 5 if natoms == 2 else 6
+    n_trans_rot = min(n_trans_rot, len(freqs_cm))
+    keep = sorted(range(len(freqs_cm)), key=lambda i: abs(eigvals[i]))[n_trans_rot:]
+    keep.sort()
+    freqs = [freqs_cm[i] for i in keep]
+    modes = [modes[i] for i in keep]
 
     return FiniteDifferenceHessianOutput(
         input_data=SimpleNamespace(structure=getattr(node, "structure", None)),

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List, Union
 
 import numpy as np
@@ -17,7 +18,12 @@ from numpy.typing import NDArray
 
 from mepd.chain import Chain
 from qcconst.constants import ANGSTROM_TO_BOHR
-from mepd.engines.engine import Engine, build_hessian_result_from_matrix
+from mepd.engines.engine import (
+    Engine,
+    FiniteDifferenceHessianOutput,
+    FiniteDifferenceHessianResults,
+    build_hessian_result_from_matrix,
+)
 from mepd.errors import (
     ElectronicStructureError,
     EnergiesNotComputedError,
@@ -283,7 +289,60 @@ class GXTBCalculator(Engine):
         return hessian
 
     def _compute_hessian_result(self, node: StructureNode, **kwargs):
-        hessian = self.compute_hessian(node=node)
+        """Prefer g-xTB's own projected vibrational analysis (parsed from its
+        g98.out output -- real frequencies with translation/rotation already
+        removed by g-xTB itself, plus real normal-mode displacement vectors)
+        over reimplementing mass-weighting/projection ourselves. Falls back
+        to the generic build_hessian_result_from_matrix (mass-weight the raw
+        Hessian, discard the lowest-magnitude modes as trans/rot) only if
+        g98.out isn't available or fails to parse.
+        """
+        natoms = len(node.symbols)
+        with tempfile.TemporaryDirectory(prefix="gxtb-hess-") as tmp:
+            workdir = Path(tmp)
+            xyz_path = workdir / "structure.xyz"
+            xyz_path.write_text(node.structure.to_xyz())
+            completed = self._run_gxtb_hessian(
+                xyz_path=xyz_path,
+                charge=int(node.structure.charge),
+                multiplicity=int(node.structure.multiplicity),
+                cwd=workdir,
+            )
+            try:
+                hessian = self._parse_hessian(workdir / "hessian", natoms=natoms)
+            except Exception as exc:
+                raise ElectronicStructureError(
+                    msg="Failed to parse g-xTB Hessian output.",
+                    obj=completed.stdout + completed.stderr,
+                ) from exc
+
+            g98_path = workdir / "g98.out"
+            freqs = modes = None
+            if g98_path.exists():
+                try:
+                    freqs, modes = self._parse_g98_frequencies_and_modes(
+                        g98_path.read_text(), natoms=natoms
+                    )
+                except Exception:
+                    freqs = modes = None
+
+            if self.keep_workdirs:
+                persistent = Path.cwd() / "gxtb-workdirs"
+                persistent.mkdir(exist_ok=True)
+                shutil.copytree(workdir, persistent / workdir.name, dirs_exist_ok=True)
+
+        if freqs and modes and len(freqs) == len(modes):
+            return FiniteDifferenceHessianOutput(
+                input_data=SimpleNamespace(structure=node.structure),
+                results=FiniteDifferenceHessianResults(
+                    hessian=hessian,
+                    normal_modes_cartesian=modes,
+                    freqs_wavenumber=freqs,
+                ),
+                success=True,
+            )
+
+        # Fallback: g-xTB's own frequency analysis wasn't available/parseable.
         return build_hessian_result_from_matrix(node=node, hessian=hessian)
 
     def _run_gxtb_hessian(
@@ -496,6 +555,45 @@ class GXTBCalculator(Engine):
             )
         hessian = np.asarray(values[:expected], dtype=float).reshape((ndof, ndof))
         return 0.5 * (hessian + hessian.T)
+
+    @staticmethod
+    def _parse_g98_frequencies_and_modes(
+        text: str, natoms: int
+    ) -> tuple[list[float], list[NDArray]]:
+        """Parse g-xTB's Gaussian-98-format frequency output (g98.out).
+
+        Unlike the raw `hessian` file, this already reports g-xTB's own
+        *projected* vibrational frequencies (translation/rotation removed)
+        plus real per-atom normal-mode displacement vectors -- modes are
+        printed in blocks of up to 3, each block starting with a
+        "Frequencies --" line followed by per-atom XYZ displacement triplets.
+        """
+        lines = text.splitlines()
+        freqs: list[float] = []
+        mode_rows: list[list[list[float]]] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.strip().startswith("Frequencies --"):
+                block_freqs = [float(v) for v in line.split("--", 1)[1].split()]
+                n_in_block = len(block_freqs)
+                j = i + 1
+                while j < len(lines) and not lines[j].strip().startswith("Atom"):
+                    j += 1
+                j += 1  # skip the "Atom AN X Y Z ..." header itself
+                block_rows = [[] for _ in range(n_in_block)]
+                for a in range(natoms):
+                    values = [float(v) for v in lines[j + a].split()[2:]]
+                    for m in range(n_in_block):
+                        block_rows[m].append(values[3 * m: 3 * m + 3])
+                freqs.extend(block_freqs)
+                mode_rows.extend(block_rows)
+                i = j + natoms
+            else:
+                i += 1
+
+        modes = [np.asarray(rows, dtype=float) for rows in mode_rows]
+        return freqs, modes
 
     @staticmethod
     def _parse_optimized_node(node: StructureNode, fp: Path) -> StructureNode:
