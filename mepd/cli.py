@@ -23,6 +23,20 @@ from mepd.inputs import NetworkInputs, RunInputs
 app = typer.Typer(help="mepd: minimum-energy-path discovery tools.")
 
 
+def _format_run_inputs_value(value) -> str:
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        return ", ".join(f"{k}={_format_run_inputs_value(v)}" for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return str(list(value)) if value else "[]"
+    if isinstance(value, bool):
+        return "[green]True[/green]" if value else "[red]False[/red]"
+    if value == "":
+        return "[dim]--[/dim]"
+    return str(value)
+
+
 def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
     """Print the settings actually in effect for this run (after any
     --inputs TOML has been loaded and any CLI-flag overrides applied)."""
@@ -32,13 +46,39 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
         typer.echo(f"(could not render RunInputs summary: {exc})", err=True)
         return
 
+    from rich import box
     from rich.console import Console
-    from rich.panel import Panel
-    from rich.pretty import Pretty
+    from rich.table import Table
 
-    Console().print(
-        Panel(Pretty(config, expand_all=True), title="RunInputs", border_style="cyan")
-    )
+    console = Console()
+    console.print("[bold cyan]RunInputs[/bold cyan]")
+
+    top_level, sections = {}, {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            sections[key] = value
+        else:
+            top_level[key] = value
+
+    def _new_table(title: str | None = None) -> Table:
+        table = Table(title=title, box=box.ROUNDED, show_header=True, title_style="bold")
+        table.add_column("Setting", style="cyan", no_wrap=True)
+        table.add_column("Value")
+        return table
+
+    table = _new_table()
+    for key, value in top_level.items():
+        table.add_row(key, _format_run_inputs_value(value))
+    console.print(table)
+
+    for key, value in sections.items():
+        table = _new_table(title=key)
+        if not value:
+            table.add_row("[dim](empty)[/dim]", "")
+        else:
+            for sub_key, sub_value in value.items():
+                table.add_row(sub_key, _format_run_inputs_value(sub_value))
+        console.print(table)
 
 
 def _normalized_path_method(method: str) -> str:
