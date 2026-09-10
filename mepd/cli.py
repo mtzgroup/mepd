@@ -28,7 +28,8 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
     --inputs TOML has been loaded and any CLI-flag overrides applied)."""
     try:
         config = run_inputs.to_dict()
-    except Exception:
+    except Exception as exc:
+        typer.echo(f"(could not render RunInputs summary: {exc})", err=True)
         return
 
     from rich.console import Console

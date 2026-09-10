@@ -653,6 +653,10 @@ class RunInputs:
             elif 'program_kwds' in key:
                 if val is None:
                     json_dict[key] = ""
+                elif isinstance(val, dict):
+                    # e.g. the gxtb engine, which never wraps program_kwds
+                    # in a ProgramArgs object -- see RunInputs.__post_init__.
+                    json_dict[key] = val
                 else:
                     d = val.json()
                     d = d.replace("null", "None")
