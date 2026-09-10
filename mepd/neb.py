@@ -124,6 +124,12 @@ class NEB(PathMinimizer):
         self._last_resolution_insert_step = -10**9
         self._adaptive_metric_history: list[dict[str, float]] = []
         self._plateau_exit_metric_history: list[dict[str, float]] = []
+        # NEBInputs is the authoritative source for these when the optimizer
+        # supports them (currently only ConjugateGradient), overriding
+        # whatever the optimizer itself was constructed with.
+        for attr in ("negative_steps_thre", "positive_steps_thre"):
+            if hasattr(self.optimizer, attr) and hasattr(self.parameters, attr):
+                setattr(self.optimizer, attr, getattr(self.parameters, attr))
         # if self.parameters.frozen_atom_indices is not None:
         #     if isinstance(self.parameters.frozen_atom_indices, str):
         #         self.parameters.frozen_atom_indices = [

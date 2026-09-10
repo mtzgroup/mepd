@@ -129,9 +129,12 @@ class NEBInputs:
         TS-guess |g_perp| and TS-triplet spring-force inf-norm must be below it \
         (default: 0.0 | i.e. no early stop check)
 
-    `negative_steps_thre`: number of steps chain can oscillate until the step size is halved (default: 2)
+    `negative_steps_thre`: number of steps chain can oscillate until the step size is halved
+        (default: 2). Synced onto `NEB.optimizer` at construction time if the optimizer
+        has a same-named attribute (currently only `ConjugateGradient` does).
 
-    `positive_steps_thre`: number of stable steps before increasing the step size (default: 2)
+    `positive_steps_thre`: number of stable steps before increasing the step size
+        (default: 50). Synced onto `NEB.optimizer` the same way as `negative_steps_thre`.
 
     `max_steps`: maximum number of NEB steps allowed (default: 1000)
 
@@ -187,7 +190,7 @@ class NEBInputs:
     early_stop_force_thre: float = 0.0
 
     negative_steps_thre: int = 2
-    positive_steps_thre: int = 2
+    positive_steps_thre: int = 50
     use_geodesic_tangent: bool = False
     do_elem_step_checks: bool = False
     adaptive_resolution: bool = False
@@ -196,8 +199,8 @@ class NEBInputs:
     adaptive_use_energy: bool = True
     adaptive_max_images: int = 25
     adaptive_cooldown_steps: int = 2
-    adaptive_plateau_window: int = 3
-    adaptive_plateau_rtol: float = 0.05
+    adaptive_plateau_window: int = 100
+    adaptive_plateau_rtol: float = 0.01
     plateau_exit_window: int = 50
     plateau_exit_rtol: float = 0.05
     validate_minima_with_hessian: bool = False
