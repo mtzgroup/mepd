@@ -7,6 +7,7 @@ if TYPE_CHECKING:
         ChainInputs,
         GIInputs,
         NEBInputs,
+        NetworkInputs,
         PathMinInputs,
         RunInputs,
     )
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
     from mepd.nodes.node import Node, StructureNode, XYNode
     from mepd.msmep import MSMEP
     from mepd.TreeNode import TreeNode
+    from mepd.pot import Pot
+    from mepd.NetworkBuilder import NetworkBuilder
 
 _CORE_EXPORTS = {
     "Node": ("mepd.nodes.node", "Node"),
@@ -25,14 +28,18 @@ _CORE_EXPORTS = {
     "NEBInputs": ("mepd.inputs", "NEBInputs"),
     "ChainInputs": ("mepd.inputs", "ChainInputs"),
     "GIInputs": ("mepd.inputs", "GIInputs"),
+    "NetworkInputs": ("mepd.inputs", "NetworkInputs"),
     "RunInputs": ("mepd.inputs", "RunInputs"),
     "MSMEP": ("mepd.msmep", "MSMEP"),
+    "Pot": ("mepd.pot", "Pot"),
 }
-# `TreeNode` (the class) is intentionally not re-exported here: the module is
-# also named `mepd.TreeNode`, and Python's import machinery registers that
+# `TreeNode` and `NetworkBuilder` (the classes) are intentionally not
+# re-exported here: their modules are named `mepd.TreeNode`/
+# `mepd.NetworkBuilder` too, and Python's import machinery registers each
 # submodule as an attribute on the `mepd` package as soon as anything imports
 # it -- which permanently shadows a `__getattr__`-based lazy export of the
-# class under the same name. Use `from mepd.TreeNode import TreeNode` instead.
+# class under the same name. Use `from mepd.TreeNode import TreeNode` /
+# `from mepd.NetworkBuilder import NetworkBuilder` instead.
 
 __all__ = sorted([*_CORE_EXPORTS, "engines"])
 

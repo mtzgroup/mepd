@@ -311,6 +311,31 @@ class GIInputs:
 
 
 @dataclass
+class NetworkInputs:
+    """
+    Inputs for NetworkBuilder (network-completion): builds/dedupes a reaction
+    network graph from a set of already-completed MSMEP results. Deliberately
+    minimal -- only the fields NetworkBuilder's core dedup/graph-build path
+    actually reads. The original upstream NetworkInputs also carried CREST/
+    slurm/conformer-sampling settings for an HPC candidate-generation pipeline
+    that isn't part of this port.
+
+    `verbose`: whether to print progress while building the network
+
+    `tolerate_kinks`: whether to include leaf chains with an apparent
+        intermediate minimum in the network construction (if False, such
+        chains are excluded rather than treated as single edges)
+
+    `maximum_barrier_height`: only add edges with a barrier lower than this
+        (kcal/mol)
+    """
+
+    verbose: bool = True
+    tolerate_kinks: bool = True
+    maximum_barrier_height: float = 1000.0
+
+
+@dataclass
 class RunInputs:
     engine_name: str = "chemcloud"
     program: str = "xtb"

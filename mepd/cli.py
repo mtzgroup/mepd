@@ -3,16 +3,16 @@
 This is intentionally a thin CLI, scoped to what this package currently
 supports: running a single- or multi-step nudged-elastic-band (NEB)
 optimization between two endpoint structures (including recursive
-autosplitting via MSMEP, serial or parallel), and transition-state
-optimization. Network-completion CLI commands will be added once that
-feature is ported in a later phase.
+autosplitting via MSMEP, serial or parallel), transition-state
+optimization, and network-completion (building/completing a reaction
+network graph from already-computed MSMEP/IRC results).
 """
 
 from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from qcdata import Structure
@@ -337,6 +337,80 @@ def ts(
     irc_path = output / "irc.xyz"
     irc_chain.write_to_disk(irc_path)
     typer.echo(f"Wrote IRC path to {irc_path}")
+
+
+@app.command("network-build")
+def network_build(
+    tree: List[Path] = typer.Option(
+        ..., "--tree", exists=True, file_okay=False,
+        help="Path to a completed MSMEP output tree directory (as written by "
+        "`mepd run --recursive`/`--parallel` to <output>/tree). Repeatable to "
+        "combine results from multiple runs into one network.",
+    ),
+    output: Path = typer.Option(
+        Path("network.json"), "--output", "-o",
+        help="Path to write the resulting network (Pot) JSON to.",
+    ),
+) -> None:
+    """Build/dedupe a reaction network from one or more completed MSMEP trees."""
+    from mepd.NetworkBuilder import NetworkBuilder
+
+    builder = NetworkBuilder(data_dir=tree[0].parent)
+    try:
+        pot = builder.create_rxn_network_from_paths(list(tree))
+    except Exception as exc:
+        typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    pot.write_to_disk(output)
+    typer.echo(
+        f"Wrote network to {output} "
+        f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
+    )
+
+
+@app.command("irc-network")
+def irc_network(
+    directory: Path = typer.Option(
+        ..., "--dir", exists=True, file_okay=False,
+        help="Directory containing IRC xyz/.energies file pairs.",
+    ),
+    pattern: str = typer.Option(
+        "*.xyz", "--pattern", help="Glob pattern used to find IRC xyz files.",
+    ),
+    recursive: bool = typer.Option(
+        False, "--recursive", help="Search the directory recursively.",
+    ),
+    charge: int = typer.Option(0, "--charge", help="Molecular charge of the IRC structures."),
+    multiplicity: int = typer.Option(
+        1, "--multiplicity", help="Spin multiplicity of the IRC structures.",
+    ),
+    output: Path = typer.Option(
+        Path("network.json"), "--output", "-o",
+        help="Path to write the resulting network (Pot) JSON to.",
+    ),
+) -> None:
+    """Build a reaction network by scanning a directory of IRC xyz/energy pairs."""
+    from mepd.irc_network import build_irc_network
+
+    try:
+        scan = build_irc_network(
+            directory,
+            pattern=pattern,
+            recursive=recursive,
+            charge=charge,
+            multiplicity=multiplicity,
+        )
+    except Exception as exc:
+        typer.echo(f"IRC network construction failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    scan.pot.write_to_disk(output)
+    typer.echo(
+        f"Wrote network to {output} "
+        f"({scan.pot.number_of_nodes} nodes, {scan.pot.graph.number_of_edges()} edges, "
+        f"{len(scan.xyz_files)} files used, {len(scan.skipped_xyz_files)} skipped)"
+    )
 
 
 @app.command("make-default-inputs")
