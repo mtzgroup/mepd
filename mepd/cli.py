@@ -83,6 +83,64 @@ def _load_endpoint(fp: Path, charge: Optional[int], multiplicity: Optional[int])
     return structure
 
 
+def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int = 500) -> dict:
+    keywords = {"coordsys": "cart", "maxit": int(default_maxiter)}
+    keywords.update(dict(getattr(run_inputs, "geometry_optimizer_kwds", {}) or {}))
+    return keywords
+
+
+def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
+    """Optimize the start/end endpoint geometries before building the initial chain.
+
+    Mirrors the source neb-dynamics CLI's `--minimize-ends` behavior: prefer a
+    batched call if the engine supports it, fall back to per-node calls, and on
+    any failure keep the original input geometry rather than aborting the run.
+    """
+    typer.echo("Minimizing input endpoints...")
+    keywords = _geometry_optimizer_keywords(run_inputs)
+    endpoints = [start_node, end_node]
+    labels = ("start", "end")
+
+    batch_optimizer = getattr(run_inputs.engine, "compute_geometry_optimizations", None)
+    if callable(batch_optimizer):
+        try:
+            try:
+                trajectories = batch_optimizer(endpoints, keywords=keywords)
+            except TypeError:
+                trajectories = batch_optimizer(endpoints)
+        except Exception as exc:
+            typer.echo(f"Endpoint batch minimization failed ({type(exc).__name__}: {exc}); keeping input geometries.")
+        else:
+            if not isinstance(trajectories, (list, tuple)) or len(trajectories) < 2:
+                typer.echo("Endpoint batch minimization returned an unexpected result; keeping input geometries.")
+            else:
+                for i, label in enumerate(labels):
+                    trajectory = trajectories[i]
+                    if trajectory:
+                        endpoints[i] = trajectory[-1]
+                    else:
+                        typer.echo(f"{label.capitalize()} endpoint optimization returned an empty trajectory; keeping input geometry.")
+        return endpoints[0], endpoints[1]
+
+    single_optimizer = getattr(run_inputs.engine, "compute_geometry_optimization", None)
+    if not callable(single_optimizer):
+        typer.echo(f"Engine {type(run_inputs.engine).__name__} does not support geometry optimization; keeping input geometries.")
+        return start_node, end_node
+
+    for i, label in enumerate(labels):
+        typer.echo(f"Minimizing {label} endpoint...")
+        try:
+            trajectory = single_optimizer(endpoints[i], keywords=keywords)
+            if trajectory:
+                endpoints[i] = trajectory[-1]
+            else:
+                typer.echo(f"{label.capitalize()} endpoint optimization returned an empty trajectory; keeping input geometry.")
+        except Exception as exc:
+            typer.echo(f"{label.capitalize()} endpoint minimization failed ({type(exc).__name__}: {exc}); keeping input geometry.")
+
+    return endpoints[0], endpoints[1]
+
+
 @app.command("run")
 def run(
     start: Path = typer.Option(..., "--start", exists=True, help="Path to the start-structure xyz file."),
@@ -96,6 +154,10 @@ def run(
     ),
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Override the spin multiplicity on both endpoints."
+    ),
+    minimize_ends: bool = typer.Option(
+        False, "--minimize-ends",
+        help="Optimize the start/end endpoint geometries before running NEB.",
     ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
@@ -113,6 +175,9 @@ def run(
 
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)
+
+    if minimize_ends:
+        start_node, end_node = _minimize_endpoints(start_node, end_node, run_inputs)
 
     seed_chain = Chain.model_validate({
         "nodes": [start_node, end_node],
