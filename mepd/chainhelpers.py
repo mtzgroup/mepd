@@ -521,11 +521,13 @@ def _coords_reordered_to_reference_symbols(
 
 
 def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, return_smoother: bool = False, **kwargs):
-    if isinstance(chain, list) and chain_inputs is None:
-        # print(
-        #     "Warning! You input a list of nodes to interpolate and no ChainInputs. Will use defaults ChainInputs"
-        # )
-        chain_inputs = ChainInputs()
+    if isinstance(chain, list):
+        # A bare node list has no attached ChainInputs of its own; fall back to
+        # defaults if the caller didn't supply any (fixes a bug where passing
+        # both a list and explicit chain_inputs left `chain` as a plain list
+        # and crashed later on `chain.model_copy`).
+        if chain_inputs is None:
+            chain_inputs = ChainInputs()
         chain = Chain.model_validate(
             {'nodes': chain, 'parameters': chain_inputs})
     elif isinstance(chain, Chain):

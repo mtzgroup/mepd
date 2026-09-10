@@ -18,36 +18,6 @@ import tomli_w
 from pathlib import Path
 import warnings
 
-_MLPGI_DEFAULT_PATH_MIN_INPUTS = {
-    # Generic MSMEP behavior flags
-    "skip_identical_graphs": True,
-    "disregard_stereochem": False,
-    "do_elem_step_checks": True,
-    "v": False,
-    # Backend/model options
-    "backend": "auto",
-    "model_path": "esen_sm_conserving_all.pt",
-    "auto_download_model": False,
-    "model_repo": "facebook/OMol25",
-    "model_cache_dir": None,
-    "hf_token": None,
-    "device": None,
-    "dtype": "float32",
-    # Optimizer settings (Table 1 in 10.1021/acs.jctc.5c01221)
-    "fire_stage1_iter": 200,
-    "fire_stage2_iter": 500,
-    "fire_grad_tol": 1e-2,
-    "variance_penalty_weight": 0.0433641,  # 1 kcal/mol in eV
-    "fire_conv_window": 20,
-    "fire_conv_geolen_tol": 0.25,          # kcal/mol (converted to eV internally)
-    "fire_conv_erelpeak_tol": 0.25,        # kcal/mol (converted to eV internally)
-    "refinement_step_interval": 10,
-    "refinement_dynamic_threshold_fraction": 0.1,
-    "tangent_project": True,
-    "climb": True,
-    "alpha_climb": 0.5,
-}
-
 _ASE_OMOL25_DEFAULT_MODEL_PATH = "/home/diptarka/fairchem/esen_sm_conserving_all.pt"
 
 
@@ -436,13 +406,6 @@ class RunInputs:
                 "tmin": 1.2e-3,
                 "v": False,
             }
-        #     default_kwds = FSMInputs()
-        # elif self.path_min_method.upper() == "PYGSM":
-        #     default_kwds = PYGSMInputs()
-
-        if path_method == 'MLPGI':
-            default_kwds = dict(_MLPGI_DEFAULT_PATH_MIN_INPUTS)
-
         if self.path_min_inputs is None:
             self.path_min_inputs = SimpleNamespace(**default_kwds)
 
