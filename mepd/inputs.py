@@ -337,7 +337,7 @@ class NetworkInputs:
 
 @dataclass
 class RunInputs:
-    engine_name: str = "chemcloud"
+    engine_name: str = "gxtb"
     program: str = "xtb"
     chemcloud_queue: str = None
     write_qcio: bool = False
@@ -621,7 +621,13 @@ class RunInputs:
 
         return obj
 
-    def save(self, fp):
+    def to_dict(self) -> dict:
+        """Serialize the config actually in effect (engine_name, program,
+        path_min_inputs/chain_inputs/gi_inputs/etc.) to a plain, TOML-safe
+        dict -- excludes the constructed `engine`/`optimizer` objects
+        themselves. Used by both `save()` (write to a TOML file) and the
+        CLI's run-settings summary (print what's actually being used).
+        """
         def _toml_safe(value):
             if value is None:
                 return None
@@ -652,8 +658,9 @@ class RunInputs:
                     d = d.replace("null", "None")
                     json_dict[key] = eval(d)
 
-        json_dict = _toml_safe(json_dict)
+        return _toml_safe(json_dict)
 
+    def save(self, fp):
+        json_dict = self.to_dict()
         with open(fp, "w+") as f:
-            # json.dump(json_dict, f)
             f.write(tomli_w.dumps(json_dict))

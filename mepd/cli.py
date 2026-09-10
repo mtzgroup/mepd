@@ -23,6 +23,23 @@ from mepd.inputs import NetworkInputs, RunInputs
 app = typer.Typer(help="mepd: minimum-energy-path discovery tools.")
 
 
+def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
+    """Print the settings actually in effect for this run (after any
+    --inputs TOML has been loaded and any CLI-flag overrides applied)."""
+    try:
+        config = run_inputs.to_dict()
+    except Exception:
+        return
+
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.pretty import Pretty
+
+    Console().print(
+        Panel(Pretty(config, expand_all=True), title="RunInputs", border_style="cyan")
+    )
+
+
 def _normalized_path_method(method: str) -> str:
     return str(method or "").strip().upper().replace("_", "-")
 
@@ -379,6 +396,7 @@ def run(
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
+    _echo_run_inputs_summary(run_inputs)
 
     start_structure = _load_endpoint(start, charge, multiplicity)
     end_structure = _load_endpoint(end, charge, multiplicity)
@@ -494,6 +512,7 @@ def ts(
     from mepd.nodes.node import StructureNode
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    _echo_run_inputs_summary(run_inputs)
 
     guess_structure = _load_endpoint(guess, charge, multiplicity)
     guess_node = StructureNode(structure=guess_structure)
