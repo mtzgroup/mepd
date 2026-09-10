@@ -1,14 +1,11 @@
 from __future__ import annotations
-from IPython.display import display, HTML
 import base64
 import io
 import warnings
 
 from typing import List, Union
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
 from numpy.typing import NDArray
 from mepd.helper_functions import get_mass
 from qcdata.view import generate_structure_viewer_html
@@ -665,6 +662,8 @@ def _animate_structure_list(structure_list):
     """
     animates a list of qcio structure objects
     """
+    from IPython.display import display, HTML
+
     structure_html = generate_structure_viewer_html(structure_list)
     return display(HTML(structure_html))
 
@@ -672,6 +671,9 @@ def _animate_structure_list(structure_list):
 def animate_chain_trajectory(
     chain_traj, min_y=-100, max_y=100, max_x=1.1, min_x=-0.1, norm_path_len=True
 ):
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from IPython.display import HTML
 
     figsize = 5
     fig, ax = plt.subplots(figsize=(1.618 * figsize, figsize))
@@ -707,6 +709,8 @@ def generate_neb_plot(
     """
     generate plot of chain
     """
+    import matplotlib.pyplot as plt
+
     try:
         energies = _energies_kcalmol(chain)
     except Exception:
@@ -834,6 +838,8 @@ def get_projections(c: Chain, eigvec, ts_geom=None):
 
 
 def plot_opt_history(chain_trajectory: List[Chain], do_3d=False):
+    import matplotlib.pyplot as plt
+
 
     s = 8
     fs = 18

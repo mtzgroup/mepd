@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Tuple
 import copy
 
-import matplotlib.pyplot as plt
 import numpy as np
 from mepd.convergence_helpers import chain_converged
 from numpy.typing import NDArray
@@ -1009,6 +1008,7 @@ class NEB(PathMinimizer):
         return new_chain
 
     def plot_chain_distances(self):
+        import matplotlib.pyplot as plt
         import mepd.chainhelpers as ch
 
         distances = ch._calculate_chain_distances(self.chain_trajectory)
@@ -1027,6 +1027,8 @@ class NEB(PathMinimizer):
         plt.show()
 
     def plot_grad_delta_mag_history(self):
+        import matplotlib.pyplot as plt
+
         s = 8
         fs = 18
         f, ax = plt.subplots(figsize=(1.16 * s, s))
@@ -1047,6 +1049,8 @@ class NEB(PathMinimizer):
         plt.show()
 
     def plot_projector_history(self, var="gradients"):
+        import matplotlib.pyplot as plt
+
         s = 8
         fs = 18
         f, ax = plt.subplots(figsize=(1.16 * s, s))
@@ -1071,6 +1075,8 @@ class NEB(PathMinimizer):
         plt.show()
 
     def plot_convergence_metrics(self, do_indiv=False):
+        import matplotlib.pyplot as plt
+
         ct = self.chain_trajectory
 
         avg_rms_gperp = []

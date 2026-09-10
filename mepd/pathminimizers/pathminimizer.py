@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from mepd.elementarystep import ElemStepResults
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 import shutil
 
@@ -13,6 +12,7 @@ class PathMinimizer(ABC):
     def optimize_chain(self) -> ElemStepResults: ...
 
     def plot_opt_history(self, do_3d=False):
+        import matplotlib.pyplot as plt
 
         s = 8
         fs = 18

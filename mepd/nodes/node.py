@@ -200,12 +200,13 @@ class StructureNode(Node):
         copy_node._cached_gradient = None
         copy_node._cached_energy = None
 
-        new_struct_dict = copy_node.structure.__dict__.copy()
-        new_struct_dict["geometry"] = new_coords
-        new_struct_dict["charge"] = copy_node.structure.charge
-        new_struct_dict["multiplicity"] = copy_node.structure.multiplicity
-
-        copy_node.structure = Structure(**new_struct_dict)
+        # model_copy skips re-validating the whole Structure (charge/multiplicity/
+        # symbols/etc. are unchanged) -- Structure(**dict) was redoing full pydantic
+        # validation on every single coordinate update, which happens on every
+        # optimizer step for every node.
+        copy_node.structure = copy_node.structure.model_copy(
+            update={"geometry": new_coords}
+        )
         if copy_node.has_molecular_graph and not copy_node._global_disable_molecular_graphs:
             copy_node.graph = structure_to_molecule(copy_node.structure)
         else:

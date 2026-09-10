@@ -4,7 +4,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Union
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from mepd.errors import EnergiesNotComputedError, GradientsNotComputedError
@@ -183,6 +182,8 @@ class Chain(BaseModel):
         return np.array(path_len)
 
     def plot_chain(self, norm_path=True, dist_func="mw_rmsd"):
+        import matplotlib.pyplot as plt
+
         s = 8
         fs = 18
         AVAIL_DISTS = ["mw_rmsd", "geodesic"]
