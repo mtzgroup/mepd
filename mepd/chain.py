@@ -181,37 +181,6 @@ class Chain(BaseModel):
         path_len = cum_sums
         return np.array(path_len)
 
-    def plot_chain(self, norm_path=True, dist_func="mw_rmsd"):
-        import matplotlib.pyplot as plt
-
-        s = 8
-        fs = 18
-        AVAIL_DISTS = ["mw_rmsd", "geodesic"]
-        f, ax = plt.subplots(figsize=(1.16 * s, s))
-
-        if dist_func == "mw_rmsd":
-            path_len = self.path_length
-        elif dist_func == "geodesic":
-            path_len = self.geodesic_path_length
-        else:
-            raise ValueError(
-                f"Invalid dist_func: {dist_func}. Use one of {AVAIL_DISTS}"
-            )
-
-        if norm_path:
-            path_len = path_len / sum(path_len)
-
-        plt.plot(
-            path_len,
-            (self.energies - self.energies[0]) * 627.5,
-            "o--",
-            label="neb",
-        )
-        plt.ylabel("Energy (kcal/mol)", fontsize=fs)
-        plt.xticks(fontsize=fs)
-        plt.yticks(fontsize=fs)
-        plt.show()
-
     def __getitem__(self, index):
         return self.nodes.__getitem__(index)
 

@@ -1,6 +1,4 @@
 from __future__ import annotations
-import base64
-import io
 import warnings
 
 from typing import List, Union
@@ -8,7 +6,6 @@ from typing import List, Union
 import numpy as np
 from numpy.typing import NDArray
 from mepd.helper_functions import get_mass
-from qcdata.view import generate_structure_viewer_html
 from scipy.signal import argrelextrema
 
 from mepd.chain import Chain
@@ -623,7 +620,7 @@ def _calculate_chain_distances(chain_traj: List[Chain]):
             continue
 
         prev_chain = chain_traj[i - 1]
-        dist = prev_chain._distance_to_chain(chain)
+        dist = _distance_to_chain(prev_chain, chain)
         distances.append(dist)
     return np.array(distances)
 
@@ -656,99 +653,6 @@ def extend_by_n_frames(list_obj: List, n: int = 2):
         new_list.extend([value] * n)
 
     return new_list
-
-
-def _animate_structure_list(structure_list):
-    """
-    animates a list of qcio structure objects
-    """
-    from IPython.display import display, HTML
-
-    structure_html = generate_structure_viewer_html(structure_list)
-    return display(HTML(structure_html))
-
-
-def animate_chain_trajectory(
-    chain_traj, min_y=-100, max_y=100, max_x=1.1, min_x=-0.1, norm_path_len=True
-):
-    import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
-    from IPython.display import HTML
-
-    figsize = 5
-    fig, ax = plt.subplots(figsize=(1.618 * figsize, figsize))
-
-    ax.set_xlim(min_x, max_x)
-    ax.set_ylim(min_y, max_y)
-
-    (line,) = ax.plot([], [], "o--", lw=3)
-
-    def animate(chain):
-        if norm_path_len:
-            x = chain.integrated_path_length
-        else:
-            x = chain.path_length
-
-        y = chain.energies_kcalmol
-        line.set_data(x, y)
-        line.set_color("skyblue")
-        return
-
-    ani = FuncAnimation(fig, animate, frames=chain_traj)
-    return HTML(ani.to_jshtml())
-
-
-def generate_neb_plot(
-    chain: List[Node],
-    ind_node,
-    figsize=(6.4, 4.8),
-    grid=True,
-    markersize=20,
-    title="Energies across chain",
-) -> str:
-    """
-    generate plot of chain
-    """
-    import matplotlib.pyplot as plt
-
-    try:
-        energies = _energies_kcalmol(chain)
-    except Exception:
-        print("Cannot plot energies.")
-        return ""
-
-    fig, ax1 = plt.subplots(figsize=figsize)
-    color = "tab:blue"
-    ax1.set_xlabel("Path length")
-    ax1.set_ylabel("Relative energies (kcal/mol)", color=color)
-    markercolors = ["green"] * len(chain)
-    markersizes = [markersize] * len(chain)
-
-    markercolors[ind_node] = "gold"
-    markersizes[ind_node] = markersize + 50
-
-    ax1.plot(path_length(chain=chain), energies, color="green")
-    ax1.scatter(
-        path_length(chain=chain),
-        energies,
-        label="Energy",
-        marker="o",
-        color=markercolors,
-        s=markersizes,
-    )
-
-    ax1.tick_params(axis="y", labelcolor=color)
-    plt.title(title, pad=20)
-    ax1.legend(loc="upper right")
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    image_base64 = base64.b64encode(buf.read()).decode("utf-8")
-    buf.close()
-    plt.close(fig)  # Close the figure to avoid duplicate plots
-    return image_base64
 
 
 def _path_len_dist_func(coords1, coords2, molecular_system: bool = False):
@@ -835,132 +739,6 @@ def get_projections(c: Chain, eigvec, ts_geom=None):
     # plt.plot(all_dists)
     return all_dists
 
-
-
-def plot_opt_history(chain_trajectory: List[Chain], do_3d=False):
-    import matplotlib.pyplot as plt
-
-
-    s = 8
-    fs = 18
-
-    if do_3d:
-        all_chains = chain_trajectory
-
-        ens = np.array([c.energies - c.energies[0] for c in all_chains])
-        all_integrated_path_lengths = np.array(
-            [c.integrated_path_length for c in all_chains]
-        )
-        opt_step = np.array(list(range(len(all_chains))))
-        s = 7
-        fs = 18
-        ax = plt.figure(figsize=(1.16 * s, s)).add_subplot(projection="3d")
-
-        # Plot a sin curve using the x and y axes.
-        x = opt_step
-        ys = all_integrated_path_lengths
-        zs = ens
-        for i, (xind, y) in enumerate(zip(x, ys)):
-            if i < len(ys) - 1:
-                ax.plot(
-                    [xind] * len(y),
-                    y,
-                    "o-",
-                    zs=zs[i],
-                    color="gray",
-                    markersize=3,
-                    alpha=0.1,
-                )
-            else:
-                ax.plot([xind] * len(y), y, "o-", zs=zs[i],
-                        color="blue", markersize=3)
-        ax.grid(False)
-
-        ax.set_xlabel("optimization step", fontsize=fs)
-        ax.set_ylabel("integrated path length", fontsize=fs)
-        ax.set_zlabel("energy (hartrees)", fontsize=fs)
-
-        # Customize the view angle so it's easier to see that the scatter points lie
-        # on the plane y=0
-        ax.view_init(elev=20.0, azim=-45)
-        plt.tight_layout()
-        plt.show()
-
-    else:
-        f, ax = plt.subplots(figsize=(1.16 * s, s))
-
-        for i, chain in enumerate(chain_trajectory):
-            if i == len(chain_trajectory) - 1:
-                plt.plot(chain.integrated_path_length,
-                         chain.energies, "o-", alpha=1)
-            else:
-                plt.plot(
-                    chain.integrated_path_length,
-                    chain.energies,
-                    "o-",
-                    alpha=0.1,
-                    color="gray",
-                )
-
-        plt.xlabel("Integrated path length", fontsize=fs)
-
-        plt.ylabel("Energy (kcal/mol)", fontsize=fs)
-        plt.xticks(fontsize=fs)
-        plt.yticks(fontsize=fs)
-        plt.show()
-
-
-def animate_trajectory(traj, c_irc, xmin=-0.1, xmax=1.1, ymin=-1, ymax=200, return_anim=False, flip_chains=False):
-    import matplotlib.pyplot as plt
-    import matplotlib.animation
-    import numpy as np
-    from IPython.display import HTML
-
-    x = [chain for chain in traj]
-    y = [list(chain.energies_kcalmol) for chain in traj]
-
-    fig, ax = plt.subplots()
-    fs = 18
-
-    l, = ax.plot([], [], 'o-', label='fsm')
-    if c_irc:
-        rxn_coord = get_rxn_coordinate(c_irc)
-        disps = np.array(get_projections(c_irc, rxn_coord))
-        # disps = c_irc.integrated_path_length
-
-        ax.plot(disps, c_irc.energies_kcalmol, '-', color='black', label='irc')
-        ax.scatter([disps[c_irc.energies.argmax()]], [
-                   max(c_irc.energies_kcalmol)], marker='x', color='black', s=50, label='TS')
-
-    # ax.axis([0,1,0,100])
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
-
-    frontconst = 1
-    if flip_chains:
-        frontconst = -1
-
-    def animate(i):
-        if c_irc:
-            disps = np.array(get_projections(
-                traj[i], rxn_coord, ts_geom=c_irc.get_ts_node()))
-            l.set_data(frontconst*disps, traj[i].energies_kcalmol)
-        else:
-            l.set_data(traj[i].integrated_path_length,
-                       traj[i].energies_kcalmol)
-            # l.set_data(traj[i].geodesic_path_length, traj[i].energies_kcalmol)
-
-    ani = matplotlib.animation.FuncAnimation(fig, animate, frames=len(traj))
-    plt.ylabel("Energies (kcal/mol)", fontsize=fs)
-    plt.xlabel("Reaction coordinate", fontsize=fs)
-    plt.xticks(fontsize=fs)
-    plt.yticks(fontsize=fs)
-    plt.legend(fontsize=fs)
-    plt.tight_layout()
-    if return_anim:
-        return ani
-    else:
-        return HTML(ani.to_jshtml())
 
 
 def _select_node_at_dist(

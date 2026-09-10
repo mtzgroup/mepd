@@ -490,18 +490,6 @@ def parse_terachem_input_file(file_path: str | Path) -> dict:
     return parsed
 
 
-def _calculate_chain_distances(chain_traj):
-    distances = [None]  # None for the first chain
-    for i, chain in enumerate(chain_traj):
-        if i == 0:
-            continue
-
-        prev_chain = chain_traj[i - 1]
-        dist = prev_chain._distance_to_chain(chain)
-        distances.append(dist)
-    return np.array(distances)
-
-
 def get_fsm_tsg_from_chain(chain):
     ind_guess = round(len(chain) / 2)
     ind_guesses = [ind_guess-1, ind_guess, ind_guess+1]

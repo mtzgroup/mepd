@@ -18,7 +18,7 @@ dependencies = [
     "qccompute>=0.13.3",
     "qccodec>=0.11.2",
     "qcinf>=0.4.1",
-    "qcdata[view]>=0.18.1",
+    "qcdata>=0.18.1",
     "qcconst>=0.2.1",
     "rdkit>=2025.3.6",
     "scipy>=1.15.3",
@@ -27,6 +27,13 @@ dependencies = [
     "tomli>=2.2.1",
     "tomli-w>=1.2.0",
     "typer>=0.17.4",
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.9.1",
+    "ipython>=8.37.0",
+    "qcdata[view]>=0.18.1",
 ]
 
 [project.scripts]
