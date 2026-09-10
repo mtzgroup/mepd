@@ -53,6 +53,34 @@ def _install_fake_gxtb(monkeypatch, calls=None):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
 
+def _install_fake_gxtb_unconverged_opt(monkeypatch, calls=None):
+    """Fake gxtb whose --opt run reports FAILED TO CONVERGE, mirroring a real
+    optimization that exhausted its iteration budget without converging."""
+
+    def fake_run(cmd, cwd, env, text, capture_output, check):
+        if calls is not None:
+            calls.append(cmd)
+        if "--opt" in cmd:
+            xyz_path = cwd / cmd[1]
+            (cwd / "xtbopt.xyz").write_text(
+                xyz_path.read_text().replace("Frame 0", "energy: -76.0")
+            )
+            stdout = "   *** FAILED TO CONVERGE GEOMETRY OPTIMIZATION IN 1 ITERATIONS ***\n"
+        else:
+            (cwd / "energy").write_text(
+                "$energy\n     1   -76.0   -76.0   -76.0\n$end\n"
+            )
+            (cwd / "gradient").write_text(
+                "   1.0E-03   0.0E+00   2.0E-03\n"
+                "  -1.0E-03   0.0E+00  -1.0E-03\n"
+                "   0.0E+00   0.0E+00  -1.0E-03\n"
+            )
+            stdout = "normal termination"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
 def _run_inputs_for_test() -> RunInputs:
     return RunInputs(
         engine_name="gxtb",
@@ -208,6 +236,35 @@ def test_cli_run_minimize_ends(tmp_path, monkeypatch, capsys):
     assert any("--opt" in call for call in calls)
     out = capsys.readouterr().out
     assert "Minimizing input endpoints" in out
+
+
+def test_cli_run_minimize_ends_hard_stops_on_nonconvergence(tmp_path, monkeypatch, capsys):
+    _install_fake_gxtb_unconverged_opt(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(0.3).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    with pytest.raises(typer.Exit) as exc_info:
+        _call_run(
+            start=start_fp,
+            end=end_fp,
+            inputs=inputs_fp,
+            minimize_ends=True,
+            output=output_dir,
+        )
+
+    assert exc_info.value.exit_code == 1
+    out = capsys.readouterr().out
+    assert "did not converge" in out
+    assert "Provide an already-minimized structure" in out
+    assert "geometry_optimizer_kwds" in out
+    assert not (output_dir / "mep_output.xyz").exists()
 
 
 def test_cli_run_rejects_recursive_and_parallel_together(tmp_path):

@@ -40,6 +40,13 @@ class ElectronicStructureError(Exception):
         super().__init__(self.msg)
 
 
+class GeometryOptimizationNotConvergedError(ElectronicStructureError):
+    """Raised when a geometry optimization ran to completion but the
+    underlying program reported it did not actually converge (as opposed to
+    crashing or being unsupported) -- e.g. it exhausted its iteration budget.
+    """
+
+
 class ExternalProgramError(ElectronicStructureError):
     program: str
     original_exception: Exception | None

@@ -21,6 +21,7 @@ from mepd.engines.engine import Engine, build_hessian_result_from_matrix
 from mepd.errors import (
     ElectronicStructureError,
     EnergiesNotComputedError,
+    GeometryOptimizationNotConvergedError,
     GradientsNotComputedError,
 )
 from mepd.fakeoutputs import FakeQCIOOutput, FakeQCIOResults
@@ -30,6 +31,30 @@ from mepd.qcdata_structure_helpers import ase_atoms_to_structure
 
 
 _TOTAL_ENERGY_RE = re.compile(r"TOTAL ENERGY\s+(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)\s+Eh")
+_OPT_FAILED_RE = re.compile(r"FAILED TO CONVERGE GEOMETRY OPTIMIZATION IN (\d+) ITERATIONS", re.IGNORECASE)
+_OPT_CONVERGED_RE = re.compile(r"GEOMETRY OPTIMIZATION CONVERGED AFTER (\d+) ITERATIONS", re.IGNORECASE)
+
+
+def _check_gxtb_optimization_converged(stdout: str, *, maxiter: int | None) -> None:
+    """Raise if g-xTB's own output reports the optimization did not converge.
+
+    g-xTB happily returns its last frame (via xtbopt.xyz/xtbopt.log) even when
+    it simply ran out of optimization cycles -- there is no other signal in
+    the returned trajectory that distinguishes "already at a minimum" from
+    "gave up mid-optimization". Only stdout says which one actually happened.
+    """
+    failed = _OPT_FAILED_RE.search(stdout)
+    if failed is None:
+        return
+    iterations = failed.group(1)
+    budget_note = f" (iteration budget: {int(maxiter)})" if maxiter is not None else ""
+    raise GeometryOptimizationNotConvergedError(
+        msg=(
+            f"g-xTB geometry optimization did not converge in {iterations} iterations"
+            f"{budget_note}. Refusing to treat an unconverged geometry as a minimum."
+        ),
+        obj=stdout,
+    )
 
 
 class _GXTBASEResultsCalculator(Calculator):
@@ -335,6 +360,7 @@ class GXTBCalculator(Engine):
                     cwd=workdir,
                     optimize=True,
                 )
+                _check_gxtb_optimization_converged(completed.stdout, maxiter=maxiter)
                 try:
                     opt_nodes = self._parse_optimization_trajectory(
                         node=node,

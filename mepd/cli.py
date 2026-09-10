@@ -90,13 +90,38 @@ def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int 
     return keywords
 
 
+def _refuse_unconverged_endpoint(label: str, exc: Exception, run_inputs: RunInputs) -> None:
+    """Hard-stop: an endpoint failed to actually converge during --minimize-ends.
+
+    Unlike other minimization failures (engine doesn't support optimization,
+    a transient crash), a reported non-convergence means we'd otherwise hand
+    NEB an endpoint that isn't really a minimum -- silently proceeding would
+    make the whole run meaningless. Refuse instead of guessing.
+    """
+    current_maxiter = _geometry_optimizer_keywords(run_inputs).get("maxit")
+    typer.echo(
+        f"{label.capitalize()} endpoint minimization did not converge: {exc}\n"
+        "Refusing to proceed with an un-minimized endpoint.\n"
+        "Options:\n"
+        "  1. Provide an already-minimized structure for this endpoint instead of using --minimize-ends.\n"
+        "  2. Increase the optimizer's iteration budget by setting maxit (or maxiter) under "
+        f"[geometry_optimizer_kwds] in your RunInputs TOML (current: {current_maxiter})."
+    )
+    raise typer.Exit(code=1)
+
+
 def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
     """Optimize the start/end endpoint geometries before building the initial chain.
 
     Mirrors the source neb-dynamics CLI's `--minimize-ends` behavior: prefer a
-    batched call if the engine supports it, fall back to per-node calls, and on
-    any failure keep the original input geometry rather than aborting the run.
+    batched call if the engine supports it, fall back to per-node calls. Most
+    failures (engine doesn't support optimization, a transient crash) keep the
+    original input geometry with a warning rather than aborting the run -- but
+    a reported non-convergence (GeometryOptimizationNotConvergedError) is a
+    hard stop, since silently continuing would run NEB on a non-minimum.
     """
+    from mepd.errors import GeometryOptimizationNotConvergedError
+
     typer.echo("Minimizing input endpoints...")
     keywords = _geometry_optimizer_keywords(run_inputs)
     endpoints = [start_node, end_node]
@@ -109,6 +134,8 @@ def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
                 trajectories = batch_optimizer(endpoints, keywords=keywords)
             except TypeError:
                 trajectories = batch_optimizer(endpoints)
+        except GeometryOptimizationNotConvergedError as exc:
+            _refuse_unconverged_endpoint("an", exc, run_inputs)
         except Exception as exc:
             typer.echo(f"Endpoint batch minimization failed ({type(exc).__name__}: {exc}); keeping input geometries.")
         else:
@@ -136,6 +163,8 @@ def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
                 endpoints[i] = trajectory[-1]
             else:
                 typer.echo(f"{label.capitalize()} endpoint optimization returned an empty trajectory; keeping input geometry.")
+        except GeometryOptimizationNotConvergedError as exc:
+            _refuse_unconverged_endpoint(label, exc, run_inputs)
         except Exception as exc:
             typer.echo(f"{label.capitalize()} endpoint minimization failed ({type(exc).__name__}: {exc}); keeping input geometry.")
 
