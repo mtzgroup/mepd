@@ -170,15 +170,6 @@ class NEBInputs:
 
     `hessian_minima_rescue_displacement`: displacement, in bohr, applied along the
         lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
-
-    `network_splits_max_followup_requests`: maximum number of follow-up recursive
-        network-split requests queued after the initial request_0 run
-
-    `recursive_split_max_depth`: maximum recursive split depth allowed before
-        stopping further subdivision, even if a branch is still non-elementary
-
-    `recursive_same_pair_split_limit`: maximum number of consecutive recursive
-        splits allowed for the same endpoint pair along one branch
     """
 
     climb: bool = False
@@ -212,9 +203,6 @@ class NEBInputs:
     validate_minima_with_hessian: bool = False
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
-    network_splits_max_followup_requests: int = 1000
-    recursive_split_max_depth: int = 200
-    recursive_same_pair_split_limit: int = 5
 
     max_steps: float = 500
 
@@ -629,14 +617,12 @@ class RunInputs:
             if 'input' in key:
                 json_dict[key] = _serialize_input_value(val)
             elif 'program_kwds' in key:
-                d = val.json()
-
-                if d != None:
+                if val is None:
+                    json_dict[key] = ""
+                else:
+                    d = val.json()
                     d = d.replace("null", "None")
                     json_dict[key] = eval(d)
-                else:
-                    d = ""
-                    json_dict[key] = d
 
         json_dict = _toml_safe(json_dict)
 
