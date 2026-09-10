@@ -4,12 +4,14 @@ import subprocess
 
 import numpy as np
 import pytest
+import typer
 from qcdata import Structure
 
-from mepd.cli import _build_path_minimizer, run as cli_run
+from mepd.cli import _build_path_minimizer, run as cli_run, ts as cli_ts
 from mepd.chain import Chain
 from mepd.inputs import RunInputs
 from mepd.nodes.node import StructureNode
+from mepd.engines.gxtb import GXTBCalculator
 
 
 def _water(x_offset: float = 0.0) -> Structure:
@@ -34,7 +36,6 @@ def _install_fake_gxtb(monkeypatch, calls=None):
             calls.append(cmd)
         if "--opt" in cmd:
             xyz_path = cwd / cmd[1]
-            natoms_line = xyz_path.read_text().splitlines()[0]
             (cwd / "xtbopt.xyz").write_text(
                 xyz_path.read_text().replace("Frame 0", "energy: -76.0")
             )
@@ -60,6 +61,47 @@ def _run_inputs_for_test() -> RunInputs:
         gi_inputs={"nimages": 4},
         path_min_inputs={"max_steps": 2, "v": False, "do_elem_step_checks": False},
     )
+
+
+def _call_run(**overrides):
+    """Invoke the `run` CLI command as a plain function with every parameter
+    given an explicit value.
+
+    This matters: calling a Typer-decorated function directly (bypassing the
+    Click/Typer runtime) does NOT resolve `typer.Option(...)` defaults to
+    their wrapped values -- any parameter not passed explicitly keeps the raw
+    `OptionInfo` object, which is truthy regardless of its wrapped default
+    (`bool(typer.Option(False, ...))` is `True`). Omitting a boolean flag here
+    would silently turn it "on". Always route calls through this helper.
+    """
+    kwargs = dict(
+        start=None,
+        end=None,
+        inputs=None,
+        charge=None,
+        multiplicity=None,
+        minimize_ends=False,
+        recursive=False,
+        parallel=False,
+        parallel_workers=None,
+        output=None,
+    )
+    kwargs.update(overrides)
+    return cli_run(**kwargs)
+
+
+def _call_ts(**overrides):
+    """Same rationale as `_call_run` -- see its docstring."""
+    kwargs = dict(
+        guess=None,
+        inputs=None,
+        charge=None,
+        multiplicity=None,
+        irc=False,
+        output=None,
+    )
+    kwargs.update(overrides)
+    return cli_ts(**kwargs)
 
 
 def test_build_path_minimizer_dispatches_neb(monkeypatch):
@@ -100,17 +142,11 @@ def test_cli_run_writes_trajectory(tmp_path, monkeypatch):
     _run_inputs_for_test().save(inputs_fp)
 
     output_dir = tmp_path / "out"
-    cli_run(
-        start=start_fp,
-        end=end_fp,
-        inputs=inputs_fp,
-        charge=None,
-        multiplicity=None,
-        output=output_dir,
-    )
+    _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir)
 
     assert (output_dir / "mep_output.xyz").exists()
     assert len(calls) > 0
+    assert not any("--opt" in call for call in calls), "should not minimize ends by default"
 
 
 def test_cli_run_applies_charge_and_multiplicity(tmp_path, monkeypatch):
@@ -133,7 +169,7 @@ def test_cli_run_applies_charge_and_multiplicity(tmp_path, monkeypatch):
     _run_inputs_for_test().save(inputs_fp)
 
     output_dir = tmp_path / "out"
-    cli_run(
+    _call_run(
         start=start_fp,
         end=end_fp,
         inputs=inputs_fp,
@@ -160,12 +196,10 @@ def test_cli_run_minimize_ends(tmp_path, monkeypatch, capsys):
     _run_inputs_for_test().save(inputs_fp)
 
     output_dir = tmp_path / "out"
-    cli_run(
+    _call_run(
         start=start_fp,
         end=end_fp,
         inputs=inputs_fp,
-        charge=None,
-        multiplicity=None,
         minimize_ends=True,
         output=output_dir,
     )
@@ -174,3 +208,147 @@ def test_cli_run_minimize_ends(tmp_path, monkeypatch, capsys):
     assert any("--opt" in call for call in calls)
     out = capsys.readouterr().out
     assert "Minimizing input endpoints" in out
+
+
+def test_cli_run_rejects_recursive_and_parallel_together(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_run(
+            start=tmp_path / "start.xyz",
+            end=tmp_path / "end.xyz",
+            output=tmp_path / "out",
+            recursive=True,
+            parallel=True,
+        )
+
+
+def _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch):
+    """A fake gxtb whose energy actually varies with geometry.
+
+    `_install_fake_gxtb` above always returns the same fixed energy/gradient
+    regardless of input coordinates, which is fine for tests that only check
+    the compute plumbing fires -- but MSMEP's endpoint-identity check
+    (`is_identical`, comparing energies within `node_ene_thre`) then sees zero
+    energy difference between ANY two endpoints and legitimately concludes
+    they're the same species, short-circuiting before any real splitting
+    logic runs. This variant ties energy to geometry so endpoints that are
+    actually far apart are correctly treated as distinct.
+    """
+
+    def fake_run(cmd, cwd, env, text, capture_output, check):
+        xyz_path = cwd / cmd[1]
+        lines = xyz_path.read_text().splitlines()
+        coords = np.array([
+            [float(x) for x in line.split()[1:4]] for line in lines[2:2 + int(lines[0])]
+        ])
+        energy = -76.0 + 0.01 * float(np.sum(coords**2))
+        (cwd / "energy").write_text(f"$energy\n     1   {energy:.8f}   {energy:.8f}   {energy:.8f}\n$end\n")
+        grad_lines = "\n".join(
+            f"   {1.0E-03:.4E}   {0.0:.4E}   {2.0E-03:.4E}" for _ in coords
+        )
+        (cwd / "gradient").write_text(grad_lines + "\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="normal termination", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_cli_run_recursive_writes_tree_and_summary(tmp_path, monkeypatch):
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp,
+        end=end_fp,
+        inputs=inputs_fp,
+        recursive=True,
+        output=output_dir,
+    )
+
+    assert (output_dir / "tree").exists()
+    assert (output_dir / "tree" / "adj_matrix.txt").exists()
+    assert (output_dir / "mep_output.xyz").exists()
+
+
+def test_ts_command_writes_optimized_structure(tmp_path, monkeypatch, capsys):
+    guess_fp = tmp_path / "guess.xyz"
+    guess_fp.write_text(_water().to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    def fake_compute_transition_state(self, node, keywords=None):
+        return node
+
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state", fake_compute_transition_state
+    )
+
+    output_dir = tmp_path / "ts_out"
+    _call_ts(guess=guess_fp, inputs=inputs_fp, output=output_dir)
+
+    ts_path = output_dir / "ts.xyz"
+    assert ts_path.exists()
+    out = capsys.readouterr().out
+    assert "Wrote optimized TS structure" in out
+
+
+def test_ts_command_reports_failure_without_crashing(tmp_path, monkeypatch, capsys):
+    guess_fp = tmp_path / "guess.xyz"
+    guess_fp.write_text(_water().to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    def failing_compute_transition_state(self, node, keywords=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state", failing_compute_transition_state
+    )
+
+    output_dir = tmp_path / "ts_out_fail"
+    with pytest.raises(typer.Exit):
+        _call_ts(guess=guess_fp, inputs=inputs_fp, output=output_dir)
+
+    out = capsys.readouterr().out
+    assert "Transition-state optimization failed" in out
+    assert not (output_dir / "ts.xyz").exists()
+
+
+def test_ts_command_with_irc(tmp_path, monkeypatch, capsys):
+    guess_fp = tmp_path / "guess.xyz"
+    guess_fp.write_text(_water().to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    def fake_compute_transition_state(self, node, keywords=None):
+        return node
+
+    def fake_compute_irc_chain(self, ts_node, keywords=None):
+        return Chain.model_validate({
+            "nodes": [ts_node, ts_node.copy()],
+            "parameters": _run_inputs_for_test().chain_inputs,
+        })
+
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state", fake_compute_transition_state
+    )
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_irc_chain", fake_compute_irc_chain, raising=False
+    )
+
+    output_dir = tmp_path / "ts_irc_out"
+    _call_ts(guess=guess_fp, inputs=inputs_fp, irc=True, output=output_dir)
+
+    assert (output_dir / "ts.xyz").exists()
+    assert (output_dir / "irc.xyz").exists()
+    out = capsys.readouterr().out
+    assert "Wrote IRC path" in out

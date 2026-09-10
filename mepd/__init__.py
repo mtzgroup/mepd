@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     )
     from mepd.neb import NEB
     from mepd.nodes.node import Node, StructureNode, XYNode
+    from mepd.msmep import MSMEP
+    from mepd.TreeNode import TreeNode
 
 _CORE_EXPORTS = {
     "Node": ("mepd.nodes.node", "Node"),
@@ -24,7 +26,13 @@ _CORE_EXPORTS = {
     "ChainInputs": ("mepd.inputs", "ChainInputs"),
     "GIInputs": ("mepd.inputs", "GIInputs"),
     "RunInputs": ("mepd.inputs", "RunInputs"),
+    "MSMEP": ("mepd.msmep", "MSMEP"),
 }
+# `TreeNode` (the class) is intentionally not re-exported here: the module is
+# also named `mepd.TreeNode`, and Python's import machinery registers that
+# submodule as an attribute on the `mepd` package as soon as anything imports
+# it -- which permanently shadows a `__getattr__`-based lazy export of the
+# class under the same name. Use `from mepd.TreeNode import TreeNode` instead.
 
 __all__ = sorted([*_CORE_EXPORTS, "engines"])
 
