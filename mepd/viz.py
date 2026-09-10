@@ -249,31 +249,6 @@ def plot_chain_distances(neb) -> None:
     plt.show()
 
 
-def plot_grad_delta_mag_history(neb) -> None:
-    """Known broken, pre-existing upstream (not a port regression): calls
-    `Chain._gradient_delta_mags`, which doesn't exist anywhere in this
-    package or the upstream neb-dynamics source. Left as-is rather than
-    guessing at the intended implementation.
-    """
-    import matplotlib.pyplot as plt
-
-    s = 8
-    fs = 18
-    plt.subplots(figsize=(1.16 * s, s))
-    projs = []
-    for i, chain in enumerate(neb.chain_trajectory):
-        if i == 0:
-            continue
-        prev_chain = neb.chain_trajectory[i - 1]
-        projs.append(prev_chain._gradient_delta_mags(chain))
-    plt.plot(projs)
-    plt.ylabel("NEB |∆gradient|", fontsize=fs)
-    plt.yticks(fontsize=fs)
-    plt.xticks(fontsize=fs)
-    plt.xlabel("Optimization step", fontsize=fs)
-    plt.show()
-
-
 def plot_projector_history(neb, var="gradients") -> None:
     import matplotlib.pyplot as plt
 
