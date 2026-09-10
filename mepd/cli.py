@@ -339,7 +339,7 @@ def run(
         "(guards against combinatorial blowup, especially with --network-completion-mode all-to-all).",
     ),
     validate_minima_with_hessian: bool = typer.Option(
-        True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian",
+        True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
         help="When a minima-based autosplit is proposed during MSMEP, compute "
         "Hessians for optimized split candidates and reject candidates with "
         "significant imaginary modes. On by default -- this is a correctness "
@@ -621,6 +621,7 @@ def irc_network(
 
 
 @app.command("make-default-inputs")
+@app.command("defaults")
 def make_default_inputs(
     output: Path = typer.Option(
         Path("mepd_inputs.toml"), "--output", "-o",
