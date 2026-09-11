@@ -90,9 +90,11 @@ class Chain(BaseModel):
             grad_shape_path = grad_shape_path_old
 
         if energies_fp.exists() and grad_path.exists() and grad_shape_path.exists():
-            energies = np.loadtxt(energies_fp)
-            gradients_flat = np.loadtxt(grad_path)
-            gradients_shape = np.loadtxt(grad_shape_path).astype(int)
+            # np.loadtxt collapses a file with a single value (e.g. a
+            # one-node chain) to a 0-d array, which isn't iterable below.
+            energies = np.atleast_1d(np.loadtxt(energies_fp))
+            gradients_flat = np.atleast_1d(np.loadtxt(grad_path))
+            gradients_shape = np.atleast_1d(np.loadtxt(grad_shape_path)).astype(int)
 
             gradients = gradients_flat.reshape(gradients_shape).tolist()
 

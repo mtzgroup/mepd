@@ -851,6 +851,53 @@ def hessian_sample(
         raise typer.Exit(code=1)
 
 
+@app.command("visualize")
+def visualize(
+    result_path: Path = typer.Argument(
+        ..., exists=True,
+        help="Path to a chain xyz file (e.g. mep_output.xyz, unique.xyz). "
+        "A matching <stem>.energies sidecar, if present, is used for the energy profile.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o",
+        help="Output HTML file path. Defaults to <result_path stem>_visualize.html "
+        "next to the input.",
+    ),
+    charge: int = typer.Option(0, "--charge", help="Charge used when reading the xyz geometries."),
+    multiplicity: int = typer.Option(
+        1, "--multiplicity", help="Spin multiplicity used when reading the xyz geometries."
+    ),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Do not automatically open the HTML file in a browser."
+    ),
+) -> None:
+    """Render an interactive 3D structure viewer (plus energy profile, if
+    available) for a chain xyz file. Requires the `viz` extra
+    (pip install "mepd\\[viz]")."""
+    from mepd.inputs import ChainInputs
+
+    try:
+        from mepd import viz
+        html = viz.render_chain_html(
+            Chain.from_xyz(result_path, ChainInputs(), charge=charge, spinmult=multiplicity),
+            title=result_path.stem,
+        )
+    except ImportError as exc:
+        typer.echo(
+            f"Visualization requires the optional `viz` extra: pip install mepd[viz] ({exc})"
+        )
+        raise typer.Exit(code=1)
+
+    out_fp = output if output is not None else result_path.parent / f"{result_path.stem}_visualize.html"
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    out_fp.write_text(html, encoding="utf-8")
+    typer.echo(f"Wrote visualization to {out_fp}")
+
+    if not no_open:
+        import webbrowser
+        webbrowser.open(out_fp.resolve().as_uri())
+
+
 @app.command("network-build")
 def network_build(
     tree: List[Path] = typer.Option(

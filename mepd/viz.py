@@ -129,6 +129,41 @@ def generate_neb_plot(
     return image_base64
 
 
+_3DMOL_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js"></script>'
+
+
+def render_chain_html(chain: Chain, title: str = "mepd chain visualization") -> str:
+    """Render a standalone HTML page: an interactive 3D structure viewer for
+    every frame in `chain`, plus an embedded energy-profile plot if the chain
+    already has computed energies. Used by `mepd visualize`.
+    """
+    from qcdata.view import generate_structure_viewer_html
+
+    structures = [node.structure for node in chain.nodes]
+    viewer_html = generate_structure_viewer_html(structures)
+
+    plot_html = ""
+    if chain._energies_already_computed and len(chain) > 1:
+        ind_node = int(np.argmax(chain.energies))
+        image_base64 = generate_neb_plot(chain.nodes, ind_node=ind_node, title="Energy profile")
+        if image_base64:
+            plot_html = f'<img src="data:image/png;base64,{image_base64}" style="max-width:100%;"/>'
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+{_3DMOL_CDN_SCRIPT}
+</head>
+<body>
+<h2>{title}</h2>
+{plot_html}
+{viewer_html}
+</body>
+</html>"""
+
+
 def plot_opt_history(chain_trajectory: List[Chain], do_3d: bool = False) -> None:
     """Plot a NEB/MSMEP optimization's energy-profile history.
 
