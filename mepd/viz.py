@@ -132,55 +132,65 @@ def generate_neb_plot(
 _3DMOL_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js"></script>'
 
 
+def _energy_profile_svg(energies_kcal: List[float], width: int = 640, height: int = 220) -> str:
+    """A minimal inline SVG line plot (frame index vs. relative energy) whose
+    points are individually addressable by id (`point-<i>`), so JS can
+    restyle one of them into a highlighted "bead" without redrawing the plot.
+    """
+    n = len(energies_kcal)
+    margin = 36
+    plot_w = width - 2 * margin
+    plot_h = height - 2 * margin
+    y_min, y_max = min(energies_kcal), max(energies_kcal)
+    if y_min == y_max:
+        y_max = y_min + 1.0
+
+    def sx(i: int) -> float:
+        return margin + (i / max(n - 1, 1)) * plot_w
+
+    def sy(e: float) -> float:
+        return margin + (1 - (e - y_min) / (y_max - y_min)) * plot_h
+
+    points = [(sx(i), sy(e)) for i, e in enumerate(energies_kcal)]
+    polyline_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    circles = "".join(
+        f'<circle id="point-{i}" cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#18834a" '
+        f'style="cursor:pointer" onclick="renderFrame({i})" />'
+        for i, (x, y) in enumerate(points)
+    )
+    return f"""<svg id="energySvg" viewBox="0 0 {width} {height}" width="100%">
+<rect x="0" y="0" width="{width}" height="{height}" fill="white" />
+<text x="{width / 2}" y="16" text-anchor="middle" font-size="13" fill="#222">Energy profile (kcal/mol vs. frame 0) -- click a point to jump to that frame</text>
+<polyline fill="none" stroke="#18834a" stroke-width="2" points="{polyline_pts}" />
+{circles}
+</svg>"""
+
+
 def render_chain_html(
     chain: Chain,
     title: str = "mepd chain visualization",
     show_atom_indices: bool = False,
 ) -> str:
-    """Render a standalone HTML page: an interactive 3D structure viewer for
-    every frame in `chain`, plus an embedded energy-profile plot if the chain
-    already has computed energies. Used by `mepd visualize`.
-
-    Each frame is labeled with its node index and (when energies are
-    available) its relative energy, with the highest-energy frame flagged as
-    the TS guess -- so a specific frame can be identified for follow-up
-    (e.g. `mepd ts --guess`) without cross-referencing the plain xyz file.
+    """Render a standalone HTML page with an interactive frame scrubber: a
+    slider steps through every frame in `chain`, updating the 3D structure
+    viewer and highlighting the corresponding point ("bead") on the
+    energy-profile plot in lockstep -- so a specific frame (e.g. the apparent
+    TS) can be identified by index for follow-up (`mepd ts --guess`) while
+    seeing exactly where it sits on the energy profile. Used by
+    `mepd visualize`.
     """
+    import json
+
     from qcdata.view import generate_structure_viewer_html
 
     structures = [node.structure for node in chain.nodes]
     n = len(structures)
-    titles = [f"Frame {i}" for i in range(n)]
+    has_energies = chain._energies_already_computed and n > 1
+    ind_ts = int(np.argmax(chain.energies)) if has_energies else None
 
-    subtitles = None
-    subtitles_extra = None
-    ind_ts = None
-    if chain._energies_already_computed and n > 1:
-        energies_kcal = chain.energies_kcalmol
-        subtitles = [f"{e:+.2f} kcal/mol" for e in energies_kcal]
-        ind_ts = int(np.argmax(chain.energies))
-        subtitles_extra = [" (TS guess)" if i == ind_ts else "" for i in range(n)]
-
-    # generate_structure_viewer_html takes *structs variadically -- passing
-    # `structures` as a single positional arg (instead of unpacked) makes it
-    # a length-1 tuple containing one list, which desyncs zip_longest against
-    # the per-frame titles/subtitles (every frame past the first gets padded
-    # with None and crashes). Unpack so each frame gets its own panel.
-    viewer_html = generate_structure_viewer_html(
-        *structures,
-        titles=titles,
-        subtitles=subtitles,
-        subtitles_extra=subtitles_extra,
-        show_indices=show_atom_indices,
-    )
-
-    plot_html = ""
-    if chain._energies_already_computed and n > 1:
-        image_base64 = generate_neb_plot(chain.nodes, ind_node=ind_ts, title="Energy profile")
-        if image_base64:
-            plot_html = f'<img src="data:image/png;base64,{image_base64}" style="max-width:100%;"/>'
-
-    return f"""<!doctype html>
+    if n == 1:
+        viewer_html = generate_structure_viewer_html(structures[0], titles=["Frame 0"])
+        return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -189,8 +199,71 @@ def render_chain_html(
 </head>
 <body>
 <h2>{title}</h2>
-{plot_html}
 {viewer_html}
+</body>
+</html>"""
+
+    # Pre-render one standalone structure-viewer document per frame; the
+    # slider swaps an <iframe>'s srcdoc between them (base64-encoded so the
+    # per-frame HTML -- which itself contains '<', '"', backticks -- can sit
+    # safely inside a JS string literal without escaping).
+    frame_docs_b64 = []
+    for i, structure in enumerate(structures):
+        frame_viewer = generate_structure_viewer_html(
+            structure, titles=[f"Frame {i}"], show_indices=show_atom_indices
+        )
+        frame_doc = (
+            f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"{_3DMOL_CDN_SCRIPT}</head><body>{frame_viewer}</body></html>"
+        )
+        frame_docs_b64.append(base64.b64encode(frame_doc.encode("utf-8")).decode("ascii"))
+
+    energy_labels = []
+    plot_html = ""
+    if has_energies:
+        energies_kcal = list(chain.energies_kcalmol)
+        energy_labels = [f"{e:+.2f} kcal/mol" for e in energies_kcal]
+        plot_html = _energy_profile_svg(energies_kcal)
+
+    frames_json = json.dumps(frame_docs_b64)
+    energy_labels_json = json.dumps(energy_labels)
+    ts_note = f'if (i === {ind_ts}) note += " (TS guess)";' if ind_ts is not None else ""
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+</head>
+<body>
+<h2>{title}</h2>
+<label for="frameSlider">Frame: <span id="frameLabel">0</span> <span id="frameEnergy"></span></label><br/>
+<input id="frameSlider" type="range" min="0" max="{n - 1}" value="0" step="1" style="width: min(720px, 90vw);" />
+<div id="plotContainer">{plot_html}</div>
+<iframe id="structureFrame" style="width: 100%; height: 520px; border: 0;" title="Structure viewer"></iframe>
+<script>
+const frameDocs = {frames_json};
+const energyLabels = {energy_labels_json};
+function renderFrame(i) {{
+  document.getElementById("frameSlider").value = String(i);
+  document.getElementById("frameLabel").textContent = String(i);
+  let note = energyLabels[i] || "";
+  {ts_note}
+  document.getElementById("frameEnergy").textContent = note;
+  document.getElementById("structureFrame").srcdoc = atob(frameDocs[i]);
+  document.querySelectorAll("#energySvg circle").forEach((c) => {{
+    c.setAttribute("r", "4");
+    c.setAttribute("fill", "#18834a");
+  }});
+  const point = document.getElementById("point-" + i);
+  if (point) {{
+    point.setAttribute("r", "8");
+    point.setAttribute("fill", "#f59e0b");
+  }}
+}}
+document.getElementById("frameSlider").addEventListener("input", (e) => renderFrame(parseInt(e.target.value, 10)));
+renderFrame({ind_ts if ind_ts is not None else 0});
+</script>
 </body>
 </html>"""
 
