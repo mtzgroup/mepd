@@ -118,6 +118,8 @@ def _call_run(**overrides):
         validate_minima_with_hessian=True,
         hessian_minimum_frequency_cutoff=0.0,
         hessian_minima_rescue_displacement=0.1,
+        use_tsopt=False,
+        irc=False,
         output=None,
     )
     kwargs.update(overrides)
@@ -348,6 +350,110 @@ def test_cli_run_recursive_writes_tree_and_summary(tmp_path, monkeypatch):
     assert (output_dir / "tree").exists()
     assert (output_dir / "tree" / "adj_matrix.txt").exists()
     assert (output_dir / "mep_output.xyz").exists()
+
+
+def test_cli_run_use_tsopt_writes_ts_per_leaf_when_recursive(tmp_path, monkeypatch):
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state",
+        lambda self, node, keywords=None: node,
+    )
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, recursive=True,
+        output=output_dir, use_tsopt=True,
+    )
+
+    assert (output_dir / "mep_output.xyz").exists()
+    ts_leaf_files = list(output_dir.glob("ts_leaf_*.xyz"))
+    assert len(ts_leaf_files) >= 1
+
+
+def test_cli_run_rejects_irc_without_use_tsopt(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_run(
+            start=tmp_path / "start.xyz",
+            end=tmp_path / "end.xyz",
+            output=tmp_path / "out",
+            irc=True,
+        )
+
+
+def test_cli_run_use_tsopt_writes_ts_after_single_neb(tmp_path, monkeypatch):
+    """Regression coverage: mepd run used to have no way to automatically
+    launch a TS optimization on its own result, unlike the upstream
+    neb-dynamics `run --use-tsopt` this was ported from.
+
+    Deliberately does not use capsys here: mepd/progress.py holds a
+    module-level rich Console() constructed once at import time, and a
+    capsys-captured stdout immediately followed by a rich-progress-heavy
+    recursive run elsewhere in this file corrupts it ("I/O operation on
+    closed file") -- pre-existing pytest/capsys/rich interaction, unrelated
+    to this feature. File existence is sufficient to verify the behavior.
+    """
+    _install_fake_gxtb(monkeypatch)
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state",
+        lambda self, node, keywords=None: node,
+    )
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir, use_tsopt=True,
+    )
+
+    assert (output_dir / "mep_output.xyz").exists()
+    assert (output_dir / "ts.xyz").exists()
+
+
+def test_cli_run_use_tsopt_with_irc_after_single_neb(tmp_path, monkeypatch):
+    _install_fake_gxtb(monkeypatch)
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state",
+        lambda self, node, keywords=None: node,
+    )
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_irc_chain",
+        lambda self, ts_node, keywords=None: Chain.model_validate({
+            "nodes": [ts_node, ts_node.copy()],
+            "parameters": _run_inputs_for_test().chain_inputs,
+        }),
+        raising=False,
+    )
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir,
+        use_tsopt=True, irc=True,
+    )
+
+    assert (output_dir / "ts.xyz").exists()
+    assert (output_dir / "irc.xyz").exists()
 
 
 def test_cli_run_network_completion_still_writes_mep_output(tmp_path, monkeypatch):

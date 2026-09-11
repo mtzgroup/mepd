@@ -404,6 +404,74 @@ def _run_network_completion(
     )
 
 
+def _optimize_ts_and_irc(
+    ts_guess_node,
+    run_inputs: RunInputs,
+    output: Path,
+    *,
+    run_irc: bool,
+    label: str = "ts",
+):
+    """Optimize a TS-guess node with the engine and, if requested, follow up
+    with an IRC -- writes <label>.xyz (and <label>_irc.xyz) into `output`.
+
+    Shared by `ts` and `run --use-tsopt`. Never raises/exits itself: returns
+    the optimized StructureNode, or None on failure/no support, so each
+    caller decides whether that is fatal (a standalone `ts` invocation should
+    exit non-zero; a TS opt launched automatically after `run` should just
+    warn and let the NEB result stand).
+    """
+    from mepd.nodes.node import StructureNode
+
+    compute_ts = getattr(run_inputs.engine, "compute_transition_state", None)
+    if not callable(compute_ts):
+        typer.echo(
+            f"Engine {type(run_inputs.engine).__name__} does not support "
+            "transition-state optimization."
+        )
+        return None
+
+    typer.echo(f"Optimizing transition state ({label})...")
+    try:
+        result = compute_ts(node=ts_guess_node)
+    except Exception as exc:
+        typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
+        return None
+
+    if not isinstance(result, StructureNode):
+        typer.echo(
+            f"Transition-state optimization did not converge to a usable structure "
+            f"({label}; engine returned {type(result).__name__})."
+        )
+        return None
+
+    ts_node = result
+    output.mkdir(parents=True, exist_ok=True)
+    ts_path = output / f"{label}.xyz"
+    ts_path.write_text(ts_node.structure.to_xyz())
+    typer.echo(f"Wrote optimized TS structure to {ts_path}")
+
+    if not run_irc:
+        return ts_node
+
+    typer.echo(f"Computing IRC ({label})...")
+    irc_fn = getattr(run_inputs.engine, "compute_irc_chain", None)
+    try:
+        if callable(irc_fn):
+            irc_chain = irc_fn(ts_node)
+        else:
+            from mepd.irc import compute_irc_chain_with_geometric
+            irc_chain = compute_irc_chain_with_geometric(run_inputs.engine, ts_node)
+    except Exception as exc:
+        typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
+        return ts_node
+
+    irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
+    irc_chain.write_to_disk(irc_path)
+    typer.echo(f"Wrote IRC path to {irc_path}")
+    return ts_node
+
+
 @app.command("run")
 def run(
     start: Path = typer.Option(..., "--start", exists=True, help="Path to the start-structure xyz file."),
@@ -470,6 +538,16 @@ def run(
         help="Displacement (bohr) applied along the lowest-frequency mode when "
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
+    use_tsopt: bool = typer.Option(
+        False, "--use-tsopt",
+        help="After the NEB/MSMEP run, automatically optimize a transition state "
+        "from each result's TS-guess node (the highest-energy interior image). "
+        "Failure is a warning, not a fatal error -- the NEB result still stands.",
+    ),
+    irc: bool = typer.Option(
+        False, "--irc",
+        help="Follow up each --use-tsopt transition state with an IRC. Requires --use-tsopt.",
+    ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
         help="Directory to write the optimized trajectory/energies into.",
@@ -487,6 +565,8 @@ def run(
         raise typer.BadParameter(
             "--network-completion-mode must be 'linear' or 'all-to-all'."
         )
+    if irc and not use_tsopt:
+        raise typer.BadParameter("--irc requires --use-tsopt.")
     if network_completion and not recursive and not parallel:
         typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
         recursive = True
@@ -575,6 +655,18 @@ def run(
         out_path = output / "mep_output.xyz"
         final_chain.write_to_disk(out_path)
         typer.echo(f"Wrote assembled output path to {out_path}")
+
+        if use_tsopt:
+            for leaf in history.ordered_leaves:
+                if not leaf.data or not leaf.data.chain_trajectory:
+                    continue
+                _optimize_ts_and_irc(
+                    leaf.data.chain_trajectory[-1].get_ts_node(),
+                    run_inputs,
+                    output,
+                    run_irc=irc,
+                    label=f"ts_leaf_{leaf.index}",
+                )
         return
 
     minimizer = _build_path_minimizer(initial_chain, run_inputs)
@@ -592,6 +684,9 @@ def run(
     out_path = output / "mep_output.xyz"
     final_chain.write_to_disk(out_path)
     typer.echo(f"Wrote optimized path to {out_path}")
+
+    if use_tsopt:
+        _optimize_ts_and_irc(final_chain.get_ts_node(), run_inputs, output, run_irc=irc, label="ts")
 
 
 @app.command("ts")
@@ -624,52 +719,9 @@ def ts(
     guess_structure = _load_endpoint(guess, charge, multiplicity)
     guess_node = StructureNode(structure=guess_structure)
 
-    compute_ts = getattr(run_inputs.engine, "compute_transition_state", None)
-    if not callable(compute_ts):
-        typer.echo(
-            f"Engine {type(run_inputs.engine).__name__} does not support "
-            "transition-state optimization."
-        )
+    ts_node = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label="ts")
+    if ts_node is None:
         raise typer.Exit(code=1)
-
-    typer.echo("Optimizing transition state...")
-    try:
-        result = compute_ts(node=guess_node)
-    except Exception as exc:
-        typer.echo(f"Transition-state optimization failed: {type(exc).__name__}: {exc}")
-        raise typer.Exit(code=1)
-
-    if not isinstance(result, StructureNode):
-        typer.echo(
-            "Transition-state optimization did not converge to a usable structure "
-            f"(engine returned {type(result).__name__})."
-        )
-        raise typer.Exit(code=1)
-
-    ts_node = result
-    output.mkdir(parents=True, exist_ok=True)
-    ts_path = output / "ts.xyz"
-    ts_path.write_text(ts_node.structure.to_xyz())
-    typer.echo(f"Wrote optimized TS structure to {ts_path}")
-
-    if not irc:
-        return
-
-    typer.echo("Computing IRC...")
-    irc_fn = getattr(run_inputs.engine, "compute_irc_chain", None)
-    try:
-        if callable(irc_fn):
-            irc_chain = irc_fn(ts_node)
-        else:
-            from mepd.irc import compute_irc_chain_with_geometric
-            irc_chain = compute_irc_chain_with_geometric(run_inputs.engine, ts_node)
-    except Exception as exc:
-        typer.echo(f"IRC computation failed ({type(exc).__name__}: {exc}); TS structure was still written.")
-        return
-
-    irc_path = output / "irc.xyz"
-    irc_chain.write_to_disk(irc_path)
-    typer.echo(f"Wrote IRC path to {irc_path}")
 
 
 @app.command("hessian-sample")
