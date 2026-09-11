@@ -527,10 +527,19 @@ def run(
 
     if recursive or parallel:
         from mepd.msmep import MSMEP
+        from mepd.TreeNode import TreeNode
 
         tree_path = output / "tree"
         if network_completion and (tree_path / "adj_matrix.txt").exists():
             typer.echo(f"Skipping initial MSMEP run: {tree_path} already complete.")
+            history = TreeNode.read_from_disk(
+                tree_path,
+                neb_parameters=run_inputs.path_min_inputs,
+                chain_parameters=run_inputs.chain_inputs,
+                gi_parameters=run_inputs.gi_inputs,
+                optimizer=run_inputs.optimizer,
+                engine=run_inputs.engine,
+            )
         else:
             msmep = MSMEP(inputs=run_inputs)
             if parallel:
@@ -557,7 +566,6 @@ def run(
                 parallel=parallel,
                 parallel_workers=parallel_workers,
             )
-            return
 
         try:
             final_chain = history.output_chain

@@ -456,6 +456,12 @@ class RunInputs:
         else:
             self.gi_inputs = GIInputs(**self.gi_inputs)
 
+        if self.program_kwds == "":
+            # TOML has no native null; to_dict()/save() writes an absent
+            # program_kwds as "" so it round-trips through TOML, but that
+            # leaves it as the string "" (not None) after RunInputs.open().
+            self.program_kwds = None
+
         if self.program_kwds is None:
             if self.engine_name == "gxtb":
                 program_args = None

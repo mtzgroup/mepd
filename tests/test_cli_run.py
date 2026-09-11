@@ -350,6 +350,35 @@ def test_cli_run_recursive_writes_tree_and_summary(tmp_path, monkeypatch):
     assert (output_dir / "mep_output.xyz").exists()
 
 
+def test_cli_run_network_completion_still_writes_mep_output(tmp_path, monkeypatch):
+    """Regression test: --network-completion used to `return` right after
+    _run_network_completion, before ever reaching the code that assembles and
+    writes mep_output.xyz -- so the final path was silently never written."""
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp,
+        end=end_fp,
+        inputs=inputs_fp,
+        recursive=True,
+        network_completion=True,
+        output=output_dir,
+    )
+
+    assert (output_dir / "tree" / "adj_matrix.txt").exists()
+    assert (output_dir / "network.json").exists()
+    assert (output_dir / "mep_output.xyz").exists()
+
+
 def test_ts_command_writes_optimized_structure(tmp_path, monkeypatch, capsys):
     guess_fp = tmp_path / "guess.xyz"
     guess_fp.write_text(_water().to_xyz())
