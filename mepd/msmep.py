@@ -707,7 +707,12 @@ class MSMEP:
                 attempt_payload["consecutive_same_pair_splits"] = int(
                     same_pair_split_count
                 )
-            if same_pair_split_count >= same_pair_split_limit:
+            if same_pair_split_count >= same_pair_split_limit and not elem_step_results.new_structures:
+                # Only enforce the stop when this attempt itself found nothing
+                # chemically new (genuinely unproductive repetition) -- a
+                # split that DID discover a new molecule/conformer this
+                # generation is real progress and must not be discarded just
+                # because prior generations repeated the same pair.
                 msg = self._same_pair_split_limit_message(same_pair_split_count)
                 if _get_verbose(self.inputs):
                     print(f"Warning! {msg}")
@@ -892,7 +897,9 @@ class MSMEP:
             attempt_payload["consecutive_same_pair_splits"] = int(
                 same_pair_split_count
             )
-        if same_pair_split_count >= same_pair_split_limit:
+        if same_pair_split_count >= same_pair_split_limit and not elem_step_results.new_structures:
+            # See the identical guard in run_recursive_minimize: only enforce
+            # the stop when this attempt itself found nothing chemically new.
             msg = self._same_pair_split_limit_message(same_pair_split_count)
             if _get_verbose(self.inputs):
                 print(f"Warning! {msg}")

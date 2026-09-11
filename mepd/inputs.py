@@ -173,6 +173,14 @@ class NEBInputs:
 
     `hessian_minima_rescue_displacement`: displacement, in bohr, applied along the
         lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
+
+    `recursive_same_pair_split_limit`: during recursive autosplitting, if a branch
+        repeats the exact same (start, end) endpoint pair this many times in a row
+        with no new chemistry found (a genuinely unproductive loop -- a split that
+        DOES discover a new molecule/conformer is never cut off by this), stop
+        splitting that branch further rather than recursing forever. For floppy
+        systems that legitimately need more attempts before finding a real
+        intermediate, raise this (default: 5).
     """
 
     climb: bool = True
@@ -206,6 +214,7 @@ class NEBInputs:
     validate_minima_with_hessian: bool = False
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
+    recursive_same_pair_split_limit: int = 5
 
     max_steps: float = 2000
 

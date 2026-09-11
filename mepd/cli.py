@@ -538,6 +538,14 @@ def run(
         help="Displacement (bohr) applied along the lowest-frequency mode when "
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
+    same_pair_split_limit: int = typer.Option(
+        5, "--same-pair-split-limit",
+        help="If a branch repeats the exact same (start, end) endpoint pair this "
+        "many times in a row with no new chemistry found, stop splitting that "
+        "branch further. A split that DOES discover a new molecule/conformer is "
+        "never cut off by this. Raise it for floppy systems that legitimately "
+        "need more attempts before finding a real intermediate.",
+    ),
     use_tsopt: bool = typer.Option(
         False, "--use-tsopt",
         help="After the NEB/MSMEP run, automatically optimize a transition state "
@@ -567,6 +575,8 @@ def run(
         )
     if irc and not use_tsopt:
         raise typer.BadParameter("--irc requires --use-tsopt.")
+    if same_pair_split_limit <= 0:
+        raise typer.BadParameter("--same-pair-split-limit must be a positive integer.")
     if network_completion and not recursive and not parallel:
         typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
         recursive = True
@@ -575,6 +585,7 @@ def run(
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
+    run_inputs.path_min_inputs.recursive_same_pair_split_limit = same_pair_split_limit
     _echo_run_inputs_summary(run_inputs)
 
     start_structure = _load_endpoint(start, charge, multiplicity)

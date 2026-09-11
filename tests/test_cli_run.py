@@ -118,6 +118,7 @@ def _call_run(**overrides):
         validate_minima_with_hessian=True,
         hessian_minimum_frequency_cutoff=0.0,
         hessian_minima_rescue_displacement=0.1,
+        same_pair_split_limit=5,
         use_tsopt=False,
         irc=False,
         output=None,
@@ -386,6 +387,46 @@ def test_cli_run_rejects_irc_without_use_tsopt(tmp_path):
             output=tmp_path / "out",
             irc=True,
         )
+
+
+def test_cli_run_rejects_nonpositive_same_pair_split_limit(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_run(
+            start=tmp_path / "start.xyz",
+            end=tmp_path / "end.xyz",
+            output=tmp_path / "out",
+            same_pair_split_limit=0,
+        )
+
+
+def test_cli_run_wires_same_pair_split_limit_into_path_min_inputs(tmp_path, monkeypatch):
+    _install_fake_gxtb(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    seen = {}
+    import mepd.cli as cli_module
+    real_summary = cli_module._echo_run_inputs_summary
+
+    def spy(run_inputs):
+        seen["limit"] = run_inputs.path_min_inputs.recursive_same_pair_split_limit
+        return real_summary(run_inputs)
+
+    monkeypatch.setattr(cli_module, "_echo_run_inputs_summary", spy)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir,
+        same_pair_split_limit=42,
+    )
+
+    assert seen["limit"] == 42
 
 
 def test_cli_run_use_tsopt_writes_ts_after_single_neb(tmp_path, monkeypatch):
