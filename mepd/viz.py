@@ -132,140 +132,390 @@ def generate_neb_plot(
 _3DMOL_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js"></script>'
 
 
-def _energy_profile_svg(energies_kcal: List[float], width: int = 640, height: int = 220) -> str:
-    """A minimal inline SVG line plot (frame index vs. relative energy) whose
-    points are individually addressable by id (`point-<i>`), so JS can
-    restyle one of them into a highlighted "bead" without redrawing the plot.
-    """
-    n = len(energies_kcal)
-    margin = 36
-    plot_w = width - 2 * margin
-    plot_h = height - 2 * margin
-    y_min, y_max = min(energies_kcal), max(energies_kcal)
-    if y_min == y_max:
-        y_max = y_min + 1.0
-
-    def sx(i: int) -> float:
-        return margin + (i / max(n - 1, 1)) * plot_w
-
-    def sy(e: float) -> float:
-        return margin + (1 - (e - y_min) / (y_max - y_min)) * plot_h
-
-    points = [(sx(i), sy(e)) for i, e in enumerate(energies_kcal)]
-    polyline_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-    circles = "".join(
-        f'<circle id="point-{i}" cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#18834a" '
-        f'style="cursor:pointer" onclick="renderFrame({i})" />'
-        for i, (x, y) in enumerate(points)
-    )
-    return f"""<svg id="energySvg" viewBox="0 0 {width} {height}" width="100%">
-<rect x="0" y="0" width="{width}" height="{height}" fill="white" />
-<text x="{width / 2}" y="16" text-anchor="middle" font-size="13" fill="#222">Energy profile (kcal/mol vs. frame 0) -- click a point to jump to that frame</text>
-<polyline fill="none" stroke="#18834a" stroke-width="2" points="{polyline_pts}" />
-{circles}
-</svg>"""
+def _chain_payload(chain: Chain) -> dict:
+    """One chain's worth of interactive-viewer data: every frame's xyz text
+    (already Angstrom-scaled, straight from qcdata -- no extra conversion
+    needed) plus, when available, each frame's relative energy and which
+    frame is the apparent TS (energy maximum)."""
+    n = len(chain)
+    has_energies = chain._energies_already_computed and n > 1
+    energies_kcal = list(chain.energies_kcalmol) if has_energies else None
+    ts_index = int(np.argmax(chain.energies)) if has_energies else None
+    frames = [
+        {
+            "xyz": node.structure.to_xyz(),
+            "energy_kcal": energies_kcal[i] if energies_kcal else None,
+        }
+        for i, node in enumerate(chain.nodes)
+    ]
+    return {"frames": frames, "ts_index": ts_index}
 
 
-def render_chain_html(
-    chain: Chain,
-    title: str = "mepd chain visualization",
+def _trajectory_payload(minimizer) -> list[dict]:
+    """One NEB/PathMinimizer's optimization trajectory: one chain payload per
+    optimization step, in order. Falls back to whatever single chain is
+    available (`optimized` or `initial_chain`) if the full step-by-step
+    trajectory was not kept."""
+    trajectory = list(getattr(minimizer, "chain_trajectory", None) or [])
+    if not trajectory:
+        fallback = getattr(minimizer, "optimized", None) or getattr(minimizer, "initial_chain", None)
+        trajectory = [fallback] if fallback is not None else []
+    return [_chain_payload(c) for c in trajectory if c is not None and len(c) > 0]
+
+
+def _tree_nodes_payload(tree) -> list[dict]:
+    """Flatten a TreeNode split-tree into a list of selectable nodes, each
+    carrying its own optimization trajectory. Nodes with no recoverable NEB
+    data (failed splits) are skipped, but their children are still walked
+    (re-parented to the nearest visualizable ancestor) so the tree stays
+    connected."""
+    nodes: list[dict] = []
+
+    def walk(node, depth: int, parent_index) -> None:
+        next_parent = parent_index
+        data = getattr(node, "data", None)
+        if data is not None:
+            trajectory = _trajectory_payload(data)
+            if trajectory:
+                label = f"Node {node.index}" + (" (leaf)" if node.is_leaf else "")
+                nodes.append({
+                    "index": int(node.index),
+                    "depth": depth,
+                    "parent": parent_index,
+                    "label": label,
+                    "trajectory": trajectory,
+                })
+                next_parent = int(node.index)
+        for child in node.children:
+            walk(child, depth + 1, next_parent)
+
+    walk(tree, 0, None)
+    return nodes
+
+
+def _network_edges_payload(pot) -> list[dict]:
+    """Flatten a reaction-network `Pot` graph into a list of selectable
+    edges, each carrying every candidate chain found for that edge
+    (`list_of_nebs`) as its "trajectory" -- reusing the same step-slider
+    concept as an optimization trajectory, since both are just "which chain
+    among several for this edge/step do I want to look at right now"."""
+    nodes: list[dict] = []
+    for i, j, edge_data in pot.graph.edges(data=True):
+        chains = edge_data.get("list_of_nebs") or []
+        trajectory = [_chain_payload(c) for c in chains if c is not None and len(c) > 0]
+        if not trajectory:
+            continue
+        nodes.append({
+            "index": len(nodes),
+            "source": int(i),
+            "target": int(j),
+            "label": f"Edge {i}→{j}",
+            "trajectory": trajectory,
+        })
+    return nodes
+
+
+def render_visualization_html(
+    obj,
+    title: str = "mepd visualization",
     show_atom_indices: bool = False,
 ) -> str:
-    """Render a standalone HTML page with an interactive frame scrubber: a
-    slider steps through every frame in `chain`, updating the 3D structure
-    viewer and highlighting the corresponding point ("bead") on the
-    energy-profile plot in lockstep -- so a specific frame (e.g. the apparent
-    TS) can be identified by index for follow-up (`mepd ts --guess`) while
-    seeing exactly where it sits on the energy profile. Used by
-    `mepd visualize`.
+    """Render a standalone, self-contained HTML page for interactively
+    exploring a `Chain`, a `NEB`/`PathMinimizer` optimization run, a full
+    `TreeNode` MSMEP split-tree, or a reaction-network `Pot` graph --
+    whichever was given.
+
+    One consistent widget handles all four, with controls that appear only
+    when there is something to navigate:
+      - Tree or network diagram (only for a TreeNode/Pot with more than one
+        visualizable node/edge): click a tree node or a network edge to load
+        its optimization run.
+      - Trajectory-step slider (only if the selected run kept more than one
+        optimization step, or the selected network edge has more than one
+        candidate chain): scrub through them.
+      - Frame slider (always): steps through the beads of whichever chain is
+        currently selected, updating the 3D structure viewer and
+        highlighting the matching point ("bead") on the energy-profile plot
+        in lockstep. Opens on the TS guess (energy maximum) by default.
+
+    Needs only a browser (3Dmol.js loaded from a CDN) -- no matplotlib,
+    IPython, or qcdata's view extra, unlike the rest of this module.
     """
     import json
 
-    from qcdata.view import generate_structure_viewer_html
+    from mepd.pathminimizers.pathminimizer import PathMinimizer
+    from mepd.pot import Pot
+    from mepd.TreeNode import TreeNode
 
-    structures = [node.structure for node in chain.nodes]
-    n = len(structures)
-    has_energies = chain._energies_already_computed and n > 1
-    ind_ts = int(np.argmax(chain.energies)) if has_energies else None
+    diagram_kind = None  # "tree", "network", or None (single chain/run, no diagram)
+    diagram_obj = None
 
-    if n == 1:
-        viewer_html = generate_structure_viewer_html(structures[0], titles=["Frame 0"])
-        return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-{_3DMOL_CDN_SCRIPT}
-</head>
-<body>
-<h2>{title}</h2>
-{viewer_html}
-</body>
-</html>"""
-
-    # Pre-render one standalone structure-viewer document per frame; the
-    # slider swaps an <iframe>'s srcdoc between them (base64-encoded so the
-    # per-frame HTML -- which itself contains '<', '"', backticks -- can sit
-    # safely inside a JS string literal without escaping).
-    frame_docs_b64 = []
-    for i, structure in enumerate(structures):
-        frame_viewer = generate_structure_viewer_html(
-            structure, titles=[f"Frame {i}"], show_indices=show_atom_indices
+    if isinstance(obj, TreeNode):
+        nodes = _tree_nodes_payload(obj)
+        if not nodes:
+            raise ValueError("Tree has no recoverable optimization data to visualize.")
+        diagram_kind, diagram_obj = "tree", nodes
+    elif isinstance(obj, Pot):
+        nodes = _network_edges_payload(obj)
+        if not nodes:
+            raise ValueError("Network has no edges with recoverable chains to visualize.")
+        diagram_kind, diagram_obj = "network", (obj, nodes)
+    elif isinstance(obj, PathMinimizer):
+        trajectory = _trajectory_payload(obj)
+        if not trajectory:
+            raise ValueError("This object has no chain trajectory to visualize.")
+        nodes = [{"index": 0, "depth": 0, "parent": None, "label": title, "trajectory": trajectory}]
+    elif isinstance(obj, Chain):
+        nodes = [{"index": 0, "depth": 0, "parent": None, "label": title, "trajectory": [_chain_payload(obj)]}]
+    else:
+        raise TypeError(
+            f"Cannot visualize object of type {type(obj).__name__}; "
+            "expected a Chain, a NEB/PathMinimizer, a TreeNode, or a Pot."
         )
-        frame_doc = (
-            f"<!doctype html><html><head><meta charset='utf-8'>"
-            f"{_3DMOL_CDN_SCRIPT}</head><body>{frame_viewer}</body></html>"
-        )
-        frame_docs_b64.append(base64.b64encode(frame_doc.encode("utf-8")).decode("ascii"))
 
-    energy_labels = []
-    plot_html = ""
-    if has_energies:
-        energies_kcal = list(chain.energies_kcalmol)
-        energy_labels = [f"{e:+.2f} kcal/mol" for e in energies_kcal]
-        plot_html = _energy_profile_svg(energies_kcal)
+    nodes_json = json.dumps(nodes)
 
-    frames_json = json.dumps(frame_docs_b64)
-    energy_labels_json = json.dumps(energy_labels)
-    ts_note = f'if (i === {ind_ts}) note += " (TS guess)";' if ind_ts is not None else ""
+    tree_html = ""
+    if diagram_kind == "tree" and len(diagram_obj) > 1:
+        tree_html = _tree_svg(diagram_obj)
+    elif diagram_kind == "network":
+        pot, edge_nodes = diagram_obj
+        tree_html = _network_svg(pot, edge_nodes)
 
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
+{_3DMOL_CDN_SCRIPT}
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; }}
+  #viewerContainer {{ width: 100%; height: 480px; position: relative; }}
+  input[type=range] {{ width: min(720px, 90vw); }}
+</style>
 </head>
 <body>
 <h2>{title}</h2>
+<div id="treeContainer">{tree_html}</div>
+<div id="stepControls" style="display:none;">
+  <label for="stepSlider">Optimization step: <span id="stepLabel">0</span> / <span id="stepMax">0</span></label><br/>
+  <input id="stepSlider" type="range" min="0" max="0" value="0" step="1" />
+</div>
 <label for="frameSlider">Frame: <span id="frameLabel">0</span> <span id="frameEnergy"></span></label><br/>
-<input id="frameSlider" type="range" min="0" max="{n - 1}" value="0" step="1" style="width: min(720px, 90vw);" />
-<div id="plotContainer">{plot_html}</div>
-<iframe id="structureFrame" style="width: 100%; height: 520px; border: 0;" title="Structure viewer"></iframe>
+<input id="frameSlider" type="range" min="0" max="0" value="0" step="1" />
+<div id="plotContainer"></div>
+<div id="viewerContainer"></div>
 <script>
-const frameDocs = {frames_json};
-const energyLabels = {energy_labels_json};
+const nodes = {nodes_json};
+const nodesByIndex = Object.fromEntries(nodes.map((n) => [n.index, n]));
+const showAtomIndices = {"true" if show_atom_indices else "false"};
+let currentNode = nodes[0];
+let currentStep = 0;
+let currentFrame = 0;
+let glviewer = null;
+
+function showStructureXyz(xyzText) {{
+  if (!glviewer) {{
+    glviewer = $3Dmol.createViewer(document.getElementById("viewerContainer"), {{backgroundColor: "white"}});
+  }}
+  glviewer.clear();
+  glviewer.removeAllLabels();
+  const model = glviewer.addModel(xyzText, "xyz");
+  glviewer.setStyle({{}}, {{stick: {{}}, sphere: {{scale: 0.3}}}});
+  if (showAtomIndices) {{
+    model.selectedAtoms({{}}).forEach((atom, idx) => {{
+      glviewer.addLabel(String(idx), {{
+        position: {{x: atom.x, y: atom.y, z: atom.z}},
+        fontSize: 10, showBackground: false, fontColor: "black",
+      }});
+    }});
+  }}
+  glviewer.zoomTo();
+  glviewer.render();
+}}
+
+function renderEnergyPlot(frames, width, height) {{
+  width = width || 640;
+  height = height || 220;
+  const container = document.getElementById("plotContainer");
+  const energies = frames.map((f) => f.energy_kcal);
+  if (energies.some((e) => e === null || e === undefined)) {{
+    container.innerHTML = "";
+    return;
+  }}
+  const margin = 36;
+  const plotW = width - 2 * margin;
+  const plotH = height - 2 * margin;
+  let yMin = Math.min(...energies);
+  let yMax = Math.max(...energies);
+  if (yMin === yMax) yMax = yMin + 1.0;
+  const n = energies.length;
+  const sx = (i) => margin + (i / Math.max(n - 1, 1)) * plotW;
+  const sy = (e) => margin + (1 - (e - yMin) / (yMax - yMin)) * plotH;
+  const points = energies.map((e, i) => [sx(i), sy(e)]);
+  const polyline = points.map(([x, y]) => `${{x.toFixed(1)}},${{y.toFixed(1)}}`).join(" ");
+  const circles = points.map(([x, y], i) => (
+    `<circle id="point-${{i}}" cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#18834a" `
+    + `style="cursor:pointer" onclick="renderFrame(${{i}})" />`
+  )).join("");
+  container.innerHTML = (
+    `<svg id="energySvg" viewBox="0 0 ${{width}} ${{height}}" width="100%">`
+    + `<rect x="0" y="0" width="${{width}}" height="${{height}}" fill="white" />`
+    + `<text x="${{width / 2}}" y="16" text-anchor="middle" font-size="13" fill="#222">`
+    + `Energy profile (kcal/mol vs. frame 0) -- click a point to jump to that frame</text>`
+    + `<polyline fill="none" stroke="#18834a" stroke-width="2" points="${{polyline}}" />`
+    + circles + `</svg>`
+  );
+}}
+
 function renderFrame(i) {{
-  document.getElementById("frameSlider").value = String(i);
-  document.getElementById("frameLabel").textContent = String(i);
-  let note = energyLabels[i] || "";
-  {ts_note}
+  const chain = currentNode.trajectory[currentStep];
+  currentFrame = Math.max(0, Math.min(i, chain.frames.length - 1));
+  const frame = chain.frames[currentFrame];
+  document.getElementById("frameSlider").max = String(chain.frames.length - 1);
+  document.getElementById("frameSlider").value = String(currentFrame);
+  document.getElementById("frameLabel").textContent = String(currentFrame);
+  let note = frame.energy_kcal === null || frame.energy_kcal === undefined
+    ? "" : frame.energy_kcal.toFixed(2) + " kcal/mol";
+  if (chain.ts_index !== null && currentFrame === chain.ts_index) note += " (TS guess)";
   document.getElementById("frameEnergy").textContent = note;
-  document.getElementById("structureFrame").srcdoc = atob(frameDocs[i]);
+  showStructureXyz(frame.xyz);
   document.querySelectorAll("#energySvg circle").forEach((c) => {{
     c.setAttribute("r", "4");
     c.setAttribute("fill", "#18834a");
   }});
-  const point = document.getElementById("point-" + i);
+  const point = document.getElementById("point-" + currentFrame);
   if (point) {{
     point.setAttribute("r", "8");
     point.setAttribute("fill", "#f59e0b");
   }}
 }}
+
+function selectStep(step) {{
+  const trajectory = currentNode.trajectory;
+  currentStep = Math.max(0, Math.min(step, trajectory.length - 1));
+  const chain = trajectory[currentStep];
+  document.getElementById("stepControls").style.display = trajectory.length > 1 ? "block" : "none";
+  document.getElementById("stepSlider").max = String(trajectory.length - 1);
+  document.getElementById("stepSlider").value = String(currentStep);
+  document.getElementById("stepLabel").textContent = String(currentStep);
+  document.getElementById("stepMax").textContent = String(trajectory.length - 1);
+  renderEnergyPlot(chain.frames);
+  renderFrame(chain.ts_index !== null ? chain.ts_index : 0);
+}}
+
+function selectNode(index) {{
+  currentNode = nodesByIndex[index];
+  document.querySelectorAll("#treeContainer [data-default-width]").forEach((el) => {{
+    el.setAttribute("stroke-width", el.getAttribute("data-default-width"));
+  }});
+  const selected = document.getElementById("tree-node-" + index);
+  if (selected) {{
+    selected.setAttribute("stroke-width", String(2 * parseFloat(selected.getAttribute("data-default-width"))));
+  }}
+  selectStep(currentNode.trajectory.length - 1);
+}}
+
+document.getElementById("stepSlider").addEventListener("input", (e) => selectStep(parseInt(e.target.value, 10)));
 document.getElementById("frameSlider").addEventListener("input", (e) => renderFrame(parseInt(e.target.value, 10)));
-renderFrame({ind_ts if ind_ts is not None else 0});
+selectNode(nodes[0].index);
 </script>
 </body>
 </html>"""
+
+
+def _tree_svg(nodes: list[dict], width: int = 900, height: int = 220) -> str:
+    """A minimal split-tree diagram: one clickable circle per selectable
+    node, laid out by depth (y) and sibling order at that depth (x), with
+    lines to each node's parent. Clicking a node loads its optimization run
+    into the frame scrubber below."""
+    by_depth: dict[int, list[dict]] = {}
+    for node in nodes:
+        by_depth.setdefault(node["depth"], []).append(node)
+
+    max_depth = max(by_depth)
+    top_pad, bottom_pad, side_pad = 30, 30, 40
+    positions: dict[int, tuple[float, float]] = {}
+    for depth, siblings in by_depth.items():
+        y = top_pad if max_depth == 0 else top_pad + depth * (height - top_pad - bottom_pad) / max_depth
+        for i, node in enumerate(siblings):
+            x = width / 2 if len(siblings) == 1 else side_pad + i * (width - 2 * side_pad) / (len(siblings) - 1)
+            positions[node["index"]] = (x, y)
+
+    lines = []
+    for node in nodes:
+        if node["parent"] is not None and node["parent"] in positions:
+            px, py = positions[node["parent"]]
+            x, y = positions[node["index"]]
+            lines.append(f'<line x1="{px:.1f}" y1="{py:.1f}" x2="{x:.1f}" y2="{y:.1f}" stroke="#b7b7b7" stroke-width="1.5" />')
+
+    circles = []
+    for node in nodes:
+        x, y = positions[node["index"]]
+        circles.append(
+            f'<circle id="tree-node-{node["index"]}" cx="{x:.1f}" cy="{y:.1f}" r="12" '
+            f'fill="#1f77b4" stroke="#0f4872" stroke-width="1.8" data-default-width="1.8" '
+            f'style="cursor:pointer" onclick="selectNode({node["index"]})" />'
+            f'<text x="{x:.1f}" y="{y + 26:.1f}" text-anchor="middle" font-size="11" fill="#333">{node["label"]}</text>'
+        )
+
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%">'
+        + "".join(lines)
+        + "".join(circles)
+        + "</svg>"
+    )
+
+
+def _network_svg(pot, edge_nodes: list[dict], width: int = 900, height: int = 320) -> str:
+    """A minimal reaction-network diagram: species as small labeled circles
+    (laid out with networkx's circular_layout -- already a base dependency,
+    deterministic, and adequate for the modest graph sizes this package
+    targets), with one clickable line per edge that has a recoverable chain.
+    Clicking an edge loads its candidate chain(s) into the frame scrubber
+    below, exactly like clicking a tree node."""
+    import networkx as nx
+
+    graph_nodes = list(pot.graph.nodes)
+    if not graph_nodes:
+        return ""
+    layout = nx.circular_layout(graph_nodes)
+    margin = 50
+
+    def scale(pos) -> tuple[float, float]:
+        x, y = pos
+        return (
+            margin + (x + 1) / 2 * (width - 2 * margin),
+            margin + (y + 1) / 2 * (height - 2 * margin),
+        )
+
+    positions = {n: scale(p) for n, p in layout.items()}
+
+    lines = []
+    for edge in edge_nodes:
+        if edge["source"] not in positions or edge["target"] not in positions:
+            continue
+        x1, y1 = positions[edge["source"]]
+        x2, y2 = positions[edge["target"]]
+        lines.append(
+            f'<line id="tree-node-{edge["index"]}" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            f'stroke="#7e7e7e" stroke-width="3" data-default-width="3" style="cursor:pointer" '
+            f'onclick="selectNode({edge["index"]})" />'
+        )
+
+    circles = []
+    for node_id, (x, y) in positions.items():
+        circles.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="10" fill="#1f77b4" stroke="#0f4872" stroke-width="1.5" />'
+            f'<text x="{x:.1f}" y="{y - 14:.1f}" text-anchor="middle" font-size="11" fill="#333">{node_id}</text>'
+        )
+
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%">'
+        + "".join(lines)
+        + "".join(circles)
+        + "</svg>"
+    )
 
 
 def plot_opt_history(chain_trajectory: List[Chain], do_3d: bool = False) -> None:

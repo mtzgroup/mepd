@@ -859,12 +859,48 @@ def hessian_sample(
         raise typer.Exit(code=1)
 
 
+def _load_visualization_object(result_path: Path, charge: int, multiplicity: int):
+    """Load whatever mepd result `result_path` points to, for `mepd
+    visualize`: a chain xyz file, a network.json (a `Pot`), a split-tree
+    directory (has adj_matrix.txt), or a bare NEB history directory (has
+    traj_*.xyz but no adj_matrix.txt -- e.g. a manually saved
+    `<name>_history/` folder)."""
+    from mepd.inputs import ChainInputs
+    from mepd.neb import NEB
+    from mepd.pot import Pot
+    from mepd.TreeNode import TreeNode
+
+    if result_path.is_dir():
+        if (result_path / "adj_matrix.txt").exists():
+            return TreeNode.read_from_disk(
+                result_path, chain_parameters=ChainInputs(), charge=charge, multiplicity=multiplicity
+            )
+        if list(result_path.glob("traj_*.xyz")):
+            return NEB.read_from_disk(
+                fp=result_path / "_unused.xyz",
+                history_folder=result_path,
+                chain_parameters=ChainInputs(),
+                charge=charge,
+                multiplicity=multiplicity,
+            )
+        raise typer.BadParameter(
+            f"'{result_path}' is a directory but has neither adj_matrix.txt (a split-tree) "
+            "nor traj_*.xyz files (a NEB history)."
+        )
+
+    if result_path.suffix == ".json":
+        return Pot.read_from_disk(result_path)
+
+    return Chain.from_xyz(result_path, ChainInputs(), charge=charge, spinmult=multiplicity)
+
+
 @app.command("visualize")
 def visualize(
     result_path: Path = typer.Argument(
         ..., exists=True,
-        help="Path to a chain xyz file (e.g. mep_output.xyz, unique.xyz). "
-        "A matching <stem>.energies sidecar, if present, is used for the energy profile.",
+        help="Path to a mepd result: a chain xyz file (mep_output.xyz, unique.xyz -- "
+        "a matching <stem>.energies sidecar, if present, is used for the energy profile), "
+        "a network.json, or a split-tree/NEB-history directory.",
     ),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o",
@@ -879,26 +915,27 @@ def visualize(
         False, "--no-open", help="Do not automatically open the HTML file in a browser."
     ),
     show_atom_indices: bool = typer.Option(
-        False, "--show-atom-indices", help="Label atom indices in each viewer panel."
+        False, "--show-atom-indices", help="Label atom indices in the structure viewer."
     ),
 ) -> None:
-    """Render an interactive 3D structure viewer (plus energy profile, if
-    available) for a chain xyz file. Each frame is labeled with its node
-    index and relative energy, with the highest-energy frame flagged as the
-    TS guess. Requires the `viz` extra (pip install "mepd\\[viz]")."""
-    from mepd.inputs import ChainInputs
+    """Render an interactive visualization: a frame scrubber (with a
+    highlighted energy-profile point) for a chain, plus -- for a split-tree
+    or network.json -- a diagram of tree nodes/network edges to click
+    through, and a trajectory-step slider for whichever one is selected."""
+    try:
+        obj = _load_visualization_object(result_path, charge, multiplicity)
+    except Exception as exc:
+        typer.echo(f"Could not load '{result_path}': {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    from mepd import viz
 
     try:
-        from mepd import viz
-        html = viz.render_chain_html(
-            Chain.from_xyz(result_path, ChainInputs(), charge=charge, spinmult=multiplicity),
-            title=result_path.stem,
-            show_atom_indices=show_atom_indices,
+        html = viz.render_visualization_html(
+            obj, title=result_path.stem, show_atom_indices=show_atom_indices
         )
-    except ImportError as exc:
-        typer.echo(
-            f"Visualization requires the optional `viz` extra: pip install mepd[viz] ({exc})"
-        )
+    except (ValueError, TypeError) as exc:
+        typer.echo(f"Could not build visualization: {exc}")
         raise typer.Exit(code=1)
 
     out_fp = output if output is not None else result_path.parent / f"{result_path.stem}_visualize.html"
