@@ -9,7 +9,7 @@ from qcdata import Structure
 
 import mepd.hessian_sample as hessian_sample_module
 from mepd.cli import _load_structure_from_smiles_or_xyz, hessian_sample as cli_hessian_sample
-from mepd.hessian_sample import HessianSampleResult
+from mepd.hessian_sample import HessianSampleCandidate, HessianSampleResult
 from mepd.inputs import RunInputs
 from mepd.nodes.node import StructureNode
 
@@ -48,6 +48,7 @@ def _call_hessian_sample(**overrides):
         multiplicity=None,
         dr=0.1,
         max_candidates=100,
+        maxiter=500,
         output=None,
     )
     kwargs.update(overrides)
@@ -90,19 +91,36 @@ def test_hessian_sample_command_rejects_nonpositive_max_candidates(tmp_path):
         _call_hessian_sample(max_candidates=0, output=tmp_path / "out")
 
 
-def test_hessian_sample_command_writes_discovered_minima(tmp_path, monkeypatch, capsys):
+def test_hessian_sample_command_rejects_nonpositive_maxiter(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_hessian_sample(maxiter=0, output=tmp_path / "out")
+
+
+def _meta(mode_index=0, direction="+", freq=100.0):
+    return HessianSampleCandidate(
+        mode_index=mode_index, direction=direction, frequency_wavenumber=freq,
+        dr=0.1, effective_dr=0.3,
+    )
+
+
+def test_hessian_sample_command_writes_full_output_set(tmp_path, monkeypatch, capsys):
+    displaced = [StructureNode(structure=_water(x_offset=0.05), _cached_energy=None) for _ in range(2)]
     minimum_a = StructureNode(structure=_water(x_offset=0.1), _cached_energy=-1.0)
     minimum_b = StructureNode(structure=_water(x_offset=-0.1), _cached_energy=-2.0)
 
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs):
         return HessianSampleResult(
             seed_energy=0.0,
-            candidates_generated=4,
+            hessian_result=None,
+            frequencies_wavenumber=[100.0, 150.0],
+            displaced_nodes=displaced,
+            displaced_metadata=[_meta(0, "+"), _meta(0, "-")],
             candidates_clipped=False,
-            minima=[minimum_a, minimum_b],
-            skipped_not_lower_energy=1,
-            skipped_duplicate=1,
-            skipped_failed_optimization=0,
+            optimization_submission_mode="serial",
+            optimized_nodes=[minimum_a, minimum_b],
+            optimized_metadata=[_meta(0, "+"), _meta(1, "+")],
+            failed_candidates=[{"meta": _meta(1, "-"), "error": "boom"}],
+            unique_minima=[minimum_a, minimum_b],
         )
 
     monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", fake_run_hessian_sample)
@@ -113,23 +131,39 @@ def test_hessian_sample_command_writes_discovered_minima(tmp_path, monkeypatch, 
     output_dir = tmp_path / "hessian_sample_out"
     _call_hessian_sample(structure="O", inputs=inputs_fp, output=output_dir)
 
-    assert (output_dir / "minimum_001.xyz").exists()
-    assert (output_dir / "minimum_002.xyz").exists()
+    assert (output_dir / "displaced.xyz").exists()
+    assert (output_dir / "optimized.xyz").exists()
+    assert (output_dir / "unique.xyz").exists()
+    assert (output_dir / "summary.json").exists()
+
+    import json
+    summary = json.loads((output_dir / "summary.json").read_text())
+    assert summary["optimized_candidates"] == 2
+    assert summary["failed_candidates"] == 1
+    assert summary["unique_minima"] == 2
+    assert summary["optimization_submission_mode"] == "serial"
+    assert len(summary["unique_minima_rel_energies_kcal_mol"]) == 2
+    assert len(summary["failed_candidate_details"]) == 1
+    assert summary["failed_candidate_details"][0]["error"] == "boom"
+
     out = capsys.readouterr().out
-    assert "Generated 4 candidate(s)" in out
-    assert "Wrote" in out
+    assert "Hessian Sample Complete" in out
 
 
-def test_hessian_sample_command_reports_no_minima_found(tmp_path, monkeypatch, capsys):
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates):
+def test_hessian_sample_command_exits_nonzero_when_all_optimizations_fail(tmp_path, monkeypatch, capsys):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs):
         return HessianSampleResult(
             seed_energy=0.0,
-            candidates_generated=4,
+            hessian_result=None,
+            frequencies_wavenumber=[100.0],
+            displaced_nodes=[StructureNode(structure=_water(), _cached_energy=None)],
+            displaced_metadata=[_meta()],
             candidates_clipped=True,
-            minima=[],
-            skipped_not_lower_energy=4,
-            skipped_duplicate=0,
-            skipped_failed_optimization=0,
+            optimization_submission_mode="serial",
+            optimized_nodes=[],
+            optimized_metadata=[],
+            failed_candidates=[{"meta": _meta(), "error": "boom"}],
+            unique_minima=[],
         )
 
     monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", fake_run_hessian_sample)
@@ -138,9 +172,10 @@ def test_hessian_sample_command_reports_no_minima_found(tmp_path, monkeypatch, c
     _run_inputs_for_test().save(inputs_fp)
 
     output_dir = tmp_path / "hessian_sample_out_empty"
-    _call_hessian_sample(structure="O", inputs=inputs_fp, output=output_dir)
+    with pytest.raises(typer.Exit):
+        _call_hessian_sample(structure="O", inputs=inputs_fp, output=output_dir)
 
     out = capsys.readouterr().out
     assert "Reached --max-candidates" in out
-    assert "No new lower-energy minima were found." in out
-    assert not output_dir.exists()
+    assert "All displaced-candidate optimizations failed." in out
+    assert (output_dir / "summary.json").exists()

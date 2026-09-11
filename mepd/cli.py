@@ -11,6 +11,7 @@ network graph from already-computed MSMEP/IRC results).
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -680,7 +681,7 @@ def hessian_sample(
     ),
     dr: float = typer.Option(
         0.1, "--dr",
-        help="Per-atom displacement magnitude (bohr) along each Hessian normal mode.",
+        help="Per-atom displacement factor; effective mode displacement is dr * n_atoms.",
     ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",
@@ -688,9 +689,13 @@ def hessian_sample(
         "Sampling every normal mode in both directions is otherwise unbounded for "
         "large molecules -- this is the control that limits the exploration.",
     ),
+    maxiter: int = typer.Option(
+        500, "--maxiter",
+        help="Maximum geometry-optimization steps for each displaced candidate.",
+    ),
     output: Path = typer.Option(
         Path("mepd_hessian_sample_output"), "--output", "-o",
-        help="Directory to write discovered minima into.",
+        help="Directory to write results into.",
     ),
 ) -> None:
     """Explore minima near a seed structure by displacing along Hessian normal modes."""
@@ -703,6 +708,8 @@ def hessian_sample(
         raise typer.BadParameter("--dr must be positive.")
     if max_candidates <= 0:
         raise typer.BadParameter("--max-candidates must be a positive integer.")
+    if maxiter <= 0:
+        raise typer.BadParameter("--maxiter must be a positive integer.")
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
     _echo_run_inputs_summary(run_inputs)
@@ -712,11 +719,16 @@ def hessian_sample(
 
     typer.echo(
         f"Computing Hessian and sampling normal modes (dr={dr:g}, "
-        f"max_candidates={max_candidates})..."
+        f"max_candidates={max_candidates}, maxiter={maxiter})..."
     )
     try:
         result = run_hessian_sample(
-            seed_node, run_inputs.engine, dr=dr, max_candidates=max_candidates
+            seed_node,
+            run_inputs.engine,
+            dr=dr,
+            max_candidates=max_candidates,
+            maxiter=maxiter,
+            chain_inputs=run_inputs.chain_inputs,
         )
     except Exception as exc:
         typer.echo(f"Hessian sampling failed: {type(exc).__name__}: {exc}")
@@ -726,25 +738,117 @@ def hessian_sample(
         typer.echo(
             f"Reached --max-candidates ({max_candidates}); not all normal modes were sampled."
         )
-    typer.echo(
-        f"Generated {result.candidates_generated} candidate(s); "
-        f"{result.skipped_failed_optimization} failed to optimize, "
-        f"{result.skipped_not_lower_energy} were not lower in energy than the seed, "
-        f"{result.skipped_duplicate} duplicated the seed or another minimum found."
-    )
-
-    if not result.minima:
-        typer.echo("No new lower-energy minima were found.")
-        return
 
     output.mkdir(parents=True, exist_ok=True)
-    for i, minimum in enumerate(result.minima, start=1):
-        minimum_path = output / f"minimum_{i:03d}.xyz"
-        minimum_path.write_text(minimum.structure.to_xyz())
-        typer.echo(
-            f"Wrote {minimum_path} (energy={minimum.energy:.8f} Eh, "
-            f"{(minimum.energy - result.seed_energy) * float(HARTREE_TO_KCAL_PER_MOL):.2f} kcal/mol vs. seed)"
+    write_qcio = bool(getattr(run_inputs, "write_qcio", False))
+
+    hessian_fp = output / "hessian.json"
+    if hasattr(result.hessian_result, "save"):
+        try:
+            result.hessian_result.save(hessian_fp)
+        except Exception:
+            hessian_fp = None
+    else:
+        hessian_fp = None
+
+    def _write_chain(nodes, filename: str):
+        if not nodes:
+            return None
+        fp = output / filename
+        chain_out = Chain.model_validate({
+            "nodes": [n.copy() for n in nodes],
+            "parameters": run_inputs.chain_inputs,
+        })
+        chain_out.write_to_disk(fp, write_qcio=write_qcio)
+        return fp
+
+    displaced_fp = _write_chain(result.displaced_nodes, "displaced.xyz")
+    optimized_fp = _write_chain(result.optimized_nodes, "optimized.xyz")
+    unique_fp = _write_chain(result.unique_minima, "unique.xyz")
+
+    def _candidate_meta_dict(meta) -> dict:
+        return {
+            "mode_index": meta.mode_index,
+            "direction": meta.direction,
+            "frequency_wavenumber": meta.frequency_wavenumber,
+            "dr": meta.dr,
+            "effective_dr": meta.effective_dr,
+        }
+
+    summary_payload = {
+        "structure": structure,
+        "inputs": str(inputs) if inputs is not None else None,
+        "dr": dr,
+        "max_candidates": max_candidates,
+        "maxiter": maxiter,
+        "seed_energy": result.seed_energy,
+        "normal_modes_total": len(result.frequencies_wavenumber),
+        "frequencies_wavenumber": result.frequencies_wavenumber,
+        "displaced_candidates": len(result.displaced_nodes),
+        "candidates_clipped": result.candidates_clipped,
+        "optimized_candidates": len(result.optimized_nodes),
+        "failed_candidates": len(result.failed_candidates),
+        "unique_minima": len(result.unique_minima),
+        "optimization_submission_mode": result.optimization_submission_mode,
+        "chain_inputs_thresholds": {
+            "node_rms_thre": run_inputs.chain_inputs.node_rms_thre,
+            "node_ene_thre": run_inputs.chain_inputs.node_ene_thre,
+        },
+        "unique_minima_energies_eh": [float(n.energy) for n in result.unique_minima],
+        "unique_minima_rel_energies_kcal_mol": [
+            (float(n.energy) - result.seed_energy) * float(HARTREE_TO_KCAL_PER_MOL)
+            for n in result.unique_minima
+        ],
+        "displaced_metadata": [_candidate_meta_dict(m) for m in result.displaced_metadata],
+        "optimized_metadata": [_candidate_meta_dict(m) for m in result.optimized_metadata],
+        "failed_candidate_details": [
+            {**_candidate_meta_dict(f["meta"]), "error": f["error"]}
+            for f in result.failed_candidates
+        ],
+        "output_files": {
+            "hessian": str(hessian_fp) if hessian_fp else None,
+            "displaced": str(displaced_fp) if displaced_fp else None,
+            "optimized": str(optimized_fp) if optimized_fp else None,
+            "unique": str(unique_fp) if unique_fp else None,
+        },
+    }
+    summary_fp = output / "summary.json"
+    summary_fp.write_text(json.dumps(summary_payload, indent=2))
+
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    result_table = Table(box=box.ROUNDED, show_header=False)
+    result_table.add_column(style="bold cyan")
+    result_table.add_column(style="white")
+    result_table.add_row("Normal modes", str(len(result.frequencies_wavenumber)))
+    result_table.add_row("Displaced candidates", str(len(result.displaced_nodes)))
+    result_table.add_row("Optimized candidates", str(len(result.optimized_nodes)))
+    result_table.add_row("Failed candidates", str(len(result.failed_candidates)))
+    result_table.add_row("Unique minima", str(len(result.unique_minima)))
+    result_table.add_row("Optimization mode", result.optimization_submission_mode)
+    if hessian_fp:
+        result_table.add_row("Hessian", str(hessian_fp))
+    if displaced_fp:
+        result_table.add_row("Displaced", str(displaced_fp))
+    if optimized_fp:
+        result_table.add_row("Optimized", str(optimized_fp))
+    if unique_fp:
+        result_table.add_row("Unique", str(unique_fp))
+    result_table.add_row("Summary", str(summary_fp))
+    Console().print(
+        Panel(
+            result_table,
+            title="[bold green]Hessian Sample Complete[/bold green]",
+            border_style="green",
         )
+    )
+
+    if not result.optimized_nodes:
+        typer.echo("All displaced-candidate optimizations failed.")
+        raise typer.Exit(code=1)
 
 
 @app.command("network-build")
