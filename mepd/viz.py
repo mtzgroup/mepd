@@ -132,19 +132,40 @@ def generate_neb_plot(
 _3DMOL_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js"></script>'
 
 
+def _chain_path_lengths(chain: Chain) -> list[float]:
+    """Normalized cumulative path length per frame (0 for the first frame, 1
+    for the last) -- the same `integrated_path_length` metric the rest of
+    this module plots against (plot_chain, plot_opt_history,
+    generate_neb_plot), so the interactive plot's x-axis matches theirs
+    instead of assuming images are evenly spaced along the path."""
+    n = len(chain)
+    if n <= 1:
+        return [0.0] * n
+    try:
+        return [float(x) for x in chain.integrated_path_length]
+    except Exception:
+        # Degenerate geometry (e.g. a distance function that chokes on some
+        # frame pair) -- fall back to even spacing rather than failing the
+        # whole visualization over an x-axis metric.
+        return [i / (n - 1) for i in range(n)]
+
+
 def _chain_payload(chain: Chain) -> dict:
     """One chain's worth of interactive-viewer data: every frame's xyz text
     (already Angstrom-scaled, straight from qcdata -- no extra conversion
-    needed) plus, when available, each frame's relative energy and which
-    frame is the apparent TS (energy maximum)."""
+    needed), its normalized position along the path, plus, when available,
+    each frame's relative energy and which frame is the apparent TS (energy
+    maximum)."""
     n = len(chain)
     has_energies = chain._energies_already_computed and n > 1
     energies_kcal = list(chain.energies_kcalmol) if has_energies else None
     ts_index = int(np.argmax(chain.energies)) if has_energies else None
+    path_lengths = _chain_path_lengths(chain)
     frames = [
         {
             "xyz": node.structure.to_xyz(),
             "energy_kcal": energies_kcal[i] if energies_kcal else None,
+            "path_length": path_lengths[i],
         }
         for i, node in enumerate(chain.nodes)
     ]
@@ -343,16 +364,16 @@ function renderEnergyPlot(frames, width, height) {{
     container.innerHTML = "";
     return;
   }}
+  const pathLengths = frames.map((f) => f.path_length);
   const margin = 36;
   const plotW = width - 2 * margin;
   const plotH = height - 2 * margin;
   let yMin = Math.min(...energies);
   let yMax = Math.max(...energies);
   if (yMin === yMax) yMax = yMin + 1.0;
-  const n = energies.length;
-  const sx = (i) => margin + (i / Math.max(n - 1, 1)) * plotW;
+  const sx = (t) => margin + t * plotW;
   const sy = (e) => margin + (1 - (e - yMin) / (yMax - yMin)) * plotH;
-  const points = energies.map((e, i) => [sx(i), sy(e)]);
+  const points = energies.map((e, i) => [sx(pathLengths[i]), sy(e)]);
   const polyline = points.map(([x, y]) => `${{x.toFixed(1)}},${{y.toFixed(1)}}`).join(" ");
   const circles = points.map(([x, y], i) => (
     `<circle id="point-${{i}}" cx="${{x.toFixed(1)}}" cy="${{y.toFixed(1)}}" r="4" fill="#18834a" `
@@ -362,7 +383,7 @@ function renderEnergyPlot(frames, width, height) {{
     `<svg id="energySvg" viewBox="0 0 ${{width}} ${{height}}" width="100%">`
     + `<rect x="0" y="0" width="${{width}}" height="${{height}}" fill="white" />`
     + `<text x="${{width / 2}}" y="16" text-anchor="middle" font-size="13" fill="#222">`
-    + `Energy profile (kcal/mol vs. frame 0) -- click a point to jump to that frame</text>`
+    + `Energy profile (kcal/mol vs. normalized path length) -- click a point to jump to that frame</text>`
     + `<polyline fill="none" stroke="#18834a" stroke-width="2" points="${{polyline}}" />`
     + circles + `</svg>`
   );

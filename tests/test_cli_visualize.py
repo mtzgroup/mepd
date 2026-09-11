@@ -108,6 +108,16 @@ def test_visualize_writes_html_with_interactive_scrubber(tmp_path):
     for frame in frames:
         assert "O" in frame["xyz"]  # real xyz text, not a pre-rendered doc
 
+    # x-axis is normalized cumulative path length (matches plot_chain/
+    # plot_opt_history/generate_neb_plot elsewhere in this module), not
+    # plain frame index -- monotonically increasing, first frame at 0,
+    # last frame at 1.
+    path_lengths = [f["path_length"] for f in frames]
+    assert path_lengths[0] == pytest.approx(0.0)
+    assert path_lengths[-1] == pytest.approx(1.0)
+    assert path_lengths == sorted(path_lengths)
+    assert "normalized path length" in html
+
 
 def test_visualize_labels_ts_guess_and_energies(tmp_path):
     xyz_fp = tmp_path / "chain.xyz"
@@ -155,7 +165,13 @@ def test_visualize_handles_single_node_chain(tmp_path):
     html = (tmp_path / "single_visualize.html").read_text()
     assert "3Dmol-min.js" in html
     nodes = _extract_nodes_payload(html)
-    assert len(nodes[0]["trajectory"][0]["frames"]) == 1
+    frames = nodes[0]["trajectory"][0]["frames"]
+    assert len(frames) == 1
+    # A single-frame chain must not divide-by-zero into a NaN path_length --
+    # NaN is not valid JSON (Python's json module is lenient about it, but a
+    # real browser's JSON.parse would reject the page outright).
+    assert frames[0]["path_length"] == 0.0
+    assert "NaN" not in html
 
 
 def test_visualize_respects_custom_output_path(tmp_path):
