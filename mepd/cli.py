@@ -37,6 +37,22 @@ def _format_run_inputs_value(value) -> str:
     return str(value)
 
 
+def _dataclass_field_values(obj) -> dict:
+    """All active fields of a dataclass instance (engine/optimizer), with
+    their currently-resolved values -- including ones left at their class
+    default and never mentioned in the TOML. Private/internal fields (leading
+    underscore) are excluded."""
+    import dataclasses
+
+    if obj is None or not dataclasses.is_dataclass(obj):
+        return {}
+    return {
+        f.name: getattr(obj, f.name, None)
+        for f in dataclasses.fields(obj)
+        if not f.name.startswith("_")
+    }
+
+
 def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
     """Print the settings actually in effect for this run (after any
     --inputs TOML has been loaded and any CLI-flag overrides applied)."""
@@ -52,6 +68,12 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
 
     console = Console()
     console.print("[bold cyan]RunInputs[/bold cyan]")
+
+    # The raw *_kwds dicts only reflect what the TOML happened to set --
+    # replaced below with the fully resolved engine/optimizer objects, which
+    # include every active field even when left at its default.
+    for key in ("optimizer_kwds", "ase_engine_kwds", "gxtb_engine_kwds"):
+        config.pop(key, None)
 
     top_level, sections = {}, {}
     for key, value in config.items():
@@ -77,6 +99,16 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
             table.add_row("[dim](empty)[/dim]", "")
         else:
             for sub_key, sub_value in value.items():
+                table.add_row(sub_key, _format_run_inputs_value(sub_value))
+        console.print(table)
+
+    for label, obj in (("engine", run_inputs.engine), ("optimizer", run_inputs.optimizer)):
+        fields = _dataclass_field_values(obj)
+        table = _new_table(title=f"{label} ({type(obj).__name__})")
+        if not fields:
+            table.add_row("[dim](no fields)[/dim]", "")
+        else:
+            for sub_key, sub_value in fields.items():
                 table.add_row(sub_key, _format_run_inputs_value(sub_value))
         console.print(table)
 

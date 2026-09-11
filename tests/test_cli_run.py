@@ -7,7 +7,7 @@ import pytest
 import typer
 from qcdata import Structure
 
-from mepd.cli import _build_path_minimizer, run as cli_run, ts as cli_ts
+from mepd.cli import _build_path_minimizer, _echo_run_inputs_summary, run as cli_run, ts as cli_ts
 from mepd.chain import Chain
 from mepd.inputs import RunInputs
 from mepd.nodes.node import StructureNode
@@ -426,3 +426,29 @@ def test_ts_command_with_irc(tmp_path, monkeypatch, capsys):
     assert (output_dir / "irc.xyz").exists()
     out = capsys.readouterr().out
     assert "Wrote IRC path" in out
+
+
+def test_echo_run_inputs_summary_shows_full_resolved_engine_and_optimizer(capsys):
+    """The printed summary must show every active engine/optimizer field --
+    including ones left at their default and never mentioned in a TOML --
+    not just the raw (possibly-partial) *_kwds dict that happened to be set."""
+    run_inputs = RunInputs(
+        engine_name="gxtb",
+        gxtb_engine_kwds={"executable": "gxtb"},
+        optimizer_kwds={"name": "cg"},
+    )
+
+    _echo_run_inputs_summary(run_inputs)
+
+    out = capsys.readouterr().out
+    # Optimizer fields never set in optimizer_kwds (only "name" was given):
+    for field in ("adaptive_dt", "corr_increase_thre", "negative_steps_thre", "positive_steps_thre"):
+        assert field in out
+    # Engine fields never set in gxtb_engine_kwds (only "executable" was given):
+    for field in ("extra_args", "keep_workdirs", "add_gxtb_flag", "n_threads"):
+        assert field in out
+    # The raw, partial *_kwds dicts should no longer be shown as their own section.
+    assert "optimizer_kwds" not in out
+    assert "gxtb_engine_kwds" not in out
+    assert "optimizer (ConjugateGradient)" in out
+    assert "engine (GXTBCalculator)" in out
