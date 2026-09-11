@@ -132,20 +132,51 @@ def generate_neb_plot(
 _3DMOL_CDN_SCRIPT = '<script src="https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js"></script>'
 
 
-def render_chain_html(chain: Chain, title: str = "mepd chain visualization") -> str:
+def render_chain_html(
+    chain: Chain,
+    title: str = "mepd chain visualization",
+    show_atom_indices: bool = False,
+) -> str:
     """Render a standalone HTML page: an interactive 3D structure viewer for
     every frame in `chain`, plus an embedded energy-profile plot if the chain
     already has computed energies. Used by `mepd visualize`.
+
+    Each frame is labeled with its node index and (when energies are
+    available) its relative energy, with the highest-energy frame flagged as
+    the TS guess -- so a specific frame can be identified for follow-up
+    (e.g. `mepd ts --guess`) without cross-referencing the plain xyz file.
     """
     from qcdata.view import generate_structure_viewer_html
 
     structures = [node.structure for node in chain.nodes]
-    viewer_html = generate_structure_viewer_html(structures)
+    n = len(structures)
+    titles = [f"Frame {i}" for i in range(n)]
+
+    subtitles = None
+    subtitles_extra = None
+    ind_ts = None
+    if chain._energies_already_computed and n > 1:
+        energies_kcal = chain.energies_kcalmol
+        subtitles = [f"{e:+.2f} kcal/mol" for e in energies_kcal]
+        ind_ts = int(np.argmax(chain.energies))
+        subtitles_extra = [" (TS guess)" if i == ind_ts else "" for i in range(n)]
+
+    # generate_structure_viewer_html takes *structs variadically -- passing
+    # `structures` as a single positional arg (instead of unpacked) makes it
+    # a length-1 tuple containing one list, which desyncs zip_longest against
+    # the per-frame titles/subtitles (every frame past the first gets padded
+    # with None and crashes). Unpack so each frame gets its own panel.
+    viewer_html = generate_structure_viewer_html(
+        *structures,
+        titles=titles,
+        subtitles=subtitles,
+        subtitles_extra=subtitles_extra,
+        show_indices=show_atom_indices,
+    )
 
     plot_html = ""
-    if chain._energies_already_computed and len(chain) > 1:
-        ind_node = int(np.argmax(chain.energies))
-        image_base64 = generate_neb_plot(chain.nodes, ind_node=ind_node, title="Energy profile")
+    if chain._energies_already_computed and n > 1:
+        image_base64 = generate_neb_plot(chain.nodes, ind_node=ind_ts, title="Energy profile")
         if image_base64:
             plot_html = f'<img src="data:image/png;base64,{image_base64}" style="max-width:100%;"/>'
 

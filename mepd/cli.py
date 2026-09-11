@@ -878,10 +878,14 @@ def visualize(
     no_open: bool = typer.Option(
         False, "--no-open", help="Do not automatically open the HTML file in a browser."
     ),
+    show_atom_indices: bool = typer.Option(
+        False, "--show-atom-indices", help="Label atom indices in each viewer panel."
+    ),
 ) -> None:
     """Render an interactive 3D structure viewer (plus energy profile, if
-    available) for a chain xyz file. Requires the `viz` extra
-    (pip install "mepd\\[viz]")."""
+    available) for a chain xyz file. Each frame is labeled with its node
+    index and relative energy, with the highest-energy frame flagged as the
+    TS guess. Requires the `viz` extra (pip install "mepd\\[viz]")."""
     from mepd.inputs import ChainInputs
 
     try:
@@ -889,6 +893,7 @@ def visualize(
         html = viz.render_chain_html(
             Chain.from_xyz(result_path, ChainInputs(), charge=charge, spinmult=multiplicity),
             title=result_path.stem,
+            show_atom_indices=show_atom_indices,
         )
     except ImportError as exc:
         typer.echo(

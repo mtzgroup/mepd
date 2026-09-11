@@ -48,6 +48,7 @@ def _call_visualize(**overrides):
         charge=0,
         multiplicity=1,
         no_open=True,
+        show_atom_indices=False,
     )
     kwargs.update(overrides)
     return cli_visualize(**kwargs)
@@ -64,6 +65,43 @@ def test_visualize_writes_html_with_viewer_and_energy_plot(tmp_path):
     html = out_fp.read_text()
     assert "3Dmol-min.js" in html
     assert 'data:image/png' in html
+
+
+def test_visualize_labels_every_frame_and_flags_the_ts_guess(tmp_path):
+    """The whole point of per-frame labeling: a specific frame (e.g. the
+    apparent TS) must be identifiable directly in the viewer, not just by
+    cross-referencing node index against the plain xyz file."""
+    xyz_fp = tmp_path / "chain.xyz"
+    _write_chain_xyz(xyz_fp, [-76.0, -75.5, -76.1])  # node 1 is the energy maximum
+
+    _call_visualize(result_path=xyz_fp)
+
+    html = (tmp_path / "chain_visualize.html").read_text()
+    assert "Frame 0" in html
+    assert "Frame 1" in html
+    assert "Frame 2" in html
+    assert "TS guess" in html
+    # relative energies (kcal/mol vs. frame 0) should appear somewhere
+    assert "kcal/mol" in html
+
+
+def test_visualize_show_atom_indices_flag_is_forwarded(tmp_path, monkeypatch):
+    xyz_fp = tmp_path / "chain.xyz"
+    _write_chain_xyz(xyz_fp, [-76.0, -75.9])
+
+    seen = {}
+    import mepd.viz as viz_module
+    real_render = viz_module.render_chain_html
+
+    def spy(chain, title="mepd chain visualization", show_atom_indices=False):
+        seen["show_atom_indices"] = show_atom_indices
+        return real_render(chain, title=title, show_atom_indices=show_atom_indices)
+
+    monkeypatch.setattr(viz_module, "render_chain_html", spy)
+
+    _call_visualize(result_path=xyz_fp, show_atom_indices=True)
+
+    assert seen["show_atom_indices"] is True
 
 
 def test_visualize_handles_single_node_chain(tmp_path):
