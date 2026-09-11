@@ -144,8 +144,8 @@ def test_conjugate_gradient_adapts_timestep_from_gradient_correlation():
     assert opt.timestep == pytest.approx(0.3)
 
 
-def test_conjugate_gradient_auto_timestep_can_be_disabled():
-    opt = ConjugateGradient(timestep=0.5, auto_timestep=False, negative_steps_thre=1)
+def test_conjugate_gradient_adaptive_dt_can_be_disabled():
+    opt = ConjugateGradient(timestep=0.5, adaptive_dt=False, negative_steps_thre=1)
 
     msg = opt.update_timestep_from_correlation(0.0)
 
@@ -324,11 +324,11 @@ def test_fire_scales_step_norm_per_image():
     np.testing.assert_allclose(steps[0] / np.linalg.norm(steps[0]), -grads[0] / np.linalg.norm(grads[0]), atol=1e-12)
 
 
-def test_deterministic_gd_auto_timestep_increases_on_plateau():
+def test_deterministic_gd_adaptive_dt_increases_on_plateau():
     chain = _make_xy_chain(np.array([[1.0, 0.0], [0.0, 1.0]]))
     opt = DeterministicGradientDescentOptimizer(
         timestep=0.05,
-        auto_timestep=True,
+        adaptive_dt=True,
         step_up=1.5,
         step_down=0.5,
         min_timestep=0.01,
@@ -349,11 +349,11 @@ def test_deterministic_gd_auto_timestep_increases_on_plateau():
     assert t2 > t1
 
 
-def test_deterministic_gd_auto_timestep_decreases_on_oscillation():
+def test_deterministic_gd_adaptive_dt_decreases_on_oscillation():
     chain = _make_xy_chain(np.array([[1.0, 0.0], [0.0, 1.0]]))
     opt = DeterministicGradientDescentOptimizer(
         timestep=0.1,
-        auto_timestep=True,
+        adaptive_dt=True,
         step_up=1.2,
         step_down=0.5,
         min_timestep=0.01,

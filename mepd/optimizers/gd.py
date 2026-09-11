@@ -13,7 +13,7 @@ class DeterministicGradientDescentOptimizer(Optimizer):
     timestep: float = 0.05
     weight_decay: float = 0.0
     max_step_norm: float | None = None
-    auto_timestep: bool = False
+    adaptive_dt: bool = False
     step_up: float = 1.10
     step_down: float = 0.6
     min_timestep: float | None = None
@@ -92,7 +92,7 @@ class DeterministicGradientDescentOptimizer(Optimizer):
         if self.weight_decay != 0.0:
             grads = grads + self.weight_decay * chain.coordinates
 
-        if bool(self.auto_timestep):
+        if bool(self.adaptive_dt):
             self._adapt_timestep(grads=grads)
 
         step = self.timestep * grads

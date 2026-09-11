@@ -175,7 +175,7 @@ class NEBInputs:
         lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
     """
 
-    climb: bool = False
+    climb: bool = True
     en_thre: float = None
     rms_grad_thre: float = None
     max_rms_grad_thre: float = None
@@ -187,19 +187,19 @@ class NEBInputs:
     ts_spring_thre: float = None
     barrier_thre: float = .1  # kcal/mol
 
-    early_stop_force_thre: float = 0.0
+    early_stop_force_thre: float = 0.01
 
     negative_steps_thre: int = 2
     positive_steps_thre: int = 50
     use_geodesic_tangent: bool = False
-    do_elem_step_checks: bool = False
+    do_elem_step_checks: bool = True
     adaptive_resolution: bool = False
     adaptive_segment_ratio: float = 2.0
     adaptive_energy_ratio: float = 2.0
     adaptive_use_energy: bool = True
-    adaptive_max_images: int = 25
-    adaptive_cooldown_steps: int = 2
-    adaptive_plateau_window: int = 100
+    adaptive_max_images: int = 20
+    adaptive_cooldown_steps: int = 10
+    adaptive_plateau_window: int = 500
     adaptive_plateau_rtol: float = 0.01
     plateau_exit_window: int = 50
     plateau_exit_rtol: float = 0.05
@@ -207,7 +207,7 @@ class NEBInputs:
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
 
-    max_steps: float = 500
+    max_steps: float = 2000
 
     v: bool = False
 
@@ -217,16 +217,16 @@ class NEBInputs:
             self.en_thre = 1e-4
 
         if self.rms_grad_thre is None:
-            self.rms_grad_thre = 0.02
+            self.rms_grad_thre = 0.005
 
         if self.ts_grad_thre is None:
-            self.ts_grad_thre = 0.05
+            self.ts_grad_thre = 0.005
 
         if self.ts_spring_thre is None:
-            self.ts_spring_thre = 0.02
+            self.ts_spring_thre = 0.005
 
         if self.max_rms_grad_thre is None:
-            self.max_rms_grad_thre = 0.05
+            self.max_rms_grad_thre = 0.01
 
     def copy(self) -> NEBInputs:
         return NEBInputs(**self.__dict__)
