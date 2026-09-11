@@ -1002,23 +1002,73 @@ def visualize(
 
 @app.command("network-build")
 def network_build(
-    tree: List[Path] = typer.Option(
-        ..., "--tree", exists=True, file_okay=False,
-        help="Path to a completed MSMEP output tree directory (as written by "
-        "`mepd run --recursive`/`--parallel` to <output>/tree). Repeatable to "
-        "combine results from multiple runs into one network.",
+    paths: List[Path] = typer.Argument(
+        ..., exists=True, file_okay=False,
+        help="One or more input directories, auto-detected by content: MSMEP "
+        "tree directories (contain adj_matrix.txt, as written by "
+        "`mepd run --recursive`/`--parallel` to <output>/tree -- give several "
+        "to combine into one network) OR a single directory of IRC "
+        "xyz/.energies file pairs. The two kinds cannot be mixed in one run.",
+    ),
+    pattern: str = typer.Option(
+        "*.xyz", "--pattern",
+        help="Glob pattern for IRC xyz files. Only used when given an IRC directory.",
+    ),
+    recursive: bool = typer.Option(
+        False, "--recursive",
+        help="Search the IRC directory recursively. Only used when given an IRC directory.",
+    ),
+    charge: int = typer.Option(
+        0, "--charge", help="Molecular charge of IRC structures. Only used when given an IRC directory.",
+    ),
+    multiplicity: int = typer.Option(
+        1, "--multiplicity",
+        help="Spin multiplicity of IRC structures. Only used when given an IRC directory.",
     ),
     output: Path = typer.Option(
         Path("network.json"), "--output", "-o",
         help="Path to write the resulting network (Pot) JSON to.",
     ),
 ) -> None:
-    """Build/dedupe a reaction network from one or more completed MSMEP trees."""
+    """Build/dedupe a reaction network from MSMEP tree directories and/or an
+    IRC scan directory -- which kind each path is gets auto-detected."""
+    tree_dirs = [p for p in paths if (p / "adj_matrix.txt").exists()]
+    irc_dirs = [p for p in paths if p not in tree_dirs]
+
+    if tree_dirs and irc_dirs:
+        raise typer.BadParameter(
+            "Cannot mix MSMEP tree directories (adj_matrix.txt) with an IRC scan "
+            "directory in the same run. Build them separately."
+        )
+    if len(irc_dirs) > 1:
+        raise typer.BadParameter("Only one IRC scan directory is supported per run.")
+
+    if irc_dirs:
+        from mepd.irc_network import build_irc_network
+
+        try:
+            scan = build_irc_network(
+                irc_dirs[0], pattern=pattern, recursive=recursive,
+                charge=charge, multiplicity=multiplicity,
+            )
+        except Exception as exc:
+            typer.echo(f"IRC network construction failed: {type(exc).__name__}: {exc}")
+            raise typer.Exit(code=1)
+
+        pot = scan.pot
+        pot.write_to_disk(output)
+        typer.echo(
+            f"Wrote network to {output} "
+            f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges, "
+            f"{len(scan.xyz_files)} files used, {len(scan.skipped_xyz_files)} skipped)"
+        )
+        return
+
     from mepd.NetworkBuilder import NetworkBuilder
 
-    builder = NetworkBuilder(data_dir=tree[0].parent)
+    builder = NetworkBuilder(data_dir=tree_dirs[0].parent)
     try:
-        pot = builder.create_rxn_network_from_paths(list(tree))
+        pot = builder.create_rxn_network_from_paths(tree_dirs)
     except Exception as exc:
         typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1)
@@ -1027,50 +1077,6 @@ def network_build(
     typer.echo(
         f"Wrote network to {output} "
         f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
-    )
-
-
-@app.command("irc-network")
-def irc_network(
-    directory: Path = typer.Option(
-        ..., "--dir", exists=True, file_okay=False,
-        help="Directory containing IRC xyz/.energies file pairs.",
-    ),
-    pattern: str = typer.Option(
-        "*.xyz", "--pattern", help="Glob pattern used to find IRC xyz files.",
-    ),
-    recursive: bool = typer.Option(
-        False, "--recursive", help="Search the directory recursively.",
-    ),
-    charge: int = typer.Option(0, "--charge", help="Molecular charge of the IRC structures."),
-    multiplicity: int = typer.Option(
-        1, "--multiplicity", help="Spin multiplicity of the IRC structures.",
-    ),
-    output: Path = typer.Option(
-        Path("network.json"), "--output", "-o",
-        help="Path to write the resulting network (Pot) JSON to.",
-    ),
-) -> None:
-    """Build a reaction network by scanning a directory of IRC xyz/energy pairs."""
-    from mepd.irc_network import build_irc_network
-
-    try:
-        scan = build_irc_network(
-            directory,
-            pattern=pattern,
-            recursive=recursive,
-            charge=charge,
-            multiplicity=multiplicity,
-        )
-    except Exception as exc:
-        typer.echo(f"IRC network construction failed: {type(exc).__name__}: {exc}")
-        raise typer.Exit(code=1)
-
-    scan.pot.write_to_disk(output)
-    typer.echo(
-        f"Wrote network to {output} "
-        f"({scan.pot.number_of_nodes} nodes, {scan.pot.graph.number_of_edges()} edges, "
-        f"{len(scan.xyz_files)} files used, {len(scan.skipped_xyz_files)} skipped)"
     )
 
 
