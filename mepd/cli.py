@@ -911,6 +911,171 @@ def hessian_sample(
         raise typer.Exit(code=1)
 
 
+@app.command("hessian-global")
+def hessian_global(
+    structure: str = typer.Argument(
+        ..., help="Seed structure: a path to an xyz file, or a SMILES string."
+    ),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", exists=True,
+        help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
+    ),
+    charge: Optional[int] = typer.Option(
+        None, "--charge", help="Override the molecular charge on the seed structure."
+    ),
+    multiplicity: Optional[int] = typer.Option(
+        None, "--multiplicity", help="Override the spin multiplicity on the seed structure."
+    ),
+    dr: float = typer.Option(
+        0.1, "--dr",
+        help="Per-atom displacement factor; effective mode displacement is dr * n_atoms.",
+    ),
+    max_candidates: int = typer.Option(
+        100, "--max-candidates",
+        help="Hard cap on the number of displaced candidates generated/optimized per source, per round.",
+    ),
+    maxiter: int = typer.Option(
+        500, "--maxiter",
+        help="Maximum geometry-optimization steps for each displaced candidate.",
+    ),
+    temperature: float = typer.Option(
+        298.15, "--temperature",
+        help="Temperature (Kelvin) for the Metropolis/Boltzmann acceptance criterion. "
+        "Higher accepts more uphill moves.",
+    ),
+    energy_tolerance_kcal: float = typer.Option(
+        1.0e-4, "--energy-tolerance-kcal",
+        help="Moves within this many kcal/mol of the seed's energy are treated as flat "
+        "(always accepted) rather than run through the Boltzmann test.",
+    ),
+    max_rounds: int = typer.Option(
+        100, "--max-rounds",
+        help="Hard cap on the number of basin-hopping rounds. Each round Hessian-samples "
+        "from every currently-queued accepted minimum -- this is the control that bounds "
+        "an otherwise-unbounded global search.",
+    ),
+    random_seed: Optional[int] = typer.Option(
+        None, "--random-seed",
+        help="Seed for the acceptance-test random draws, for reproducible runs. "
+        "Omit for non-deterministic acceptance.",
+    ),
+    output: Path = typer.Option(
+        Path("mepd_hessian_global_output"), "--output", "-o",
+        help="Directory to write results into.",
+    ),
+) -> None:
+    """Basin-hopping-style global optimization: repeatedly Hessian-sample
+    from every accepted minimum found so far, accepting new minima via a
+    Metropolis/Boltzmann criterion, until the search exhausts itself or
+    --max-rounds is reached."""
+    from mepd.hessian_sample import run_hessian_global_optimization
+    from mepd.nodes.node import StructureNode
+
+    if dr <= 0:
+        raise typer.BadParameter("--dr must be positive.")
+    if max_candidates <= 0:
+        raise typer.BadParameter("--max-candidates must be a positive integer.")
+    if maxiter <= 0:
+        raise typer.BadParameter("--maxiter must be a positive integer.")
+    if temperature <= 0:
+        raise typer.BadParameter("--temperature must be positive.")
+    if max_rounds <= 0:
+        raise typer.BadParameter("--max-rounds must be a positive integer.")
+
+    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    _echo_run_inputs_summary(run_inputs)
+
+    seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
+    seed_node = StructureNode(structure=seed_structure)
+
+    typer.echo(
+        f"Running basin-hopping global optimization (dr={dr:g}, max_candidates={max_candidates}, "
+        f"temperature={temperature:g}K, max_rounds={max_rounds})..."
+    )
+    try:
+        result = run_hessian_global_optimization(
+            seed_node,
+            run_inputs.engine,
+            dr=dr,
+            max_candidates=max_candidates,
+            maxiter=maxiter,
+            temperature=temperature,
+            energy_tolerance_kcal=energy_tolerance_kcal,
+            max_rounds=max_rounds,
+            random_seed=random_seed,
+            chain_inputs=run_inputs.chain_inputs,
+        )
+    except Exception as exc:
+        typer.echo(f"Global optimization failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    output.mkdir(parents=True, exist_ok=True)
+    write_qcio = bool(getattr(run_inputs, "write_qcio", False))
+
+    accepted_fp = None
+    if result.accepted_minima:
+        accepted_fp = output / "accepted_minima.xyz"
+        chain_out = Chain.model_validate({
+            "nodes": [n.copy() for n in result.accepted_minima],
+            "parameters": run_inputs.chain_inputs,
+        })
+        chain_out.write_to_disk(accepted_fp, write_qcio=write_qcio)
+
+    from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
+
+    hartree_to_kcal = float(HARTREE_TO_KCAL_PER_MOL)
+    summary_payload = {
+        "structure": structure,
+        "inputs": str(inputs) if inputs is not None else None,
+        "dr": dr,
+        "max_candidates": max_candidates,
+        "maxiter": maxiter,
+        "temperature": temperature,
+        "energy_tolerance_kcal": energy_tolerance_kcal,
+        "max_rounds": max_rounds,
+        "random_seed": random_seed,
+        "start_energy": result.start_energy,
+        "rounds_run": result.rounds_run,
+        "stopped_reason": result.stopped_reason,
+        "accepted_minima": len(result.accepted_minima),
+        "accepted_minima_energies_eh": [float(n.energy) for n in result.accepted_minima],
+        "accepted_minima_rel_energies_kcal_mol": [
+            (float(n.energy) - result.start_energy) * hartree_to_kcal
+            for n in result.accepted_minima
+        ],
+        "round_summaries": result.round_summaries,
+        "output_files": {
+            "accepted_minima": str(accepted_fp) if accepted_fp else None,
+        },
+    }
+    summary_fp = output / "summary.json"
+    summary_fp.write_text(json.dumps(summary_payload, indent=2))
+
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    result_table = Table(box=box.ROUNDED, show_header=False)
+    result_table.add_column(style="bold cyan")
+    result_table.add_column(style="white")
+    result_table.add_row("Rounds run", f"{result.rounds_run} ({result.stopped_reason})")
+    result_table.add_row("Accepted minima", str(len(result.accepted_minima)))
+    if accepted_fp:
+        result_table.add_row("Accepted minima xyz", str(accepted_fp))
+    result_table.add_row("Summary", str(summary_fp))
+    Console().print(
+        Panel(
+            result_table,
+            title="[bold green]Hessian Global Optimization Complete[/bold green]",
+            border_style="green",
+        )
+    )
+
+    if not result.accepted_minima:
+        typer.echo("No new minima were accepted.")
+
+
 def _load_visualization_object(result_path: Path, charge: int, multiplicity: int):
     """Load whatever mepd result `result_path` points to, for `mepd
     visualize`: a chain xyz file, a network.json (a `Pot`), a split-tree

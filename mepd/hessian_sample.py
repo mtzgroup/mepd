@@ -13,16 +13,26 @@ silently filtering to only those lower in energy than the seed.
 
 from __future__ import annotations
 
+import hashlib
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
+import qcconst.constants as _qcconst_constants
 
 from mepd.elementarystep import _extract_hessian_modes_and_frequencies
 from mepd.engines.engine import Engine, build_hessian_result_from_matrix
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import Node
 from mepd.nodes.nodehelpers import displace_by_dr, is_identical
+
+# kcal/(mol*K), derived from CODATA constants rather than hardcoded.
+_R_GAS_KCAL_MOL_K = (
+    float(_qcconst_constants.BOLTZMANN_CONSTANT)
+    * float(_qcconst_constants.AVOGADRO_NUMBER)
+    / float(_qcconst_constants.KCAL_TO_JOULE)
+)
 
 
 @dataclass
@@ -215,3 +225,153 @@ def run_hessian_sample(
     result.unique_minima = _dedupe_minima_nodes(optimized_nodes, chain_inputs)
 
     return result
+
+
+def _boltzmann_acceptance_probability(delta_kcal: float, temperature_kelvin: float) -> float:
+    """Classic Metropolis/Boltzmann acceptance probability. A non-uphill move
+    (delta_kcal <= 0) is always accepted (probability 1); an uphill move is
+    accepted with probability exp(-delta_kcal / (R*T))."""
+    if delta_kcal <= 0:
+        return 1.0
+    exponent = -float(delta_kcal) / (_R_GAS_KCAL_MOL_K * float(temperature_kelvin))
+    return float(min(1.0, np.exp(exponent)))
+
+
+def _candidate_acceptance_draw(random_seed: Optional[int], generation_index: int) -> float:
+    """A uniform [0, 1) draw for the acceptance test. When `random_seed` is
+    given, the draw is a deterministic hash of (seed, generation_index) --
+    not a stateful RNG stream -- so re-running with the same seed reproduces
+    identical accept/reject outcomes regardless of how many candidates were
+    evaluated before this one. Falls back to real randomness when no seed is
+    given."""
+    if random_seed is None:
+        return random.random()
+    digest = hashlib.blake2b(f"{random_seed}:{generation_index}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") / 2**64
+
+
+@dataclass
+class HessianGlobalOptResult:
+    start_energy: float
+    rounds_run: int = 0
+    stopped_reason: str = "queue_exhausted"  # or "max_rounds"
+    accepted_minima: List[Node] = field(default_factory=list)
+    round_summaries: List[dict] = field(default_factory=list)
+
+
+def run_hessian_global_optimization(
+    seed_node: Node,
+    engine: Engine,
+    *,
+    dr: float = 0.1,
+    max_candidates: int = 100,
+    maxiter: int = 500,
+    temperature: float = 298.15,
+    energy_tolerance_kcal: float = 1.0e-4,
+    max_rounds: int = 100,
+    random_seed: Optional[int] = None,
+    chain_inputs: ChainInputs | None = None,
+) -> HessianGlobalOptResult:
+    """Basin-hopping-style global optimization built on repeated Hessian
+    sampling.
+
+    Each round Hessian-samples from every currently-queued accepted minimum
+    (a breadth-first expansion -- not "chase a single best/last-accepted
+    structure"). A newly-found minimum is accepted via the Metropolis/
+    Boltzmann criterion (`temperature`), evaluated against the *original*
+    seed's energy, not its immediate source -- moves within
+    `energy_tolerance_kcal` of that baseline are treated as flat (always
+    accepted); uphill moves beyond it are accepted with probability
+    exp(-deltaE / (R*T)). Every accepted, globally-unique minimum becomes a
+    seed for the next round. Stops when the queue empties (`stopped_reason
+    == "queue_exhausted"`) or after `max_rounds` rounds
+    (`"max_rounds"`) -- the control that bounds this otherwise-unbounded
+    search.
+    """
+    if float(temperature) <= 0:
+        raise ValueError("temperature must be positive.")
+    if int(max_rounds) < 1:
+        raise ValueError("max_rounds must be a positive integer.")
+    if chain_inputs is None:
+        chain_inputs = ChainInputs()
+
+    from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
+
+    hartree_to_kcal = float(HARTREE_TO_KCAL_PER_MOL)
+    start_energy = float(engine.compute_energies([seed_node])[0])
+
+    accepted_minima: List[Node] = []
+    # Dedup pool starts with the seed itself (not reported in accepted_minima,
+    # which is "newly found" minima) -- otherwise the search can rediscover
+    # the starting structure indefinitely: it is always isoenergetic with
+    # itself, so it would pass the energy-tolerance auto-accept branch every
+    # time a branch happens to lead back to it, re-queuing forever.
+    known_structures: List[Node] = [seed_node]
+    queue: List[Node] = [seed_node]
+    round_summaries: List[dict] = []
+    generation_index = 0
+    rounds_run = 0
+    stopped_reason = "max_rounds"
+
+    for round_index in range(int(max_rounds)):
+        if not queue:
+            stopped_reason = "queue_exhausted"
+            break
+        rounds_run = round_index + 1
+        current_queue, queue = queue, []
+        candidates_optimized = 0
+        accepted_this_round = 0
+
+        for source_node in current_queue:
+            try:
+                sample = run_hessian_sample(
+                    source_node, engine, dr=dr, max_candidates=max_candidates,
+                    maxiter=maxiter, chain_inputs=chain_inputs,
+                )
+            except Exception:
+                continue
+            candidates_optimized += len(sample.optimized_nodes)
+
+            for candidate in sample.unique_minima:
+                delta_kcal = (float(candidate.energy) - start_energy) * hartree_to_kcal
+                effective_delta = 0.0 if abs(delta_kcal) <= energy_tolerance_kcal else delta_kcal
+                if effective_delta <= 0:
+                    accept = True
+                else:
+                    probability = _boltzmann_acceptance_probability(effective_delta, temperature)
+                    accept = _candidate_acceptance_draw(random_seed, generation_index) < probability
+                generation_index += 1
+                if not accept:
+                    continue
+
+                is_duplicate = any(
+                    is_identical(
+                        candidate, existing,
+                        fragment_rmsd_cutoff=chain_inputs.node_rms_thre,
+                        kcal_mol_cutoff=chain_inputs.node_ene_thre,
+                        verbose=False, collect_comparison=False,
+                    )
+                    for existing in known_structures
+                )
+                if is_duplicate:
+                    continue
+
+                accepted_minima.append(candidate)
+                known_structures.append(candidate)
+                queue.append(candidate)
+                accepted_this_round += 1
+
+        round_summaries.append({
+            "round": round_index,
+            "sources": len(current_queue),
+            "candidates_optimized": candidates_optimized,
+            "accepted": accepted_this_round,
+        })
+
+    return HessianGlobalOptResult(
+        start_energy=start_energy,
+        rounds_run=rounds_run,
+        stopped_reason=stopped_reason,
+        accepted_minima=accepted_minima,
+        round_summaries=round_summaries,
+    )
