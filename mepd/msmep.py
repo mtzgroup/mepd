@@ -551,9 +551,10 @@ class MSMEP:
 
     def _same_pair_split_limit_message(self, count: int) -> str:
         return (
-            f"Stopping autosplitting after {int(count)} consecutive splits of "
-            "the same endpoint pair. For floppy systems this usually means "
-            "`node_rms_thre` and/or `node_ene_thre` are too small."
+            f"Stopping further splitting of this branch only after {int(count)} "
+            "consecutive splits of the same endpoint pair (other branches, and "
+            "the rest of autosplitting, are unaffected). For floppy systems "
+            "this usually means `node_rms_thre` and/or `node_ene_thre` are too small."
         )
 
     def _refresh_attempted_pair_cache(self) -> None:
