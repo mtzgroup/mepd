@@ -142,6 +142,31 @@ def _load_endpoint(fp: Path, charge: Optional[int], multiplicity: Optional[int])
     return structure
 
 
+def _load_structure_from_smiles_or_xyz(
+    value: str, charge: Optional[int], multiplicity: Optional[int]
+) -> Structure:
+    """Load a Structure from an xyz file path, or -- if `value` isn't an
+    existing file -- embed it in 3D from a SMILES string."""
+    path = Path(value)
+    if path.exists():
+        return _load_endpoint(path, charge, multiplicity)
+
+    import qcinf
+
+    kwargs = {}
+    if charge is not None:
+        kwargs["charge"] = charge
+    if multiplicity is not None:
+        kwargs["multiplicity"] = multiplicity
+    try:
+        return qcinf.smiles_to_structure(value, **kwargs)
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"'{value}' is neither an existing xyz file nor a valid SMILES string "
+            f"({type(exc).__name__}: {exc})."
+        )
+
+
 def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int = 500) -> dict:
     keywords = {"coordsys": "cart", "maxit": int(default_maxiter)}
     keywords.update(dict(getattr(run_inputs, "geometry_optimizer_kwds", {}) or {}))
@@ -604,6 +629,90 @@ def ts(
     irc_path = output / "irc.xyz"
     irc_chain.write_to_disk(irc_path)
     typer.echo(f"Wrote IRC path to {irc_path}")
+
+
+@app.command("hessian-sample")
+def hessian_sample(
+    structure: str = typer.Argument(
+        ..., help="Seed structure: a path to an xyz file, or a SMILES string."
+    ),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", exists=True,
+        help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
+    ),
+    charge: Optional[int] = typer.Option(
+        None, "--charge", help="Override the molecular charge on the seed structure."
+    ),
+    multiplicity: Optional[int] = typer.Option(
+        None, "--multiplicity", help="Override the spin multiplicity on the seed structure."
+    ),
+    dr: float = typer.Option(
+        0.1, "--dr",
+        help="Per-atom displacement magnitude (bohr) along each Hessian normal mode.",
+    ),
+    max_candidates: int = typer.Option(
+        100, "--max-candidates",
+        help="Hard cap on the number of displaced candidates generated/optimized. "
+        "Sampling every normal mode in both directions is otherwise unbounded for "
+        "large molecules -- this is the control that limits the exploration.",
+    ),
+    output: Path = typer.Option(
+        Path("mepd_hessian_sample_output"), "--output", "-o",
+        help="Directory to write discovered minima into.",
+    ),
+) -> None:
+    """Explore minima near a seed structure by displacing along Hessian normal modes."""
+    from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
+
+    from mepd.hessian_sample import run_hessian_sample
+    from mepd.nodes.node import StructureNode
+
+    if dr <= 0:
+        raise typer.BadParameter("--dr must be positive.")
+    if max_candidates <= 0:
+        raise typer.BadParameter("--max-candidates must be a positive integer.")
+
+    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    _echo_run_inputs_summary(run_inputs)
+
+    seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
+    seed_node = StructureNode(structure=seed_structure)
+
+    typer.echo(
+        f"Computing Hessian and sampling normal modes (dr={dr:g}, "
+        f"max_candidates={max_candidates})..."
+    )
+    try:
+        result = run_hessian_sample(
+            seed_node, run_inputs.engine, dr=dr, max_candidates=max_candidates
+        )
+    except Exception as exc:
+        typer.echo(f"Hessian sampling failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    if result.candidates_clipped:
+        typer.echo(
+            f"Reached --max-candidates ({max_candidates}); not all normal modes were sampled."
+        )
+    typer.echo(
+        f"Generated {result.candidates_generated} candidate(s); "
+        f"{result.skipped_failed_optimization} failed to optimize, "
+        f"{result.skipped_not_lower_energy} were not lower in energy than the seed, "
+        f"{result.skipped_duplicate} duplicated the seed or another minimum found."
+    )
+
+    if not result.minima:
+        typer.echo("No new lower-energy minima were found.")
+        return
+
+    output.mkdir(parents=True, exist_ok=True)
+    for i, minimum in enumerate(result.minima, start=1):
+        minimum_path = output / f"minimum_{i:03d}.xyz"
+        minimum_path.write_text(minimum.structure.to_xyz())
+        typer.echo(
+            f"Wrote {minimum_path} (energy={minimum.energy:.8f} Eh, "
+            f"{(minimum.energy - result.seed_energy) * float(HARTREE_TO_KCAL_PER_MOL):.2f} kcal/mol vs. seed)"
+        )
 
 
 @app.command("network-build")
