@@ -82,6 +82,17 @@ def test_load_structure_from_smiles_or_xyz_rejects_invalid_input():
         _load_structure_from_smiles_or_xyz("not_a_valid_smiles(((", None, None)
 
 
+def test_load_structure_from_smiles_or_xyz_falls_back_to_openbabel_for_multi_fragment_smiles():
+    # RDKit (the default backend) refuses multi-fragment SMILES outright;
+    # openbabel embeds them fine -- exactly the kind of noncovalent complex
+    # (a solute plus explicit waters) discovery commands want to explore.
+    structure = _load_structure_from_smiles_or_xyz("C=C.O.O.O", None, None)
+
+    assert sorted(structure.symbols).count("O") == 3
+    assert sorted(structure.symbols).count("C") == 2
+    assert structure.geometry.shape[0] == len(structure.symbols)
+
+
 def test_hessian_sample_command_rejects_nonpositive_dr(tmp_path):
     with pytest.raises(typer.BadParameter):
         _call_hessian_sample(dr=0.0, output=tmp_path / "out")

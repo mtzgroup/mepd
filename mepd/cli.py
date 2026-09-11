@@ -179,7 +179,13 @@ def _load_structure_from_smiles_or_xyz(
     value: str, charge: Optional[int], multiplicity: Optional[int]
 ) -> Structure:
     """Load a Structure from an xyz file path, or -- if `value` isn't an
-    existing file -- embed it in 3D from a SMILES string."""
+    existing file -- embed it in 3D from a SMILES string.
+
+    Tries qcinf's default RDKit backend first, then falls back to openbabel:
+    RDKit refuses multi-fragment SMILES (e.g. "C=C.O.O.O" for a solute plus
+    explicit waters -- exactly the kind of noncovalent complex discovery
+    commands want to explore), which openbabel embeds fine.
+    """
     path = Path(value)
     if path.exists():
         return _load_endpoint(path, charge, multiplicity)
@@ -191,13 +197,18 @@ def _load_structure_from_smiles_or_xyz(
         kwargs["charge"] = charge
     if multiplicity is not None:
         kwargs["multiplicity"] = multiplicity
-    try:
-        return qcinf.smiles_to_structure(value, **kwargs)
-    except Exception as exc:
-        raise typer.BadParameter(
-            f"'{value}' is neither an existing xyz file nor a valid SMILES string "
-            f"({type(exc).__name__}: {exc})."
-        )
+
+    errors = []
+    for backend in ("rdkit", "openbabel"):
+        try:
+            return qcinf.smiles_to_structure(value, backend=backend, **kwargs)
+        except Exception as exc:
+            errors.append(f"{backend}: {type(exc).__name__}: {exc}")
+
+    raise typer.BadParameter(
+        f"'{value}' is neither an existing xyz file nor a valid SMILES string.\n"
+        + "\n".join(errors)
+    )
 
 
 def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int = 500) -> dict:
