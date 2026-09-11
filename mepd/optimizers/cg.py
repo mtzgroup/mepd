@@ -16,10 +16,10 @@ class ConjugateGradient(Optimizer):
     min_timestep: float | None = None
     max_timestep: float | None = None
     adaptive_dt: bool = True
-    corr_decrease_thre: float = 0.5
+    corr_decrease_thre: float = 0.75
     corr_increase_thre: float = 0.95
     negative_steps_thre: int = 2
-    positive_steps_thre: int = 2
+    positive_steps_thre: int = 15
 
     def __post_init__(self):
         self.g_old = None
@@ -28,7 +28,7 @@ class ConjugateGradient(Optimizer):
         if self.min_timestep is None:
             self.min_timestep = max(1e-6, 1e-3 * self.orig_timestep)
         if self.max_timestep is None:
-            self.max_timestep = max(self.orig_timestep, 4.0 * self.orig_timestep)
+            self.max_timestep = max(self.orig_timestep, 6.0 * self.orig_timestep)
         if self.max_timestep < self.min_timestep:
             self.min_timestep, self.max_timestep = self.max_timestep, self.min_timestep
         self._nsteps_low_corr = 0

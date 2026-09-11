@@ -134,7 +134,7 @@ class NEBInputs:
         has a same-named attribute (currently only `ConjugateGradient` does).
 
     `positive_steps_thre`: number of stable steps before increasing the step size
-        (default: 50). Synced onto `NEB.optimizer` the same way as `negative_steps_thre`.
+        (default: 15). Synced onto `NEB.optimizer` the same way as `negative_steps_thre`.
 
     `max_steps`: maximum number of NEB steps allowed (default: 1000)
 
@@ -190,7 +190,7 @@ class NEBInputs:
     early_stop_force_thre: float = 0.01
 
     negative_steps_thre: int = 2
-    positive_steps_thre: int = 50
+    positive_steps_thre: int = 15
     use_geodesic_tangent: bool = False
     do_elem_step_checks: bool = True
     adaptive_resolution: bool = False
