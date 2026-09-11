@@ -150,7 +150,8 @@ class _LiveMinimaWriter:
         self._console.print(
             f"[bold green]✓ New minimum #{len(self.nodes)}[/bold green] "
             f"(round {payload['round'] + 1}): {label}  "
-            f"ΔE={payload['rel_energy_kcal']:+.2f} kcal/mol -> {self._output_fp}"
+            f"ΔE={payload['rel_energy_kcal']:+.2f} kcal/mol -> {self._output_fp}",
+            highlight=False,
         )
         chain_out = Chain.model_validate({
             "nodes": [n.copy() for n in self.nodes],
