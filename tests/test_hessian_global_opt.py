@@ -7,7 +7,7 @@ import pytest
 from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
 
 from mepd.engines.engine import Engine
-from mepd.hessian_sample import (
+from mepd.discovery.hessian_sample import (
     _boltzmann_acceptance_probability,
     _candidate_acceptance_draw,
     run_hessian_global_optimization,
@@ -135,6 +135,60 @@ def test_run_hessian_global_optimization_stops_at_max_rounds_if_reached_first():
     assert len(result.round_summaries) == 1
     # only B should be found in a single round (D requires a second round from B)
     assert [round(float(n.coords[0]), 1) for n in result.accepted_minima] == [10.0]
+
+
+def test_run_hessian_global_optimization_emits_minimum_accepted_events_live():
+    """`on_event("minimum_accepted", ...)` must fire the instant each minimum
+    is accepted -- not just be derivable from the final result -- so a caller
+    can stream/write results out without waiting for the whole search."""
+    engine = _FakeMultiWellEngine()
+    events = []
+
+    result = run_hessian_global_optimization(
+        _seed(), engine, dr=0.5, max_candidates=2, temperature=298.15,
+        energy_tolerance_kcal=1.0e-4, max_rounds=5, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        on_event=lambda event, payload: events.append((event, payload)),
+    )
+
+    accepted_events = [payload for event, payload in events if event == "minimum_accepted"]
+    assert len(accepted_events) == len(result.accepted_minima) == 2
+
+    # Fired in acceptance order, 1-indexed, each carrying the actual node and
+    # its energy relative to the seed (not the clipped/tolerance-adjusted value).
+    assert [e["index"] for e in accepted_events] == [1, 2]
+    assert [round(float(e["node"].coords[0]), 1) for e in accepted_events] == [10.0, 20.0]
+    assert [round(e["rel_energy_kcal"], 6) for e in accepted_events] == pytest.approx(
+        [-1.0, -2.0], abs=1e-6,
+    )
+    assert accepted_events[0]["round"] == 0
+    assert accepted_events[1]["round"] == 1
+
+
+def test_run_hessian_global_optimization_forwards_dr_values_to_each_round(monkeypatch):
+    """--full-dr-scan should reach `run_hessian_sample` every round, not just
+    the first -- and `dr` should be ignored while it does."""
+    import mepd.discovery.hessian_sample as hessian_sample_module
+
+    seen_dr_values = []
+    original = hessian_sample_module.run_hessian_sample
+
+    def spy(*args, **kwargs):
+        seen_dr_values.append(kwargs.get("dr_values"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", spy)
+
+    engine = _FakeMultiWellEngine()
+    result = run_hessian_global_optimization(
+        _seed(), engine, dr=999.0, dr_values=[0.5], max_candidates=2, temperature=298.15,
+        max_rounds=5, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+    )
+
+    assert result.rounds_run >= 1
+    assert seen_dr_values  # at least one round ran
+    assert all(dr_values == [0.5] for dr_values in seen_dr_values)
 
 
 def test_run_hessian_global_optimization_rejects_nonpositive_temperature():

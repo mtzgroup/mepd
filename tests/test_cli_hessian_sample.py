@@ -7,9 +7,10 @@ import pytest
 import typer
 from qcdata import Structure
 
-import mepd.hessian_sample as hessian_sample_module
-from mepd.cli import _load_structure_from_smiles_or_xyz, hessian_sample as cli_hessian_sample
-from mepd.hessian_sample import HessianSampleCandidate, HessianSampleResult
+import mepd.discovery.hessian_sample as hessian_sample_module
+from mepd.cli import _load_structure_from_smiles_or_xyz
+from mepd.discovery.cli import hessian_sample as cli_hessian_sample
+from mepd.discovery.hessian_sample import HessianSampleCandidate, HessianSampleResult
 from mepd.inputs import RunInputs
 from mepd.nodes.node import StructureNode
 
@@ -108,7 +109,7 @@ def test_hessian_sample_command_writes_full_output_set(tmp_path, monkeypatch, ca
     minimum_a = StructureNode(structure=_water(x_offset=0.1), _cached_energy=-1.0)
     minimum_b = StructureNode(structure=_water(x_offset=-0.1), _cached_energy=-2.0)
 
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs, on_event=None):
         return HessianSampleResult(
             seed_energy=0.0,
             hessian_result=None,
@@ -151,7 +152,7 @@ def test_hessian_sample_command_writes_full_output_set(tmp_path, monkeypatch, ca
 
 
 def test_hessian_sample_command_exits_nonzero_when_all_optimizations_fail(tmp_path, monkeypatch, capsys):
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs, on_event=None):
         return HessianSampleResult(
             seed_energy=0.0,
             hessian_result=None,

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from mepd.engines.engine import Engine
-from mepd.hessian_sample import run_hessian_sample
+from mepd.discovery.hessian_sample import run_hessian_sample
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import XYNode
 
@@ -68,6 +68,17 @@ class _FakeBatchEngine(_FakeHessianSampleEngine):
                     [XYNode(structure=np.array(coords, dtype=float), _cached_energy=energy)]
                 )
         return trajectories
+
+
+class _FakeBatchEngineThatRaisesMidBatch(_FakeHessianSampleEngine):
+    """A "batch" optimizer that is really a sequential loop under the hood
+    (like GXTBCalculator/QCComputeEngine's non-ChemCloud fallback) and lets
+    one candidate's failure raise and abort the whole call, instead of
+    isolating it like a true batch backend (e.g. ChemCloud) does. Exercises
+    `run_hessian_sample`'s fallback to per-candidate serial optimization."""
+
+    def compute_geometry_optimizations(self, nodes, keywords=None):
+        raise RuntimeError("simulated non-convergence blew up the whole batch call")
 
 
 def _seed():
@@ -171,6 +182,70 @@ def test_run_hessian_sample_rejects_nonpositive_maxiter():
     engine = _FakeHessianSampleEngine(["fail"] * 6)
     with pytest.raises(ValueError):
         run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=10, maxiter=0)
+
+
+def test_run_hessian_sample_falls_back_to_serial_when_batch_call_raises():
+    engine = _FakeBatchEngineThatRaisesMidBatch(_MIXED_OUTCOMES)
+
+    result = run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=100)
+
+    assert result.optimization_submission_mode == "batch_fallback_serial"
+    # Same outcomes as the plain-serial/plain-batch paths (test_hessian_sample.py
+    # above): one candidate genuinely fails, the rest are isolated and still
+    # produce results -- a batch call raising outright must not lose everyone
+    # else in the batch.
+    assert len(result.failed_candidates) == 1
+    assert len(result.optimized_nodes) == 5
+    assert len(result.unique_minima) == 4
+
+
+def test_run_hessian_sample_dr_values_scans_every_value_independently():
+    # 3 modes x 2 directions x 2 dr values = 12 candidates.
+    engine = _FakeHessianSampleEngine(["fail"] * 12)
+
+    result = run_hessian_sample(
+        _seed(), engine, dr_values=[0.5, 1.0], max_candidates=100,
+    )
+
+    assert len(result.displaced_nodes) == 12
+    assert result.candidates_clipped is False
+    scan_indices = sorted(m.dr_scan_index for m in result.displaced_metadata)
+    assert scan_indices == [0] * 6 + [1] * 6
+    drs = {round(m.dr, 6) for m in result.displaced_metadata}
+    assert drs == {0.5, 1.0}
+
+
+def test_run_hessian_sample_dr_values_caps_max_candidates_per_scan_value():
+    # max_candidates=2 should clip each of the 2 dr values independently,
+    # for 4 total displaced candidates -- not a single shared cap of 2.
+    engine = _FakeHessianSampleEngine(["fail"] * 4)
+
+    result = run_hessian_sample(
+        _seed(), engine, dr_values=[0.5, 1.0], max_candidates=2,
+    )
+
+    assert len(result.displaced_nodes) == 4
+    assert result.candidates_clipped is True
+
+
+def test_run_hessian_sample_dr_values_ignores_dr():
+    engine_scan = _FakeHessianSampleEngine(["fail"] * 6)
+    engine_single = _FakeHessianSampleEngine(["fail"] * 6)
+
+    scanned = run_hessian_sample(_seed(), engine_scan, dr=999.0, dr_values=[0.5], max_candidates=100)
+    single = run_hessian_sample(_seed(), engine_single, dr=0.5, max_candidates=100)
+
+    assert [round(m.effective_dr, 6) for m in scanned.displaced_metadata] == [
+        round(m.effective_dr, 6) for m in single.displaced_metadata
+    ]
+
+
+def test_run_hessian_sample_rejects_empty_or_nonpositive_dr_values():
+    engine = _FakeHessianSampleEngine(["fail"] * 6)
+    with pytest.raises(ValueError):
+        run_hessian_sample(_seed(), engine, dr_values=[], max_candidates=10)
+    with pytest.raises(ValueError):
+        run_hessian_sample(_seed(), engine, dr_values=[0.5, -1.0], max_candidates=10)
 
 
 def test_run_hessian_sample_requires_normal_modes():

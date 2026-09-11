@@ -48,7 +48,7 @@ def test_chain_from_xyz_round_trips_multi_node_chain(tmp_path):
 def test_chain_from_xyz_round_trips_single_node_chain(tmp_path):
     """Regression test: np.loadtxt collapses a single-value .energies/.gradients
     file to a 0-d array, which used to raise `TypeError: iteration over a 0-d
-    array` when reloading a one-node chain (e.g. mepd hessian-sample's
+    array` when reloading a one-node chain (e.g. mepd discovery hessian-sample's
     unique.xyz when only one minimum was found)."""
     chain = Chain.model_validate({
         "nodes": [_node_with_energy(0.0, -76.0)],

@@ -12,11 +12,151 @@ from pathlib import Path
 from typing import List, Optional
 
 import typer
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from mepd.chain import Chain
 from mepd.inputs import RunInputs
 
 discovery_app = typer.Typer(help="Structure-discovery/global-optimization tools.")
+
+
+def _progress() -> Progress:
+    """A `rich.progress.Progress` shared by both commands below: a spinner +
+    description for indeterminate stages (e.g. computing a Hessian), a bar +
+    x/y count for determinate ones (e.g. optimizing N candidates), plus
+    elapsed time throughout so a long-running call still visibly ticks."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+    )
+
+
+class _HessianSampleProgress:
+    """Renders `run_hessian_sample`'s `on_event` callbacks onto a `Progress`:
+    a Hessian-computation spinner, then a per-candidate optimization bar."""
+
+    def __init__(self, progress: Progress, *, description_prefix: str = "") -> None:
+        self._progress = progress
+        self._prefix = description_prefix
+        self._hessian_task: Optional[int] = None
+        self._candidate_task: Optional[int] = None
+
+    def __call__(self, event: str, payload: dict) -> None:
+        p = self._progress
+        if event == "hessian_computing":
+            self._hessian_task = p.add_task(f"{self._prefix}Computing Hessian...", total=None)
+        elif event == "hessian_computed":
+            if self._hessian_task is not None:
+                p.remove_task(self._hessian_task)
+                self._hessian_task = None
+        elif event == "optimizing_candidates":
+            total = payload["total"]
+            self._candidate_task = p.add_task(
+                f"{self._prefix}Optimizing {total} candidate(s)", total=total or None,
+            )
+        elif event == "candidate_done":
+            if self._candidate_task is not None:
+                p.update(self._candidate_task, completed=payload["index"], total=payload["total"])
+        elif event == "candidates_optimized":
+            if self._candidate_task is not None:
+                p.remove_task(self._candidate_task)
+                self._candidate_task = None
+
+
+class _HessianGlobalProgress(_HessianSampleProgress):
+    """Adds a round-level bar (out of --max-rounds) on top of
+    `_HessianSampleProgress`'s Hessian/candidate stages, re-labelled per
+    round/source as the basin-hopping search visits each queued minimum."""
+
+    def __init__(self, progress: Progress, *, max_rounds: int) -> None:
+        super().__init__(progress)
+        self._max_rounds = max_rounds
+        self._round_task = progress.add_task(f"Round 0/{max_rounds}", total=max_rounds)
+        self._round_index = 0
+        self._n_sources = 0
+
+    def __call__(self, event: str, payload: dict) -> None:
+        p = self._progress
+        if event == "round_start":
+            self._round_index = payload["round"]
+            self._n_sources = payload["n_sources"]
+            p.update(
+                self._round_task,
+                description=(
+                    f"Round {self._round_index + 1}/{self._max_rounds} "
+                    f"({self._n_sources} source(s))"
+                ),
+            )
+        elif event == "source_start":
+            source_index = payload["source_index"]
+            self._prefix = (
+                f"  [round {self._round_index + 1}, source {source_index + 1}/{self._n_sources}] "
+            )
+        elif event == "round_done":
+            p.update(
+                self._round_task,
+                completed=self._round_index + 1,
+                description=(
+                    f"Round {self._round_index + 1}/{self._max_rounds} done "
+                    f"({payload['accepted']} accepted, {payload['candidates_optimized']} optimized)"
+                ),
+            )
+        else:
+            super().__call__(event, payload)
+
+
+def _describe_node(node) -> str:
+    """A short human-readable label for a discovered structure: a canonical
+    SMILES when the geometry's connectivity can be perceived, else a Hill
+    formula (e.g. "C6H6O") -- good enough to recognize a species at a
+    glance in the live discovery stream without waiting for the run to
+    finish and inspecting the xyz file."""
+    try:
+        import qcinf
+
+        return qcinf.structure_to_smiles(node.structure)
+    except Exception:
+        pass
+    from collections import Counter
+
+    counts = Counter(node.symbols)
+    order = ["C", "H"] + sorted(el for el in counts if el not in ("C", "H"))
+    return "".join(f"{el}{counts[el]}" for el in order if counts.get(el))
+
+
+class _LiveMinimaWriter:
+    """Writes newly accepted minima to `output_fp` incrementally, as each one
+    is found, instead of only once at the very end -- so `accepted_fp` is a
+    valid, loadable chain (e.g. for `mepd run`) at any point while a
+    long-running `hessian-global` search is still going, not just after it
+    completes. Also prints a one-line description of each new find."""
+
+    def __init__(self, *, console, output_fp: Path, chain_inputs, write_qcio: bool) -> None:
+        self._console = console
+        self._output_fp = output_fp
+        self._chain_inputs = chain_inputs
+        self._write_qcio = write_qcio
+        self.nodes: List = []
+
+    def __call__(self, event: str, payload: dict) -> None:
+        if event != "minimum_accepted":
+            return
+        node = payload["node"]
+        self.nodes.append(node.copy())
+        label = _describe_node(node)
+        self._console.print(
+            f"[bold green]✓ New minimum #{len(self.nodes)}[/bold green] "
+            f"(round {payload['round'] + 1}): {label}  "
+            f"ΔE={payload['rel_energy_kcal']:+.2f} kcal/mol -> {self._output_fp}"
+        )
+        chain_out = Chain.model_validate({
+            "nodes": [n.copy() for n in self.nodes],
+            "parameters": self._chain_inputs,
+        })
+        chain_out.write_to_disk(self._output_fp, write_qcio=self._write_qcio)
 
 
 @discovery_app.command("hessian-sample")
@@ -78,14 +218,16 @@ def hessian_sample(
         f"max_candidates={max_candidates}, maxiter={maxiter})..."
     )
     try:
-        result = run_hessian_sample(
-            seed_node,
-            run_inputs.engine,
-            dr=dr,
-            max_candidates=max_candidates,
-            maxiter=maxiter,
-            chain_inputs=run_inputs.chain_inputs,
-        )
+        with _progress() as progress:
+            result = run_hessian_sample(
+                seed_node,
+                run_inputs.engine,
+                dr=dr,
+                max_candidates=max_candidates,
+                maxiter=maxiter,
+                chain_inputs=run_inputs.chain_inputs,
+                on_event=_HessianSampleProgress(progress),
+            )
     except Exception as exc:
         typer.echo(f"Hessian sampling failed: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1)
@@ -316,6 +458,10 @@ def hessian_global(
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
 
+    output.mkdir(parents=True, exist_ok=True)
+    write_qcio = bool(getattr(run_inputs, "write_qcio", False))
+    accepted_fp = output / "accepted_minima.xyz"
+
     dr_label = (
         f"dr_scan_values={','.join(f'{v:g}' for v in dr_scan_values_list)}"
         if full_dr_scan
@@ -326,29 +472,41 @@ def hessian_global(
         f"temperature={temperature:g}K, max_rounds={max_rounds})..."
     )
     try:
-        result = run_hessian_global_optimization(
-            seed_node,
-            run_inputs.engine,
-            dr=dr,
-            dr_values=dr_scan_values_list,
-            max_candidates=max_candidates,
-            maxiter=maxiter,
-            temperature=temperature,
-            energy_tolerance_kcal=energy_tolerance_kcal,
-            max_rounds=max_rounds,
-            random_seed=random_seed,
-            chain_inputs=run_inputs.chain_inputs,
-        )
+        with _progress() as progress:
+            renderer = _HessianGlobalProgress(progress, max_rounds=max_rounds)
+            live_writer = _LiveMinimaWriter(
+                console=progress.console, output_fp=accepted_fp,
+                chain_inputs=run_inputs.chain_inputs, write_qcio=write_qcio,
+            )
+
+            def _on_event(event: str, payload: dict) -> None:
+                renderer(event, payload)
+                live_writer(event, payload)
+
+            result = run_hessian_global_optimization(
+                seed_node,
+                run_inputs.engine,
+                dr=dr,
+                dr_values=dr_scan_values_list,
+                max_candidates=max_candidates,
+                maxiter=maxiter,
+                temperature=temperature,
+                energy_tolerance_kcal=energy_tolerance_kcal,
+                max_rounds=max_rounds,
+                random_seed=random_seed,
+                chain_inputs=run_inputs.chain_inputs,
+                on_event=_on_event,
+            )
     except Exception as exc:
         typer.echo(f"Global optimization failed: {type(exc).__name__}: {exc}")
         raise typer.Exit(code=1)
 
-    output.mkdir(parents=True, exist_ok=True)
-    write_qcio = bool(getattr(run_inputs, "write_qcio", False))
-
-    accepted_fp = None
-    if result.accepted_minima:
-        accepted_fp = output / "accepted_minima.xyz"
+    if not result.accepted_minima:
+        accepted_fp = None
+    else:
+        # Already written incrementally as each minimum was found (see
+        # _LiveMinimaWriter); rewritten once more here as cheap insurance
+        # that the final file reflects exactly `result.accepted_minima`.
         chain_out = Chain.model_validate({
             "nodes": [n.copy() for n in result.accepted_minima],
             "parameters": run_inputs.chain_inputs,

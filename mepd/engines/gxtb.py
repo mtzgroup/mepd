@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List, Union
+from typing import Any, Callable, List, Union
 
 import numpy as np
 from ase import Atoms
@@ -453,11 +453,21 @@ class GXTBCalculator(Engine):
         self,
         nodes: list[StructureNode],
         keywords: dict[str, Any] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[list[StructureNode]]:
-        return [
-            self.compute_geometry_optimization(node=node, keywords=keywords)
-            for node in nodes
-        ]
+        """Batch geometry optimizations, one g-xTB subprocess per node.
+
+        `progress_callback`, if given, is called as `progress_callback(completed,
+        total)` after each node finishes -- this "batch" is really a sequential
+        loop under the hood (one local subprocess at a time), so per-candidate
+        progress is available live, unlike a true remote batch backend.
+        """
+        results: list[list[StructureNode]] = []
+        for node in nodes:
+            results.append(self.compute_geometry_optimization(node=node, keywords=keywords))
+            if progress_callback is not None:
+                progress_callback(len(results), len(nodes))
+        return results
 
     def _as_ase_engine_for_node(self, node: StructureNode):
         from mepd.engines.ase import ASEEngine

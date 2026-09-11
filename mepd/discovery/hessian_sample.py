@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import qcconst.constants as _qcconst_constants
@@ -34,6 +34,16 @@ _R_GAS_KCAL_MOL_K = (
     / float(_qcconst_constants.KCAL_TO_JOULE)
 )
 
+# Optional progress hook: called as `on_event(event_name, payload)` at
+# various points during sampling/optimization, purely for callers (e.g. the
+# CLI) to render live progress -- never load-bearing for the result itself.
+OnEvent = Optional[Callable[[str, dict], None]]
+
+
+def _emit(on_event: OnEvent, event: str, **payload) -> None:
+    if on_event is not None:
+        on_event(event, payload)
+
 
 @dataclass
 class HessianSampleCandidate:
@@ -42,6 +52,7 @@ class HessianSampleCandidate:
     frequency_wavenumber: Optional[float]
     dr: float
     effective_dr: float
+    dr_scan_index: Optional[int] = None
 
 
 @dataclass
@@ -96,14 +107,89 @@ def _dedupe_minima_nodes(nodes: List[Node], chain_inputs: ChainInputs) -> List[N
     return unique_nodes
 
 
+def _generate_dr_displacements(
+    seed_node: Node,
+    modes: List[np.ndarray],
+    freqs: List[float],
+    *,
+    dr: float,
+    max_candidates: int,
+    dr_scan_index: Optional[int] = None,
+) -> tuple[List[Node], List[HessianSampleCandidate], bool]:
+    """Displace `seed_node` along every normal mode (both directions) by a
+    single `dr`, capped at `max_candidates`. Shared by the single-dr path and
+    each value of a `--full-dr-scan` sweep (in which case `dr_scan_index`
+    records which scan value this batch came from)."""
+    scaled_dr = _effective_dr(seed_node, dr)
+    nodes: List[Node] = []
+    metadata: List[HessianSampleCandidate] = []
+    clipped = False
+    for mode_index, mode in enumerate(modes):
+        freq = float(freqs[mode_index]) if mode_index < len(freqs) else None
+        for direction, signed_dr in (("+", scaled_dr), ("-", -scaled_dr)):
+            nodes.append(
+                displace_by_dr(node=seed_node, displacement=np.asarray(mode), dr=signed_dr)
+            )
+            metadata.append(
+                HessianSampleCandidate(
+                    mode_index=mode_index,
+                    direction=direction,
+                    frequency_wavenumber=freq,
+                    dr=abs(float(dr)),
+                    effective_dr=abs(float(signed_dr)),
+                    dr_scan_index=dr_scan_index,
+                )
+            )
+            if len(nodes) >= int(max_candidates):
+                clipped = True
+                break
+        if clipped:
+            break
+    return nodes, metadata, clipped
+
+
+def _optimize_candidates_serially(
+    engine: Engine,
+    candidates: List[Node],
+    metadata: List[HessianSampleCandidate],
+    keywords: dict,
+    *,
+    on_event: OnEvent = None,
+) -> tuple[List[Node], List[HessianSampleCandidate], List[dict]]:
+    """Optimize each candidate one at a time, isolating failures per
+    candidate rather than letting one blow up the rest -- used both when the
+    engine has no batch optimizer, and as a fallback when the batch call
+    itself raises (see `run_hessian_sample`)."""
+    optimized_nodes: List[Node] = []
+    optimized_metadata: List[HessianSampleCandidate] = []
+    failed_candidates: List[dict] = []
+    total = len(candidates)
+    for index, (candidate, meta) in enumerate(zip(candidates, metadata), start=1):
+        try:
+            try:
+                trajectory = engine.compute_geometry_optimization(candidate, keywords=keywords)
+            except TypeError:
+                trajectory = engine.compute_geometry_optimization(candidate)
+            if not trajectory:
+                raise ValueError("optimization returned an empty trajectory")
+            optimized_nodes.append(trajectory[-1])
+            optimized_metadata.append(meta)
+        except Exception as exc:
+            failed_candidates.append({"meta": meta, "error": f"{type(exc).__name__}: {exc}"})
+        _emit(on_event, "candidate_done", index=index, total=total)
+    return optimized_nodes, optimized_metadata, failed_candidates
+
+
 def run_hessian_sample(
     seed_node: Node,
     engine: Engine,
     *,
     dr: float = 0.1,
+    dr_values: Optional[List[float]] = None,
     max_candidates: int = 100,
     maxiter: int = 500,
     chain_inputs: ChainInputs | None = None,
+    on_event: OnEvent = None,
 ) -> HessianSampleResult:
     """Explore minima near `seed_node` by displacing along Hessian normal modes.
 
@@ -113,14 +199,32 @@ def run_hessian_sample(
     an unbounded number of optimizations. `maxiter` caps the optimization step
     budget for each individual candidate.
 
+    `dr_values`, when given, switches to a full displacement scan (matching
+    upstream's `--full-dr-scan`/`--dr-scan-values`): every value is displaced
+    across both directions of every normal mode, each value capped
+    independently at `max_candidates` -- trading a single fixed displacement
+    per mode for a denser sweep of the local potential-energy surface. `dr` is
+    ignored when `dr_values` is given.
+
     Every successfully optimized candidate is kept (deduped into
     `unique_minima`) -- not just ones lower in energy than the seed -- so the
     caller can inspect and filter by whatever criterion it wants afterward.
+
+    `on_event`, if given, is called with `(event_name, payload)` at each
+    stage (`hessian_computing`, `hessian_computed`, `candidates_generated`,
+    `optimizing_candidates`, `candidate_done`, `candidates_optimized`) purely
+    so a caller (e.g. the CLI) can render live progress; it never affects the
+    result.
     """
     if int(max_candidates) <= 0:
         raise ValueError("max_candidates must be a positive integer.")
     if int(maxiter) <= 0:
         raise ValueError("maxiter must be a positive integer.")
+    if dr_values is not None:
+        if len(dr_values) == 0:
+            raise ValueError("dr_values must contain at least one positive value.")
+        if any(float(value) <= 0 for value in dr_values):
+            raise ValueError("dr_values entries must be positive.")
     if chain_inputs is None:
         chain_inputs = ChainInputs()
 
@@ -133,6 +237,7 @@ def run_hessian_sample(
 
     seed_energy = float(engine.compute_energies([seed_node])[0])
 
+    _emit(on_event, "hessian_computing")
     compute_result = getattr(engine, "_compute_hessian_result", None)
     if callable(compute_result):
         hessian_result = compute_result(node=seed_node)
@@ -143,32 +248,26 @@ def run_hessian_sample(
     modes, freqs = _extract_hessian_modes_and_frequencies(hessian_result, seed_node)
     if not modes:
         raise ValueError("No normal modes were returned from the Hessian result.")
+    _emit(on_event, "hessian_computed", n_modes=len(modes))
 
-    scaled_dr = _effective_dr(seed_node, dr)
     max_candidates = int(max_candidates)
     displaced_nodes: List[Node] = []
     displaced_metadata: List[HessianSampleCandidate] = []
     clipped = False
-    for mode_index, mode in enumerate(modes):
-        freq = float(freqs[mode_index]) if mode_index < len(freqs) else None
-        for direction, signed_dr in (("+", scaled_dr), ("-", -scaled_dr)):
-            displaced_nodes.append(
-                displace_by_dr(node=seed_node, displacement=np.asarray(mode), dr=signed_dr)
+    if dr_values:
+        for scan_index, scan_dr in enumerate(dr_values):
+            scan_nodes, scan_metadata, scan_clipped = _generate_dr_displacements(
+                seed_node, modes, freqs,
+                dr=float(scan_dr), max_candidates=max_candidates, dr_scan_index=scan_index,
             )
-            displaced_metadata.append(
-                HessianSampleCandidate(
-                    mode_index=mode_index,
-                    direction=direction,
-                    frequency_wavenumber=freq,
-                    dr=abs(float(dr)),
-                    effective_dr=abs(float(signed_dr)),
-                )
-            )
-            if len(displaced_nodes) >= max_candidates:
-                clipped = True
-                break
-        if clipped:
-            break
+            displaced_nodes.extend(scan_nodes)
+            displaced_metadata.extend(scan_metadata)
+            clipped = clipped or scan_clipped
+    else:
+        displaced_nodes, displaced_metadata, clipped = _generate_dr_displacements(
+            seed_node, modes, freqs, dr=float(dr), max_candidates=max_candidates,
+        )
+    _emit(on_event, "candidates_generated", n_candidates=len(displaced_nodes), clipped=clipped)
 
     result = HessianSampleResult(
         seed_energy=seed_energy,
@@ -184,45 +283,76 @@ def run_hessian_sample(
     optimized_nodes: List[Node] = []
     optimized_metadata: List[HessianSampleCandidate] = []
     failed_candidates: List[dict] = []
+    total_candidates = len(displaced_nodes)
+    _emit(on_event, "optimizing_candidates", total=total_candidates)
 
     if callable(batch_optimizer):
-        result.optimization_submission_mode = "batch"
+        # Best-effort: engines whose batch call is really a sequential loop
+        # under the hood (e.g. GXTBCalculator) can accept an optional
+        # `progress_callback(completed, total)` to report live per-candidate
+        # progress during that one blocking call; engines that don't support
+        # it (a TypeError on the attempt) fall back silently -- their
+        # progress just shows up in one shot when the whole call returns.
+        def _batch_progress_cb(completed: int, total: int = total_candidates) -> None:
+            _emit(on_event, "candidate_done", index=completed, total=total)
+
         try:
-            trajectories = batch_optimizer(displaced_nodes, keywords=keywords)
-        except TypeError:
-            trajectories = batch_optimizer(displaced_nodes)
-        if len(trajectories) != len(displaced_nodes):
-            raise ValueError(
-                "Batch geometry optimization returned a trajectory count "
-                "different from the submitted candidate count."
-            )
-        for meta, trajectory in zip(displaced_metadata, trajectories):
-            if trajectory:
-                optimized_nodes.append(trajectory[-1])
-                optimized_metadata.append(meta)
-            else:
-                failed_candidates.append(
-                    {"meta": meta, "error": "optimization returned an empty trajectory"}
+            try:
+                trajectories = batch_optimizer(
+                    displaced_nodes, keywords=keywords, progress_callback=_batch_progress_cb,
                 )
+            except TypeError:
+                try:
+                    trajectories = batch_optimizer(displaced_nodes, keywords=keywords)
+                except TypeError:
+                    trajectories = batch_optimizer(displaced_nodes)
+        except Exception:
+            trajectories = None
+
+        if trajectories is None:
+            # Some engines' "batch" optimizer is really just a sequential
+            # loop under the hood (no true remote batching), so one
+            # candidate's failure -- commonly a non-convergent geometry
+            # optimization for an aggressive displacement -- raises and
+            # aborts the whole call instead of isolating it, unlike a real
+            # batch backend (e.g. ChemCloud) which reports per-candidate
+            # failures as empty trajectories. Fall back to optimizing each
+            # candidate individually so the rest of the batch isn't lost to
+            # one bad candidate.
+            result.optimization_submission_mode = "batch_fallback_serial"
+            optimized_nodes, optimized_metadata, failed_candidates = _optimize_candidates_serially(
+                engine, displaced_nodes, displaced_metadata, keywords, on_event=on_event,
+            )
+        else:
+            result.optimization_submission_mode = "batch"
+            if len(trajectories) != len(displaced_nodes):
+                raise ValueError(
+                    "Batch geometry optimization returned a trajectory count "
+                    "different from the submitted candidate count."
+                )
+            for index, (meta, trajectory) in enumerate(zip(displaced_metadata, trajectories), start=1):
+                if trajectory:
+                    optimized_nodes.append(trajectory[-1])
+                    optimized_metadata.append(meta)
+                else:
+                    failed_candidates.append(
+                        {"meta": meta, "error": "optimization returned an empty trajectory"}
+                    )
+                _emit(on_event, "candidate_done", index=index, total=total_candidates)
     else:
         result.optimization_submission_mode = "serial"
-        for candidate, meta in zip(displaced_nodes, displaced_metadata):
-            try:
-                try:
-                    trajectory = engine.compute_geometry_optimization(candidate, keywords=keywords)
-                except TypeError:
-                    trajectory = engine.compute_geometry_optimization(candidate)
-                if not trajectory:
-                    raise ValueError("optimization returned an empty trajectory")
-                optimized_nodes.append(trajectory[-1])
-                optimized_metadata.append(meta)
-            except Exception as exc:
-                failed_candidates.append({"meta": meta, "error": f"{type(exc).__name__}: {exc}"})
+        optimized_nodes, optimized_metadata, failed_candidates = _optimize_candidates_serially(
+            engine, displaced_nodes, displaced_metadata, keywords, on_event=on_event,
+        )
 
     result.optimized_nodes = optimized_nodes
     result.optimized_metadata = optimized_metadata
     result.failed_candidates = failed_candidates
     result.unique_minima = _dedupe_minima_nodes(optimized_nodes, chain_inputs)
+    _emit(
+        on_event, "candidates_optimized",
+        n_optimized=len(optimized_nodes), n_failed=len(failed_candidates),
+    )
 
     return result
 
@@ -264,6 +394,7 @@ def run_hessian_global_optimization(
     engine: Engine,
     *,
     dr: float = 0.1,
+    dr_values: Optional[List[float]] = None,
     max_candidates: int = 100,
     maxiter: int = 500,
     temperature: float = 298.15,
@@ -271,6 +402,7 @@ def run_hessian_global_optimization(
     max_rounds: int = 100,
     random_seed: Optional[int] = None,
     chain_inputs: ChainInputs | None = None,
+    on_event: OnEvent = None,
 ) -> HessianGlobalOptResult:
     """Basin-hopping-style global optimization built on repeated Hessian
     sampling.
@@ -287,6 +419,18 @@ def run_hessian_global_optimization(
     == "queue_exhausted"`) or after `max_rounds` rounds
     (`"max_rounds"`) -- the control that bounds this otherwise-unbounded
     search.
+
+    `dr_values`, when given, is forwarded to every round's Hessian sampling
+    as a full displacement scan (see `run_hessian_sample`) instead of the
+    single fixed `dr` -- matching upstream's `--full-dr-scan`.
+
+    `on_event`, if given, is called with `(event_name, payload)` for live
+    progress -- round/source-level events (`round_start`, `source_start`,
+    `round_done`), `minimum_accepted` the instant each new minimum is
+    accepted (payload includes the `node` itself and `rel_energy_kcal`, so a
+    caller can stream/write results out without waiting for the whole
+    search), plus every `run_hessian_sample` event forwarded as-is from
+    whichever source is currently being sampled.
     """
     if float(temperature) <= 0:
         raise ValueError("temperature must be positive.")
@@ -321,14 +465,28 @@ def run_hessian_global_optimization(
         current_queue, queue = queue, []
         candidates_optimized = 0
         accepted_this_round = 0
+        source_errors: List[str] = []
+        _emit(
+            on_event, "round_start",
+            round=round_index, max_rounds=int(max_rounds), n_sources=len(current_queue),
+        )
 
-        for source_node in current_queue:
+        for source_index, source_node in enumerate(current_queue):
+            _emit(
+                on_event, "source_start",
+                round=round_index, source_index=source_index, n_sources=len(current_queue),
+            )
             try:
                 sample = run_hessian_sample(
-                    source_node, engine, dr=dr, max_candidates=max_candidates,
-                    maxiter=maxiter, chain_inputs=chain_inputs,
+                    source_node, engine, dr=dr, dr_values=dr_values, max_candidates=max_candidates,
+                    maxiter=maxiter, chain_inputs=chain_inputs, on_event=on_event,
                 )
-            except Exception:
+            except Exception as exc:
+                # A source failing outright (e.g. its Hessian computation
+                # itself errors) shouldn't silently look like "no minima
+                # found" -- record it so callers/summaries can surface it,
+                # then move on to the other queued sources.
+                source_errors.append(f"{type(exc).__name__}: {exc}")
                 continue
             candidates_optimized += len(sample.optimized_nodes)
 
@@ -360,13 +518,24 @@ def run_hessian_global_optimization(
                 known_structures.append(candidate)
                 queue.append(candidate)
                 accepted_this_round += 1
+                _emit(
+                    on_event, "minimum_accepted",
+                    round=round_index, index=len(accepted_minima),
+                    node=candidate, rel_energy_kcal=delta_kcal,
+                )
 
         round_summaries.append({
             "round": round_index,
             "sources": len(current_queue),
             "candidates_optimized": candidates_optimized,
             "accepted": accepted_this_round,
+            "source_errors": source_errors,
         })
+        _emit(
+            on_event, "round_done",
+            round=round_index, max_rounds=int(max_rounds),
+            candidates_optimized=candidates_optimized, accepted=accepted_this_round,
+        )
 
     return HessianGlobalOptResult(
         start_energy=start_energy,

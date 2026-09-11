@@ -932,6 +932,7 @@ class QCComputeEngine(Engine):
         self,
         nodes: list[StructureNode],
         keywords=None,
+        progress_callback=None,
     ) -> list[list[StructureNode]]:
         """
         Batch geometry optimizations when the backend can accept a list of inputs.
@@ -941,6 +942,10 @@ class QCComputeEngine(Engine):
         For ChemCloud batch calls, individual optimization failures are represented
         as empty trajectories so successful optimizations can still be consumed by
         callers in a single batch submission.
+
+        `progress_callback`, if given, is called as `progress_callback(completed,
+        total)` after each node -- only meaningful for the sequential (non-ChemCloud)
+        path below, where nodes are genuinely optimized one at a time locally.
         """
         if len(nodes) == 0:
             return []
@@ -948,7 +953,12 @@ class QCComputeEngine(Engine):
         keywords = self._geometry_optimizer_keywords(keywords)
 
         if self.compute_program != "chemcloud":
-            return [self.compute_geometry_optimization(node=node, keywords=keywords) for node in nodes]
+            results: list[list[StructureNode]] = []
+            for node in nodes:
+                results.append(self.compute_geometry_optimization(node=node, keywords=keywords))
+                if progress_callback is not None:
+                    progress_callback(len(results), len(nodes))
+            return results
 
         frozen_override = self._coerce_frozen_atom_indices(
             keywords.pop("frozen_atom_indices", None)
