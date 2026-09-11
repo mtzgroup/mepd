@@ -1270,5 +1270,28 @@ def make_default_inputs(
     typer.echo(f"Wrote default inputs to {output}")
 
 
+try:
+    from mepd.discovery.cli import discovery_app  # noqa: E402
+except ImportError:
+    discovery_app = None
+
+if discovery_app is not None:
+    app.add_typer(discovery_app, name="discovery")
+else:
+
+    @app.command(
+        "discovery",
+        context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    )
+    def _discovery_unavailable(ctx: typer.Context) -> None:  # noqa: E402
+        """Structure-discovery tools (unavailable: mepd.discovery failed to import)."""
+        typer.echo(
+            "mepd discovery is unavailable: the mepd.discovery submodule could not be "
+            "imported. Install its dependencies (e.g. `pip install mepd[discovery]`) "
+            "and try again."
+        )
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()

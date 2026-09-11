@@ -35,6 +35,9 @@ viz = [
     "ipython>=8.37.0",
     "qcdata[view]>=0.18.1",
 ]
+discovery = [
+    "rich>=13.0.0",
+]
 
 [project.scripts]
 mepd = "mepd.cli:app"
