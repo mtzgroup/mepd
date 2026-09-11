@@ -16,7 +16,6 @@ import mepd.chainhelpers as ch
 from mepd.chain import Chain
 from mepd.elementarystep import ElemStepResults, check_if_elem_step
 from mepd.engines import Engine
-from mepd.engines.ase import ASEEngine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
 # from mepd.gsm_helper import minimal_wrapper_de_gsm, gsm_to_ase_atoms
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs

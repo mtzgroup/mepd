@@ -3,14 +3,15 @@ import os
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import TYPE_CHECKING, List, Tuple, Union
+
+if TYPE_CHECKING:
+    from ase import Atoms
 
 import numpy as np
 from openbabel import openbabel, pybel
 from qcdata.models.inputs import ProgramInput
 from qcdata.models.structure import Structure
-from ase import Atoms
-
 
 from qcconst.constants import ANGSTROM_TO_BOHR
 from mepd.geodesic_interpolation2.fileio import read_xyz
@@ -238,6 +239,7 @@ def _change_prog_input_property(
 
 
 def structure_to_ase_atoms(structure: Structure):
+    from ase import Atoms
 
     symbs = structure.symbols
     pos = structure.geometry_angstrom

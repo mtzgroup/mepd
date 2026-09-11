@@ -7,7 +7,6 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 dependencies = [
-    "ase>=3.26.0",
     "chemcloud>=0.17.0",
     "geometric>=1.1",
     "networkx>=3.4.2",
@@ -22,7 +21,6 @@ dependencies = [
     "qcconst>=0.2.1",
     "rdkit>=2025.3.6",
     "scipy>=1.15.3",
-    "sella>=2.3.4",
     "timeout-timer>=0.2.0",
     "tomli>=2.2.1",
     "tomli-w>=1.2.0",
@@ -37,6 +35,20 @@ viz = [
 ]
 discovery = [
     "rich>=13.0.0",
+]
+# ASEEngine (engine_name="ase") and its SELLA-based TS-opt/IRC support. Not
+# needed for the qc*/chemcloud-backed engines, which are the main workhorse.
+ase = [
+    "ase>=3.26.0",
+    "sella>=2.3.4",
+]
+# GXTBCalculator (engine_name="gxtb") wraps g-xTB as an ase.Calculator --
+# a temporary workaround until qccompute supports g-xTB natively. TS-opt/IRC
+# through gxtb additionally goes through ASEEngine/Sella, so this pulls in
+# the same packages as the `ase` extra.
+gxtb = [
+    "ase>=3.26.0",
+    "sella>=2.3.4",
 ]
 
 [project.scripts]

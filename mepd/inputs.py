@@ -547,7 +547,13 @@ class RunInputs:
                              frozen_atom_indices=self.chain_inputs.frozen_atom_indices,
                              )
         elif self.engine_name == 'ase':
-            from mepd.engines.ase import ASEEngine
+            try:
+                from mepd.engines.ase import ASEEngine
+            except ImportError as exc:
+                raise ImportError(
+                    "engine_name='ase' requires the 'ase' extra "
+                    "(pip install mepd[ase])."
+                ) from exc
             ase_progs = ['omol25']
             assert self.program in ase_progs, f"{self.program} not yet supported with ASEEngine. Use one of {ase_progs} instead."
             if self.program == 'omol25':
@@ -587,7 +593,13 @@ class RunInputs:
                 )
             eng = ASEEngine(calculator=calc, **ase_kwds)
         elif self.engine_name == 'gxtb':
-            from mepd.engines.gxtb import GXTBCalculator
+            try:
+                from mepd.engines.gxtb import GXTBCalculator
+            except ImportError as exc:
+                raise ImportError(
+                    "engine_name='gxtb' requires the 'gxtb' extra "
+                    "(pip install mepd[gxtb])."
+                ) from exc
             eng = GXTBCalculator(**dict(self.gxtb_engine_kwds or {}))
         else:
             raise ValueError(f"Unsupported engine: {self.engine_name}")
