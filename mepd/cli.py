@@ -307,6 +307,64 @@ def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
     )
 
 
+def _run_msmep_pairs(
+    structures,
+    candidates: list,
+    pairs_dir: Path,
+    run_inputs: RunInputs,
+    *,
+    parallel: bool,
+    parallel_workers: Optional[int],
+) -> None:
+    """Runs recursive NEB/MSMEP autosplitting for each (i, j) structure-index
+    pair in `candidates`, writing each result to <pairs_dir>/pair_<i>_<j>/tree/.
+
+    Resumable with no separate manifest/state file: a pair is skipped if its
+    directory already holds a completed tree, so re-running against the same
+    `pairs_dir` picks up wherever a prior run left off -- the directory tree
+    on disk IS the resume state. Shared by --network-completion (candidates
+    seeded from newly-discovered intermediates) and `network-splits`
+    (candidates seeded from a user-supplied list of minima).
+    """
+    from mepd.msmep import MSMEP
+    import mepd.chainhelpers as ch
+
+    for i, j in candidates:
+        pair_dir = pairs_dir / f"pair_{i}_{j}"
+        tree_dir = pair_dir / "tree"
+        if (tree_dir / "adj_matrix.txt").exists():
+            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
+            continue
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")
+        try:
+            seed_chain = Chain.model_validate({
+                "nodes": [structures[i], structures[j]],
+                "parameters": copy.deepcopy(run_inputs.chain_inputs),
+            })
+            pair_chain = ch.run_geodesic(
+                chain=seed_chain,
+                chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
+                nimages=run_inputs.gi_inputs.nimages,
+                friction=run_inputs.gi_inputs.friction,
+                nudge=run_inputs.gi_inputs.nudge,
+                random_seed=run_inputs.gi_inputs.random_seed,
+                align=run_inputs.gi_inputs.align,
+                **(run_inputs.gi_inputs.extra_kwds or {}),
+            )
+            msmep = MSMEP(inputs=run_inputs)
+            if parallel:
+                pair_history = msmep.run_parallel_recursive_minimize(
+                    pair_chain, max_workers=parallel_workers
+                )
+            else:
+                pair_history = msmep.run_recursive_minimize(pair_chain)
+            pair_history.write_to_disk(tree_dir)
+        except Exception as exc:
+            typer.echo(f"Pair ({i}, {j}) failed ({type(exc).__name__}: {exc}); skipping.")
+            continue
+
+
 def _run_network_completion(
     *,
     output: Path,
@@ -322,16 +380,10 @@ def _run_network_completion(
     """Auto-generate and run follow-up NEB/MSMEP requests connecting
     newly-discovered intermediates, then build the completed reaction network.
 
-    Resumable with no separate manifest/state file: each follow-up pair's
-    MSMEP output lives at a deterministic path
-    (<output>/network_completion/pair_<i>_<j>/tree/), and a pair is skipped
-    if that directory already holds a completed tree. Re-running the exact
-    same command against the same --output therefore picks up wherever a
-    prior run left off -- the directory tree on disk IS the resume state.
+    Resumable: see `_run_msmep_pairs`. Re-running the exact same command
+    against the same --output picks up wherever a prior run left off.
     """
-    from mepd.msmep import MSMEP
     from mepd.NetworkBuilder import NetworkBuilder
-    import mepd.chainhelpers as ch
 
     completion_dir = output / "network_completion"
     completion_dir.mkdir(parents=True, exist_ok=True)
@@ -365,40 +417,10 @@ def _run_network_completion(
     if not candidates:
         typer.echo("No new candidate pairs for --network-completion.")
 
-    for i, j in candidates:
-        pair_dir = completion_dir / f"pair_{i}_{j}"
-        tree_dir = pair_dir / "tree"
-        if (tree_dir / "adj_matrix.txt").exists():
-            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
-            continue
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        typer.echo(f"Running follow-up NEB/MSMEP for pair ({i}, {j})...")
-        try:
-            seed_chain = Chain.model_validate({
-                "nodes": [structures[i], structures[j]],
-                "parameters": copy.deepcopy(run_inputs.chain_inputs),
-            })
-            pair_chain = ch.run_geodesic(
-                chain=seed_chain,
-                chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
-                nimages=run_inputs.gi_inputs.nimages,
-                friction=run_inputs.gi_inputs.friction,
-                nudge=run_inputs.gi_inputs.nudge,
-                random_seed=run_inputs.gi_inputs.random_seed,
-                align=run_inputs.gi_inputs.align,
-                **(run_inputs.gi_inputs.extra_kwds or {}),
-            )
-            msmep = MSMEP(inputs=run_inputs)
-            if parallel:
-                pair_history = msmep.run_parallel_recursive_minimize(
-                    pair_chain, max_workers=parallel_workers
-                )
-            else:
-                pair_history = msmep.run_recursive_minimize(pair_chain)
-            pair_history.write_to_disk(tree_dir)
-        except Exception as exc:
-            typer.echo(f"Follow-up pair ({i}, {j}) failed ({type(exc).__name__}: {exc}); skipping.")
-            continue
+    _run_msmep_pairs(
+        structures, candidates, completion_dir, run_inputs,
+        parallel=parallel, parallel_workers=parallel_workers,
+    )
 
     builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
     try:
@@ -911,6 +933,142 @@ def network_build(
     pot.write_to_disk(output)
     typer.echo(
         f"Wrote network to {output} "
+        f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
+    )
+
+
+@app.command("network-splits")
+def network_splits(
+    minima: List[Path] = typer.Argument(
+        ..., exists=True, dir_okay=False,
+        help="Two or more xyz files, each a single minimum geometry (not a "
+        "multi-frame trajectory/chain). Every pair is connected by a "
+        "recursive NEB/MSMEP run by default (--mode all-to-all); the "
+        "results are combined into a completed reaction network.",
+    ),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", exists=True,
+        help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
+    ),
+    charge: Optional[int] = typer.Option(
+        None, "--charge", help="Override the molecular charge on every minimum."
+    ),
+    multiplicity: Optional[int] = typer.Option(
+        None, "--multiplicity", help="Override the spin multiplicity on every minimum."
+    ),
+    mode: str = typer.Option(
+        "all-to-all", "--mode",
+        help="Pairing heuristic connecting the given minima. Currently only "
+        "'all-to-all' (every pair) is supported; more heuristics (e.g. "
+        "energy- or similarity-based pruning) may be added later.",
+    ),
+    max_pairs: int = typer.Option(
+        100, "--max-pairs",
+        help="Cap on the number of pairs to run (guards against the "
+        "combinatorial blowup of all-to-all pairing for many minima).",
+    ),
+    parallel: bool = typer.Option(
+        False, "--parallel",
+        help="Run each pair's recursive autosplitting (MSMEP) with branches "
+        "evaluated in parallel.",
+    ),
+    parallel_workers: Optional[int] = typer.Option(
+        None, "--parallel-workers",
+        help="Maximum number of concurrent workers for --parallel. Defaults to "
+        "min(4, cpu count).",
+    ),
+    validate_minima_with_hessian: bool = typer.Option(
+        True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="When a minima-based autosplit is proposed during MSMEP, compute "
+        "Hessians for optimized split candidates and reject candidates with "
+        "significant imaginary modes. On by default -- this is a correctness "
+        "check, not a convenience.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff",
+        help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="Displacement (bohr) applied along the lowest-frequency mode when "
+        "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
+    ),
+    same_pair_split_limit: int = typer.Option(
+        5, "--same-pair-split-limit",
+        help="If a branch repeats the exact same (start, end) endpoint pair this "
+        "many times in a row with no new chemistry found, stop splitting that "
+        "branch further. A split that DOES discover a new molecule/conformer is "
+        "never cut off by this.",
+    ),
+    output: Path = typer.Option(
+        Path("mepd_network_splits_output"), "--output", "-o",
+        help="Directory to write pair trees and the completed network into.",
+    ),
+) -> None:
+    """Run the network-splits workflow directly from a list of minima,
+    instead of discovering intermediates from a single start/end MSMEP run:
+    every pair of the given minima is connected by a recursive NEB/MSMEP run
+    (all-to-all by default), and the results are combined into a completed
+    reaction network."""
+    if len(minima) < 2:
+        raise typer.BadParameter("Provide at least two minima.")
+    if mode != "all-to-all":
+        raise typer.BadParameter("--mode currently only supports 'all-to-all'.")
+    if max_pairs <= 0:
+        raise typer.BadParameter("--max-pairs must be a positive integer.")
+    if same_pair_split_limit <= 0:
+        raise typer.BadParameter("--same-pair-split-limit must be a positive integer.")
+
+    from mepd.nodes.node import StructureNode
+    from mepd.NetworkBuilder import NetworkBuilder
+
+    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
+    run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
+    run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
+    run_inputs.path_min_inputs.recursive_same_pair_split_limit = same_pair_split_limit
+    _echo_run_inputs_summary(run_inputs)
+
+    structures = [
+        StructureNode(structure=_load_endpoint(fp, charge, multiplicity))
+        for fp in minima
+    ]
+
+    candidates = [
+        (i, j) for i in range(len(structures)) for j in range(i + 1, len(structures))
+    ]
+    if len(candidates) > max_pairs:
+        typer.echo(
+            f"{len(candidates)} candidate pairs found (all-to-all over "
+            f"{len(structures)} minima), capping at --max-pairs={max_pairs}."
+        )
+        candidates = candidates[:max_pairs]
+
+    output.mkdir(parents=True, exist_ok=True)
+    pairs_dir = output / "pairs"
+    pairs_dir.mkdir(parents=True, exist_ok=True)
+
+    _run_msmep_pairs(
+        structures, candidates, pairs_dir, run_inputs,
+        parallel=parallel, parallel_workers=parallel_workers,
+    )
+
+    tree_dirs = _completed_tree_dirs(pairs_dir)
+    if not tree_dirs:
+        typer.echo("No pairs completed successfully; nothing to build a network from.")
+        raise typer.Exit(code=1)
+
+    builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
+    try:
+        pot = builder.create_rxn_network_from_paths(tree_dirs)
+    except Exception as exc:
+        typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    network_path = output / "network.json"
+    pot.write_to_disk(network_path)
+    typer.echo(
+        f"Wrote network to {network_path} "
         f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
     )
 
