@@ -71,16 +71,23 @@ class HessianSampleResult:
 
 
 def _effective_dr(seed_node: Node, dr: float) -> float:
-    """Scale the requested displacement by system size, matching the
-    upstream convention -- a fixed per-mode displacement in bohr becomes
-    vanishingly small (in per-atom RMS terms) for large molecules otherwise.
+    """Scale the requested displacement by system size so the per-atom RMS
+    displacement stays roughly constant across molecule sizes, instead of a
+    fixed per-mode displacement in bohr becoming vanishingly small (in
+    per-atom RMS terms) for large molecules.
+
+    `displace_by_dr` normalizes the mode to unit norm across the full 3N
+    Cartesian vector, then steps by this returned value -- so the resulting
+    per-atom RMS displacement is `effective_dr / sqrt(N)`. For that to equal
+    `dr` regardless of N, `effective_dr` must be `dr * sqrt(N)`, not `dr * N`
+    (which would make the per-atom RMS grow with sqrt(N) instead).
     """
     if float(dr) <= 0:
         raise ValueError("The Hessian-sample displacement (dr) must be positive.")
     natoms = int(np.asarray(seed_node.coords, dtype=float).shape[0])
     if natoms <= 0:
         raise ValueError("Cannot resolve a Hessian-sample displacement for an empty structure.")
-    return float(dr) * float(natoms)
+    return float(dr) * float(natoms) ** 0.5
 
 
 def _dedupe_minima_nodes(nodes: List[Node], chain_inputs: ChainInputs) -> List[Node]:

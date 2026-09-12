@@ -177,7 +177,10 @@ def hessian_sample(
     ),
     dr: float = typer.Option(
         0.1, "--dr",
-        help="Per-atom displacement factor; effective mode displacement is dr * n_atoms.",
+        help="Target per-atom RMS displacement (bohr). Effective mode "
+        "displacement is dr * sqrt(n_atoms), which keeps this size-invariant "
+        "(a fixed per-mode displacement in bohr would otherwise give "
+        "systematically weaker per-atom kicks for larger molecules).",
     ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",
@@ -387,7 +390,10 @@ def hessian_global(
     ),
     dr: float = typer.Option(
         0.1, "--dr",
-        help="Per-atom displacement factor; effective mode displacement is dr * n_atoms.",
+        help="Target per-atom RMS displacement (bohr). Effective mode "
+        "displacement is dr * sqrt(n_atoms), which keeps this size-invariant "
+        "(a fixed per-mode displacement in bohr would otherwise give "
+        "systematically weaker per-atom kicks for larger molecules).",
     ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",

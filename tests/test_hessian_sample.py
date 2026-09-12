@@ -5,10 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from qcconst.constants import BOHR_TO_ANGSTROM
+from qcdata import Structure
+
 from mepd.engines.engine import Engine
+from mepd.discovery.hessian_sample import _effective_dr
 from mepd.discovery.hessian_sample import run_hessian_sample
 from mepd.inputs import ChainInputs
-from mepd.nodes.node import XYNode
+from mepd.nodes.node import StructureNode, XYNode
 
 
 class _FakeHessianSampleEngine(Engine):
@@ -164,6 +168,32 @@ def test_run_hessian_sample_caps_at_max_candidates():
     assert result.candidates_clipped is True
     assert len(result.failed_candidates) == 2
     assert result.unique_minima == []
+
+
+def _fake_structure_node(n_atoms: int) -> StructureNode:
+    return StructureNode(structure=Structure(
+        symbols=["H"] * n_atoms,
+        geometry=np.zeros((n_atoms, 3)),
+        charge=0, multiplicity=1,
+    ))
+
+
+def test_effective_dr_gives_size_invariant_per_atom_rms_displacement():
+    """`displace_by_dr` normalizes the mode to unit norm across the full 3N
+    Cartesian vector, so per-atom RMS displacement is `effective_dr /
+    sqrt(N)`. `_effective_dr` must return `dr * sqrt(N)` (not `dr * N`) for
+    that per-atom RMS to actually equal `dr`, independent of molecule size --
+    otherwise larger molecules get systematically harder kicks, biasing
+    novelty yield and failure rate by molecular size for anyone comparing
+    across a size range."""
+    dr = 0.1
+    rms_per_atom_angstrom = {
+        n: (_effective_dr(_fake_structure_node(n), dr) / (n**0.5)) * BOHR_TO_ANGSTROM
+        for n in (5, 20, 60)
+    }
+    assert rms_per_atom_angstrom[5] == pytest.approx(rms_per_atom_angstrom[20])
+    assert rms_per_atom_angstrom[20] == pytest.approx(rms_per_atom_angstrom[60])
+    assert rms_per_atom_angstrom[20] == pytest.approx(dr * BOHR_TO_ANGSTROM)
 
 
 def test_run_hessian_sample_rejects_nonpositive_dr():
