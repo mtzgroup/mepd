@@ -11,9 +11,16 @@ import numpy as np
 import scipy.sparse.linalg
 from openbabel import openbabel
 from pysmiles import write_smiles
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from qcconst import periodic_table
 
+# RDKit's sanitization/valence errors (e.g. "Explicit valence for atom # N H,
+# 2, is greater than permitted") go through its own C++ logger, not Python's
+# `warnings`/`logging` -- routine when perceiving bonds from distorted
+# geometries (TS regions, hessian-sample displacements, network-splits pairs)
+# and always handled by the caller, but otherwise floods stdout/stderr
+# regardless of any try/except around the call that triggered it.
+RDLogger.DisableLog("rdApp.*")
 
 warnings.filterwarnings("ignore")
 with warnings.catch_warnings():
