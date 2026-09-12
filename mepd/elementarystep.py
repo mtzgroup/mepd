@@ -137,14 +137,43 @@ def _extract_hessian_modes_and_frequencies(
     hessian_result,
     node: Node,
 ) -> tuple[list[np.ndarray], list[float]]:
+    modes, freqs, _source = _extract_hessian_modes_frequencies_and_source(hessian_result, node)
+    return modes, freqs
+
+
+def _extract_hessian_modes_frequencies_and_source(
+    hessian_result,
+    node: Node,
+) -> tuple[list[np.ndarray], list[float], str]:
+    """Same as `_extract_hessian_modes_and_frequencies`, but also reports
+    which source actually produced the modes:
+
+    - `"normal_modes_cartesian"`: whatever a QC program's own result object
+      emitted (usually already excludes translations/rotations, in whatever
+      order the program used).
+    - `"parse_nma_freq_data"`: parsed from a mass-weighted-modes file (e.g.
+      TeraChem), or -- indistinguishably from here -- that parser's own
+      internal raw-Hessian-eigendecomposition fallback when no such file is
+      available (ascending order, translations/rotations included).
+    - `"hessian_eigendecomposition"`: this function's own bottom-of-the-line
+      fallback, a raw `np.linalg.eigh` of the Cartesian Hessian (ascending
+      order, translations/rotations included).
+    - `"none"`: no Hessian data could be extracted at all.
+
+    Used by `prepare_modes` for provenance, and to know that translation/
+    rotation filtering is only ever a no-op (not a mistake) on the sources
+    that already exclude them.
+    """
     results = getattr(hessian_result, "results", None)
     modes = getattr(results, "normal_modes_cartesian", None)
     freqs = getattr(results, "freqs_wavenumber", None)
     if modes is not None and freqs is not None:
         try:
-            return [np.asarray(mode, dtype=float) for mode in modes], [
-                float(freq) for freq in freqs
-            ]
+            return (
+                [np.asarray(mode, dtype=float) for mode in modes],
+                [float(freq) for freq in freqs],
+                "normal_modes_cartesian",
+            )
         except Exception:
             pass
 
@@ -153,15 +182,17 @@ def _extract_hessian_modes_and_frequencies(
 
         parsed_modes, parsed_freqs = parse_nma_freq_data(hessian_result)
         if parsed_modes and parsed_freqs:
-            return [np.asarray(mode, dtype=float) for mode in parsed_modes], [
-                float(freq) for freq in parsed_freqs
-            ]
+            return (
+                [np.asarray(mode, dtype=float) for mode in parsed_modes],
+                [float(freq) for freq in parsed_freqs],
+                "parse_nma_freq_data",
+            )
     except Exception:
         pass
 
     hessian = _extract_hessian_matrix(hessian_result)
     if hessian is None:
-        return [], []
+        return [], [], "none"
     eigvals, eigvecs = np.linalg.eigh(hessian)
     modes = []
     for mode_index in range(eigvecs.shape[1]):
@@ -172,7 +203,182 @@ def _extract_hessian_modes_and_frequencies(
             pass
         modes.append(mode)
     freqs = [float(np.sign(val) * np.sqrt(abs(val))) for val in eigvals]
-    return modes, freqs
+    return modes, freqs, "hessian_eigendecomposition"
+
+
+_TRANS_ROT_CUTOFF_WAVENUMBER = 50.0
+_MODE_NORM_MIN = 1e-8
+
+
+def _expected_trans_rot_dof(coords: np.ndarray) -> int:
+    """3 translational plus 0 (single atom), 2 (linear), or 3 (otherwise)
+    rotational degrees of freedom. Linearity is detected by the rank of the
+    centered coordinate matrix: colinear atoms span a 1-D subspace, so the
+    second-largest singular value is ~0.
+
+    Returns 0 for anything that isn't a genuine (n_atoms, 3) Cartesian
+    geometry (e.g. a toy 2-D potential's coordinates) -- translation/
+    rotation only has physical meaning for real 3-D molecular structures, so
+    mode-dropping is simply skipped for anything else rather than guessing.
+    """
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        return 0
+    natoms = coords.shape[0]
+    if natoms <= 1:
+        return 3 * natoms
+    centered = coords - coords.mean(axis=0)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    is_linear = len(singular_values) < 2 or singular_values[1] < 1e-6 * max(singular_values[0], 1e-12)
+    return 5 if is_linear else 6
+
+
+@dataclass
+class ModeSet:
+    """Cartesian normal modes ready for displacement: translations/rotations
+    filtered out, sorted ascending by signed frequency (imaginary modes --
+    negative frequency, i.e. a reaction coordinate at a TS -- first), each
+    mode L2-normalized over the full 3N Cartesian vector, with its harmonic
+    force constant precomputed. Built by `prepare_modes`.
+    """
+
+    vectors: list[np.ndarray]        # each shaped like node.coords, L2-normalized over 3N
+    freqs_wavenumber: list[float]    # signed; negative == imaginary
+    force_constants: list[float]     # k_i = u_i^T H u_i, Hartree/bohr^2 (nan if Hessian unavailable)
+    imaginary_indices: list[int]
+    source: str
+    n_dropped_trans_rot: int
+
+    def __len__(self) -> int:
+        return len(self.vectors)
+
+
+def prepare_modes(
+    hessian_result,
+    node: Node,
+    *,
+    trans_rot_cutoff_wavenumber: float = _TRANS_ROT_CUTOFF_WAVENUMBER,
+) -> ModeSet:
+    """The single place every Hessian-mode consumer that wants to *displace*
+    along modes (e.g. `run_hessian_sample`) should go through, instead of
+    calling `_extract_hessian_modes_and_frequencies` directly.
+
+    That function has four possible sources with inconsistent guarantees
+    (see `_extract_hessian_modes_frequencies_and_source`): two of them
+    return every 3N eigenvector, translations/rotations included, in
+    ascending-eigenvalue order; the other two typically already exclude
+    trans/rot but in whatever order the QC program emitted them. Code that
+    just takes the first `max_candidates` modes in list order therefore
+    silently wastes part of its budget on directions that displace nothing
+    physical (a translation/rotation re-optimizes straight back to the seed)
+    on two of the four sources, and gets an inconsistent ordering across all
+    four.
+
+    This normalizes all four into one contract:
+
+    - Translations/rotations dropped when the source gave the full 3N set
+      (the two raw-eigendecomposition sources), capped at the expected count
+      (6, or 5 for a linear molecule, from `_expected_trans_rot_dof`) so a
+      genuinely soft low-frequency vibration is never mistaken for one -- a
+      mismatch between the cutoff-based count and the expected count is
+      reported via `warnings.warn` rather than silently dropping more or
+      fewer. A source that already gave fewer than 3N modes is trusted to
+      have excluded trans/rot itself; nothing further is dropped from it.
+    - Sorted ascending by signed frequency, so imaginary modes (the reaction
+      coordinate at a TS seed) come first.
+    - Each mode L2-normalized over the full 3N Cartesian vector -- the same
+      normalization `displace_by_dr` applies, done once here so force
+      constants are computed against the actual unit vector displacement
+      uses.
+    - Harmonic force constant `k_i = u_i^T H u_i` precomputed from the same
+      Cartesian Hessian (Hartree/bohr^2). This needs no reduced masses (not
+      reliably available across all four sources) and is exactly the
+      curvature felt along the direction displacement actually moves in.
+    """
+    modes, freqs, source = _extract_hessian_modes_frequencies_and_source(hessian_result, node)
+    if not modes or not freqs:
+        return ModeSet(
+            vectors=[], freqs_wavenumber=[], force_constants=[],
+            imaginary_indices=[], source=source, n_dropped_trans_rot=0,
+        )
+
+    count = min(len(modes), len(freqs))
+    coords = np.asarray(node.coords, dtype=float)
+
+    reshaped_modes: list[np.ndarray] = []
+    kept_freqs: list[float] = []
+    for mode, freq in zip(modes[:count], freqs[:count]):
+        mode = np.asarray(mode, dtype=float)
+        if mode.shape != coords.shape:
+            try:
+                mode = mode.reshape(coords.shape)
+            except ValueError:
+                continue  # can't align this mode to the seed's geometry; drop it
+        norm = float(np.linalg.norm(mode))
+        if not np.isfinite(norm) or norm < _MODE_NORM_MIN:
+            continue
+        reshaped_modes.append(mode / norm)
+        kept_freqs.append(float(freq))
+
+    expected_trans_rot = _expected_trans_rot_dof(coords)
+    natoms = coords.shape[0] if coords.ndim == 2 and coords.shape[1] == 3 else 0
+    already_excluded = expected_trans_rot == 0 or len(kept_freqs) <= max(
+        3 * natoms - expected_trans_rot, 0
+    )
+    if already_excluded:
+        # Fewer modes were given than the full 3N (or this isn't a real 3-D
+        # geometry at all) -- the source already looks like it excludes
+        # translations/rotations, so trust it rather than second-guessing
+        # via the cutoff, which would risk dropping a genuine soft mode.
+        drop_indices: set[int] = set()
+    else:
+        candidate_drop = [
+            i for i, f in enumerate(kept_freqs) if abs(f) < trans_rot_cutoff_wavenumber
+        ]
+        if len(candidate_drop) != expected_trans_rot:
+            import warnings
+            warnings.warn(
+                f"prepare_modes: expected {expected_trans_rot} translation/rotation "
+                f"mode(s) below {trans_rot_cutoff_wavenumber} cm^-1, found "
+                f"{len(candidate_drop)} (source={source}). Capping at "
+                f"{expected_trans_rot} lowest-magnitude candidates so a genuinely "
+                "soft vibration isn't mistaken for one.",
+                stacklevel=2,
+            )
+        drop_indices = set(
+            sorted(candidate_drop, key=lambda i: abs(kept_freqs[i]))[:expected_trans_rot]
+        )
+
+    vectors = [m for i, m in enumerate(reshaped_modes) if i not in drop_indices]
+    vibrational_freqs = [f for i, f in enumerate(kept_freqs) if i not in drop_indices]
+    n_dropped = len(drop_indices)
+
+    order = sorted(range(len(vibrational_freqs)), key=lambda i: vibrational_freqs[i])
+    vectors = [vectors[i] for i in order]
+    vibrational_freqs = [vibrational_freqs[i] for i in order]
+
+    hessian = _extract_hessian_matrix(hessian_result)
+    force_constants: list[float] = []
+    for vec in vectors:
+        if hessian is None:
+            force_constants.append(float("nan"))
+            continue
+        flat = vec.reshape(-1)
+        if flat.shape[0] != hessian.shape[0]:
+            force_constants.append(float("nan"))
+        else:
+            force_constants.append(float(flat @ hessian @ flat))
+
+    imaginary_indices = [i for i, f in enumerate(vibrational_freqs) if f < 0]
+
+    return ModeSet(
+        vectors=vectors,
+        freqs_wavenumber=vibrational_freqs,
+        force_constants=force_constants,
+        imaginary_indices=imaginary_indices,
+        source=source,
+        n_dropped_trans_rot=n_dropped,
+    )
 
 
 def _lowest_frequency_mode(
