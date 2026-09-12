@@ -201,3 +201,91 @@ def test_run_hessian_global_optimization_rejects_nonpositive_max_rounds():
     engine = _FakeMultiWellEngine()
     with pytest.raises(ValueError):
         run_hessian_global_optimization(_seed(), engine, max_rounds=0)
+
+
+def test_run_hessian_global_optimization_rejects_invalid_acceptance_baseline():
+    engine = _FakeMultiWellEngine()
+    with pytest.raises(ValueError):
+        run_hessian_global_optimization(_seed(), engine, acceptance_baseline="nonsense")
+
+
+class _FakeTsSeededEngine(Engine):
+    """A toy engine reproducing the exact acceptance-baseline bug: a
+    high-energy seed (like a TS guess) from which round 1 finds a real
+    minimum (B), and round 2 finds a *worse* minimum (C) reachable only from
+    B -- worse than B, but still far below the original seed.
+
+    Wells (kcal/mol relative to the seed, A, at x=0):
+      A (x=0, seed): 0.0 kcal -- a TS-like high-energy starting structure
+      B (x=10): -50.0 kcal -- downhill from A, reachable from A
+      C (x=20): -45.0 kcal -- *uphill* from B by 5 kcal/mol, reachable only
+        from B; still far below A, so a baseline fixed at A's energy would
+        always call this move downhill.
+    """
+
+    WELLS = {
+        "A": (0.0, 0.0),
+        "B": (10.0, _kcal_to_hartree(-50.0)),
+        "C": (20.0, _kcal_to_hartree(-45.0)),
+    }
+
+    def compute_energies(self, nodes):
+        return [n._cached_energy if n._cached_energy is not None else 0.0 for n in nodes]
+
+    def compute_gradients(self, nodes):
+        raise NotImplementedError
+
+    def _compute_hessian_result(self, node, **kwargs):
+        modes = [np.array([1.0, 0.0])]
+        freqs = [100.0]
+        return SimpleNamespace(
+            results=SimpleNamespace(normal_modes_cartesian=modes, freqs_wavenumber=freqs)
+        )
+
+    def compute_geometry_optimization(self, node, keywords=None):
+        x = float(node.coords[0])
+        if abs(x) < 5:
+            target = "B"
+        else:
+            target = "C"  # from B (or C itself): C is a dead end
+        well_x, energy = self.WELLS[target]
+        return [XYNode(structure=np.array([well_x, 0.0]), _cached_energy=energy)]
+
+
+def test_run_hessian_global_optimization_connected_baseline_rejects_uphill_from_source():
+    """The bug this fixes: comparing every round to the *original* seed's
+    energy means that, seeded from a high-energy structure, a later move
+    that is genuinely uphill relative to where the search actually is (B ->
+    C, +5 kcal/mol) still looks steeply downhill against the stale seed
+    baseline and gets accepted unconditionally. "connected" (the default)
+    compares each candidate to its own source instead, so this uphill move
+    goes through the real Metropolis test -- and at a low enough
+    temperature, is essentially never accepted."""
+    engine = _FakeTsSeededEngine()
+
+    result = run_hessian_global_optimization(
+        _seed(), engine, dr=0.5, max_candidates=1, temperature=50.0,
+        max_rounds=5, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        acceptance_baseline="connected",
+    )
+    accepted_x = sorted(round(float(n.coords[0]), 1) for n in result.accepted_minima)
+    assert accepted_x == [10.0]  # B accepted, C (uphill from B) rejected
+
+
+def test_run_hessian_global_optimization_seed_baseline_reproduces_the_old_bug():
+    """Same scenario, but with the old "seed" baseline: C is still compared
+    against the original (very high) seed energy in round 2, so it looks
+    steeply downhill and gets accepted despite being uphill from B -- this
+    is the exact bug the "connected" default fixes, kept as a regression
+    test against `acceptance_baseline="seed"` itself changing behavior."""
+    engine = _FakeTsSeededEngine()
+
+    result = run_hessian_global_optimization(
+        _seed(), engine, dr=0.5, max_candidates=1, temperature=50.0,
+        max_rounds=5, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        acceptance_baseline="seed",
+    )
+    accepted_x = sorted(round(float(n.coords[0]), 1) for n in result.accepted_minima)
+    assert accepted_x == [10.0, 20.0]  # both accepted -- the old, buggy behavior

@@ -21,7 +21,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import qcconst.constants as _qcconst_constants
 
-from mepd.elementarystep import _extract_hessian_modes_and_frequencies
+from mepd.elementarystep import prepare_modes
 from mepd.engines.engine import Engine, build_hessian_result_from_matrix
 from mepd.inputs import ChainInputs
 from mepd.nodes.node import Node
@@ -50,9 +50,17 @@ class HessianSampleCandidate:
     mode_index: int
     direction: str  # "+" or "-"
     frequency_wavenumber: Optional[float]
-    dr: float
-    effective_dr: float
+    dr: Optional[float]  # bohr; None under amplitude_policy="energy" (see target_energy_kcal instead)
+    effective_dr: float  # bohr; the actual per-mode displacement magnitude, under any policy
     dr_scan_index: Optional[int] = None
+    mode_source: Optional[str] = None  # which of prepare_modes' sources this mode came from
+    is_reaction_coordinate: bool = False  # True for an imaginary (negative-frequency) mode
+    displacement_energy_kcal: Optional[float] = None  # harmonic estimate, 1/2 k_i * effective_dr^2
+    amplitude_policy: str = "fixed_cartesian"
+    target_energy_kcal: Optional[float] = None  # kcal/mol; set only under amplitude_policy="energy"
+    # Filled in after optimization completes:
+    outcome: Optional[str] = None  # "new_minimum" | "known_minimum" | "returned_to_seed_basin" | "opt_failed"
+    final_energy_kcal_rel_seed: Optional[float] = None
 
 
 @dataclass
@@ -114,37 +122,176 @@ def _dedupe_minima_nodes(nodes: List[Node], chain_inputs: ChainInputs) -> List[N
     return unique_nodes
 
 
-def _generate_dr_displacements(
-    seed_node: Node,
-    modes: List[np.ndarray],
-    freqs: List[float],
+def _classify_optimized_outcomes(
+    optimized_nodes: List[Node], seed_node: Node, chain_inputs: ChainInputs,
+) -> List[str]:
+    """One outcome label per successfully optimized candidate, in the same
+    order as `optimized_nodes`: `"returned_to_seed_basin"` (re-optimized
+    straight back to the seed -- no new chemistry found), `"known_minimum"`
+    (matches a minimum an earlier candidate this run already found), or
+    `"new_minimum"` (the first candidate this run to land here). Purely
+    diagnostic -- does not affect `unique_minima`, which is computed
+    separately by `_dedupe_minima_nodes` and unchanged by this.
+    """
+    outcomes: List[str] = []
+    unique_so_far: List[Node] = []
+    for node in optimized_nodes:
+        if is_identical(
+            node, seed_node,
+            fragment_rmsd_cutoff=chain_inputs.node_rms_thre,
+            kcal_mol_cutoff=chain_inputs.node_ene_thre,
+            verbose=False, collect_comparison=False,
+        ):
+            outcomes.append("returned_to_seed_basin")
+            continue
+        duplicate = any(
+            is_identical(
+                node, existing,
+                fragment_rmsd_cutoff=chain_inputs.node_rms_thre,
+                kcal_mol_cutoff=chain_inputs.node_ene_thre,
+                verbose=False, collect_comparison=False,
+            )
+            for existing in unique_so_far
+        )
+        if duplicate:
+            outcomes.append("known_minimum")
+        else:
+            outcomes.append("new_minimum")
+            unique_so_far.append(node)
+    return outcomes
+
+
+def _harmonic_displacement_energy_kcal(force_constant: float, effective_dr: float) -> Optional[float]:
+    """Harmonic estimate of the energy this displacement costs, 1/2 k a^2
+    (Hartree/bohr^2 * bohr^2 = Hartree, converted to kcal/mol) -- purely from
+    already-known quantities (no extra QM calls). Negative for an imaginary
+    mode (displacing along negative curvature releases energy in the
+    harmonic approximation -- expected, not a bug). None if the force
+    constant isn't available (e.g. no Hessian matrix could be extracted)."""
+    if force_constant is None or not np.isfinite(force_constant):
+        return None
+    hartree = 0.5 * float(force_constant) * float(effective_dr) ** 2
+    return hartree * float(_qcconst_constants.HARTREE_TO_KCAL_PER_MOL)
+
+
+_DEFAULT_FORCE_CONSTANT_MIN = 1.0e-4  # Hartree/bohr^2
+_DEFAULT_IMAGINARY_MODE_AMPLITUDE = 0.3  # bohr
+
+
+def _amplitudes_for_modes(
+    mode_set,  # ModeSet, from mepd.elementarystep.prepare_modes
     *,
-    dr: float,
+    seed_node: Node,
+    amplitude_policy: str,
+    scan_value: float,
+    imaginary_mode_amplitude: float,
+    force_constant_min: float,
+) -> List[Optional[float]]:
+    """One displacement amplitude (bohr; the full-3N-vector norm fed to
+    `displace_by_dr`) per mode in `mode_set`, or None to skip that mode
+    entirely.
+
+    `"fixed_cartesian"`: every mode gets the same amplitude, `scan_value`
+    (interpreted as a target per-atom RMS displacement in bohr) scaled by
+    `_effective_dr` -- a uniform Cartesian kick, unaware of how stiff or
+    soft any given mode is.
+
+    `"energy"`: `scan_value` is a target harmonic displacement energy in
+    kcal/mol; each mode's amplitude is calibrated so that displacing it
+    costs (in the harmonic approximation) exactly that energy --
+    `a_i = sqrt(2 * E_target / k_i)` -- instead of every mode getting the
+    same Cartesian distance regardless of how stiff it is (which over-
+    stretches stiff bonds and under-perturbs soft ones for the same `dr`).
+    A mode with `k_i` below `force_constant_min` is skipped (its amplitude
+    would otherwise diverge); an imaginary mode (the reaction coordinate at
+    a TS seed, `k_i < 0`) instead gets the fixed `imaginary_mode_amplitude`,
+    since harmonic energy calibration is undefined for negative curvature.
+    """
+    if amplitude_policy == "fixed_cartesian":
+        effective = _effective_dr(seed_node, scan_value)
+        return [effective for _ in mode_set.freqs_wavenumber]
+
+    if amplitude_policy == "energy":
+        target_hartree = float(scan_value) / float(_qcconst_constants.HARTREE_TO_KCAL_PER_MOL)
+        amplitudes: List[Optional[float]] = []
+        for force_constant, freq in zip(mode_set.force_constants, mode_set.freqs_wavenumber):
+            if freq < 0:
+                amplitudes.append(float(imaginary_mode_amplitude))
+            elif (
+                force_constant is None
+                or not np.isfinite(force_constant)
+                or force_constant < force_constant_min
+            ):
+                amplitudes.append(None)
+            else:
+                amplitudes.append(float((2.0 * target_hartree / force_constant) ** 0.5))
+        return amplitudes
+
+    raise ValueError(
+        f"amplitude_policy must be 'fixed_cartesian' or 'energy', got {amplitude_policy!r}."
+    )
+
+
+def _generate_mode_displacements(
+    seed_node: Node,
+    mode_set,  # ModeSet, from mepd.elementarystep.prepare_modes
+    *,
+    amplitude_policy: str,
+    scan_value: float,
     max_candidates: int,
+    imaginary_mode_amplitude: float = _DEFAULT_IMAGINARY_MODE_AMPLITUDE,
+    force_constant_min: float = _DEFAULT_FORCE_CONSTANT_MIN,
     dr_scan_index: Optional[int] = None,
 ) -> tuple[List[Node], List[HessianSampleCandidate], bool]:
-    """Displace `seed_node` along every normal mode (both directions) by a
-    single `dr`, capped at `max_candidates`. Shared by the single-dr path and
-    each value of a `--full-dr-scan` sweep (in which case `dr_scan_index`
-    records which scan value this batch came from)."""
-    scaled_dr = _effective_dr(seed_node, dr)
+    """Displace `seed_node` along every normal mode (both directions),
+    capped at `max_candidates`. Shared by the single-value path and each
+    value of a `--full-dr-scan`/energy-target scan (in which case
+    `dr_scan_index` records which scan value this batch came from).
+
+    `scan_value` is a target per-atom RMS displacement (bohr) under
+    `amplitude_policy="fixed_cartesian"`, or a target harmonic displacement
+    energy (kcal/mol) under `"energy"` -- see `_amplitudes_for_modes`.
+    """
+    amplitudes = _amplitudes_for_modes(
+        mode_set, seed_node=seed_node, amplitude_policy=amplitude_policy,
+        scan_value=scan_value, imaginary_mode_amplitude=imaginary_mode_amplitude,
+        force_constant_min=force_constant_min,
+    )
+    is_fixed_cartesian = amplitude_policy == "fixed_cartesian"
+
     nodes: List[Node] = []
     metadata: List[HessianSampleCandidate] = []
     clipped = False
-    for mode_index, mode in enumerate(modes):
-        freq = float(freqs[mode_index]) if mode_index < len(freqs) else None
-        for direction, signed_dr in (("+", scaled_dr), ("-", -scaled_dr)):
+    for mode_index, (mode, amplitude) in enumerate(zip(mode_set.vectors, amplitudes)):
+        if amplitude is None:
+            continue  # e.g. a near-zero force constant under "energy" policy
+        freq = (
+            float(mode_set.freqs_wavenumber[mode_index])
+            if mode_index < len(mode_set.freqs_wavenumber) else None
+        )
+        force_constant = (
+            mode_set.force_constants[mode_index]
+            if mode_index < len(mode_set.force_constants) else None
+        )
+        for direction, signed_amplitude in (("+", amplitude), ("-", -amplitude)):
             nodes.append(
-                displace_by_dr(node=seed_node, displacement=np.asarray(mode), dr=signed_dr)
+                displace_by_dr(node=seed_node, displacement=np.asarray(mode), dr=signed_amplitude)
             )
             metadata.append(
                 HessianSampleCandidate(
                     mode_index=mode_index,
                     direction=direction,
                     frequency_wavenumber=freq,
-                    dr=abs(float(dr)),
-                    effective_dr=abs(float(signed_dr)),
+                    dr=abs(float(scan_value)) if is_fixed_cartesian else None,
+                    effective_dr=abs(float(signed_amplitude)),
                     dr_scan_index=dr_scan_index,
+                    mode_source=mode_set.source,
+                    is_reaction_coordinate=freq is not None and freq < 0,
+                    displacement_energy_kcal=_harmonic_displacement_energy_kcal(
+                        force_constant, signed_amplitude
+                    ),
+                    amplitude_policy=amplitude_policy,
+                    target_energy_kcal=None if is_fixed_cartesian else abs(float(scan_value)),
                 )
             )
             if len(nodes) >= int(max_candidates):
@@ -193,6 +340,10 @@ def run_hessian_sample(
     *,
     dr: float = 0.1,
     dr_values: Optional[List[float]] = None,
+    amplitude_policy: str = "fixed_cartesian",
+    target_energy_kcal: float = 25.0,
+    target_energy_kcal_values: Optional[List[float]] = None,
+    imaginary_mode_amplitude: float = _DEFAULT_IMAGINARY_MODE_AMPLITUDE,
     max_candidates: int = 100,
     maxiter: int = 500,
     chain_inputs: ChainInputs | None = None,
@@ -206,12 +357,31 @@ def run_hessian_sample(
     an unbounded number of optimizations. `maxiter` caps the optimization step
     budget for each individual candidate.
 
-    `dr_values`, when given, switches to a full displacement scan (matching
-    upstream's `--full-dr-scan`/`--dr-scan-values`): every value is displaced
-    across both directions of every normal mode, each value capped
-    independently at `max_candidates` -- trading a single fixed displacement
-    per mode for a denser sweep of the local potential-energy surface. `dr` is
-    ignored when `dr_values` is given.
+    `amplitude_policy` controls how far each mode is displaced:
+
+    - `"fixed_cartesian"` (default): every mode gets the same Cartesian
+      distance, `dr` (a target per-atom RMS displacement in bohr, scaled by
+      `sqrt(n_atoms)` to stay size-invariant). Simple, but a fixed distance
+      probes very different energies on a stiff mode (e.g. an X-H stretch)
+      versus a soft one (e.g. a torsion) -- a uniform `dr` large enough to
+      be useful on soft modes can over-stretch stiff bonds into unphysical
+      geometries, or vice versa.
+    - `"energy"`: `target_energy_kcal` is a target *harmonic displacement
+      energy* (kcal/mol) instead -- every mode's amplitude is calibrated
+      (`a_i = sqrt(2 * E_target / k_i)`, from the mode's own harmonic force
+      constant) so displacing it costs roughly that much energy, regardless
+      of stiffness. An imaginary mode (the reaction coordinate at a TS seed)
+      instead gets the fixed `imaginary_mode_amplitude` (bohr), since
+      harmonic calibration is undefined for negative curvature.
+
+    `dr_values`/`target_energy_kcal_values`, when given (matching the
+    active `amplitude_policy`), switch to a full scan (upstream's
+    `--full-dr-scan`/`--dr-scan-values`, generalized to either policy):
+    every value is displaced across both directions of every normal mode,
+    each value capped independently at `max_candidates` -- trading a single
+    fixed displacement per mode for a denser sweep of the local potential-
+    energy surface. `dr`/`target_energy_kcal` are ignored when the
+    corresponding `*_values` list is given.
 
     Every successfully optimized candidate is kept (deduped into
     `unique_minima`) -- not just ones lower in energy than the seed -- so the
@@ -227,11 +397,30 @@ def run_hessian_sample(
         raise ValueError("max_candidates must be a positive integer.")
     if int(maxiter) <= 0:
         raise ValueError("maxiter must be a positive integer.")
-    if dr_values is not None:
-        if len(dr_values) == 0:
-            raise ValueError("dr_values must contain at least one positive value.")
-        if any(float(value) <= 0 for value in dr_values):
-            raise ValueError("dr_values entries must be positive.")
+    if amplitude_policy not in ("fixed_cartesian", "energy"):
+        raise ValueError(
+            f"amplitude_policy must be 'fixed_cartesian' or 'energy', got {amplitude_policy!r}."
+        )
+    if dr_values is not None and amplitude_policy != "fixed_cartesian":
+        raise ValueError("dr_values is only used with amplitude_policy='fixed_cartesian'.")
+    if target_energy_kcal_values is not None and amplitude_policy != "energy":
+        raise ValueError(
+            "target_energy_kcal_values is only used with amplitude_policy='energy'."
+        )
+    is_scan = dr_values is not None if amplitude_policy == "fixed_cartesian" else (
+        target_energy_kcal_values is not None
+    )
+    if amplitude_policy == "fixed_cartesian":
+        scan_values = list(dr_values) if dr_values is not None else [float(dr)]
+    else:
+        scan_values = (
+            list(target_energy_kcal_values) if target_energy_kcal_values is not None
+            else [float(target_energy_kcal)]
+        )
+    if not scan_values:
+        raise ValueError("At least one scan/target value is required.")
+    if any(float(value) <= 0 for value in scan_values):
+        raise ValueError("All dr/dr_values/target_energy_kcal(_values) entries must be positive.")
     if chain_inputs is None:
         chain_inputs = ChainInputs()
 
@@ -252,28 +441,29 @@ def run_hessian_sample(
         hessian = engine.compute_hessian(node=seed_node)
         hessian_result = build_hessian_result_from_matrix(node=seed_node, hessian=hessian)
 
-    modes, freqs = _extract_hessian_modes_and_frequencies(hessian_result, seed_node)
+    mode_set = prepare_modes(hessian_result, seed_node)
+    modes, freqs = mode_set.vectors, mode_set.freqs_wavenumber
     if not modes:
         raise ValueError("No normal modes were returned from the Hessian result.")
-    _emit(on_event, "hessian_computed", n_modes=len(modes))
+    _emit(
+        on_event, "hessian_computed", n_modes=len(modes),
+        n_dropped_trans_rot=mode_set.n_dropped_trans_rot, mode_source=mode_set.source,
+    )
 
     max_candidates = int(max_candidates)
     displaced_nodes: List[Node] = []
     displaced_metadata: List[HessianSampleCandidate] = []
     clipped = False
-    if dr_values:
-        for scan_index, scan_dr in enumerate(dr_values):
-            scan_nodes, scan_metadata, scan_clipped = _generate_dr_displacements(
-                seed_node, modes, freqs,
-                dr=float(scan_dr), max_candidates=max_candidates, dr_scan_index=scan_index,
-            )
-            displaced_nodes.extend(scan_nodes)
-            displaced_metadata.extend(scan_metadata)
-            clipped = clipped or scan_clipped
-    else:
-        displaced_nodes, displaced_metadata, clipped = _generate_dr_displacements(
-            seed_node, modes, freqs, dr=float(dr), max_candidates=max_candidates,
+    for index, scan_value in enumerate(scan_values):
+        scan_nodes, scan_metadata, scan_clipped = _generate_mode_displacements(
+            seed_node, mode_set,
+            amplitude_policy=amplitude_policy, scan_value=float(scan_value),
+            max_candidates=max_candidates, imaginary_mode_amplitude=imaginary_mode_amplitude,
+            dr_scan_index=index if is_scan else None,
         )
+        displaced_nodes.extend(scan_nodes)
+        displaced_metadata.extend(scan_metadata)
+        clipped = clipped or scan_clipped
     _emit(on_event, "candidates_generated", n_candidates=len(displaced_nodes), clipped=clipped)
 
     result = HessianSampleResult(
@@ -352,6 +542,15 @@ def run_hessian_sample(
             engine, displaced_nodes, displaced_metadata, keywords, on_event=on_event,
         )
 
+    for failed in failed_candidates:
+        failed["meta"].outcome = "opt_failed"
+
+    hartree_to_kcal = float(_qcconst_constants.HARTREE_TO_KCAL_PER_MOL)
+    outcomes = _classify_optimized_outcomes(optimized_nodes, seed_node, chain_inputs)
+    for node, meta, outcome in zip(optimized_nodes, optimized_metadata, outcomes):
+        meta.outcome = outcome
+        meta.final_energy_kcal_rel_seed = (float(node.energy) - seed_energy) * hartree_to_kcal
+
     result.optimized_nodes = optimized_nodes
     result.optimized_metadata = optimized_metadata
     result.failed_candidates = failed_candidates
@@ -409,6 +608,7 @@ def run_hessian_global_optimization(
     max_rounds: int = 100,
     random_seed: Optional[int] = None,
     chain_inputs: ChainInputs | None = None,
+    acceptance_baseline: str = "connected",
     on_event: OnEvent = None,
 ) -> HessianGlobalOptResult:
     """Basin-hopping-style global optimization built on repeated Hessian
@@ -417,15 +617,34 @@ def run_hessian_global_optimization(
     Each round Hessian-samples from every currently-queued accepted minimum
     (a breadth-first expansion -- not "chase a single best/last-accepted
     structure"). A newly-found minimum is accepted via the Metropolis/
-    Boltzmann criterion (`temperature`), evaluated against the *original*
-    seed's energy, not its immediate source -- moves within
-    `energy_tolerance_kcal` of that baseline are treated as flat (always
-    accepted); uphill moves beyond it are accepted with probability
+    Boltzmann criterion (`temperature`): moves within `energy_tolerance_kcal`
+    of the acceptance baseline are treated as flat (always accepted);
+    uphill moves beyond it are accepted with probability
     exp(-deltaE / (R*T)). Every accepted, globally-unique minimum becomes a
     seed for the next round. Stops when the queue empties (`stopped_reason
     == "queue_exhausted"`) or after `max_rounds` rounds
     (`"max_rounds"`) -- the control that bounds this otherwise-unbounded
     search.
+
+    `acceptance_baseline` selects what each candidate's energy is compared
+    against:
+
+    - `"connected"` (default): the specific source structure this candidate
+      was Hessian-sampled from -- standard Metropolis basin-hopping
+      semantics (accept/reject relative to the state you stepped from).
+      This is the fix for a real bug in the old, only behavior (comparing
+      every round to the *original* seed's energy): seeded from a
+      high-energy structure (e.g. a transition-state guess), every later
+      round's candidates would look unconditionally downhill relative to
+      that fixed, stale baseline and the Metropolis test would never
+      actually discriminate -- the search would just accumulate whatever it
+      found until `max_rounds`, never using its own progress. `"connected"`
+      makes the baseline track the search as it moves to new minima.
+    - `"seed"`: always the original seed's energy (the old, only behavior).
+      Kept for anyone who explicitly wants that.
+    - `"running_best"`: the lowest energy found so far (seed included) --
+      a more greedy variant that only rewards genuine improvement over the
+      whole run rather than each local step.
 
     `dr_values`, when given, is forwarded to every round's Hessian sampling
     as a full displacement scan (see `run_hessian_sample`) instead of the
@@ -443,6 +662,11 @@ def run_hessian_global_optimization(
         raise ValueError("temperature must be positive.")
     if int(max_rounds) < 1:
         raise ValueError("max_rounds must be a positive integer.")
+    if acceptance_baseline not in ("seed", "connected", "running_best"):
+        raise ValueError(
+            "acceptance_baseline must be 'seed', 'connected', or 'running_best', "
+            f"got {acceptance_baseline!r}."
+        )
     if chain_inputs is None:
         chain_inputs = ChainInputs()
 
@@ -450,6 +674,7 @@ def run_hessian_global_optimization(
 
     hartree_to_kcal = float(HARTREE_TO_KCAL_PER_MOL)
     start_energy = float(engine.compute_energies([seed_node])[0])
+    best_energy = start_energy  # only tracked/used for acceptance_baseline="running_best"
 
     accepted_minima: List[Node] = []
     # Dedup pool starts with the seed itself (not reported in accepted_minima,
@@ -497,9 +722,24 @@ def run_hessian_global_optimization(
                 continue
             candidates_optimized += len(sample.optimized_nodes)
 
+            if acceptance_baseline == "seed":
+                baseline_energy = start_energy
+            elif acceptance_baseline == "connected":
+                baseline_energy = float(source_node.energy)
+            else:  # "running_best"
+                baseline_energy = best_energy
+
             for candidate in sample.unique_minima:
-                delta_kcal = (float(candidate.energy) - start_energy) * hartree_to_kcal
-                effective_delta = 0.0 if abs(delta_kcal) <= energy_tolerance_kcal else delta_kcal
+                # Always reported relative to the original seed (an
+                # intuitive, fixed reference point for the caller), even
+                # though acceptance itself is decided against
+                # `baseline_energy`, which may be a different reference.
+                report_delta_kcal = (float(candidate.energy) - start_energy) * hartree_to_kcal
+                acceptance_delta_kcal = (float(candidate.energy) - baseline_energy) * hartree_to_kcal
+                effective_delta = (
+                    0.0 if abs(acceptance_delta_kcal) <= energy_tolerance_kcal
+                    else acceptance_delta_kcal
+                )
                 if effective_delta <= 0:
                     accept = True
                 else:
@@ -525,10 +765,11 @@ def run_hessian_global_optimization(
                 known_structures.append(candidate)
                 queue.append(candidate)
                 accepted_this_round += 1
+                best_energy = min(best_energy, float(candidate.energy))
                 _emit(
                     on_event, "minimum_accepted",
                     round=round_index, index=len(accepted_minima),
-                    node=candidate, rel_energy_kcal=delta_kcal,
+                    node=candidate, rel_energy_kcal=report_delta_kcal,
                 )
 
         round_summaries.append({

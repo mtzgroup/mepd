@@ -177,10 +177,31 @@ def hessian_sample(
     ),
     dr: float = typer.Option(
         0.1, "--dr",
-        help="Target per-atom RMS displacement (bohr). Effective mode "
-        "displacement is dr * sqrt(n_atoms), which keeps this size-invariant "
-        "(a fixed per-mode displacement in bohr would otherwise give "
-        "systematically weaker per-atom kicks for larger molecules).",
+        help="Target per-atom RMS displacement (bohr), used when "
+        "--amplitude-policy=fixed-cartesian. Effective mode displacement is "
+        "dr * sqrt(n_atoms), which keeps this size-invariant (a fixed "
+        "per-mode displacement in bohr would otherwise give systematically "
+        "weaker per-atom kicks for larger molecules).",
+    ),
+    amplitude_policy: str = typer.Option(
+        "fixed-cartesian", "--amplitude-policy",
+        help="How far each mode is displaced. 'fixed-cartesian' (default): every "
+        "mode gets the same Cartesian distance (--dr), unaware of how stiff or "
+        "soft it is. 'energy': --target-energy-kcal is a target harmonic "
+        "displacement energy instead -- each mode's amplitude is calibrated "
+        "(from its own harmonic force constant) so displacing it costs roughly "
+        "that much energy, regardless of stiffness.",
+    ),
+    target_energy_kcal: float = typer.Option(
+        25.0, "--target-energy-kcal",
+        help="Target harmonic displacement energy (kcal/mol), used when "
+        "--amplitude-policy=energy.",
+    ),
+    imaginary_mode_amplitude: float = typer.Option(
+        0.3, "--imaginary-mode-amplitude",
+        help="Fixed displacement (bohr) for an imaginary (negative-frequency) "
+        "mode -- the reaction coordinate at a TS seed -- under "
+        "--amplitude-policy=energy, where harmonic calibration is undefined.",
     ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",
@@ -204,8 +225,13 @@ def hessian_sample(
     from mepd.discovery.hessian_sample import run_hessian_sample
     from mepd.nodes.node import StructureNode
 
+    amplitude_policy_internal = amplitude_policy.replace("-", "_")
+    if amplitude_policy_internal not in ("fixed_cartesian", "energy"):
+        raise typer.BadParameter("--amplitude-policy must be 'fixed-cartesian' or 'energy'.")
     if dr <= 0:
         raise typer.BadParameter("--dr must be positive.")
+    if target_energy_kcal <= 0:
+        raise typer.BadParameter("--target-energy-kcal must be positive.")
     if max_candidates <= 0:
         raise typer.BadParameter("--max-candidates must be a positive integer.")
     if maxiter <= 0:
@@ -217,9 +243,14 @@ def hessian_sample(
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
 
+    amplitude_label = (
+        f"dr={dr:g}" if amplitude_policy_internal == "fixed_cartesian"
+        else f"target_energy_kcal={target_energy_kcal:g}"
+    )
     typer.echo(
-        f"Computing Hessian and sampling normal modes (dr={dr:g}, "
-        f"max_candidates={max_candidates}, maxiter={maxiter})..."
+        f"Computing Hessian and sampling normal modes ({amplitude_label}, "
+        f"amplitude_policy={amplitude_policy}, max_candidates={max_candidates}, "
+        f"maxiter={maxiter})..."
     )
     try:
         with _progress() as progress:
@@ -227,6 +258,9 @@ def hessian_sample(
                 seed_node,
                 run_inputs.engine,
                 dr=dr,
+                amplitude_policy=amplitude_policy_internal,
+                target_energy_kcal=target_energy_kcal,
+                imaginary_mode_amplitude=imaginary_mode_amplitude,
                 max_candidates=max_candidates,
                 maxiter=maxiter,
                 chain_inputs=run_inputs.chain_inputs,
@@ -281,6 +315,9 @@ def hessian_sample(
         "structure": structure,
         "inputs": str(inputs) if inputs is not None else None,
         "dr": dr,
+        "amplitude_policy": amplitude_policy,
+        "target_energy_kcal": target_energy_kcal,
+        "imaginary_mode_amplitude": imaginary_mode_amplitude,
         "max_candidates": max_candidates,
         "maxiter": maxiter,
         "seed_energy": result.seed_energy,
@@ -410,8 +447,17 @@ def hessian_global(
     ),
     energy_tolerance_kcal: float = typer.Option(
         1.0e-4, "--energy-tolerance-kcal",
-        help="Moves within this many kcal/mol of the seed's energy are treated as flat "
-        "(always accepted) rather than run through the Boltzmann test.",
+        help="Moves within this many kcal/mol of the acceptance baseline are treated as "
+        "flat (always accepted) rather than run through the Boltzmann test.",
+    ),
+    acceptance_baseline: str = typer.Option(
+        "connected", "--acceptance-baseline",
+        help="What each candidate's energy is compared against: 'connected' (default) "
+        "compares to the specific minimum it was Hessian-sampled from -- standard "
+        "Metropolis basin-hopping semantics, and the fix for a real bug in always "
+        "comparing to the original seed ('seed'), which makes acceptance unconditional "
+        "and inert once the search has moved past a high-energy seed (e.g. a TS guess). "
+        "'running_best' compares to the lowest energy found so far.",
     ),
     max_rounds: int = typer.Option(
         100, "--max-rounds",
@@ -457,6 +503,10 @@ def hessian_global(
         raise typer.BadParameter("--temperature must be positive.")
     if max_rounds <= 0:
         raise typer.BadParameter("--max-rounds must be a positive integer.")
+    if acceptance_baseline not in ("seed", "connected", "running_best"):
+        raise typer.BadParameter(
+            "--acceptance-baseline must be 'seed', 'connected', or 'running_best'."
+        )
     dr_scan_values_list = _parse_dr_scan_values(dr_scan_values) if full_dr_scan else None
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
@@ -502,6 +552,7 @@ def hessian_global(
                 max_rounds=max_rounds,
                 random_seed=random_seed,
                 chain_inputs=run_inputs.chain_inputs,
+                acceptance_baseline=acceptance_baseline,
                 on_event=_on_event,
             )
     except Exception as exc:
@@ -535,6 +586,7 @@ def hessian_global(
         "energy_tolerance_kcal": energy_tolerance_kcal,
         "max_rounds": max_rounds,
         "random_seed": random_seed,
+        "acceptance_baseline": acceptance_baseline,
         "start_energy": result.start_energy,
         "rounds_run": result.rounds_run,
         "stopped_reason": result.stopped_reason,

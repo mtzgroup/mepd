@@ -48,6 +48,9 @@ def _call_hessian_sample(**overrides):
         charge=None,
         multiplicity=None,
         dr=0.1,
+        amplitude_policy="fixed-cartesian",
+        target_energy_kcal=25.0,
+        imaginary_mode_amplitude=0.3,
         max_candidates=100,
         maxiter=500,
         output=None,
@@ -108,6 +111,16 @@ def test_hessian_sample_command_rejects_nonpositive_maxiter(tmp_path):
         _call_hessian_sample(maxiter=0, output=tmp_path / "out")
 
 
+def test_hessian_sample_command_rejects_invalid_amplitude_policy(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_hessian_sample(amplitude_policy="nonsense", output=tmp_path / "out")
+
+
+def test_hessian_sample_command_rejects_nonpositive_target_energy_kcal(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_hessian_sample(target_energy_kcal=0.0, output=tmp_path / "out")
+
+
 def _meta(mode_index=0, direction="+", freq=100.0):
     return HessianSampleCandidate(
         mode_index=mode_index, direction=direction, frequency_wavenumber=freq,
@@ -120,7 +133,7 @@ def test_hessian_sample_command_writes_full_output_set(tmp_path, monkeypatch, ca
     minimum_a = StructureNode(structure=_water(x_offset=0.1), _cached_energy=-1.0)
     minimum_b = StructureNode(structure=_water(x_offset=-0.1), _cached_energy=-2.0)
 
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs, on_event=None):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, amplitude_policy, target_energy_kcal, imaginary_mode_amplitude, max_candidates, maxiter, chain_inputs, on_event=None):
         return HessianSampleResult(
             seed_energy=0.0,
             hessian_result=None,
@@ -163,7 +176,7 @@ def test_hessian_sample_command_writes_full_output_set(tmp_path, monkeypatch, ca
 
 
 def test_hessian_sample_command_exits_nonzero_when_all_optimizations_fail(tmp_path, monkeypatch, capsys):
-    def fake_run_hessian_sample(seed_node, engine, *, dr, max_candidates, maxiter, chain_inputs, on_event=None):
+    def fake_run_hessian_sample(seed_node, engine, *, dr, amplitude_policy, target_energy_kcal, imaginary_mode_amplitude, max_candidates, maxiter, chain_inputs, on_event=None):
         return HessianSampleResult(
             seed_energy=0.0,
             hessian_result=None,

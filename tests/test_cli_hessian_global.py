@@ -54,6 +54,7 @@ def _call_hessian_global(**overrides):
         energy_tolerance_kcal=1.0e-4,
         max_rounds=100,
         random_seed=None,
+        acceptance_baseline="connected",
         full_dr_scan=False,
         dr_scan_values="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
         output=None,
@@ -70,6 +71,11 @@ def test_hessian_global_command_rejects_nonpositive_temperature(tmp_path):
 def test_hessian_global_command_rejects_nonpositive_max_rounds(tmp_path):
     with pytest.raises(typer.BadParameter):
         _call_hessian_global(max_rounds=0, output=tmp_path / "out")
+
+
+def test_hessian_global_command_rejects_invalid_acceptance_baseline(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_hessian_global(acceptance_baseline="nonsense", output=tmp_path / "out")
 
 
 def test_hessian_global_command_writes_accepted_minima_and_summary(tmp_path, monkeypatch):

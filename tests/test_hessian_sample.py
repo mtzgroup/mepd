@@ -51,6 +51,24 @@ class _FakeHessianSampleEngine(Engine):
         return [XYNode(structure=np.array(coords, dtype=float), _cached_energy=energy)]
 
 
+class _FakeHessianSampleEngineWithHessian(_FakeHessianSampleEngine):
+    """Same toy engine, but its Hessian result also carries a real (diagonal)
+    Cartesian Hessian matrix -- so force constants (and thus the harmonic
+    displacement-energy estimate) are actually computable, and one mode is
+    given a negative (imaginary) frequency to exercise reaction-coordinate
+    tagging."""
+
+    def _compute_hessian_result(self, node, **kwargs):
+        modes = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        freqs = [100.0, -150.0]  # second mode: imaginary, k_b < 0
+        hessian = np.array([[4.0, 0.0], [0.0, -9.0]])
+        return SimpleNamespace(
+            results=SimpleNamespace(
+                normal_modes_cartesian=modes, freqs_wavenumber=freqs, hessian=hessian,
+            )
+        )
+
+
 class _FakeBatchEngine(_FakeHessianSampleEngine):
     """Same as above, but exposes a batch `compute_geometry_optimizations`."""
 
@@ -116,6 +134,59 @@ def test_run_hessian_sample_reports_every_optimized_candidate_deduped():
     assert len(result.unique_minima) == 4
     energies = sorted(round(m.energy, 4) for m in result.unique_minima)
     assert energies == [-2.0, -1.0, -0.0001, 5.0]
+
+
+def test_run_hessian_sample_tags_outcome_and_mode_provenance_on_metadata():
+    engine = _FakeHessianSampleEngine(_MIXED_OUTCOMES)
+
+    result = run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=100)
+
+    # generation order: +mode_a (new A), -mode_a (re-finds seed),
+    # +mode_b (duplicates A), -mode_b (fails), +mode_c (new B), -mode_c (new)
+    assert [m.outcome for m in result.optimized_metadata] == [
+        "new_minimum", "returned_to_seed_basin", "known_minimum",
+        "new_minimum", "new_minimum",
+    ]
+    assert result.failed_candidates[0]["meta"].outcome == "opt_failed"
+
+    # final_energy_kcal_rel_seed matches (candidate energy - seed energy) in kcal/mol
+    hartree_to_kcal = 627.5094740630558
+    for node, meta in zip(result.optimized_nodes, result.optimized_metadata):
+        assert meta.final_energy_kcal_rel_seed == pytest.approx(
+            node.energy * hartree_to_kcal, rel=1e-4
+        )
+
+    # The fake engine's Hessian result carries no Hessian matrix, so force
+    # constants (and thus the harmonic displacement-energy estimate) aren't
+    # available -- must be None, not a bogus number.
+    assert all(m.displacement_energy_kcal is None for m in result.displaced_metadata)
+    # All three fake modes are real (positive-frequency) vibrations.
+    assert all(not m.is_reaction_coordinate for m in result.displaced_metadata)
+    assert all(m.mode_source == "normal_modes_cartesian" for m in result.displaced_metadata)
+
+
+def test_run_hessian_sample_computes_displacement_energy_and_reaction_coordinate_flag():
+    """With a real Hessian matrix available, displacement_energy_kcal must
+    be the exact harmonic estimate (1/2 k a^2, converted to kcal/mol), and
+    the negative-frequency mode must be tagged as the reaction coordinate."""
+    engine = _FakeHessianSampleEngineWithHessian(["fail"] * 4)
+
+    result = run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=100)
+
+    effective_dr = 1.0 * (2 ** 0.5)  # dr * sqrt(natoms), natoms=2 for this toy node
+    hartree_to_kcal = 627.5094740630558
+    # prepare_modes sorts ascending by frequency, so the imaginary mode
+    # (freq=-150, k=-9.0) sorts to index 0 and the real one (freq=100,
+    # k=+4.0) to index 1 -- the reverse of the engine's own mode order.
+    expected_energy_kcal = {
+        0: 0.5 * -9.0 * effective_dr**2 * hartree_to_kcal,  # imaginary mode, k=-9.0
+        1: 0.5 * 4.0 * effective_dr**2 * hartree_to_kcal,   # real mode, k=+4.0
+    }
+    for meta in result.displaced_metadata:
+        assert meta.displacement_energy_kcal == pytest.approx(
+            expected_energy_kcal[meta.mode_index], rel=1e-6
+        )
+        assert meta.is_reaction_coordinate == (meta.mode_index == 0)
 
 
 def test_run_hessian_sample_passes_maxiter_through_keywords():
@@ -276,6 +347,112 @@ def test_run_hessian_sample_rejects_empty_or_nonpositive_dr_values():
         run_hessian_sample(_seed(), engine, dr_values=[], max_candidates=10)
     with pytest.raises(ValueError):
         run_hessian_sample(_seed(), engine, dr_values=[0.5, -1.0], max_candidates=10)
+
+
+def test_run_hessian_sample_rejects_invalid_amplitude_policy():
+    engine = _FakeHessianSampleEngine(["fail"] * 6)
+    with pytest.raises(ValueError):
+        run_hessian_sample(_seed(), engine, amplitude_policy="nonsense", max_candidates=10)
+
+
+def test_run_hessian_sample_rejects_dr_values_with_energy_policy():
+    engine = _FakeHessianSampleEngineWithHessian(["fail"] * 4)
+    with pytest.raises(ValueError):
+        run_hessian_sample(
+            _seed(), engine, amplitude_policy="energy", dr_values=[0.1, 0.2], max_candidates=10,
+        )
+
+
+def test_run_hessian_sample_rejects_target_energy_kcal_values_with_fixed_cartesian_policy():
+    engine = _FakeHessianSampleEngine(["fail"] * 6)
+    with pytest.raises(ValueError):
+        run_hessian_sample(
+            _seed(), engine, amplitude_policy="fixed_cartesian",
+            target_energy_kcal_values=[5.0, 10.0], max_candidates=10,
+        )
+
+
+def test_run_hessian_sample_rejects_nonpositive_target_energy_kcal():
+    engine = _FakeHessianSampleEngineWithHessian(["fail"] * 4)
+    with pytest.raises(ValueError):
+        run_hessian_sample(
+            _seed(), engine, amplitude_policy="energy", target_energy_kcal=0.0, max_candidates=10,
+        )
+
+
+def test_run_hessian_sample_energy_policy_calibrates_amplitude_per_mode():
+    """a_i = sqrt(2 * E_target / k_i) exactly, for a mode with a real,
+    known force constant; the imaginary mode instead gets the fixed
+    imaginary_mode_amplitude, since harmonic calibration is undefined for
+    negative curvature."""
+    engine = _FakeHessianSampleEngineWithHessian(["fail"] * 4)
+    target_energy_kcal = 20.0
+    imaginary_mode_amplitude = 0.42
+
+    result = run_hessian_sample(
+        _seed(), engine, amplitude_policy="energy", target_energy_kcal=target_energy_kcal,
+        imaginary_mode_amplitude=imaginary_mode_amplitude, max_candidates=10,
+    )
+
+    hartree_to_kcal = 627.5094740630558
+    target_hartree = target_energy_kcal / hartree_to_kcal
+    # prepare_modes sorts the imaginary mode (freq=-150, k=-9.0) to index 0
+    # and the real mode (freq=100, k=+4.0) to index 1.
+    expected_effective_dr = {
+        0: imaginary_mode_amplitude,
+        1: (2.0 * target_hartree / 4.0) ** 0.5,
+    }
+    assert len(result.displaced_metadata) == 4  # 2 modes x 2 directions
+    for meta in result.displaced_metadata:
+        assert meta.effective_dr == pytest.approx(expected_effective_dr[meta.mode_index], rel=1e-9)
+        assert meta.amplitude_policy == "energy"
+        assert meta.target_energy_kcal == target_energy_kcal
+        assert meta.dr is None
+
+
+def test_run_hessian_sample_energy_policy_skips_near_zero_force_constant_modes():
+    """A mode whose harmonic force constant is (numerically) zero would
+    otherwise need an infinite amplitude to reach any nonzero target energy
+    -- it must be skipped, not silently produce a divergent/garbage
+    displacement."""
+
+    class _FakeZeroForceConstantEngine(_FakeHessianSampleEngine):
+        def _compute_hessian_result(self, node, **kwargs):
+            from types import SimpleNamespace
+            modes = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+            freqs = [100.0, 150.0]
+            hessian = np.array([[4.0, 0.0], [0.0, 0.0]])  # second mode: k=0
+            return SimpleNamespace(
+                results=SimpleNamespace(
+                    normal_modes_cartesian=modes, freqs_wavenumber=freqs, hessian=hessian,
+                )
+            )
+
+    engine = _FakeZeroForceConstantEngine(["fail"] * 2)
+    result = run_hessian_sample(
+        _seed(), engine, amplitude_policy="energy", target_energy_kcal=10.0, max_candidates=10,
+    )
+
+    # Only the k=4.0 mode produces candidates (2, one per direction); the
+    # k=0 mode is skipped entirely.
+    assert len(result.displaced_metadata) == 2
+    assert all(m.mode_index == 0 for m in result.displaced_metadata)
+
+
+def test_run_hessian_sample_energy_policy_forwards_target_energy_kcal_values_to_each_scan(monkeypatch):
+    engine = _FakeHessianSampleEngineWithHessian(["fail"] * 8)
+
+    result = run_hessian_sample(
+        _seed(), engine, amplitude_policy="energy",
+        target_energy_kcal_values=[5.0, 15.0], max_candidates=100,
+    )
+
+    # 2 modes x 2 directions x 2 scan values
+    assert len(result.displaced_metadata) == 8
+    scan_indices = sorted({m.dr_scan_index for m in result.displaced_metadata})
+    assert scan_indices == [0, 1]
+    targets = sorted({m.target_energy_kcal for m in result.displaced_metadata})
+    assert targets == [5.0, 15.0]
 
 
 def test_run_hessian_sample_requires_normal_modes():
