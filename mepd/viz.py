@@ -243,8 +243,10 @@ def render_visualization_html(
 ) -> str:
     """Render a standalone, self-contained HTML page for interactively
     exploring a `Chain`, a `NEB`/`PathMinimizer` optimization run, a full
-    `TreeNode` MSMEP split-tree, or a reaction-network `Pot` graph --
-    whichever was given.
+    `TreeNode` MSMEP split-tree, a reaction-network `Pot` graph, or a bare
+    list of `Node` objects (e.g. `run_hessian_sample(...).optimized_nodes`,
+    or the old neb-dynamics `visualize_chain([...])` convention -- treated
+    as the frames of one chain) -- whichever was given.
 
     One consistent widget handles all four, with controls that appear only
     when there is something to navigate:
@@ -264,9 +266,24 @@ def render_visualization_html(
     """
     import json
 
+    from mepd.inputs import ChainInputs
     from mepd.pathminimizers.pathminimizer import PathMinimizer
     from mepd.pot import Pot
     from mepd.TreeNode import TreeNode
+
+    if isinstance(obj, (list, tuple)):
+        # A bare list of structures/nodes (e.g. `run_hessian_sample(...).
+        # optimized_nodes`, or the old neb-dynamics `visualize_chain([...])`
+        # convention) -- treat it as the frames of one chain.
+        if not obj:
+            raise ValueError("Cannot visualize an empty list of structures.")
+        try:
+            obj = Chain.model_validate({"nodes": list(obj), "parameters": ChainInputs()})
+        except Exception as exc:
+            raise TypeError(
+                f"Cannot visualize a list of {type(obj[0]).__name__}; "
+                "expected a list of Node objects (e.g. StructureNode)."
+            ) from exc
 
     diagram_kind = None  # "tree", "network", or None (single chain/run, no diagram)
     diagram_obj = None
@@ -291,7 +308,8 @@ def render_visualization_html(
     else:
         raise TypeError(
             f"Cannot visualize object of type {type(obj).__name__}; "
-            "expected a Chain, a NEB/PathMinimizer, a TreeNode, or a Pot."
+            "expected a Chain, a NEB/PathMinimizer, a TreeNode, a Pot, or a "
+            "list of Node objects."
         )
 
     nodes_json = json.dumps(nodes)

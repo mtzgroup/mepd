@@ -174,6 +174,36 @@ def test_visualize_handles_single_node_chain(tmp_path):
     assert "NaN" not in html
 
 
+def test_render_visualization_html_accepts_a_bare_list_of_nodes():
+    """`viz.render_visualization_html` must also accept a plain list of Node
+    objects directly (e.g. `run_hessian_sample(...).optimized_nodes`, or the
+    old neb-dynamics `visualize_chain([...])` convention), not just a Chain
+    -- treating it as the frames of one chain."""
+    from mepd import viz
+
+    nodes = [_water_node(0.05 * i, -76.0 + 0.01 * i) for i in range(3)]
+
+    html = viz.render_visualization_html(nodes)
+
+    parsed_nodes = _extract_nodes_payload(html)
+    frames = parsed_nodes[0]["trajectory"][0]["frames"]
+    assert len(frames) == 3
+
+
+def test_render_visualization_html_rejects_empty_list():
+    from mepd import viz
+
+    with pytest.raises(ValueError):
+        viz.render_visualization_html([])
+
+
+def test_render_visualization_html_rejects_list_of_wrong_type():
+    from mepd import viz
+
+    with pytest.raises(TypeError):
+        viz.render_visualization_html([1, 2, 3])
+
+
 def test_visualize_respects_custom_output_path(tmp_path):
     xyz_fp = tmp_path / "chain.xyz"
     _write_chain_xyz(xyz_fp, [-76.0, -75.9])
