@@ -431,6 +431,34 @@ class RunInputs:
                 "tmin": 1.2e-3,
                 "v": False,
             }
+        elif path_method == "GSM":
+            default_kwds = {
+                "executable": None,  # falls back to $GSM_EXECUTABLE, then "gsm"
+                "nnodes": 9,
+                "max_opt_iters": 80,
+                "step_opt_iters": 30,
+                "conv_tol": 0.0005,
+                "add_node_tol": 0.1,
+                "ts_final_type": 1,  # 0 = no bond breaking, 1 = bond breaking
+                "scaling": 1.0,
+                "ssm_dqmax": 0.8,
+                "int_thresh": 2.0,
+                "min_spacing": 5.0,
+                "bond_fragments": 1,
+                "initial_opt": 0,
+                "final_opt": 150,
+                "product_limit": 100.0,
+                "timeout": None,
+                "keep_workdirs": False,
+                "do_elem_step_checks": True,
+                "skip_identical_graphs": True,
+                "disregard_stereochem": False,
+                "validate_minima_with_hessian": False,
+                "hessian_minimum_frequency_cutoff": 0.0,
+                "hessian_minima_rescue_displacement": 0.1,
+                "verbosity": 1,
+            }
+
         if self.path_min_inputs is None:
             self.path_min_inputs = SimpleNamespace(**default_kwds)
 

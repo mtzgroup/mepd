@@ -157,9 +157,17 @@ def _build_path_minimizer(initial_chain: Chain, run_inputs: RunInputs):
             engine=run_inputs.engine,
             parameters=run_inputs.path_min_inputs,
         )
+    if method == "GSM":
+        from mepd.pathminimizers.gsm import GSM
+
+        return GSM(
+            initial_chain=initial_chain,
+            engine=run_inputs.engine,
+            parameters=run_inputs.path_min_inputs,
+        )
     raise typer.BadParameter(
         f"Unsupported path_min_method '{run_inputs.path_min_method}'. "
-        "This build supports: NEB, FNEB, NEB-DLF, GEOMETRIC-NEB."
+        "This build supports: NEB, FNEB, NEB-DLF, GEOMETRIC-NEB, GSM."
     )
 
 

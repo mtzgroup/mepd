@@ -61,7 +61,7 @@ def _disregard_stereochem(inputs: RunInputs) -> bool:
     return bool(getattr(inputs.path_min_inputs, "disregard_stereochem", False))
 
 
-PATH_METHODS = ["NEB", "FNEB", "MLPGI", "NEB-DLF", "GEOMETRIC-NEB"]
+PATH_METHODS = ["NEB", "FNEB", "MLPGI", "NEB-DLF", "GEOMETRIC-NEB", "GSM"]
 DEFAULT_CONSECUTIVE_SAME_PAIR_SPLIT_LIMIT = 5
 
 
@@ -1382,9 +1382,21 @@ class MSMEP:
                 engine=self.inputs.engine,
                 parameters=self.inputs.path_min_inputs,
             )
+        elif path_method == "GSM":
+            from mepd.pathminimizers.gsm import GSM
+            msg = "Using molecularGSM (Zimmerman lab growing string method)"
+            if _get_verbose(self.inputs):
+                print(msg)
+            else:
+                update_status(msg)
+            n = GSM(
+                initial_chain=initial_chain,
+                engine=self.inputs.engine,
+                parameters=self.inputs.path_min_inputs,
+            )
         else:
             raise NotImplementedError(
-                "Invalid path minimization method. Select from NEB, FNEB, MLPGI, NEB-DLF, or GEOMETRIC-NEB.")
+                "Invalid path minimization method. Select from NEB, FNEB, MLPGI, NEB-DLF, GEOMETRIC-NEB, or GSM.")
 
         return n
 
