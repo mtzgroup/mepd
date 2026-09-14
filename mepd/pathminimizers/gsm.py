@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import pickle
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,23 +36,71 @@ IS_ELEM_STEP = ElemStepResults(
     number_grad_calls=0,
 )
 
-# Standalone driver script invoked by the compiled `gsm` binary (built with
-# -DGSM_ENABLE_ASE=1) as `./grad.py <endstr> <ncpu> <charge>` once per node
-# gradient/energy request. It has no template placeholders: the engine and a
-# reference node (for charge/multiplicity/symbols) are unpickled from
-# `engine.pkl`, written alongside it in the run's working directory.
+# `./grad.py <endstr> <ncpu> <charge>` is what the compiled `gsm` binary
+# (built with -DGSM_ENABLE_ASE=1) actually shells out to, once per node
+# gradient/energy request -- hundreds of times per run. Naively unpickling
+# the engine and importing mepd fresh in that script, every single call,
+# was measured at ~1.9s/call (dominated by `import mepd...`'s transitive
+# pydantic/qcdata/rdkit/ASE cost -- the real gxtb call itself is ~50-90ms),
+# which is why a GSM run's wall-clock time didn't track its (much lower)
+# gradient-call count vs. NEB. So `grad.py` is instead a near-zero-import
+# client (stdlib `socket`+`sys` only) that forwards the node id to a
+# long-lived _ENGINE_SERVER_SOURCE process (started once per
+# `optimize_chain()` call, see `_start_engine_server`) over a Unix domain
+# socket. The server pays the mepd import + engine unpickle cost exactly
+# once, then answers every subsequent request for the life of the run.
 _GRAD_PY_SOURCE = '''#!/usr/bin/env python3
-import pickle
+import socket
 import sys
+
+SOCKET_PATH = "engine.sock"
+
+
+def main():
+    endstr = sys.argv[1]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(SOCKET_PATH)
+    try:
+        sock.sendall(endstr.encode())
+        response = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+    finally:
+        sock.close()
+
+    if not response.startswith(b"OK"):
+        sys.stderr.write(response.decode(errors="replace"))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# Long-lived server `grad.py` clients above talk to. Started once per
+# `optimize_chain()` call (see `_start_engine_server`), killed once GSM's
+# subprocess exits. Unlike `grad.py`, this one does pay the real import/
+# unpickle cost -- but only once for however many hundreds of node
+# requests the run makes, instead of once per request.
+_ENGINE_SERVER_SOURCE = '''#!/usr/bin/env python3
+import os
+import pickle
+import socket
+import sys
+import traceback
 
 import numpy as np
 from qcconst.constants import ANGSTROM_TO_BOHR
 
 HARTREE_TO_EV = 27.2114
+SOCKET_PATH = "engine.sock"
+READY_MARKER = SOCKET_PATH + ".ready"
 
 
-def main():
-    endstr = sys.argv[1]
+def handle(endstr, engine, template_node):
     with open("scratch/structure" + endstr) as fh:
         lines = fh.read().splitlines()
     natoms = int(lines[0].strip())
@@ -59,11 +109,7 @@ def main():
         fields = row.split()
         coords.append([float(fields[1]), float(fields[2]), float(fields[3])])
     coords_bohr = np.asarray(coords, dtype=float) * ANGSTROM_TO_BOHR
-
-    with open("engine.pkl", "rb") as fh:
-        payload = pickle.load(fh)
-    node = payload["template_node"].update_coords(coords_bohr)
-    engine = payload["engine"]
+    node = template_node.update_coords(coords_bohr)
 
     energy = float(engine.compute_energies([node])[0])
     gradient = np.asarray(engine.compute_gradients([node])[0], dtype=float)
@@ -79,6 +125,43 @@ def main():
 
     with open("grad_calls.count", "a") as fh:
         fh.write("1\\n")
+
+
+def main():
+    with open("engine.pkl", "rb") as fh:
+        payload = pickle.load(fh)
+    engine = payload["engine"]
+    template_node = payload["template_node"]
+
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    server.listen(8)
+    # Written only after bind()+listen() succeed, so the parent process
+    # polling for this file never races a socket that isn't accept()-able yet.
+    with open(READY_MARKER, "w") as fh:
+        fh.write("1")
+
+    try:
+        while True:
+            conn, _ = server.accept()
+            try:
+                data = conn.recv(4096).decode().strip()
+                if data == "__SHUTDOWN__":
+                    conn.sendall(b"OK")
+                    break
+                try:
+                    handle(data, engine, template_node)
+                    conn.sendall(b"OK")
+                except Exception:
+                    conn.sendall(("ERROR\\n" + traceback.format_exc()).encode())
+            finally:
+                conn.close()
+    finally:
+        server.close()
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
 
 
 if __name__ == "__main__":
@@ -174,11 +257,13 @@ class GSM(PathMinimizer):
         e_reactant = float(reactant.energy)
 
         workdir = Path(tempfile.mkdtemp(prefix="gsm-"))
+        server_proc = None
         try:
             self._write_inputs(workdir, reactant, product)
             counter_fp = workdir / "grad_calls.count"
             counter_fp.write_text("")
 
+            server_proc = self._start_engine_server(workdir)
             self._log("Running molecularGSM (DE-GSM)...")
             self._run_gsm(workdir)
 
@@ -221,6 +306,7 @@ class GSM(PathMinimizer):
             else:
                 elem_step_results = IS_ELEM_STEP
         finally:
+            self._stop_engine_server(server_proc, workdir)
             if not getattr(self.parameters, "keep_workdirs", False):
                 shutil.rmtree(workdir, ignore_errors=True)
             else:
@@ -243,11 +329,70 @@ class GSM(PathMinimizer):
         grad_py.write_text(_GRAD_PY_SOURCE)
         grad_py.chmod(0o755)
 
+        engine_server_py = workdir / "engine_server.py"
+        engine_server_py.write_text(_ENGINE_SERVER_SOURCE)
+        engine_server_py.chmod(0o755)
+
+    def _start_engine_server(self, workdir: Path) -> subprocess.Popen:
+        """Launch the long-lived engine server `grad.py` clients talk to
+        (see the module-level comment on `_ENGINE_SERVER_SOURCE`), and block
+        until its socket is actually ready to accept connections.
+        """
+        ready_marker = workdir / "engine.sock.ready"
+        proc = subprocess.Popen(
+            [sys.executable, "engine_server.py"],
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        timeout = 30.0
+        poll_interval = 0.01
+        waited = 0.0
+        while not ready_marker.exists():
+            if proc.poll() is not None:
+                out = proc.stdout.read() if proc.stdout else ""
+                raise ElectronicStructureError(
+                    msg="GSM engine server exited before it was ready.",
+                    obj=out,
+                )
+            if waited >= timeout:
+                proc.kill()
+                raise ElectronicStructureError(
+                    msg=f"GSM engine server did not become ready within {timeout}s."
+                )
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        return proc
+
+    def _stop_engine_server(
+        self, proc: subprocess.Popen | None, workdir: Path
+    ) -> None:
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return
+        socket_path = workdir / "engine.sock"
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(str(socket_path))
+            sock.sendall(b"__SHUTDOWN__")
+            sock.recv(64)
+            sock.close()
+            proc.wait(timeout=5.0)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
     def _run_gsm(self, workdir: Path) -> None:
         executable = self._resolve_executable()
         # `./grad.py` is invoked by GSM via a bare `system("./grad.py ...")`
-        # relying on its shebang + $PATH; make sure the interpreter that has
-        # `mepd` importable (this process's own) is the one found first.
+        # relying on its shebang + $PATH; grad.py itself only needs stdlib
+        # (see _GRAD_PY_SOURCE), so any python3 on PATH works, but keep this
+        # for robustness in minimal environments.
         env = os.environ.copy()
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
