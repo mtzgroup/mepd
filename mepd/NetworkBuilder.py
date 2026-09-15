@@ -143,7 +143,7 @@ class NetworkBuilder:
 
     def _energies_fail(self, chain: Chain):
         try:
-            chain.gradients
+            chain.energies
             return False
         except Exception:
             return True
