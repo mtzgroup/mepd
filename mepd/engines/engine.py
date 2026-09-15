@@ -263,6 +263,19 @@ class Engine(ABC):
         # make sure the node isn't frozen so it returns a gradient
         last_node.converged = False
 
+        # The loop below reads last_node.gradient/.energy starting on its very
+        # first iteration, before ever calling compute_gradients/compute_energies
+        # itself (those calls are only made for the NEW node each step) -- so a
+        # caller passing in a node with no cached gradient/energy yet (e.g. a
+        # freshly-built split-candidate structure, as opposed to a chain node
+        # that already went through NEB/GSM) would otherwise crash immediately
+        # with GradientsNotComputedError. Compute them here if missing instead
+        # of assuming the caller already did.
+        if last_node._cached_gradient is None:
+            last_node._cached_gradient = self.compute_gradients([last_node])[0]
+        if last_node._cached_energy is None:
+            last_node._cached_energy = self.compute_energies([last_node])[0]
+
         curr_step = 0
         converged = False
         natom = node.coords.shape[0]

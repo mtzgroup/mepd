@@ -487,10 +487,18 @@ class GSM(PathMinimizer):
             {"nodes": [reactant, product], "parameters": chain.parameters}
         )
         gi = self.gi_inputs
+        # `path_min_inputs.nnodes` -- not `gi_inputs.nimages` -- is the node
+        # count that actually reaches GSM here: RESTART locks the string size
+        # to however many frames are in the restart file (`restart_string`
+        # sets nn = nnR = nnmax = nrnodes straight from the file; NNODES in
+        # inpfileq is never consulted once RESTART is set), so `nnodes` has to
+        # be what builds this seed, or a user's `nnodes` setting would be
+        # silently ignored whenever seed_with_geodesic_interpolation is on.
+        nimages = int(getattr(self.parameters, "nnodes", gi.nimages))
         interpolated = ch.run_geodesic(
             chain=seed_chain,
             chain_inputs=chain.parameters,
-            nimages=gi.nimages,
+            nimages=nimages,
             friction=gi.friction,
             nudge=gi.nudge,
             random_seed=gi.random_seed,

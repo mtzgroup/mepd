@@ -16,8 +16,10 @@ replaces both the old `NEB`/`PathMinimizer` `.plot_opt_history()` methods
 from __future__ import annotations
 
 import base64
+import html
 import io
-from typing import List
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import numpy as np
 
@@ -236,6 +238,86 @@ def _network_edges_payload(pot) -> list[dict]:
     return nodes
 
 
+@dataclass
+class ConformerNetworkResult:
+    """The on-disk output of `mepd conformers` (conformer pools + one
+    completed MSMEP tree per reactant/product conformer pair, optionally an
+    aggregated network.json), bundled for `render_visualization_html` to
+    show as one clickable page: reactant conformers, product conformers,
+    and completed MEP outputs, each its own group."""
+
+    reactant_conformers: list = field(default_factory=list)
+    product_conformers: list = field(default_factory=list)
+    pairs: list = field(default_factory=list)  # list[tuple[str, Chain]]
+    network: Optional[object] = None  # Pot | None
+
+
+def _single_structure_payload(node) -> dict:
+    """One bare structure (e.g. a conformer, not an optimization frame) as a
+    single-frame chain payload -- reuses `_chain_payload`'s energy handling
+    (shows a relative energy if this node was minimized) but drops the "TS
+    guess" framing, which doesn't mean anything for a single structure."""
+    from mepd.inputs import ChainInputs
+
+    chain = Chain.model_validate({"nodes": [node], "parameters": ChainInputs()})
+    payload = _chain_payload(chain)
+    payload["ts_index"] = None
+    return payload
+
+
+def _conformer_network_nodes_payload(result: ConformerNetworkResult) -> list[dict]:
+    nodes: list[dict] = []
+
+    def add(group: str, label: str, trajectory: list[dict]) -> None:
+        if not trajectory:
+            return
+        nodes.append({
+            "index": len(nodes),
+            "depth": 0,
+            "parent": None,
+            "group": group,
+            "label": label,
+            "trajectory": trajectory,
+        })
+
+    for i, node in enumerate(result.reactant_conformers):
+        add("Reactant conformers", f"Reactant conformer {i}", [_single_structure_payload(node)])
+    for i, node in enumerate(result.product_conformers):
+        add("Product conformers", f"Product conformer {i}", [_single_structure_payload(node)])
+    for label, chain in result.pairs:
+        if chain is not None and len(chain) > 0:
+            add("Completed MEP outputs", label, [_chain_payload(chain)])
+    if result.network is not None:
+        for edge in _network_edges_payload(result.network):
+            add("Aggregated network edges", edge["label"], edge["trajectory"])
+
+    return nodes
+
+
+def _conformer_network_html(nodes: list[dict]) -> str:
+    """Grouped clickable list (not a tree/graph diagram): one section per
+    group -- reactant conformers, product conformers, completed MEP outputs,
+    aggregated network edges -- each a row of buttons picking that node as
+    the current selection via the shared `selectNode(index)`."""
+    groups: dict[str, list[dict]] = {}
+    for node in nodes:
+        groups.setdefault(node["group"], []).append(node)
+
+    sections = []
+    for group_name, group_nodes in groups.items():
+        buttons = "".join(
+            f'<button class="node-button" id="list-node-{n["index"]}" '
+            f'onclick="selectNode({n["index"]})" title="{html.escape(n["label"])}">'
+            f'{html.escape(n["label"])}</button>'
+            for n in group_nodes
+        )
+        sections.append(
+            f'<div class="node-group"><h4>{html.escape(group_name)} ({len(group_nodes)})</h4>'
+            f'<div class="node-group-buttons">{buttons}</div></div>'
+        )
+    return "".join(sections)
+
+
 def render_visualization_html(
     obj,
     title: str = "mepd visualization",
@@ -298,6 +380,14 @@ def render_visualization_html(
         if not nodes:
             raise ValueError("Network has no edges with recoverable chains to visualize.")
         diagram_kind, diagram_obj = "network", (obj, nodes)
+    elif isinstance(obj, ConformerNetworkResult):
+        nodes = _conformer_network_nodes_payload(obj)
+        if not nodes:
+            raise ValueError(
+                "Nothing recoverable to visualize: no conformers and no "
+                "completed MEP outputs found."
+            )
+        diagram_kind, diagram_obj = "grouped", nodes
     elif isinstance(obj, PathMinimizer):
         trajectory = _trajectory_payload(obj)
         if not trajectory:
@@ -308,8 +398,8 @@ def render_visualization_html(
     else:
         raise TypeError(
             f"Cannot visualize object of type {type(obj).__name__}; "
-            "expected a Chain, a NEB/PathMinimizer, a TreeNode, a Pot, or a "
-            "list of Node objects."
+            "expected a Chain, a NEB/PathMinimizer, a TreeNode, a Pot, a "
+            "ConformerNetworkResult, or a list of Node objects."
         )
 
     nodes_json = json.dumps(nodes)
@@ -320,6 +410,8 @@ def render_visualization_html(
     elif diagram_kind == "network":
         pot, edge_nodes = diagram_obj
         tree_html = _network_svg(pot, edge_nodes)
+    elif diagram_kind == "grouped":
+        tree_html = _conformer_network_html(diagram_obj)
 
     return f"""<!doctype html>
 <html>
@@ -331,6 +423,12 @@ def render_visualization_html(
   body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; }}
   #viewerContainer {{ width: 100%; height: 480px; position: relative; }}
   input[type=range] {{ width: min(720px, 90vw); }}
+  .node-group {{ margin-bottom: 0.75rem; }}
+  .node-group h4 {{ margin: 0 0 0.3rem 0; }}
+  .node-group-buttons {{ display: flex; flex-wrap: wrap; gap: 0.4rem; }}
+  .node-button {{ padding: 0.3rem 0.6rem; border: 1px solid #ccc; border-radius: 0.3rem;
+                  background: white; cursor: pointer; font-size: 0.85rem; }}
+  .node-button.selected {{ background: #dbeafe; border-color: #2563eb; }}
 </style>
 </head>
 <body>
@@ -451,6 +549,11 @@ function selectNode(index) {{
   const selected = document.getElementById("tree-node-" + index);
   if (selected) {{
     selected.setAttribute("stroke-width", String(2 * parseFloat(selected.getAttribute("data-default-width"))));
+  }}
+  document.querySelectorAll("#treeContainer .node-button").forEach((el) => el.classList.remove("selected"));
+  const selectedButton = document.getElementById("list-node-" + index);
+  if (selectedButton) {{
+    selectedButton.classList.add("selected");
   }}
   selectStep(currentNode.trajectory.length - 1);
 }}

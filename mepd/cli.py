@@ -192,8 +192,7 @@ def _load_structure_from_smiles_or_xyz(
 
     Tries qcinf's default RDKit backend first, then falls back to openbabel:
     RDKit refuses multi-fragment SMILES (e.g. "C=C.O.O.O" for a solute plus
-    explicit waters -- exactly the kind of noncovalent complex discovery
-    commands want to explore), which openbabel embeds fine.
+    explicit waters), which openbabel embeds fine.
     """
     path = Path(value)
     if path.exists():
@@ -201,23 +200,35 @@ def _load_structure_from_smiles_or_xyz(
 
     import qcinf
 
+    # Only forward `multiplicity` to qcinf -- both of its smiles_to_structure
+    # backends always compute their own `charge` (from the RDKit mol's formal
+    # charge, or from Open Babel's partial charges) and pass it explicitly to
+    # Structure(...), so also forwarding a user-supplied `charge` here collides
+    # ("got multiple values for keyword argument 'charge'"). Apply a charge
+    # override afterward instead, the same way `_load_endpoint` does for xyz
+    # files.
     kwargs = {}
-    if charge is not None:
-        kwargs["charge"] = charge
     if multiplicity is not None:
         kwargs["multiplicity"] = multiplicity
 
     errors = []
+    structure = None
     for backend in ("rdkit", "openbabel"):
         try:
-            return qcinf.smiles_to_structure(value, backend=backend, **kwargs)
+            structure = qcinf.smiles_to_structure(value, backend=backend, **kwargs)
+            break
         except Exception as exc:
             errors.append(f"{backend}: {type(exc).__name__}: {exc}")
 
-    raise typer.BadParameter(
-        f"'{value}' is neither an existing xyz file nor a valid SMILES string.\n"
-        + "\n".join(errors)
-    )
+    if structure is None:
+        raise typer.BadParameter(
+            f"'{value}' is neither an existing xyz file nor a valid SMILES string.\n"
+            + "\n".join(errors)
+        )
+
+    if charge is not None:
+        structure = structure.model_copy(update={"charge": charge})
+    return structure
 
 
 def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int = 500) -> dict:
@@ -394,6 +405,16 @@ def _run_msmep_pairs(
             continue
         pair_dir.mkdir(parents=True, exist_ok=True)
         typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")
+        # MSMEP's "endpoints already attempted elsewhere" dedup (meant to stop
+        # redundant re-splitting of the same species discovered mid-recursion
+        # within ONE pair's own tree) stores its cache directly on this shared
+        # `run_inputs.path_min_inputs` object -- reset it before each pair so
+        # it can't leak across pairs and wrongly skip a later, genuinely
+        # different pair that merely resembles an earlier one under
+        # `is_identical`'s generous default thresholds (this matters most for
+        # conformer-network, where many pairs deliberately share the same
+        # reactant/product molecular graph across different conformers).
+        setattr(run_inputs.path_min_inputs, "attempted_pairs_payload", [])
         try:
             seed_chain = Chain.model_validate({
                 "nodes": [structures[i], structures[j]],
@@ -576,9 +597,13 @@ def run(
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Override the spin multiplicity on both endpoints."
     ),
-    minimize_ends: bool = typer.Option(
-        False, "--minimize-ends",
-        help="Optimize the start/end endpoint geometries before running NEB.",
+    minimize_ends: Optional[bool] = typer.Option(
+        None, "--minimize-ends/--no-minimize-ends",
+        help="Optimize the start/end endpoint geometries before running NEB. "
+        "Defaults to on when either --start/--end is given as SMILES (an "
+        "RDKit-embedded guess, not a real minimum on the target engine's "
+        "surface) and off when both are already-provided xyz files "
+        "(presumed already minimized). Pass explicitly to override either way.",
     ),
     recursive: bool = typer.Option(
         False, "--recursive",
@@ -688,7 +713,10 @@ def run(
     run_inputs.path_min_inputs.recursive_same_pair_split_limit = same_pair_split_limit
     _echo_run_inputs_summary(run_inputs)
 
-    if not Path(start).exists() and not Path(end).exists():
+    start_is_smiles = not Path(start).exists()
+    end_is_smiles = not Path(end).exists()
+
+    if start_is_smiles and end_is_smiles:
         typer.echo(
             "--start/--end are both SMILES strings; computing a SLAPMapper "
             "atom-to-atom mapping to build a consistently-indexed structure pair..."
@@ -714,7 +742,16 @@ def run(
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)
 
-    if minimize_ends:
+    effective_minimize_ends = minimize_ends
+    if effective_minimize_ends is None:
+        effective_minimize_ends = start_is_smiles or end_is_smiles
+        if effective_minimize_ends:
+            typer.echo(
+                "An endpoint was given as SMILES (an RDKit-embedded guess, not a "
+                "real minimum); minimizing endpoints by default. Pass "
+                "--no-minimize-ends to skip."
+            )
+    if effective_minimize_ends:
         start_node, end_node = _minimize_endpoints(start_node, end_node, run_inputs)
 
     seed_chain = Chain.model_validate({
@@ -855,12 +892,82 @@ def ts(
         raise typer.Exit(code=1)
 
 
+def _load_conformer_network_result(result_path: Path, charge: int, multiplicity: int):
+    """Load a `mepd conformers` output directory (has a conformers/ pool
+    directory and/or a pairs/ directory of per-pair MSMEP trees) into a
+    `ConformerNetworkResult` for `mepd visualize`."""
+    from mepd.inputs import ChainInputs
+    from mepd.pot import Pot
+    from mepd.TreeNode import TreeNode
+    from mepd.viz import ConformerNetworkResult
+
+    def _load_conformer_pool(fp: Path) -> list:
+        if not fp.exists():
+            return []
+        return list(
+            Chain.from_xyz(fp, ChainInputs(), charge=charge, spinmult=multiplicity).nodes
+        )
+
+    reactant_conformers = _load_conformer_pool(result_path / "conformers" / "start.xyz")
+    product_conformers = _load_conformer_pool(result_path / "conformers" / "end.xyz")
+
+    pairs = []
+    load_errors = []
+    pairs_dir = result_path / "pairs"
+    if pairs_dir.is_dir():
+        for pair_dir in sorted(pairs_dir.iterdir()):
+            tree_dir = pair_dir / "tree"
+            if not (tree_dir / "adj_matrix.txt").exists():
+                continue
+            try:
+                tree = TreeNode.read_from_disk(
+                    tree_dir, chain_parameters=ChainInputs(), charge=charge, multiplicity=multiplicity
+                )
+                chain = tree.output_chain
+            except Exception as exc:
+                # adj_matrix.txt existing doesn't guarantee the tree has any
+                # usable node data -- e.g. every node in it failed to compute
+                # (missing/misconfigured engine) and only an empty tree got
+                # written. Report it instead of just silently omitting the
+                # pair, so "no MEP outputs shown" doesn't look like this
+                # feature is broken when the real cause is upstream.
+                load_errors.append(f"{pair_dir.name}: {type(exc).__name__}: {exc}")
+                continue
+            pairs.append((pair_dir.name, chain))
+
+    if load_errors:
+        typer.echo(
+            f"Warning: {len(load_errors)} pair tree(s) under 'pairs/' have an "
+            "adj_matrix.txt but no usable chain data (most likely every node "
+            "in them failed to compute -- e.g. the run's engine wasn't "
+            "available) and are not shown:"
+        )
+        for msg in load_errors:
+            typer.echo(f"  - {msg}")
+
+    network = None
+    network_path = result_path / "network.json"
+    if network_path.exists():
+        try:
+            network = Pot.read_from_disk(network_path)
+        except Exception:
+            network = None
+
+    return ConformerNetworkResult(
+        reactant_conformers=reactant_conformers,
+        product_conformers=product_conformers,
+        pairs=pairs,
+        network=network,
+    )
+
+
 def _load_visualization_object(result_path: Path, charge: int, multiplicity: int):
     """Load whatever mepd result `result_path` points to, for `mepd
     visualize`: a chain xyz file, a network.json (a `Pot`), a split-tree
-    directory (has adj_matrix.txt), or a bare NEB history directory (has
+    directory (has adj_matrix.txt), a bare NEB history directory (has
     traj_*.xyz but no adj_matrix.txt -- e.g. a manually saved
-    `<name>_history/` folder)."""
+    `<name>_history/` folder), or a `mepd conformers` output directory (has
+    conformers/ and/or pairs/)."""
     from mepd.inputs import ChainInputs
     from mepd.neb import NEB
     from mepd.pot import Pot
@@ -879,9 +986,11 @@ def _load_visualization_object(result_path: Path, charge: int, multiplicity: int
                 charge=charge,
                 multiplicity=multiplicity,
             )
+        if (result_path / "conformers").is_dir() or (result_path / "pairs").is_dir():
+            return _load_conformer_network_result(result_path, charge, multiplicity)
         raise typer.BadParameter(
-            f"'{result_path}' is a directory but has neither adj_matrix.txt (a split-tree) "
-            "nor traj_*.xyz files (a NEB history)."
+            f"'{result_path}' is a directory but has neither adj_matrix.txt (a split-tree), "
+            "traj_*.xyz files (a NEB history), nor conformers/ or pairs/ (a `mepd conformers` output)."
         )
 
     if result_path.suffix == ".json":
@@ -896,7 +1005,8 @@ def visualize(
         ..., exists=True,
         help="Path to a mepd result: a chain xyz file (mep_output.xyz, unique.xyz -- "
         "a matching <stem>.energies sidecar, if present, is used for the energy profile), "
-        "a network.json, or a split-tree/NEB-history directory.",
+        "a network.json, a split-tree/NEB-history directory, or a `mepd conformers` "
+        "output directory.",
     ),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o",
@@ -917,7 +1027,9 @@ def visualize(
     """Render an interactive visualization: a frame scrubber (with a
     highlighted energy-profile point) for a chain, plus -- for a split-tree
     or network.json -- a diagram of tree nodes/network edges to click
-    through, and a trajectory-step slider for whichever one is selected."""
+    through, and a trajectory-step slider for whichever one is selected.
+    For a `mepd conformers` output directory, shows reactant conformers,
+    product conformers, and completed MEP outputs as clickable groups."""
     try:
         obj = _load_visualization_object(result_path, charge, multiplicity)
     except Exception as exc:
@@ -1132,6 +1244,266 @@ def network_splits(
         candidates = candidates[:max_pairs]
 
     output.mkdir(parents=True, exist_ok=True)
+    pairs_dir = output / "pairs"
+    pairs_dir.mkdir(parents=True, exist_ok=True)
+
+    _run_msmep_pairs(
+        structures, candidates, pairs_dir, run_inputs,
+        parallel=parallel, parallel_workers=parallel_workers,
+    )
+
+    tree_dirs = _completed_tree_dirs(pairs_dir)
+    if not tree_dirs:
+        typer.echo("No pairs completed successfully; nothing to build a network from.")
+        raise typer.Exit(code=1)
+
+    builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
+    try:
+        pot = builder.create_rxn_network_from_paths(tree_dirs)
+    except Exception as exc:
+        typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+
+    network_path = output / "network.json"
+    pot.write_to_disk(network_path)
+    typer.echo(
+        f"Wrote network to {network_path} "
+        f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
+    )
+
+
+def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> list:
+    """Optimize every node in a conformer pool with the QM engine, dropping
+    (with a warning) any conformer that fails to converge or produces an
+    empty trajectory rather than failing the whole batch -- unlike
+    `_minimize_endpoints` (which hard-stops on a single non-convergent
+    endpoint), one bad conformer out of many shouldn't sink the run.
+    """
+    from mepd.errors import GeometryOptimizationNotConvergedError
+
+    if not nodes:
+        return nodes
+
+    keywords = _geometry_optimizer_keywords(run_inputs)
+    optimized: list = []
+
+    batch_optimizer = getattr(run_inputs.engine, "compute_geometry_optimizations", None)
+    if callable(batch_optimizer):
+        try:
+            try:
+                trajectories = batch_optimizer(nodes, keywords=keywords)
+            except TypeError:
+                trajectories = batch_optimizer(nodes)
+        except Exception as exc:
+            typer.echo(
+                f"{label} conformer batch minimization failed "
+                f"({type(exc).__name__}: {exc}); keeping input geometries."
+            )
+            return nodes
+        for i, trajectory in enumerate(trajectories):
+            if trajectory:
+                optimized.append(trajectory[-1])
+            else:
+                typer.echo(f"{label} conformer {i} optimization returned an empty trajectory; dropping it.")
+        return optimized
+
+    single_optimizer = getattr(run_inputs.engine, "compute_geometry_optimization", None)
+    if not callable(single_optimizer):
+        typer.echo(
+            f"Engine {type(run_inputs.engine).__name__} does not support geometry "
+            f"optimization; keeping input geometries for {label}."
+        )
+        return nodes
+
+    for i, node in enumerate(nodes):
+        try:
+            trajectory = single_optimizer(node, keywords=keywords)
+            if trajectory:
+                optimized.append(trajectory[-1])
+            else:
+                typer.echo(f"{label} conformer {i} optimization returned an empty trajectory; dropping it.")
+        except GeometryOptimizationNotConvergedError as exc:
+            typer.echo(f"{label} conformer {i} did not converge ({exc}); dropping it.")
+        except Exception as exc:
+            typer.echo(f"{label} conformer {i} minimization failed ({type(exc).__name__}: {exc}); dropping it.")
+    return optimized
+
+
+@app.command("conformers")
+def conformer_network(
+    start: str = typer.Option(..., "--start", help="Path to the reactant-endpoint xyz file, or a SMILES string."),
+    end: str = typer.Option(..., "--end", help="Path to the product-endpoint xyz file, or a SMILES string."),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", exists=True,
+        help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
+    ),
+    charge: Optional[int] = typer.Option(
+        None, "--charge", help="Override the molecular charge on both endpoints."
+    ),
+    multiplicity: Optional[int] = typer.Option(
+        None, "--multiplicity", help="Override the spin multiplicity on both endpoints."
+    ),
+    realign_atoms: bool = typer.Option(
+        False, "--realign-atoms",
+        help="Every run checks whether SLAPMapper's Weisfeiler-Lehman-like/"
+        "sequential-LAP atom-to-atom mapping (Koda, ChemRxiv 2025) between "
+        "--start and --end agrees with their shared input atom ordering, "
+        "warning if not. Passing this flag additionally reindexes --end's "
+        "atoms (and therefore every product conformer generated from it) to "
+        "match the suggested mapping instead of just warning. No-op when "
+        "--start/--end are both SMILES or atom counts differ.",
+    ),
+    backend: str = typer.Option(
+        "rdkit", "--backend",
+        help="Conformer-generation backend. Currently only 'rdkit' is implemented; "
+        "'crest' is planned as a follow-up.",
+    ),
+    n_conformers: int = typer.Option(
+        10, "--n-conformers",
+        help="Maximum number of distinct conformers to keep for EACH endpoint "
+        "after generation and RMSD-based deduplication.",
+    ),
+    n_embed: int = typer.Option(
+        50, "--n-embed",
+        help="Number of raw conformer embeddings to attempt per endpoint before "
+        "deduplication (rdkit backend only). Should comfortably exceed --n-conformers.",
+    ),
+    rmsd_cutoff: float = typer.Option(
+        0.5, "--rmsd-cutoff",
+        help="Minimum pairwise RMSD (bohr) for two conformers of the same endpoint "
+        "to count as distinct.",
+    ),
+    random_seed: int = typer.Option(0, "--random-seed", help="Random seed for conformer embedding."),
+    minimize_ends: bool = typer.Option(
+        True, "--minimize-ends/--no-minimize-ends",
+        help="Optimize every generated conformer with the QM engine before pairing. "
+        "On by default: RDKit/MMFF conformers are not QM minima, and every pair's "
+        "MSMEP run otherwise starts from a force-field-quality endpoint rather "
+        "than a real minimum at your input level of theory. A conformer that "
+        "fails to converge is dropped rather than failing the whole run.",
+    ),
+    max_pairs: int = typer.Option(
+        100, "--max-pairs",
+        help="Hard cap on the total number of reactant x product conformer pairs to "
+        "run (default matches the default 10 x 10 endpoint caps; raise this if more "
+        "compute is available).",
+    ),
+    parallel: bool = typer.Option(
+        False, "--parallel",
+        help="Run each pair's recursive autosplitting (MSMEP) with branches "
+        "evaluated in parallel.",
+    ),
+    parallel_workers: Optional[int] = typer.Option(
+        None, "--parallel-workers",
+        help="Maximum number of concurrent workers for --parallel. Defaults to "
+        "min(4, cpu count).",
+    ),
+    validate_minima_with_hessian: bool = typer.Option(
+        True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="When a minima-based autosplit is proposed during each pair's MSMEP, "
+        "compute Hessians for optimized split candidates and reject candidates "
+        "with significant imaginary modes. On by default -- this is a "
+        "correctness check, not a convenience.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff",
+        help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="Displacement (bohr) applied along the lowest-frequency mode when "
+        "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
+    ),
+    output: Path = typer.Option(
+        Path("mepd_conformer_network_output"), "--output", "-o",
+        help="Directory to write conformer-pair trees and the completed network into.",
+    ),
+) -> None:
+    """Conformer-driven MEP sampling: generate conformers of the --start and
+    --end endpoints, then run a recursive NEB/MSMEP for every (reactant
+    conformer, product conformer) pair, combining the results into one
+    reaction network -- so the network reflects the true lowest-barrier path
+    between the relevant conformers, not just whichever single conformer
+    happened to be given as input."""
+    if n_conformers <= 0:
+        raise typer.BadParameter("--n-conformers must be a positive integer.")
+    if n_embed <= 0:
+        raise typer.BadParameter("--n-embed must be a positive integer.")
+    if max_pairs <= 0:
+        raise typer.BadParameter("--max-pairs must be a positive integer.")
+
+    from mepd.conformers import ConformerInputs, generate_conformers
+    from mepd.nodes.node import StructureNode
+    from mepd.NetworkBuilder import NetworkBuilder
+
+    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
+    run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
+    run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
+    _echo_run_inputs_summary(run_inputs)
+
+    start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
+    end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
+    end_structure = _check_endpoint_atom_mapping(start_structure, end_structure, realign_atoms)
+    start_node = StructureNode(structure=start_structure)
+    end_node = StructureNode(structure=end_structure)
+
+    conformer_inputs = ConformerInputs(
+        backend=backend,
+        n_conformers=n_conformers,
+        n_embed=n_embed,
+        rmsd_cutoff=rmsd_cutoff,
+        random_seed=random_seed,
+    )
+
+    typer.echo(f"Generating up to {n_conformers} start-endpoint conformers ({backend})...")
+    start_confs = generate_conformers(start_node, conformer_inputs)
+    typer.echo(f"  -> {len(start_confs)} distinct conformer(s).")
+
+    typer.echo(f"Generating up to {n_conformers} end-endpoint conformers ({backend})...")
+    end_confs = generate_conformers(end_node, conformer_inputs)
+    typer.echo(f"  -> {len(end_confs)} distinct conformer(s).")
+
+    if minimize_ends:
+        typer.echo("Minimizing start-endpoint conformers...")
+        start_confs = _minimize_conformer_pool(start_confs, "start", run_inputs)
+        typer.echo("Minimizing end-endpoint conformers...")
+        end_confs = _minimize_conformer_pool(end_confs, "end", run_inputs)
+
+    if not start_confs or not end_confs:
+        typer.echo("No usable conformers for one or both endpoints; nothing to run.")
+        raise typer.Exit(code=1)
+
+    structures = start_confs + end_confs
+    n_start = len(start_confs)
+    candidates = [
+        (i, n_start + j) for i in range(n_start) for j in range(len(end_confs))
+    ]
+
+    if len(candidates) > max_pairs:
+        typer.echo(
+            f"{len(candidates)} candidate reactant x product conformer pairs found "
+            f"({n_start} x {len(end_confs)}), capping at --max-pairs={max_pairs}."
+        )
+        candidates = candidates[:max_pairs]
+
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Persisted so `mepd visualize <output>` can show the actual conformer
+    # pools used for pairing (post-minimization, if --minimize-ends), not
+    # just the completed pairs -- otherwise there'd be no way to see e.g. a
+    # reactant conformer that never made it into any --max-pairs-capped pair.
+    from mepd.inputs import ChainInputs
+
+    conformers_dir = output / "conformers"
+    conformers_dir.mkdir(parents=True, exist_ok=True)
+    Chain.model_validate(
+        {"nodes": start_confs, "parameters": ChainInputs()}
+    ).write_to_disk(conformers_dir / "start.xyz")
+    Chain.model_validate(
+        {"nodes": end_confs, "parameters": ChainInputs()}
+    ).write_to_disk(conformers_dir / "end.xyz")
+
     pairs_dir = output / "pairs"
     pairs_dir.mkdir(parents=True, exist_ok=True)
 

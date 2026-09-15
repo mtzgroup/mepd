@@ -245,12 +245,16 @@ def structure_to_ase_atoms(structure: Structure):
     pos = structure.geometry_angstrom
     # ASE uses the sum of the partial charges and magnetic moments
     # to determine what the total charge and spinnmultiplicity
-    # of the system is, thus the hacky workaround
+    # of the system is, thus the hacky workaround. ASE's own convention is
+    # that the total initial magnetic moment is the number of UNPAIRED
+    # electrons, i.e. multiplicity - 1 -- not multiplicity itself, which
+    # would make a singlet look like it has one unpaired electron and get
+    # rejected as electronically inconsistent by calculators that enforce it.
     atoms = Atoms(
         symbols=symbs,
         positions=pos,
         charges=[structure.charge] + [0] * (len(pos) - 1),
-        magmoms=[structure.multiplicity] + [0] * (len(pos) - 1),
+        magmoms=[structure.multiplicity - 1] + [0] * (len(pos) - 1),
     )
 
     # this is for OMOL25 compatibility

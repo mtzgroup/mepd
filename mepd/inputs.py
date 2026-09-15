@@ -513,7 +513,10 @@ class RunInputs:
             self.program_kwds = None
 
         if self.program_kwds is None:
-            if self.engine_name == "gxtb":
+            if self.engine_name in {"gxtb", "ase"}:
+                # Neither engine uses qccompute/chemcloud's ProgramArgs/QCIO
+                # input construct -- gxtb shells out directly, and ASEEngine
+                # takes an already-constructed ase.Calculator.
                 program_args = None
             elif self.program == "xtb":
                 if shutil.which("crest") is not None:
