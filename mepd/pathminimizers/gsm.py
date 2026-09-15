@@ -280,14 +280,18 @@ class GSM(PathMinimizer):
             self.optimized = final_chain
 
             if getattr(self.parameters, "do_elem_step_checks", True):
-                short_chain = Chain.model_validate(
-                    {
-                        "nodes": [final_chain[0], final_chain.get_ts_node(), final_chain[-1]],
-                        "parameters": final_chain.parameters,
-                    }
-                )
+                # Pass the FULL converged chain, not a 3-node
+                # [reactant, TS-guess, product] reduction -- check_if_elem_step's
+                # minima-based concavity check (_get_ind_minima) scans the chain
+                # it's given for local dips, and a 3-node chain (one interior
+                # point, by construction the *highest*-energy node) can never
+                # represent an "up-down-up" profile, so a real intermediate
+                # visible in the full GSM path would be structurally invisible
+                # to it. This matches how the full NEB class does it
+                # (mepd/neb.py's check_if_elem_step calls all pass `final_chain`
+                # directly) rather than FreezingNEB's 3-node reduction.
                 elem_step_results = check_if_elem_step(
-                    short_chain,
+                    final_chain,
                     engine=self.engine,
                     validate_minima_with_hessian=bool(
                         getattr(self.parameters, "validate_minima_with_hessian", False)
