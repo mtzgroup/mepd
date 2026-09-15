@@ -714,23 +714,18 @@ def update_node_cache(node_list, results):
 
 
 def create_pairs_from_smiles(smi1: str, smi2: str, spinmult=1):
-    raise NotImplementedError(
-        "Latest RXNMapper update has made this feature incompatible. Need to fix compatibility.")
-    # rxnsmi = f"{smi1}>>{smi2}"
-    # rxn_mapper = RXNMapper()
-    # rxn = [rxnsmi]
-    # result = rxn_mapper.get_attention_guided_atom_maps(rxn)[0]
-    # mapped_smi = result["mapped_rxn"]
-    # r_smi, p_smi = mapped_smi.split(">>")
-    # print(r_smi, p_smi)
-    # r = Molecule.from_mapped_smiles(r_smi)
-    # p = Molecule.from_mapped_smiles(p_smi)
+    """Builds a pair of atom-index-consistent Structures from two
+    reaction-endpoint SMILES strings, using SLAPMapper's atom-to-atom
+    mapping (see `mepd.atom_mapping.map_smiles_pair`) to determine the
+    correspondence between `smi1`'s and `smi2`'s atoms.
 
-    # td_r, td_p = (
-    #     molecule_to_structure(r, charge=r.charge, spinmult=spinmult),
-    #     molecule_to_structure(p, charge=p.charge, spinmult=spinmult),
-    # )
-    # return td_r, td_p
+    Requires the optional `slapmapper` dependency (`pip install mepd[aam]`).
+    """
+    from mepd.atom_mapping import map_smiles_pair
+
+    return map_smiles_pair(
+        smi1, smi2, multiplicity_start=spinmult, multiplicity_end=spinmult
+    )
 
 
 def displace_by_dr(node: Node, displacement: np.array, dr: float = 0.1) -> Node:

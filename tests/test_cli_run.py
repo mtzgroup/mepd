@@ -121,6 +121,7 @@ def _call_run(**overrides):
         same_pair_split_limit=5,
         use_tsopt=False,
         irc=False,
+        realign_atoms=False,
         output=None,
     )
     kwargs.update(overrides)
@@ -628,3 +629,116 @@ def test_echo_run_inputs_summary_shows_full_resolved_engine_and_optimizer(capsys
     assert "gxtb_engine_kwds" not in out
     assert "optimizer (ConjugateGradient)" in out
     assert "engine (GXTBCalculator)" in out
+
+
+def _propene_xyz(order) -> str:
+    """CH2=CH-CH3, atoms optionally permuted by `order` (end[i] = base[order[i]])."""
+    symbols = ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
+    geometry = [
+        [0.000, 1.303, 0.000], [0.000, 0.000, 0.000], [1.501, -0.400, 0.000],
+        [-0.920, 1.860, 0.000], [0.920, 1.860, 0.000], [-0.950, -0.550, 0.000],
+        [1.550, -1.030, 0.870], [1.550, -1.030, -0.870], [2.300, 0.320, 0.000],
+    ]
+    order = list(order)
+    lines = [str(len(order)), ""]
+    for i in order:
+        x, y, z = geometry[i]
+        lines.append(f"{symbols[i]} {x:.6f} {y:.6f} {z:.6f}")
+    return "\n".join(lines) + "\n"
+
+
+def test_cli_run_warns_on_atom_mapping_mismatch_but_does_not_reorder_by_default(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("slapmapper")
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_propene_xyz(range(9)))
+    # genuinely swap the terminal-CH2 block with the methyl block.
+    end_fp.write_text(_propene_xyz([2, 1, 0, 6, 7, 8, 5, 3, 4]))
+
+    seen_structures = []
+    original_init = StructureNode.__init__
+
+    def spying_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        seen_structures.append(self.structure)
+
+    monkeypatch.setattr(StructureNode, "__init__", spying_init)
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    with pytest.warns(UserWarning, match="disagrees"):
+        _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir)
+
+    # --realign-atoms wasn't passed, so --end's atoms are untouched.
+    assert list(seen_structures[1].symbols) == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
+
+
+def test_cli_run_realign_atoms_reorders_end_to_match_mapping(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("slapmapper")
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_propene_xyz(range(9)))
+    scrambled_order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    end_fp.write_text(_propene_xyz(scrambled_order))
+
+    seen_structures = []
+    original_init = StructureNode.__init__
+
+    def spying_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        seen_structures.append(self.structure)
+
+    monkeypatch.setattr(StructureNode, "__init__", spying_init)
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    with pytest.warns(UserWarning, match="disagrees"):
+        _call_run(
+            start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir,
+            realign_atoms=True,
+        )
+
+    out = capsys.readouterr().out
+    assert "reindexing --end's atoms" in out
+    start_symbols = list(seen_structures[0].symbols)
+    end_symbols = list(seen_structures[1].symbols)
+    assert start_symbols == end_symbols == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
+    assert np.allclose(
+        np.asarray(seen_structures[1].geometry), np.asarray(seen_structures[0].geometry)
+    )
+
+
+def test_cli_run_accepts_smiles_for_start_and_end(tmp_path, monkeypatch):
+    pytest.importorskip("slapmapper")
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    seen_structures = []
+    original_init = StructureNode.__init__
+
+    def spying_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        seen_structures.append(self.structure)
+
+    monkeypatch.setattr(StructureNode, "__init__", spying_init)
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start="CC=O", end="OC=C", inputs=inputs_fp, output=output_dir,
+    )
+
+    assert (output_dir / "mep_output.xyz").exists()
+    # The first two StructureNodes built are --start and --end themselves.
+    start_structure, end_structure = seen_structures[0], seen_structures[1]
+    assert len(start_structure.symbols) == len(end_structure.symbols)
+    assert sorted(start_structure.symbols) == sorted(end_structure.symbols)

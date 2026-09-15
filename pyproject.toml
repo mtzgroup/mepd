@@ -50,6 +50,17 @@ gxtb = [
     "ase>=3.26.0",
     "sella>=2.3.4",
 ]
+# mepd.atom_mapping: SLAPMapper-based atom-to-atom mapping (WL-like iterative
+# label refinement + sequential linear assignment problems), used to sanity-
+# check --start/--end atom correspondence in `mepd run` and to build a
+# consistently-indexed structure pair when --start/--end are given as SMILES.
+# Implements Koda, "General and scalable atom-to-atom mapping via
+# Weisfeiler-Lehman-like approximate graph matching" (ChemRxiv, 2025,
+# https://chemrxiv.org/doi/10.26434/chemrxiv-2025-hthwn). Not on PyPI yet --
+# installed directly from its GitHub repo.
+aam = [
+    "slapmapper @ git+https://github.com/shin1koda/slap-mapper",
+]
 
 [project.scripts]
 mepd = "mepd.cli:app"
@@ -65,3 +76,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mepd"]
+
+[tool.hatch.metadata]
+# The `aam` optional-dependency group pins slapmapper via a git URL
+# (direct reference), which hatchling refuses to build without this.
+allow-direct-references = true

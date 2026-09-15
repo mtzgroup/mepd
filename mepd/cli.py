@@ -306,6 +306,54 @@ def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
     return endpoints[0], endpoints[1]
 
 
+def _check_endpoint_atom_mapping(
+    start_structure: Structure, end_structure: Structure, realign_atoms: bool
+) -> Structure:
+    """Sanity-check --start/--end's atom correspondence via SLAPMapper's
+    Weisfeiler-Lehman-like/sequential-LAP atom-to-atom mapping (Koda,
+    ChemRxiv 2025), warning if it disagrees with the identity mapping
+    implied by the two Structures sharing the same atom indexing.
+
+    Returns `end_structure` unchanged, unless `realign_atoms` is set and a
+    disagreeing mapping was found -- in which case `end_structure`'s atoms
+    are reordered to match --start according to that mapping.
+    """
+    if len(start_structure.symbols) != len(end_structure.symbols):
+        return end_structure
+
+    from mepd.atom_mapping import HAS_SLAPMAPPER
+
+    if not HAS_SLAPMAPPER:
+        typer.echo(
+            "Note: skipping the --start/--end atom-mapping sanity check "
+            "('slapmapper' not installed; `pip install mepd[aam]` to enable it)."
+        )
+        return end_structure
+
+    from mepd.atom_mapping import check_atom_mapping, realign_end_to_start
+
+    try:
+        atom_map = check_atom_mapping(start_structure, end_structure)
+    except Exception as exc:
+        typer.echo(
+            f"Atom-mapping check between --start and --end failed "
+            f"({type(exc).__name__}: {exc}); skipping."
+        )
+        return end_structure
+
+    if atom_map is None or atom_map.is_identity:
+        return end_structure
+
+    if realign_atoms:
+        typer.echo(
+            "--realign-atoms: reindexing --end's atoms to match the "
+            "SLAPMapper-suggested start<->end atom correspondence."
+        )
+        return realign_end_to_start(atom_map, end_structure)
+
+    return end_structure
+
+
 def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
     if not completion_dir.is_dir():
         return []
@@ -515,8 +563,8 @@ def _optimize_ts_and_irc(
 
 @app.command("run")
 def run(
-    start: Path = typer.Option(..., "--start", exists=True, help="Path to the start-structure xyz file."),
-    end: Path = typer.Option(..., "--end", exists=True, help="Path to the end-structure xyz file."),
+    start: str = typer.Option(..., "--start", help="Path to the start-structure xyz file, or a SMILES string."),
+    end: str = typer.Option(..., "--end", help="Path to the end-structure xyz file, or a SMILES string."),
     inputs: Optional[Path] = typer.Option(
         None, "--inputs", "-i", exists=True,
         help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
@@ -597,6 +645,16 @@ def run(
         False, "--irc",
         help="Follow up each --use-tsopt transition state with an IRC. Requires --use-tsopt.",
     ),
+    realign_atoms: bool = typer.Option(
+        False, "--realign-atoms",
+        help="Every run checks whether SLAPMapper's Weisfeiler-Lehman-like/"
+        "sequential-LAP atom-to-atom mapping (Koda, ChemRxiv 2025) between "
+        "--start and --end agrees with their shared input atom ordering, "
+        "warning if not. Passing this flag additionally reindexes --end's "
+        "atoms to match the suggested mapping instead of just warning. "
+        "No-op when --start/--end are both SMILES (already mapped "
+        "consistently before 3D embedding) or atom counts differ.",
+    ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
         help="Directory to write the optimized trajectory/energies into.",
@@ -629,8 +687,22 @@ def run(
     run_inputs.path_min_inputs.recursive_same_pair_split_limit = same_pair_split_limit
     _echo_run_inputs_summary(run_inputs)
 
-    start_structure = _load_endpoint(start, charge, multiplicity)
-    end_structure = _load_endpoint(end, charge, multiplicity)
+    if not Path(start).exists() and not Path(end).exists():
+        typer.echo(
+            "--start/--end are both SMILES strings; computing a SLAPMapper "
+            "atom-to-atom mapping to build a consistently-indexed structure pair..."
+        )
+        from mepd.atom_mapping import map_smiles_pair
+
+        start_structure, end_structure = map_smiles_pair(
+            start, end,
+            charge_start=charge, charge_end=charge,
+            multiplicity_start=multiplicity or 1, multiplicity_end=multiplicity or 1,
+        )
+    else:
+        start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
+        end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
+        end_structure = _check_endpoint_atom_mapping(start_structure, end_structure, realign_atoms)
 
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)

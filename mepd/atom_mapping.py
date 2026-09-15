@@ -1,0 +1,234 @@
+"""Atom-to-atom mapping between two molecular structures.
+
+Wraps SLAPMapper -- Koda, "General and scalable atom-to-atom mapping via
+Weisfeiler-Lehman-like approximate graph matching"
+(ChemRxiv, 2025, https://chemrxiv.org/doi/10.26434/chemrxiv-2025-hthwn) -- a
+WL-style iterative label-refinement scheme coupled with sequential
+linear-assignment problems, to:
+
+  1. sanity-check that a pair of endpoint structures handed to us as
+     "already atom-matched" (same index means the same atom on both sides
+     of the reaction) actually is, warning when SLAPMapper's own suggested
+     correspondence disagrees (`check_atom_mapping`); and
+  2. build a consistently-indexed structure pair directly from two
+     reaction-endpoint SMILES strings, where no such correspondence exists
+     until a mapping is computed (`map_smiles_pair`).
+
+Requires the optional `slapmapper` dependency (`pip install mepd[aam]`).
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from qcdata.models.structure import Structure
+
+from mepd.helper_functions import symbol_to_atomic_number
+from mepd.molecule import Molecule
+from mepd.qcdata_structure_helpers import molecule_to_structure, structure_to_molecule
+
+try:
+    from slapmapper.core import LabeledGraph, SlapMapper
+
+    HAS_SLAPMAPPER = True
+except ImportError:  # pragma: no cover - exercised only without the optional dep
+    HAS_SLAPMAPPER = False
+
+# Mirrors mepd.qcdata_structure_helpers.molecule_to_structure's bond-order map.
+_BOND_ORDER_WEIGHT = {"single": 1.0, "double": 2.0, "triple": 3.0, "aromatic": 1.5}
+
+
+@dataclass
+class AtomMapping:
+    """The correspondence SLAPMapper suggests between two structures'
+    atoms: `mapping[i]` is the index into the `end`-side structure that
+    atom `i` of the `start`-side structure maps onto.
+    """
+
+    mapping: dict[int, int]
+    cost: float
+    n_alternatives: int
+
+    @property
+    def is_identity(self) -> bool:
+        return all(k == v for k, v in self.mapping.items())
+
+    def as_order(self) -> list[int]:
+        """`end`-side reordering such that `end[order[i]]` corresponds to
+        `start`'s atom `i`."""
+        return [self.mapping[i] for i in range(len(self.mapping))]
+
+
+def _require_slapmapper() -> None:
+    if not HAS_SLAPMAPPER:
+        raise ImportError(
+            "Atom-to-atom mapping requires the optional 'slapmapper' package. "
+            "Install it with `pip install mepd[aam]`."
+        )
+
+
+def _atomic_numbers(mol: Molecule) -> list[int]:
+    return [symbol_to_atomic_number(mol.nodes[n]["element"]) for n in mol.nodes]
+
+
+def molecule_to_labeled_graph(mol: Molecule) -> "LabeledGraph":
+    """Build a SLAPMapper `LabeledGraph` from a mepd `Molecule` graph.
+
+    Node labels are atomic numbers; edge weights are bond orders. Assumes
+    `mol`'s node indices are the dense range 0..N-1, in the same order as
+    the `Structure` it was derived from -- true for
+    `mepd.qcdata_structure_helpers.structure_to_molecule` output.
+    """
+    _require_slapmapper()
+
+    nodes = sorted(mol.nodes)
+    if nodes != list(range(len(nodes))):
+        raise ValueError(
+            "Molecule nodes must be a dense 0..N-1 range for atom mapping."
+        )
+
+    labels = _atomic_numbers(mol)
+    graph: dict[int, dict[int, float]] = {i: {} for i in nodes}
+    for u, v, data in mol.edges(data=True):
+        weight = _BOND_ORDER_WEIGHT[data["bond_order"]]
+        graph[u][v] = weight
+        graph[v][u] = weight
+
+    return LabeledGraph(graph, labels)
+
+
+def suggest_atom_mapping(
+    struct_start: Structure, struct_end: Structure, *, binary: bool = True
+) -> Optional[AtomMapping]:
+    """Suggest an atom mapping from `struct_start` onto `struct_end` using
+    SLAPMapper's WL-refinement + sequential-LAP algorithm.
+
+    `binary=True` (the default, matching SLAPMapper's own chemical-AAM
+    default) ignores bond order and matches on adjacency alone -- important
+    since bonds are expected to change order (or break/form) between a
+    reaction's endpoints.
+
+    Returns None if the two structures don't share the same multiset of
+    atomic numbers (SLAPMapper doesn't support such "unbalanced" pairs) or
+    if SLAPMapper finds no mapping.
+    """
+    _require_slapmapper()
+
+    mol_start = structure_to_molecule(struct_start)
+    mol_end = structure_to_molecule(struct_end)
+
+    if sorted(_atomic_numbers(mol_start)) != sorted(_atomic_numbers(mol_end)):
+        return None
+
+    lg_start = molecule_to_labeled_graph(mol_start)
+    lg_end = molecule_to_labeled_graph(mol_end)
+
+    mapper = SlapMapper(binary=binary)
+    mapper.get_maps([lg_start, lg_end])
+    if not mapper.results:
+        return None
+
+    result = mapper.results[0]
+    label2idxs_start = result["lgp"][0].label2idxs
+    label2idxs_end = result["lgp"][1].label2idxs
+
+    mapping: dict[int, int] = {}
+    for label, idxs_start in label2idxs_start.items():
+        idxs_end = label2idxs_end[label]
+        for a, b in zip(sorted(idxs_start), sorted(idxs_end)):
+            mapping[a] = b
+
+    return AtomMapping(
+        mapping=mapping, cost=result["val"], n_alternatives=len(mapper.results)
+    )
+
+
+def check_atom_mapping(
+    struct_start: Structure, struct_end: Structure, *, binary: bool = True
+) -> Optional[AtomMapping]:
+    """Like `suggest_atom_mapping`, but also raises a `UserWarning` when the
+    suggested mapping disagrees with the identity mapping implied by
+    `struct_start`/`struct_end` sharing the same atom indexing.
+    """
+    atom_map = suggest_atom_mapping(struct_start, struct_end, binary=binary)
+    if atom_map is not None and not atom_map.is_identity:
+        warnings.warn(
+            "SLAPMapper's suggested atom-to-atom mapping disagrees with the "
+            "input structures' shared atom ordering "
+            f"(WL/LAP cost={atom_map.cost}, {atom_map.n_alternatives} equally-good "
+            f"mapping(s) found). Suggested mapping (start index -> end index): "
+            f"{atom_map.mapping}",
+            UserWarning,
+            stacklevel=2,
+        )
+    return atom_map
+
+
+def reorder_structure(structure: Structure, order: list[int]) -> Structure:
+    """Return a copy of `structure` with atoms permuted to `order`, i.e.
+    `reordered.symbols[i] == structure.symbols[order[i]]`.
+    """
+    symbols = np.asarray(structure.symbols)[order]
+    geometry = np.asarray(structure.geometry)[order]
+    return Structure(
+        symbols=symbols,
+        geometry=geometry,
+        charge=structure.charge,
+        multiplicity=structure.multiplicity,
+    )
+
+
+def realign_end_to_start(atom_map: AtomMapping, struct_end: Structure) -> Structure:
+    """Reorder `struct_end`'s atoms to align with the `start` structure
+    `atom_map` was computed against."""
+    return reorder_structure(struct_end, atom_map.as_order())
+
+
+def map_smiles_pair(
+    smi_start: str,
+    smi_end: str,
+    *,
+    charge_start: Optional[int] = None,
+    charge_end: Optional[int] = None,
+    multiplicity_start: int = 1,
+    multiplicity_end: int = 1,
+) -> tuple[Structure, Structure]:
+    """Build a pair of 3D `Structure`s from two reaction-endpoint SMILES
+    strings, with atom indices made consistent across the pair via
+    SLAPMapper's atom-to-atom mapping.
+
+    Parsing/embedding each SMILES independently would give each structure
+    its own arbitrary (canonical-SMILES-order) atom indexing with no
+    correspondence between the two -- exactly the case SLAPMapper's
+    chemistry-aware extension (`slapmapper.aam.SlapAAM.map_smiles`) is for.
+    """
+    _require_slapmapper()
+    from slapmapper.aam import SlapAAM
+
+    mapper = SlapAAM(binary=True)
+    mapper.map_smiles(f"{smi_start}>>{smi_end}")
+    if not mapper.results:
+        raise ValueError(
+            f"SLAPMapper could not find an atom mapping between "
+            f"{smi_start!r} and {smi_end!r}."
+        )
+
+    mapped_smi_start, mapped_smi_end = mapper.results[0]["smiles"].split(">>")
+
+    mol_start = Molecule.from_mapped_smiles(mapped_smi_start)
+    mol_end = Molecule.from_mapped_smiles(mapped_smi_end)
+
+    struct_start = molecule_to_structure(
+        mol_start,
+        charge=charge_start if charge_start is not None else mol_start.charge,
+        spinmult=multiplicity_start,
+    )
+    struct_end = molecule_to_structure(
+        mol_end,
+        charge=charge_end if charge_end is not None else mol_end.charge,
+        spinmult=multiplicity_end,
+    )
+    return struct_start, struct_end
