@@ -450,6 +450,7 @@ class RunInputs:
                 "product_limit": 100.0,
                 "timeout": None,
                 "keep_workdirs": False,
+                "seed_with_geodesic_interpolation": False,
                 "do_elem_step_checks": True,
                 "skip_identical_graphs": True,
                 "disregard_stereochem": False,

@@ -207,8 +207,18 @@ if __name__ == "__main__":
 '''
 
 
-def _inpfileq_text(parameters: SimpleNamespace) -> str:
+def _inpfileq_text(
+    parameters: SimpleNamespace,
+    *,
+    restart: int = 0,
+    nnodes_override: int | None = None,
+) -> str:
     p = parameters
+    nnodes = (
+        int(nnodes_override)
+        if nnodes_override is not None
+        else int(getattr(p, "nnodes", 9))
+    )
     return f"""
 # FSM/GSM/SSM inpfileq
 
@@ -219,7 +229,7 @@ GSM_go1q       # name of run
 
 ------------ String Info --------------------------------
 SM_TYPE                 GSM    # SSM, FSM or GSM
-RESTART                 0      # read restart.xyz
+RESTART                 {int(restart)}      # read restart.xyz
 MAX_OPT_ITERS           {int(getattr(p, "max_opt_iters", 80))}     # maximum iterations
 STEP_OPT_ITERS          {int(getattr(p, "step_opt_iters", 30))}     # for FSM/SSM
 CONV_TOL                {float(getattr(p, "conv_tol", 0.0005))} # perp grad
@@ -234,7 +244,7 @@ INITIAL_OPT             {int(getattr(p, "initial_opt", 0))}      # opt steps fir
 FINAL_OPT               {int(getattr(p, "final_opt", 150))}    # opt steps last SSM node
 PRODUCT_LIMIT           {float(getattr(p, "product_limit", 100.0))}  # kcal/mol
 TS_FINAL_TYPE           {int(getattr(p, "ts_final_type", 1))}      # any/delta bond: 0/1
-NNODES                  {int(getattr(p, "nnodes", 9))}      # including endpoints
+NNODES                  {nnodes}      # including endpoints
 ---------------------------------------------------------
 """
 
@@ -252,17 +262,30 @@ class GSM(PathMinimizer):
     script per run to unpickle *this* `engine` and call its
     `compute_energies`/`compute_gradients` directly, so GSM is driven by the
     exact same engine (e.g. gxtb) as every other path minimizer in mepd.
+
+    By default GSM grows its own path from scratch using its internal-
+    coordinate scheme (`GSM/icoord.cpp`) -- it needs no starting guess for
+    the interior nodes at all. Setting
+    `path_min_inputs.seed_with_geodesic_interpolation = True` instead seeds
+    the search with a geodesic-interpolated path (`mepd.chainhelpers.run_geodesic`,
+    the same helper NEB/FreezingNEB use) between the same two endpoints, via
+    the compiled binary's native `RESTART` mechanism -- see
+    `_build_geodesic_seed`'s docstring for how that's wired up.
     """
 
     initial_chain: Chain
     engine: Engine
     parameters: SimpleNamespace = None
     chain_trajectory: list = field(default_factory=list)
+    gi_inputs: SimpleNamespace = None
 
     def __post_init__(self):
         if self.parameters is None:
             ri = RunInputs(path_min_method="GSM")
             self.parameters = ri.path_min_inputs
+        if self.gi_inputs is None:
+            ri = RunInputs(path_min_method="GSM")
+            self.gi_inputs = ri.gi_inputs
         self.grad_calls_made = 0
         self.geom_grad_calls_made = 0
 
@@ -294,10 +317,14 @@ class GSM(PathMinimizer):
         self.grad_calls_made += 2
         e_reactant = float(reactant.energy)
 
+        seed_nodes = None
+        if bool(getattr(self.parameters, "seed_with_geodesic_interpolation", False)):
+            seed_nodes = self._build_geodesic_seed(chain, reactant, product)
+
         workdir = Path(tempfile.mkdtemp(prefix="gsm-"))
         server_proc = None
         try:
-            self._write_inputs(workdir, reactant, product, e_reactant)
+            self._write_inputs(workdir, reactant, product, e_reactant, seed_nodes=seed_nodes)
             counter_fp = workdir / "grad_calls.count"
             counter_fp.write_text("")
 
@@ -356,15 +383,112 @@ class GSM(PathMinimizer):
 
         return elem_step_results
 
+    def _build_geodesic_seed(self, chain: Chain, reactant, product) -> list:
+        """Build a geodesic-interpolated path between `reactant` and `product`
+        and evaluate real energies on every node via `self.engine`, so this
+        path can seed molecularGSM's search via its native `RESTART`
+        mechanism instead of letting it grow its own path from scratch.
+
+        Why this works -- `RESTART` in the C++ source (all in GSM/gstring.cpp):
+        when `inpfileq`'s `RESTART` tag (parsed around line 1232) is nonzero,
+        `String_Method_Optimization` (~line 562-587) skips `starting_string`/
+        `growth_iters` entirely -- the from-scratch internal-coordinate growth
+        this class normally relies on -- and instead calls
+        `restart_string("restart.xyz0000")` (~line 6299), which reads that
+        file via `read_string` (~line 6222) in the exact same block format
+        `_parse_string_blocks` reads (and `_write_string_blocks` writes):
+        `<natoms>` / `<energy kcal/mol>` / `<natoms> "SYMBOL x y z"` lines,
+        Angstrom, no blank lines between blocks -- the same format
+        `print_string` writes as `stringfile.xyz0000` output. `restart_string`
+        then sets `nn = nnR = nnmax = nrnodes` (the frame count actually
+        found in the file) and marks every interior node `active`, so GSM
+        treats the restart file as an already-fully-grown string and jumps
+        straight into its optimization/TS-search phase. We use `RESTART=1`
+        (not 2): the restart file's own endpoint frames *are*
+        `reactant`/`product`, so there's nothing to preserve separately
+        (unlike `RESTART=2`'s use case of overriding a restart file with
+        different endpoints than `initial0000.xyz`).
+        """
+        import mepd.chainhelpers as ch
+
+        seed_chain = Chain.model_validate(
+            {"nodes": [reactant, product], "parameters": chain.parameters}
+        )
+        gi = self.gi_inputs
+        interpolated = ch.run_geodesic(
+            chain=seed_chain,
+            chain_inputs=chain.parameters,
+            nimages=gi.nimages,
+            friction=gi.friction,
+            nudge=gi.nudge,
+            random_seed=gi.random_seed,
+            align=gi.align,
+            **(gi.extra_kwds or {}),
+        )
+        # run_geodesic rebuilds every node fresh (including the endpoints)
+        # from interpolated coordinates, so it has no idea reactant/product
+        # were already evaluated moments ago in optimize_chain -- swap the
+        # already-cached originals back in so compute_energies below only
+        # pays for the genuinely new interior nodes, not two redundant calls
+        # at coordinates it already has the answer for.
+        interpolated.nodes[0] = reactant
+        interpolated.nodes[-1] = product
+
+        n_before = sum(1 for n in interpolated.nodes if n._cached_energy is None)
+        self.engine.compute_energies(interpolated.nodes)
+        self.grad_calls_made += n_before
+        self._log(
+            f"Seeding molecularGSM with a {len(interpolated.nodes)}-node "
+            "geodesic-interpolated path (RESTART mode)."
+        )
+        return list(interpolated.nodes)
+
+    @staticmethod
+    def _write_string_blocks(fp: Path, nodes: list, e_reference: float) -> None:
+        """Inverse of `_parse_string_blocks`: write `nodes` (each needing a
+        real `.energy` and `.coords`) to `fp` in the same block format GSM's
+        own `stringfile.xyz<run>`/`restart.xyz<run>` files use.
+        """
+        from qcconst.constants import ANGSTROM_TO_BOHR
+
+        lines = []
+        for node in nodes:
+            symbols = list(node.symbols)
+            coords_angstrom = np.asarray(node.coords, dtype=float) / ANGSTROM_TO_BOHR
+            v_kcal = (float(node.energy) - e_reference) * _KCAL_PER_HARTREE
+            lines.append(f" {len(symbols)}")
+            lines.append(f" {v_kcal:.10f}")
+            for symbol, (x, y, z) in zip(symbols, coords_angstrom):
+                lines.append(f"  {symbol} {x:.10f} {y:.10f} {z:.10f}")
+        fp.write_text("\n".join(lines) + "\n")
+
     def _write_inputs(
-        self, workdir: Path, reactant, product, e_reactant: float
+        self,
+        workdir: Path,
+        reactant,
+        product,
+        e_reactant: float,
+        seed_nodes: list | None = None,
     ) -> None:
         scratch = workdir / "scratch"
         scratch.mkdir()
         (scratch / "initial0000.xyz").write_text(
             reactant.structure.to_xyz() + product.structure.to_xyz()
         )
-        (workdir / "inpfileq").write_text(_inpfileq_text(self.parameters))
+
+        if seed_nodes:
+            # Written at the workdir *root* (not scratch/) -- matches the
+            # `restart.xyz` + 4-digit-run-number convention the binary uses
+            # for both this input file and its `stringfile.xyz0000` output.
+            self._write_string_blocks(
+                workdir / "restart.xyz0000", seed_nodes, e_reactant
+            )
+            inpfileq_text = _inpfileq_text(
+                self.parameters, restart=1, nnodes_override=len(seed_nodes)
+            )
+        else:
+            inpfileq_text = _inpfileq_text(self.parameters)
+        (workdir / "inpfileq").write_text(inpfileq_text)
 
         with open(workdir / "engine.pkl", "wb") as fh:
             pickle.dump(

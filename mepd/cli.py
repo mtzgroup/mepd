@@ -164,6 +164,7 @@ def _build_path_minimizer(initial_chain: Chain, run_inputs: RunInputs):
             initial_chain=initial_chain,
             engine=run_inputs.engine,
             parameters=run_inputs.path_min_inputs,
+            gi_inputs=run_inputs.gi_inputs,
         )
     raise typer.BadParameter(
         f"Unsupported path_min_method '{run_inputs.path_min_method}'. "

@@ -1393,6 +1393,7 @@ class MSMEP:
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,
                 parameters=self.inputs.path_min_inputs,
+                gi_inputs=self.inputs.gi_inputs,
             )
         else:
             raise NotImplementedError(
