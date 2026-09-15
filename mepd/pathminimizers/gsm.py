@@ -322,69 +322,102 @@ class GSM(PathMinimizer):
         if bool(getattr(self.parameters, "seed_with_geodesic_interpolation", False)):
             seed_nodes = self._build_geodesic_seed(chain, reactant, product)
 
+        do_elem_step_checks = bool(getattr(self.parameters, "do_elem_step_checks", True))
+        # GSM's DE-GSM mode has no native "stop because an intermediate is
+        # present" hook to lean on (see _run_gsm's docstring), so this can
+        # only ever be as trustworthy as the check that verifies it --
+        # never arm it without do_elem_step_checks also on.
+        allow_early_stop = do_elem_step_checks and bool(
+            getattr(self.parameters, "early_stop_on_minima", True)
+        )
+
+        final_chain, history, early_stopped = self._execute_gsm_attempt(
+            chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
+        )
+        self.chain_trajectory = [self.initial_chain.copy(), *history, final_chain]
+        # Every other PathMinimizer sets this after a successful optimize_chain()
+        # -- msmep.run_minimize_chain reads it unconditionally right afterward.
+        self.optimized = final_chain
+
+        elem_step_results = (
+            self._check_elem_step(final_chain) if do_elem_step_checks else IS_ELEM_STEP
+        )
+
+        if early_stopped and elem_step_results.is_elem_step:
+            # The persistent-minimum signal that triggered the early stop
+            # was a false alarm per our own (more thorough) check -- rather
+            # than settle for a chain that was never let converge, resume:
+            # a fresh GSM invocation seeded (via RESTART -- see
+            # _build_geodesic_seed's docstring for how that mechanism
+            # works) from exactly the point we stopped at, this time run to
+            # full natural completion (early_allow_stop=False, so this
+            # can't recurse).
+            self._log(
+                "Early stop looked like a real intermediate but "
+                "check_if_elem_step disagreed; resuming to full "
+                "convergence from the same point.",
+                level="warning",
+            )
+            final_chain, resume_history, _ = self._execute_gsm_attempt(
+                chain, reactant, product, e_reactant, final_chain.nodes, False
+            )
+            self.chain_trajectory.extend(resume_history)
+            self.chain_trajectory.append(final_chain)
+            self.optimized = final_chain
+            elem_step_results = (
+                self._check_elem_step(final_chain)
+                if do_elem_step_checks
+                else IS_ELEM_STEP
+            )
+
+        return elem_step_results
+
+    def _execute_gsm_attempt(
+        self, chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
+    ) -> tuple[Chain, list, bool]:
+        """One full GSM invocation: write inputs, start the engine server,
+        run the binary (optionally monitoring for a persistent minimum to
+        stop early on), tear down. Returns `(final_chain, history,
+        early_stopped)`. Used both for the normal single-attempt path and,
+        via `optimize_chain`'s resume logic, a second time after an early
+        stop check_if_elem_step didn't confirm.
+        """
         workdir = Path(tempfile.mkdtemp(prefix="gsm-"))
         server_proc = None
         try:
-            self._write_inputs(workdir, reactant, product, e_reactant, seed_nodes=seed_nodes)
+            self._write_inputs(
+                workdir, reactant, product, e_reactant, seed_nodes=seed_nodes
+            )
             counter_fp = workdir / "grad_calls.count"
             counter_fp.write_text("")
 
             server_proc = self._start_engine_server(workdir)
             self._log("Running molecularGSM (DE-GSM)...")
-            live_history = self._run_gsm(
-                workdir, reactant, product, e_reactant, chain.parameters
+            history, early_stopped = self._run_gsm(
+                workdir,
+                reactant,
+                product,
+                e_reactant,
+                chain.parameters,
+                allow_early_stop=allow_early_stop,
             )
 
             n_calls = counter_fp.read_text().count("\n")
             self.grad_calls_made += n_calls
             self._log(f"molecularGSM made {n_calls} gradient/energy calls", verbose=2)
 
-            final_chain = self._parse_stringfile(
-                workdir, reactant, e_reactant, chain.parameters
-            )
-            # live_history is a real snapshot per node update the engine
-            # server reported (see _run_gsm), not just the two bookend
-            # entries -- gives a GSM run genuine intermediate-step history,
-            # the same way NEB's chain_trajectory already does.
-            self.chain_trajectory = [
-                self.initial_chain.copy(),
-                *live_history,
-                final_chain,
-            ]
-            # Every other PathMinimizer sets this after a successful optimize_chain()
-            # -- msmep.run_minimize_chain reads it unconditionally right afterward.
-            self.optimized = final_chain
-
-            if getattr(self.parameters, "do_elem_step_checks", True):
-                # Pass the FULL converged chain, not a 3-node
-                # [reactant, TS-guess, product] reduction -- check_if_elem_step's
-                # minima-based concavity check (_get_ind_minima) scans the chain
-                # it's given for local dips, and a 3-node chain (one interior
-                # point, by construction the *highest*-energy node) can never
-                # represent an "up-down-up" profile, so a real intermediate
-                # visible in the full GSM path would be structurally invisible
-                # to it. This matches how the full NEB class does it
-                # (mepd/neb.py's check_if_elem_step calls all pass `final_chain`
-                # directly) rather than FreezingNEB's 3-node reduction.
-                elem_step_results = check_if_elem_step(
-                    final_chain,
-                    engine=self.engine,
-                    validate_minima_with_hessian=bool(
-                        getattr(self.parameters, "validate_minima_with_hessian", False)
-                    ),
-                    hessian_minimum_frequency_cutoff=float(
-                        getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
-                    ),
-                    hessian_minima_rescue_displacement=float(
-                        getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
-                    ),
-                    disregard_stereochem=bool(
-                        getattr(self.parameters, "disregard_stereochem", False)
-                    ),
-                )
-                self.geom_grad_calls_made += elem_step_results.number_grad_calls
+            if early_stopped:
+                # A killed process never writes stringfile.xyz0000 -- the
+                # last live snapshot (already has pinned, correct
+                # reactant/product endpoints; see _build_live_chain) is the
+                # best final chain there is until/unless optimize_chain's
+                # resume logic decides to try again.
+                final_chain = history[-1]
             else:
-                elem_step_results = IS_ELEM_STEP
+                final_chain = self._parse_stringfile(
+                    workdir, reactant, e_reactant, chain.parameters
+                )
+            return final_chain, history, early_stopped
         finally:
             self._stop_engine_server(server_proc, workdir)
             if not getattr(self.parameters, "keep_workdirs", False):
@@ -392,6 +425,34 @@ class GSM(PathMinimizer):
             else:
                 self._log(f"Kept GSM workdir at {workdir}", level="warning")
 
+    def _check_elem_step(self, final_chain: Chain) -> ElemStepResults:
+        # Pass the FULL converged chain, not a 3-node
+        # [reactant, TS-guess, product] reduction -- check_if_elem_step's
+        # minima-based concavity check (_get_ind_minima) scans the chain
+        # it's given for local dips, and a 3-node chain (one interior
+        # point, by construction the *highest*-energy node) can never
+        # represent an "up-down-up" profile, so a real intermediate
+        # visible in the full GSM path would be structurally invisible
+        # to it. This matches how the full NEB class does it
+        # (mepd/neb.py's check_if_elem_step calls all pass `final_chain`
+        # directly) rather than FreezingNEB's 3-node reduction.
+        elem_step_results = check_if_elem_step(
+            final_chain,
+            engine=self.engine,
+            validate_minima_with_hessian=bool(
+                getattr(self.parameters, "validate_minima_with_hessian", False)
+            ),
+            hessian_minimum_frequency_cutoff=float(
+                getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
+            ),
+            hessian_minima_rescue_displacement=float(
+                getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
+            ),
+            disregard_stereochem=bool(
+                getattr(self.parameters, "disregard_stereochem", False)
+            ),
+        )
+        self.geom_grad_calls_made += elem_step_results.number_grad_calls
         return elem_step_results
 
     def _build_geodesic_seed(self, chain: Chain, reactant, product) -> list:
@@ -605,15 +666,30 @@ class GSM(PathMinimizer):
             proc.wait(timeout=5.0)
 
     def _run_gsm(
-        self, workdir: Path, reactant, product, e_reactant: float, chain_parameters
-    ) -> list[Chain]:
-        """Run the compiled binary to completion, live-printing and
-        accumulating a real `Chain` snapshot (see `_build_live_chain`) every
-        time the engine server reports new node data, and return that
-        history in run order. The caller folds it into `self.chain_trajectory`
-        so a GSM run gets genuine intermediate-snapshot history -- not just
-        the two bookend entries -- for visualization, and it's the same data
-        a future persistent-minima early-stop check would monitor.
+        self,
+        workdir: Path,
+        reactant,
+        product,
+        e_reactant: float,
+        chain_parameters,
+        allow_early_stop: bool = False,
+    ) -> tuple[list[Chain], bool]:
+        """Run the compiled binary, live-printing and accumulating a real
+        `Chain` snapshot (see `_build_live_chain`) every time the engine
+        server reports new node data. Returns `(history, early_stopped)`.
+
+        If `allow_early_stop`, also monitors that same history for a
+        persistent local minimum (`_track_persistent_minima`) once growth
+        has finished, and terminates the binary the moment one has held
+        steady for `early_stop_persistence_window` consecutive updates --
+        GSM's own DE-GSM mode has no native equivalent to lean on here (its
+        `INT_THRESH`/`find_peaks(type=4)` multi-peak detection only fires
+        for SSM, gated behind `if (isSSM && !added)` in `opt_iters`,
+        `GSM/gstring.cpp`). When that happens `history[-1]` is the best
+        final chain there is -- there's no `stringfile.xyz0000` from a
+        killed process -- and `early_stopped=True` tells the caller to
+        verify it with `check_if_elem_step` before trusting it, since a
+        killed run is never as refined as one that converged naturally.
         """
         executable = self._resolve_executable()
         # `./grad.py` is invoked by GSM via a bare `system("./grad.py ...")`
@@ -657,6 +733,19 @@ class GSM(PathMinimizer):
         # every node request (see _ENGINE_SERVER_SOURCE) is the only way to
         # show progress -- there's nothing to await synchronously otherwise.
         history: list[Chain] = []
+        early_stopped = False
+        nnodes_target = int(getattr(self.parameters, "nnodes", 9))
+        persistence_window = int(
+            getattr(self.parameters, "early_stop_persistence_window", 3)
+        )
+        persistence_rtol = float(
+            getattr(self.parameters, "early_stop_minima_rtol", 0.02)
+        )
+        persistence_min_depth_kcal = float(
+            getattr(self.parameters, "early_stop_minima_min_depth_kcal", 1.0)
+        )
+        persistence_state = {"index": None, "energy_kcal": None, "count": 0}
+
         start_time = time.time()
         last_mtime = None
         while proc.poll() is None:
@@ -678,31 +767,146 @@ class GSM(PathMinimizer):
                 if live_chain is not None:
                     history.append(live_chain)
                     self._print_live_chain(live_chain)
+                    triggered = allow_early_stop and self._track_persistent_minima(
+                        live_chain,
+                        nnodes_target,
+                        persistence_window,
+                        persistence_rtol,
+                        persistence_min_depth_kcal,
+                        persistence_state,
+                    )
+                    if triggered:
+                        self._log(
+                            "Persistent local minimum detected in the live "
+                            "GSM string; stopping early to verify it "
+                            "against check_if_elem_step.",
+                            level="warning",
+                        )
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=5.0)
+                        early_stopped = True
+                        break
             time.sleep(poll_interval)
 
-        # One last refresh in case a final write raced the process exit --
-        # only if the file actually changed since our last in-loop capture
-        # (_build_live_chain always returns a fresh object, so comparing the
-        # chains themselves can't detect "nothing new happened here").
-        try:
-            mtime = live_path.stat().st_mtime
-        except OSError:
-            mtime = None
-        if mtime is not None and mtime != last_mtime:
-            live_chain = self._build_live_chain(
-                live_path, reactant, product, e_reactant, chain_parameters
-            )
-            if live_chain is not None:
-                history.append(live_chain)
-                self._print_live_chain(live_chain)
+        if not early_stopped:
+            # One last refresh in case a final write raced the process exit
+            # -- only if the file actually changed since our last in-loop
+            # capture (_build_live_chain always returns a fresh object, so
+            # comparing the chains themselves can't detect "nothing new
+            # happened here").
+            try:
+                mtime = live_path.stat().st_mtime
+            except OSError:
+                mtime = None
+            if mtime is not None and mtime != last_mtime:
+                live_chain = self._build_live_chain(
+                    live_path, reactant, product, e_reactant, chain_parameters
+                )
+                if live_chain is not None:
+                    history.append(live_chain)
+                    self._print_live_chain(live_chain)
 
-        if proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists():
-            raise ElectronicStructureError(
-                msg=f"GSM calculation failed with exit code {proc.returncode}.",
-                obj="".join(stdout_chunks),
-            )
+            if proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists():
+                raise ElectronicStructureError(
+                    msg=f"GSM calculation failed with exit code {proc.returncode}.",
+                    obj="".join(stdout_chunks),
+                )
 
-        return history
+        return history, early_stopped
+
+    @staticmethod
+    def _track_persistent_minima(
+        live_chain: Chain,
+        nnodes_target: int,
+        window: int,
+        rtol: float,
+        min_depth_kcal: float,
+        state: dict,
+    ) -> bool:
+        """Update `state` (mutated in place) with the current live chain's
+        deepest interior local-minimum candidate (reusing
+        `mepd.elementarystep._get_ind_minima`, the same scan NEB's own
+        concavity check is built on) and report whether a minimum of about
+        the same *depth* (energy within `rtol` of the profile's energy span)
+        has now held steady across `window` consecutive polls in a row,
+        counting only polls taken after growth has finished -- a partial
+        string's minima aren't real signal yet, since GSM keeps inserting
+        interior nodes while it's still growing.
+
+        `nnodes_target` (`path_min_inputs.nnodes`) is a ceiling, not a
+        guarantee: confirmed directly on the oxy-Cope rearrangement, where
+        the converged string stopped growing at 10 nodes despite `nnodes=11`
+        being requested -- an earlier version of this check required
+        `len(chain) == nnodes_target` exactly, so growth was (wrongly)
+        considered permanently incomplete for the entire rest of that run,
+        and persistence could never even start accumulating. "Growth
+        finished" is instead detected empirically: the chain's length
+        hasn't changed since the last poll.
+
+        Deliberately tracks by energy value, not node index: GSM
+        periodically reparametrizes the string (`ic_reparam`/`ic_reparam_g`
+        in GSM/gstring.cpp) to keep nodes evenly spaced, which can shift
+        which index a given physical location along the path corresponds to
+        between polls even when the underlying chemistry -- a real, stable
+        dip -- hasn't changed. Requiring the *same index* to hold across
+        consecutive polls (an earlier version of this check) meant
+        reparametrization noise could defeat detection of a minimum that
+        was, in substance, already persistent.
+        """
+        length_stable = state.get("length") == len(live_chain)
+        state["length"] = len(live_chain)
+        if not length_stable:
+            state["index"] = None
+            state["energy_kcal"] = None
+            state["count"] = 0
+            return False
+
+        from mepd.elementarystep import _get_ind_minima
+
+        minima = _get_ind_minima(live_chain)
+        if len(minima) == 0:
+            state["index"] = None
+            state["energy_kcal"] = None
+            state["count"] = 0
+            return False
+
+        energies_kcal = live_chain.energies_kcalmol
+        # Depth = the smaller of the two drops down to this candidate from
+        # its immediate neighbors -- _get_ind_minima only guarantees it's
+        # lower than both neighbors by *some* amount, which includes pure
+        # numerical noise (confirmed empirically: an early poll on the
+        # oxy-Cope rearrangement triggered on a "minimum" ~0.01 kcal/mol
+        # deep, essentially flat, near the reactant end). Require a real
+        # barrier drop, mirroring the spirit of GSM's own INT_THRESH
+        # (PEAK4_EDIFF in GSM/gstring.cpp) -- which would do exactly this
+        # for us if it applied to DE-GSM, but per _run_gsm's docstring it
+        # doesn't.
+        depths = np.minimum(
+            energies_kcal[minima - 1] - energies_kcal[minima],
+            energies_kcal[minima + 1] - energies_kcal[minima],
+        )
+        deep_enough = minima[depths >= min_depth_kcal]
+        if len(deep_enough) == 0:
+            state["index"] = None
+            state["energy_kcal"] = None
+            state["count"] = 0
+            return False
+
+        idx = int(deep_enough[np.argmin(energies_kcal[deep_enough])])
+        energy = float(energies_kcal[idx])
+        span = float(np.ptp(energies_kcal)) or 1.0
+
+        if state["energy_kcal"] is not None and abs(energy - state["energy_kcal"]) / span <= rtol:
+            state["count"] += 1
+        else:
+            state["count"] = 1
+        state["index"] = idx
+        state["energy_kcal"] = energy
+        return state["count"] >= max(1, window)
 
     def _print_live_chain(self, live_chain: Chain) -> None:
         """Render an already-built live chain (see `_build_live_chain`) as a

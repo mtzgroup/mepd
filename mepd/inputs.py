@@ -451,6 +451,18 @@ class RunInputs:
                 "timeout": None,
                 "keep_workdirs": False,
                 "seed_with_geodesic_interpolation": False,
+                # Stop early once a local minimum in the live string has held
+                # steady for `early_stop_persistence_window` consecutive
+                # updates (only checked once growth has finished). Only ever
+                # actually arms when do_elem_step_checks is also True -- see
+                # GSM._run_gsm's docstring for why (no native DE-GSM
+                # equivalent exists to lean on instead) and optimize_chain's
+                # resume logic for what happens if check_if_elem_step
+                # disagrees with the early-stop signal.
+                "early_stop_on_minima": True,
+                "early_stop_persistence_window": 3,
+                "early_stop_minima_rtol": 0.02,
+                "early_stop_minima_min_depth_kcal": 1.0,
                 "do_elem_step_checks": True,
                 "skip_identical_graphs": True,
                 "disregard_stereochem": False,
