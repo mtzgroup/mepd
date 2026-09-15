@@ -50,6 +50,13 @@ gxtb = [
     "ase>=3.26.0",
     "sella>=2.3.4",
 ]
+# OllamaBackend (mepd agentic tune --backend ollama) talks HTTP to a local or
+# Ollama-Cloud-proxied Ollama server. httpx is already pulled in transitively
+# by chemcloud, but declared explicitly here so it isn't an undocumented
+# accidental dependency.
+agentic = [
+    "httpx>=0.27.0",
+]
 
 [project.scripts]
 mepd = "mepd.cli:app"

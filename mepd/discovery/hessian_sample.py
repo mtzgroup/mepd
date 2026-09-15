@@ -76,6 +76,13 @@ class HessianSampleResult:
     optimized_metadata: List[HessianSampleCandidate] = field(default_factory=list)
     failed_candidates: List[dict] = field(default_factory=list)
     unique_minima: List[Node] = field(default_factory=list)
+    # Only populated when `validate_minima_with_hessian=True`: `unique_minima`
+    # then holds only candidates confirmed (or rescued into) a genuine
+    # Hessian minimum, and this holds the ones dropped for failing that check
+    # even after a rescue attempt.
+    hessian_validation_enabled: bool = False
+    rejected_minima: List[Node] = field(default_factory=list)
+    hessian_validation_rescue_grad_calls: int = 0
 
 
 def _effective_dr(seed_node: Node, dr: float) -> float:
@@ -347,6 +354,9 @@ def run_hessian_sample(
     max_candidates: int = 100,
     maxiter: int = 500,
     chain_inputs: ChainInputs | None = None,
+    validate_minima_with_hessian: bool = False,
+    hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
     on_event: OnEvent = None,
 ) -> HessianSampleResult:
     """Explore minima near `seed_node` by displacing along Hessian normal modes.
@@ -386,6 +396,16 @@ def run_hessian_sample(
     Every successfully optimized candidate is kept (deduped into
     `unique_minima`) -- not just ones lower in energy than the seed -- so the
     caller can inspect and filter by whatever criterion it wants afterward.
+
+    `validate_minima_with_hessian`, if set, verifies each deduped candidate is
+    a genuine minimum by computing its own Hessian and checking for imaginary
+    frequencies below `hessian_minimum_frequency_cutoff` -- a plain geometry
+    optimization can converge to a saddle point, especially from an
+    aggressive displacement. A candidate that fails is rescued once
+    (displaced by `hessian_minima_rescue_displacement` bohr along its own
+    lowest-frequency mode, in both directions, and reoptimized) before being
+    dropped from `unique_minima` into `rejected_minima` instead. Off by
+    default since it roughly doubles the Hessian calls this function makes.
 
     `on_event`, if given, is called with `(event_name, payload)` at each
     stage (`hessian_computing`, `hessian_computed`, `candidates_generated`,
@@ -560,6 +580,30 @@ def run_hessian_sample(
         n_optimized=len(optimized_nodes), n_failed=len(failed_candidates),
     )
 
+    if validate_minima_with_hessian and result.unique_minima:
+        from mepd.elementarystep import _validate_hessian_split_candidates
+
+        _emit(on_event, "validating_minima", total=len(result.unique_minima))
+        validated, rejected, rescue_grad_calls = _validate_hessian_split_candidates(
+            result.unique_minima,
+            engine,
+            frequency_cutoff=hessian_minimum_frequency_cutoff,
+            rescue_displacement=hessian_minima_rescue_displacement,
+            verbose=False,
+            label="hessian-sample",
+        )
+        result.hessian_validation_enabled = True
+        # A rescue can shift a candidate onto another already-accepted (or
+        # newly-rescued) minimum -- dedupe again rather than report the same
+        # structure twice.
+        result.unique_minima = _dedupe_minima_nodes(validated, chain_inputs)
+        result.rejected_minima = rejected
+        result.hessian_validation_rescue_grad_calls = rescue_grad_calls
+        _emit(
+            on_event, "minima_validated",
+            n_accepted=len(result.unique_minima), n_rejected=len(rejected),
+        )
+
     return result
 
 
@@ -601,6 +645,10 @@ def run_hessian_global_optimization(
     *,
     dr: float = 0.1,
     dr_values: Optional[List[float]] = None,
+    amplitude_policy: str = "fixed_cartesian",
+    target_energy_kcal: float = 25.0,
+    target_energy_kcal_values: Optional[List[float]] = None,
+    imaginary_mode_amplitude: float = _DEFAULT_IMAGINARY_MODE_AMPLITUDE,
     max_candidates: int = 100,
     maxiter: int = 500,
     temperature: float = 298.15,
@@ -609,6 +657,9 @@ def run_hessian_global_optimization(
     random_seed: Optional[int] = None,
     chain_inputs: ChainInputs | None = None,
     acceptance_baseline: str = "connected",
+    validate_minima_with_hessian: bool = False,
+    hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
     on_event: OnEvent = None,
 ) -> HessianGlobalOptResult:
     """Basin-hopping-style global optimization built on repeated Hessian
@@ -648,7 +699,27 @@ def run_hessian_global_optimization(
 
     `dr_values`, when given, is forwarded to every round's Hessian sampling
     as a full displacement scan (see `run_hessian_sample`) instead of the
-    single fixed `dr` -- matching upstream's `--full-dr-scan`.
+    single fixed `dr` -- matching upstream's `--full-dr-scan`. Only used
+    under `amplitude_policy="fixed_cartesian"`.
+
+    `amplitude_policy`, `target_energy_kcal`, and `imaginary_mode_amplitude`
+    are forwarded to every round's `run_hessian_sample` call as-is (see
+    there): `"energy"` calibrates each mode's displacement from its own
+    harmonic force constant instead of using a uniform Cartesian `dr`,
+    which matters more here than for a single `hessian-sample` call, since
+    every accepted minimum becomes a new source whose modes can differ
+    widely in stiffness from the seed's. `target_energy_kcal_values`, when
+    given, is the `"energy"`-policy analog of `dr_values` -- a full scan of
+    target harmonic-displacement energies applied every round instead of
+    the single fixed `target_energy_kcal`. Only used under
+    `amplitude_policy="energy"`.
+
+    `validate_minima_with_hessian`, `hessian_minimum_frequency_cutoff`, and
+    `hessian_minima_rescue_displacement` are forwarded to every round's
+    `run_hessian_sample` call as-is (see there): when enabled, a candidate
+    that only reoptimized onto a saddle point (not rescued into a genuine
+    minimum) never reaches the acceptance test at all, since it's dropped
+    from `sample.unique_minima` before this function ever sees it.
 
     `on_event`, if given, is called with `(event_name, payload)` for live
     progress -- round/source-level events (`round_start`, `source_start`,
@@ -666,6 +737,16 @@ def run_hessian_global_optimization(
         raise ValueError(
             "acceptance_baseline must be 'seed', 'connected', or 'running_best', "
             f"got {acceptance_baseline!r}."
+        )
+    if amplitude_policy not in ("fixed_cartesian", "energy"):
+        raise ValueError(
+            f"amplitude_policy must be 'fixed_cartesian' or 'energy', got {amplitude_policy!r}."
+        )
+    if dr_values is not None and amplitude_policy != "fixed_cartesian":
+        raise ValueError("dr_values is only used with amplitude_policy='fixed_cartesian'.")
+    if target_energy_kcal_values is not None and amplitude_policy != "energy":
+        raise ValueError(
+            "target_energy_kcal_values is only used with amplitude_policy='energy'."
         )
     if chain_inputs is None:
         chain_inputs = ChainInputs()
@@ -710,8 +791,16 @@ def run_hessian_global_optimization(
             )
             try:
                 sample = run_hessian_sample(
-                    source_node, engine, dr=dr, dr_values=dr_values, max_candidates=max_candidates,
-                    maxiter=maxiter, chain_inputs=chain_inputs, on_event=on_event,
+                    source_node, engine, dr=dr, dr_values=dr_values,
+                    amplitude_policy=amplitude_policy, target_energy_kcal=target_energy_kcal,
+                    target_energy_kcal_values=target_energy_kcal_values,
+                    imaginary_mode_amplitude=imaginary_mode_amplitude,
+                    max_candidates=max_candidates,
+                    maxiter=maxiter, chain_inputs=chain_inputs,
+                    validate_minima_with_hessian=validate_minima_with_hessian,
+                    hessian_minimum_frequency_cutoff=hessian_minimum_frequency_cutoff,
+                    hessian_minima_rescue_displacement=hessian_minima_rescue_displacement,
+                    on_event=on_event,
                 )
             except Exception as exc:
                 # A source failing outright (e.g. its Hessian computation

@@ -63,7 +63,8 @@ def test_mepd_cli_imports_without_mepd_discovery(mepd_cli_without_discovery):
     command_names = {c.name for c in mepd_cli_without_discovery.app.registered_commands}
     assert {"run", "ts", "network-build", "defaults", "visualize"} <= command_names
     assert "discovery" in command_names
-    assert not mepd_cli_without_discovery.app.registered_groups
+    group_names = {g.name for g in mepd_cli_without_discovery.app.registered_groups}
+    assert "discovery" not in group_names
 
 
 def test_discovery_command_reports_friendly_error_without_mepd_discovery(mepd_cli_without_discovery):

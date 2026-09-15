@@ -463,6 +463,42 @@ selectNode(nodes[0].index);
 </html>"""
 
 
+def view(
+    obj,
+    title: str = "mepd visualization",
+    show_atom_indices: bool = False,
+    width: int | str = "100%",
+    height: int = 950,
+) -> None:
+    """Display `obj` as an interactive widget inline in a Jupyter notebook --
+    the notebook analogue of `qcdata.view.view()` for mepd objects.
+
+    `render_visualization_html` returns the visualization as a standalone
+    HTML page (str); calling that directly in a notebook cell just prints
+    the markup as text, since a bare string has no rich display. This
+    generates that same page and renders it in a sandboxed iframe so it
+    actually shows up as a widget, and so element ids/globals in the
+    generated page (`viewerContainer`, `nodes`, ...) don't collide across
+    repeated calls in the same notebook.
+
+    Accepts the same objects as `render_visualization_html`: a `Chain`, a
+    `NEB`/`PathMinimizer`, a `TreeNode`, a `Pot`, or a bare list of `Node`
+    objects.
+    """
+    import html as _html
+
+    from IPython.display import HTML, display
+
+    page = render_visualization_html(obj, title=title, show_atom_indices=show_atom_indices)
+    srcdoc = _html.escape(page, quote=True)
+    display(
+        HTML(
+            f'<iframe srcdoc="{srcdoc}" width="{width}" height="{height}" '
+            'style="border:none;"></iframe>'
+        )
+    )
+
+
 def _tree_svg(nodes: list[dict], width: int = 900, height: int = 220) -> str:
     """A minimal split-tree diagram: one clickable circle per selectable
     node, laid out by depth (y) and sibling order at that depth (x), with

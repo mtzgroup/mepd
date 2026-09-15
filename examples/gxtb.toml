@@ -36,10 +36,10 @@ align = true
 [gi_inputs.extra_kwds]
 
 [optimizer_kwds]
-name = "gd"
-timestep = 0.5
-step_up = 1.5
-step_down = 0.5
-min_timestep = 0.01
-max_timestep = 2.0
-max_step_norm = 0.05
+name = "cg"
+#timestep = 0.5
+#step_up = 1.5
+#step_down = 0.5
+#min_timestep = 0.01
+#max_timestep = 2.0
+#max_step_norm = 0.05

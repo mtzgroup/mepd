@@ -54,9 +54,17 @@ def _dataclass_field_values(obj) -> dict:
     }
 
 
-def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
+def _echo_run_inputs_summary(run_inputs: RunInputs, *, mode: str = "full") -> None:
     """Print the settings actually in effect for this run (after any
-    --inputs TOML has been loaded and any CLI-flag overrides applied)."""
+    --inputs TOML has been loaded and any CLI-flag overrides applied).
+
+    `mode="discovery"` (for hessian-sample/hessian-global) trims this down to
+    just the electronic-structure engine and the geometry-optimizer settings
+    used for --minimize-seed/candidate reoptimization -- those commands never
+    run a path minimizer, so path_min_inputs/chain_inputs/gi_inputs/
+    nanoreactor_inputs/path_min_method/the path optimizer are all NEB-only
+    noise that doesn't apply to them.
+    """
     try:
         config = run_inputs.to_dict()
     except Exception as exc:
@@ -75,6 +83,14 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
     # include every active field even when left at its default.
     for key in ("optimizer_kwds", "ase_engine_kwds", "gxtb_engine_kwds"):
         config.pop(key, None)
+
+    if mode == "discovery":
+        allowed_top_level = {"engine_name", "program", "chemcloud_queue", "write_qcio", "print_stdout"}
+        allowed_sections = {"geometry_optimizer_kwds"}
+        config = {
+            key: value for key, value in config.items()
+            if key in allowed_top_level or key in allowed_sections
+        }
 
     top_level, sections = {}, {}
     for key, value in config.items():
@@ -103,7 +119,10 @@ def _echo_run_inputs_summary(run_inputs: RunInputs) -> None:
                 table.add_row(sub_key, _format_run_inputs_value(sub_value))
         console.print(table)
 
-    for label, obj in (("engine", run_inputs.engine), ("optimizer", run_inputs.optimizer)):
+    labeled_objs = [("engine", run_inputs.engine)]
+    if mode != "discovery":
+        labeled_objs.append(("optimizer", run_inputs.optimizer))
+    for label, obj in labeled_objs:
         fields = _dataclass_field_values(obj)
         table = _new_table(title=f"{label} ({type(obj).__name__})")
         if not fields:
@@ -225,24 +244,69 @@ def _geometry_optimizer_keywords(run_inputs: RunInputs, *, default_maxiter: int 
     return keywords
 
 
-def _refuse_unconverged_endpoint(label: str, exc: Exception, run_inputs: RunInputs) -> None:
-    """Hard-stop: an endpoint failed to actually converge during --minimize-ends.
+def _refuse_unconverged_endpoint(
+    label: str, exc: Exception, run_inputs: RunInputs, *, flag: str = "--minimize-ends",
+) -> None:
+    """Hard-stop: an endpoint failed to actually converge during minimization.
 
     Unlike other minimization failures (engine doesn't support optimization,
     a transient crash), a reported non-convergence means we'd otherwise hand
-    NEB an endpoint that isn't really a minimum -- silently proceeding would
-    make the whole run meaningless. Refuse instead of guessing.
+    NEB (or Hessian sampling) an endpoint/seed that isn't really a minimum --
+    silently proceeding would make the whole run meaningless. Refuse instead
+    of guessing.
     """
     current_maxiter = _geometry_optimizer_keywords(run_inputs).get("maxit")
     typer.echo(
         f"{label.capitalize()} endpoint minimization did not converge: {exc}\n"
         "Refusing to proceed with an un-minimized endpoint.\n"
         "Options:\n"
-        "  1. Provide an already-minimized structure for this endpoint instead of using --minimize-ends.\n"
+        f"  1. Provide an already-minimized structure for this endpoint instead of using {flag}.\n"
         "  2. Increase the optimizer's iteration budget by setting maxit (or maxiter) under "
         f"[geometry_optimizer_kwds] in your RunInputs TOML (current: {current_maxiter})."
     )
     raise typer.Exit(code=1)
+
+
+def _minimize_single_node(node, run_inputs: RunInputs, *, label: str = "seed", flag: str = "--minimize-seed"):
+    """Optimize a single node's geometry, e.g. before Hessian normal-mode
+    sampling around it -- important when the input came from a SMILES string
+    (embedded into 3D by a force field, so typically a high-energy,
+    off-minimum structure) rather than an already-minimized xyz file.
+
+    Mirrors `_minimize_endpoints`'s per-node fallback path: most failures
+    (engine doesn't support optimization, a transient crash) keep the input
+    geometry with a warning, but a reported non-convergence
+    (GeometryOptimizationNotConvergedError) is a hard stop, since silently
+    continuing would sample normal modes around a non-minimum.
+    """
+    from mepd.errors import GeometryOptimizationNotConvergedError
+
+    typer.echo(f"Minimizing {label} structure...")
+    keywords = _geometry_optimizer_keywords(run_inputs)
+    optimizer = getattr(run_inputs.engine, "compute_geometry_optimization", None)
+    if not callable(optimizer):
+        typer.echo(
+            f"Engine {type(run_inputs.engine).__name__} does not support geometry "
+            "optimization; keeping input geometry."
+        )
+        return node
+    try:
+        trajectory = optimizer(node, keywords=keywords)
+    except GeometryOptimizationNotConvergedError as exc:
+        _refuse_unconverged_endpoint(label, exc, run_inputs, flag=flag)
+    except Exception as exc:
+        typer.echo(
+            f"{label.capitalize()} structure minimization failed "
+            f"({type(exc).__name__}: {exc}); keeping input geometry."
+        )
+        return node
+    if not trajectory:
+        typer.echo(
+            f"{label.capitalize()} structure optimization returned an empty trajectory; "
+            "keeping input geometry."
+        )
+        return node
+    return trajectory[-1]
 
 
 def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
@@ -445,6 +509,31 @@ def _run_network_completion(
     )
 
 
+def _report_ts_opt_result(result, output: Path, label: str):
+    """Echo + write a `TSOptResult` to `output` (`<label>.xyz`, and
+    `<label>_irc.xyz` -- or `irc.xyz` for the bare "ts" label -- when an IRC
+    was computed). Returns the optimized StructureNode, or None if TS-opt
+    itself didn't produce one."""
+    if result.ts_node is None:
+        typer.echo(f"{result.error} ({label})")
+        return None
+
+    output.mkdir(parents=True, exist_ok=True)
+    ts_path = output / f"{label}.xyz"
+    ts_path.write_text(result.ts_node.structure.to_xyz())
+    typer.echo(f"Wrote optimized TS structure to {ts_path}")
+
+    if result.irc_chain is None:
+        if result.error:
+            typer.echo(f"{result.error} ({label}); TS structure was still written.")
+    else:
+        irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
+        result.irc_chain.write_to_disk(irc_path)
+        typer.echo(f"Wrote IRC path to {irc_path}")
+
+    return result.ts_node
+
+
 def _optimize_ts_and_irc(
     ts_guess_node,
     run_inputs: RunInputs,
@@ -462,55 +551,13 @@ def _optimize_ts_and_irc(
     exit non-zero; a TS opt launched automatically after `run` should just
     warn and let the NEB result stand).
     """
-    from mepd.nodes.node import StructureNode
-
-    compute_ts = getattr(run_inputs.engine, "compute_transition_state", None)
-    if not callable(compute_ts):
-        typer.echo(
-            f"Engine {type(run_inputs.engine).__name__} does not support "
-            "transition-state optimization."
-        )
-        return None
+    from mepd.tsopt import optimize_ts_and_irc
 
     typer.echo(f"Optimizing transition state ({label})...")
-    try:
-        result = compute_ts(node=ts_guess_node)
-    except Exception as exc:
-        typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
-        return None
-
-    if not isinstance(result, StructureNode):
-        typer.echo(
-            f"Transition-state optimization did not converge to a usable structure "
-            f"({label}; engine returned {type(result).__name__})."
-        )
-        return None
-
-    ts_node = result
-    output.mkdir(parents=True, exist_ok=True)
-    ts_path = output / f"{label}.xyz"
-    ts_path.write_text(ts_node.structure.to_xyz())
-    typer.echo(f"Wrote optimized TS structure to {ts_path}")
-
-    if not run_irc:
-        return ts_node
-
-    typer.echo(f"Computing IRC ({label})...")
-    irc_fn = getattr(run_inputs.engine, "compute_irc_chain", None)
-    try:
-        if callable(irc_fn):
-            irc_chain = irc_fn(ts_node)
-        else:
-            from mepd.irc import compute_irc_chain_with_geometric
-            irc_chain = compute_irc_chain_with_geometric(run_inputs.engine, ts_node)
-    except Exception as exc:
-        typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
-        return ts_node
-
-    irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
-    irc_chain.write_to_disk(irc_path)
-    typer.echo(f"Wrote IRC path to {irc_path}")
-    return ts_node
+    if run_irc:
+        typer.echo(f"Computing IRC ({label})...")
+    result = optimize_ts_and_irc(ts_guess_node, run_inputs.engine, run_irc=run_irc)
+    return _report_ts_opt_result(result, output, label)
 
 
 @app.command("run")
@@ -593,9 +640,18 @@ def run(
         "from each result's TS-guess node (the highest-energy interior image). "
         "Failure is a warning, not a fatal error -- the NEB result still stands.",
     ),
+    greedy_tsopt: bool = typer.Option(
+        False, "--greedy-tsopt",
+        help="After a --recursive/--parallel run, optimize a transition state from "
+        "every NEB run in the split tree's optimization history (not just "
+        "elem-step leaves, unlike --use-tsopt) -- a wider net that doesn't trust "
+        "the tree's own leaf classification. Geometrically-duplicate TS guesses "
+        "are skipped; each remaining failure is a warning, not fatal.",
+    ),
     irc: bool = typer.Option(
         False, "--irc",
-        help="Follow up each --use-tsopt transition state with an IRC. Requires --use-tsopt.",
+        help="Follow up each --use-tsopt/--greedy-tsopt transition state with an "
+        "IRC. Requires --use-tsopt or --greedy-tsopt.",
     ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
@@ -614,8 +670,10 @@ def run(
         raise typer.BadParameter(
             "--network-completion-mode must be 'linear' or 'all-to-all'."
         )
-    if irc and not use_tsopt:
-        raise typer.BadParameter("--irc requires --use-tsopt.")
+    if irc and not use_tsopt and not greedy_tsopt:
+        raise typer.BadParameter("--irc requires --use-tsopt or --greedy-tsopt.")
+    if greedy_tsopt and not recursive and not parallel:
+        raise typer.BadParameter("--greedy-tsopt requires --recursive or --parallel.")
     if same_pair_split_limit <= 0:
         raise typer.BadParameter("--same-pair-split-limit must be a positive integer.")
     if network_completion and not recursive and not parallel:
@@ -718,6 +776,24 @@ def run(
                     output,
                     run_irc=irc,
                     label=f"ts_leaf_{leaf.index}",
+                )
+
+        if greedy_tsopt:
+            typer.echo(
+                "Running greedy TS-opt over the full optimization history..."
+            )
+            candidates = history.greedy_tsopt(
+                run_inputs.engine,
+                run_irc=irc,
+                chain_inputs=run_inputs.chain_inputs,
+            )
+            typer.echo(
+                f"Attempted {len(candidates)} de-duplicated TS-guess candidate(s) "
+                f"from {len(history.get_optimization_history())} NEB run(s) in the tree."
+            )
+            for candidate in candidates:
+                _report_ts_opt_result(
+                    candidate.result, output, f"ts_hist_{candidate.source_index}"
                 )
         return
 
@@ -1113,6 +1189,29 @@ else:
         typer.echo(
             "mepd discovery is unavailable: the mepd.discovery submodule could not be "
             "imported. Install its dependencies (e.g. `pip install mepd[discovery]`) "
+            "and try again."
+        )
+        raise typer.Exit(code=1)
+
+
+try:
+    from mepd.agentic.cli import agentic_app  # noqa: E402
+except ImportError:
+    agentic_app = None
+
+if agentic_app is not None:
+    app.add_typer(agentic_app, name="agentic")
+else:
+
+    @app.command(
+        "agentic",
+        context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+    )
+    def _agentic_unavailable(ctx: typer.Context) -> None:  # noqa: E402
+        """LLM-guided parameter tuning (unavailable: mepd.agentic failed to import)."""
+        typer.echo(
+            "mepd agentic is unavailable: the mepd.agentic submodule could not be "
+            "imported. Install its dependencies (e.g. `pip install mepd[agentic]`) "
             "and try again."
         )
         raise typer.Exit(code=1)

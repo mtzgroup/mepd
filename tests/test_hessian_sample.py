@@ -465,3 +465,77 @@ def test_run_hessian_sample_requires_normal_modes():
     engine = _NoModesEngine(["fail"] * 6)
     with pytest.raises(ValueError):
         run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=10)
+
+
+def test_run_hessian_sample_skips_hessian_validation_by_default(monkeypatch):
+    import mepd.elementarystep as elementarystep_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_validate_hessian_split_candidates must not run unless opted in")
+
+    monkeypatch.setattr(elementarystep_module, "_validate_hessian_split_candidates", _boom)
+
+    engine = _FakeHessianSampleEngine(_MIXED_OUTCOMES)
+    result = run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=100)
+
+    assert result.hessian_validation_enabled is False
+    assert result.rejected_minima == []
+    assert len(result.unique_minima) == 4
+
+
+def test_run_hessian_sample_validate_minima_with_hessian_splits_accepted_and_rejected(monkeypatch):
+    import mepd.elementarystep as elementarystep_module
+
+    engine = _FakeHessianSampleEngine(_MIXED_OUTCOMES)
+    result = run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=100)
+    pre_validation_unique = list(result.unique_minima)
+    assert len(pre_validation_unique) == 4
+
+    captured = {}
+
+    def fake_validate(nodes, validation_engine, *, frequency_cutoff, rescue_displacement, verbose, label):
+        captured["nodes"] = nodes
+        captured["engine"] = validation_engine
+        captured["frequency_cutoff"] = frequency_cutoff
+        captured["rescue_displacement"] = rescue_displacement
+        captured["label"] = label
+        # Keep the first two, reject the rest.
+        return nodes[:2], nodes[2:], 7
+
+    monkeypatch.setattr(elementarystep_module, "_validate_hessian_split_candidates", fake_validate)
+
+    engine2 = _FakeHessianSampleEngine(_MIXED_OUTCOMES)
+    result2 = run_hessian_sample(
+        _seed(), engine2, dr=1.0, max_candidates=100,
+        validate_minima_with_hessian=True,
+        hessian_minimum_frequency_cutoff=12.5,
+        hessian_minima_rescue_displacement=0.25,
+    )
+
+    assert captured["engine"] is engine2
+    assert captured["frequency_cutoff"] == 12.5
+    assert captured["rescue_displacement"] == 0.25
+    assert captured["label"] == "hessian-sample"
+    assert len(captured["nodes"]) == 4
+
+    assert result2.hessian_validation_enabled is True
+    assert len(result2.unique_minima) == 2
+    assert len(result2.rejected_minima) == 2
+    assert result2.hessian_validation_rescue_grad_calls == 7
+
+
+def test_run_hessian_sample_validate_minima_with_hessian_noop_when_no_unique_minima(monkeypatch):
+    import mepd.elementarystep as elementarystep_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("validation must not run with zero unique minima to validate")
+
+    monkeypatch.setattr(elementarystep_module, "_validate_hessian_split_candidates", _boom)
+
+    engine = _FakeHessianSampleEngine(["fail"] * 6)
+    result = run_hessian_sample(
+        _seed(), engine, dr=1.0, max_candidates=100, validate_minima_with_hessian=True,
+    )
+
+    assert result.unique_minima == []
+    assert result.hessian_validation_enabled is False

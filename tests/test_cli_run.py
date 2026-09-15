@@ -120,6 +120,7 @@ def _call_run(**overrides):
         hessian_minima_rescue_displacement=0.1,
         same_pair_split_limit=5,
         use_tsopt=False,
+        greedy_tsopt=False,
         irc=False,
         output=None,
     )
@@ -379,6 +380,80 @@ def test_cli_run_use_tsopt_writes_ts_per_leaf_when_recursive(tmp_path, monkeypat
     assert len(ts_leaf_files) >= 1
 
 
+def test_cli_run_greedy_tsopt_writes_ts_per_history_entry_when_recursive(tmp_path, monkeypatch):
+    """--greedy-tsopt TS-opts a guess from every NEB in the split tree's
+    optimization history (TreeNode.get_optimization_history()), not just the
+    elem-step leaves -- a wider net than --use-tsopt."""
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state",
+        lambda self, node, keywords=None: node,
+    )
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, recursive=True,
+        output=output_dir, greedy_tsopt=True,
+    )
+
+    assert (output_dir / "mep_output.xyz").exists()
+    ts_hist_files = list(output_dir.glob("ts_hist_*.xyz"))
+    assert len(ts_hist_files) >= 1
+
+
+def test_cli_run_greedy_tsopt_with_irc_writes_irc_per_history_entry(tmp_path, monkeypatch):
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_transition_state",
+        lambda self, node, keywords=None: node,
+    )
+    monkeypatch.setattr(
+        GXTBCalculator, "compute_irc_chain",
+        lambda self, ts_node, keywords=None: Chain.model_validate({
+            "nodes": [ts_node, ts_node.copy()],
+            "parameters": _run_inputs_for_test().chain_inputs,
+        }),
+        raising=False,
+    )
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, recursive=True,
+        output=output_dir, greedy_tsopt=True, irc=True,
+    )
+
+    ts_hist_files = list(output_dir.glob("ts_hist_*.xyz"))
+    irc_hist_files = list(output_dir.glob("ts_hist_*_irc.xyz"))
+    assert len(ts_hist_files) >= 1
+    assert len(irc_hist_files) >= 1
+
+
+def test_cli_run_rejects_greedy_tsopt_without_recursive_or_parallel(tmp_path):
+    with pytest.raises(typer.BadParameter):
+        _call_run(
+            start=tmp_path / "start.xyz",
+            end=tmp_path / "end.xyz",
+            output=tmp_path / "out",
+            greedy_tsopt=True,
+        )
+
+
 def test_cli_run_rejects_irc_without_use_tsopt(tmp_path):
     with pytest.raises(typer.BadParameter):
         _call_run(
@@ -628,3 +703,29 @@ def test_echo_run_inputs_summary_shows_full_resolved_engine_and_optimizer(capsys
     assert "gxtb_engine_kwds" not in out
     assert "optimizer (ConjugateGradient)" in out
     assert "engine (GXTBCalculator)" in out
+
+
+def test_echo_run_inputs_summary_discovery_mode_omits_path_minimizer_settings(capsys):
+    """hessian-sample/hessian-global never run a path minimizer -- their
+    RunInputs summary should show only the electronic-structure engine and
+    the geometry-optimizer settings (used for --minimize-seed/candidate
+    reoptimization), not NEB-only sections like chain_inputs/gi_inputs/
+    path_min_inputs or the path optimizer."""
+    run_inputs = RunInputs(
+        engine_name="gxtb",
+        gxtb_engine_kwds={"executable": "gxtb"},
+        optimizer_kwds={"name": "cg"},
+    )
+
+    _echo_run_inputs_summary(run_inputs, mode="discovery")
+
+    out = capsys.readouterr().out
+    assert "engine (GXTBCalculator)" in out
+    # rich wraps this table's title ("geometry_optimizer_kwds") across two
+    # lines when the section is empty and narrow -- check the stable prefix.
+    assert "geometry_optimizer_" in out
+    assert "optimizer (ConjugateGradient)" not in out
+    assert "chain_inputs" not in out
+    assert "gi_inputs" not in out
+    assert "path_min_inputs" not in out
+    assert "path_min_method" not in out

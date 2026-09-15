@@ -175,6 +175,15 @@ def hessian_sample(
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Override the spin multiplicity on the seed structure."
     ),
+    minimize_seed: bool = typer.Option(
+        False, "--minimize-seed/--no-minimize-seed",
+        help="Optimize the seed structure to a minimum before Hessian sampling. "
+        "Important when `structure` is a SMILES string -- it's embedded into 3D "
+        "by a force field, typically a high-energy, off-minimum geometry -- or "
+        "any other rough/unoptimized xyz guess. Leave disabled when the seed is "
+        "meant to be a saddle point/TS guess (e.g. to sample its imaginary mode "
+        "as the reaction coordinate), since minimizing would move it off the TS.",
+    ),
     dr: float = typer.Option(
         0.1, "--dr",
         help="Target per-atom RMS displacement (bohr), used when "
@@ -203,6 +212,27 @@ def hessian_sample(
         "mode -- the reaction coordinate at a TS seed -- under "
         "--amplitude-policy=energy, where harmonic calibration is undefined.",
     ),
+    full_dr_scan: bool = typer.Option(
+        False, "--full-dr-scan/--no-full-dr-scan", "-D/-noD",
+        help="Scan every value in --dr-scan-values (instead of just --dr), "
+        "displacing every normal mode (both directions) by each value in turn. "
+        "Only used with --amplitude-policy=fixed-cartesian.",
+    ),
+    dr_scan_values: str = typer.Option(
+        "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0", "--dr-scan-values", "-dv",
+        help="Comma-separated displacement values (bohr) for --full-dr-scan. Each "
+        "value is capped independently at --max-candidates.",
+    ),
+    full_energy_scan: bool = typer.Option(
+        False, "--full-energy-scan/--no-full-energy-scan", "-E/-noE",
+        help="Scan every value in --energy-scan-values-kcal (instead of just "
+        "--target-energy-kcal). Only used with --amplitude-policy=energy.",
+    ),
+    energy_scan_values_kcal: str = typer.Option(
+        "25,50,100,200,400", "--energy-scan-values-kcal", "-ev",
+        help="Comma-separated target harmonic displacement energies (kcal/mol) for "
+        "--full-energy-scan. Each value is capped independently at --max-candidates.",
+    ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",
         help="Hard cap on the number of displaced candidates generated/optimized. "
@@ -213,6 +243,25 @@ def hessian_sample(
         500, "--maxiter",
         help="Maximum geometry-optimization steps for each displaced candidate.",
     ),
+    validate_minima_with_hessian: bool = typer.Option(
+        False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="After deduping optimized candidates, verify each one is a genuine "
+        "minimum by computing its own Hessian and checking for imaginary "
+        "frequencies -- a geometry optimization can converge to a saddle point, "
+        "especially for an aggressive displacement. A candidate that fails is "
+        "rescued once (displaced along its lowest-frequency mode and "
+        "reoptimized, see --hessian-minima-rescue-displacement) before being "
+        "moved from `unique.xyz` to `rejected.xyz`.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff",
+        help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="Displacement (bohr) along the lowest-frequency mode when "
+        "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
+    ),
     output: Path = typer.Option(
         Path("mepd_hessian_sample_output"), "--output", "-o",
         help="Directory to write results into.",
@@ -221,13 +270,18 @@ def hessian_sample(
     """Explore minima near a seed structure by displacing along Hessian normal modes."""
     from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
 
-    from mepd.cli import _echo_run_inputs_summary, _load_structure_from_smiles_or_xyz
+    from mepd.cli import (
+        _echo_run_inputs_summary,
+        _load_structure_from_smiles_or_xyz,
+        _minimize_single_node,
+    )
     from mepd.discovery.hessian_sample import run_hessian_sample
     from mepd.nodes.node import StructureNode
 
-    amplitude_policy_internal = amplitude_policy.replace("-", "_")
-    if amplitude_policy_internal not in ("fixed_cartesian", "energy"):
-        raise typer.BadParameter("--amplitude-policy must be 'fixed-cartesian' or 'energy'.")
+    amplitude_policy_internal = _resolve_amplitude_policy(
+        amplitude_policy, full_dr_scan=full_dr_scan, full_energy_scan=full_energy_scan,
+    )
+    amplitude_policy = "energy" if amplitude_policy_internal == "energy" else "fixed-cartesian"
     if dr <= 0:
         raise typer.BadParameter("--dr must be positive.")
     if target_energy_kcal <= 0:
@@ -236,17 +290,33 @@ def hessian_sample(
         raise typer.BadParameter("--max-candidates must be a positive integer.")
     if maxiter <= 0:
         raise typer.BadParameter("--maxiter must be a positive integer.")
+    dr_scan_values_list = (
+        _parse_scan_values(dr_scan_values, flag="--dr-scan-values") if full_dr_scan else None
+    )
+    energy_scan_values_list = (
+        _parse_scan_values(energy_scan_values_kcal, flag="--energy-scan-values-kcal")
+        if full_energy_scan else None
+    )
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
-    _echo_run_inputs_summary(run_inputs)
+    _echo_run_inputs_summary(run_inputs, mode="discovery")
 
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
 
-    amplitude_label = (
-        f"dr={dr:g}" if amplitude_policy_internal == "fixed_cartesian"
-        else f"target_energy_kcal={target_energy_kcal:g}"
-    )
+    if minimize_seed:
+        seed_node = _minimize_single_node(seed_node, run_inputs, label="seed", flag="--minimize-seed")
+
+    if amplitude_policy_internal == "fixed_cartesian":
+        amplitude_label = (
+            f"dr_scan_values={','.join(f'{v:g}' for v in dr_scan_values_list)}"
+            if full_dr_scan else f"dr={dr:g}"
+        )
+    else:
+        amplitude_label = (
+            f"energy_scan_values_kcal={','.join(f'{v:g}' for v in energy_scan_values_list)}"
+            if full_energy_scan else f"target_energy_kcal={target_energy_kcal:g}"
+        )
     typer.echo(
         f"Computing Hessian and sampling normal modes ({amplitude_label}, "
         f"amplitude_policy={amplitude_policy}, max_candidates={max_candidates}, "
@@ -258,12 +328,17 @@ def hessian_sample(
                 seed_node,
                 run_inputs.engine,
                 dr=dr,
+                dr_values=dr_scan_values_list,
                 amplitude_policy=amplitude_policy_internal,
                 target_energy_kcal=target_energy_kcal,
+                target_energy_kcal_values=energy_scan_values_list,
                 imaginary_mode_amplitude=imaginary_mode_amplitude,
                 max_candidates=max_candidates,
                 maxiter=maxiter,
                 chain_inputs=run_inputs.chain_inputs,
+                validate_minima_with_hessian=validate_minima_with_hessian,
+                hessian_minimum_frequency_cutoff=hessian_minimum_frequency_cutoff,
+                hessian_minima_rescue_displacement=hessian_minima_rescue_displacement,
                 on_event=_HessianSampleProgress(progress),
             )
     except Exception as exc:
@@ -301,6 +376,10 @@ def hessian_sample(
     displaced_fp = _write_chain(result.displaced_nodes, "displaced.xyz")
     optimized_fp = _write_chain(result.optimized_nodes, "optimized.xyz")
     unique_fp = _write_chain(result.unique_minima, "unique.xyz")
+    rejected_fp = (
+        _write_chain(result.rejected_minima, "rejected.xyz")
+        if result.hessian_validation_enabled else None
+    )
 
     def _candidate_meta_dict(meta) -> dict:
         return {
@@ -314,12 +393,20 @@ def hessian_sample(
     summary_payload = {
         "structure": structure,
         "inputs": str(inputs) if inputs is not None else None,
+        "minimize_seed": minimize_seed,
         "dr": dr,
+        "full_dr_scan": full_dr_scan,
+        "dr_scan_values": dr_scan_values_list if full_dr_scan else [],
         "amplitude_policy": amplitude_policy,
         "target_energy_kcal": target_energy_kcal,
+        "full_energy_scan": full_energy_scan,
+        "energy_scan_values_kcal": energy_scan_values_list if full_energy_scan else [],
         "imaginary_mode_amplitude": imaginary_mode_amplitude,
         "max_candidates": max_candidates,
         "maxiter": maxiter,
+        "validate_minima_with_hessian": validate_minima_with_hessian,
+        "hessian_minimum_frequency_cutoff": hessian_minimum_frequency_cutoff,
+        "hessian_minima_rescue_displacement": hessian_minima_rescue_displacement,
         "seed_energy": result.seed_energy,
         "normal_modes_total": len(result.frequencies_wavenumber),
         "frequencies_wavenumber": result.frequencies_wavenumber,
@@ -328,6 +415,8 @@ def hessian_sample(
         "optimized_candidates": len(result.optimized_nodes),
         "failed_candidates": len(result.failed_candidates),
         "unique_minima": len(result.unique_minima),
+        "rejected_minima": len(result.rejected_minima),
+        "hessian_validation_rescue_grad_calls": result.hessian_validation_rescue_grad_calls,
         "optimization_submission_mode": result.optimization_submission_mode,
         "chain_inputs_thresholds": {
             "node_rms_thre": run_inputs.chain_inputs.node_rms_thre,
@@ -349,6 +438,7 @@ def hessian_sample(
             "displaced": str(displaced_fp) if displaced_fp else None,
             "optimized": str(optimized_fp) if optimized_fp else None,
             "unique": str(unique_fp) if unique_fp else None,
+            "rejected": str(rejected_fp) if rejected_fp else None,
         },
     }
     summary_fp = output / "summary.json"
@@ -367,6 +457,8 @@ def hessian_sample(
     result_table.add_row("Optimized candidates", str(len(result.optimized_nodes)))
     result_table.add_row("Failed candidates", str(len(result.failed_candidates)))
     result_table.add_row("Unique minima", str(len(result.unique_minima)))
+    if result.hessian_validation_enabled:
+        result_table.add_row("Rejected (failed Hessian validation)", str(len(result.rejected_minima)))
     result_table.add_row("Optimization mode", result.optimization_submission_mode)
     if hessian_fp:
         result_table.add_row("Hessian", str(hessian_fp))
@@ -376,6 +468,8 @@ def hessian_sample(
         result_table.add_row("Optimized", str(optimized_fp))
     if unique_fp:
         result_table.add_row("Unique", str(unique_fp))
+    if rejected_fp:
+        result_table.add_row("Rejected", str(rejected_fp))
     result_table.add_row("Summary", str(summary_fp))
     Console().print(
         Panel(
@@ -390,7 +484,39 @@ def hessian_sample(
         raise typer.Exit(code=1)
 
 
-def _parse_dr_scan_values(raw_values: str) -> List[float]:
+def _resolve_amplitude_policy(amplitude_policy: str, *, full_dr_scan: bool, full_energy_scan: bool) -> str:
+    """Normalize `--amplitude-policy` to its internal spelling, inferring it
+    from `--full-dr-scan`/`--full-energy-scan` when they conflict with it --
+    each scan flag is only meaningful under one policy, so asking for it is
+    already an unambiguous statement of which policy is wanted, and forcing
+    the user to also spell out `--amplitude-policy` is redundant. Only
+    overrides the default ('fixed-cartesian'); an explicit, contradictory
+    `--amplitude-policy` combined with both scan flags at once is refused
+    rather than guessed.
+    """
+    internal = amplitude_policy.replace("-", "_")
+    if internal not in ("fixed_cartesian", "energy"):
+        raise typer.BadParameter("--amplitude-policy must be 'fixed-cartesian' or 'energy'.")
+    if full_dr_scan and full_energy_scan:
+        raise typer.BadParameter(
+            "--full-dr-scan and --full-energy-scan cannot both be used at once."
+        )
+    if full_energy_scan and internal != "energy":
+        typer.echo(
+            "--full-energy-scan implies --amplitude-policy=energy; using that "
+            f"instead of {amplitude_policy!r}."
+        )
+        internal = "energy"
+    elif full_dr_scan and internal != "fixed_cartesian":
+        typer.echo(
+            "--full-dr-scan implies --amplitude-policy=fixed-cartesian; using that "
+            f"instead of {amplitude_policy!r}."
+        )
+        internal = "fixed_cartesian"
+    return internal
+
+
+def _parse_scan_values(raw_values: str, *, flag: str) -> List[float]:
     values: List[float] = []
     for raw_item in str(raw_values).split(","):
         item = raw_item.strip()
@@ -400,13 +526,13 @@ def _parse_dr_scan_values(raw_values: str) -> List[float]:
             value = float(item)
         except ValueError as exc:
             raise typer.BadParameter(
-                f"--dr-scan-values must be a comma-separated list of positive numbers; got {item!r}."
+                f"{flag} must be a comma-separated list of positive numbers; got {item!r}."
             ) from exc
         if value <= 0:
-            raise typer.BadParameter("--dr-scan-values entries must be positive.")
+            raise typer.BadParameter(f"{flag} entries must be positive.")
         values.append(value)
     if not values:
-        raise typer.BadParameter("--dr-scan-values must contain at least one positive value.")
+        raise typer.BadParameter(f"{flag} must contain at least one positive value.")
     return values
 
 
@@ -425,12 +551,46 @@ def hessian_global(
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Override the spin multiplicity on the seed structure."
     ),
+    minimize_seed: bool = typer.Option(
+        False, "--minimize-seed/--no-minimize-seed",
+        help="Optimize the seed structure to a minimum before the search starts. "
+        "Important when `structure` is a SMILES string -- it's embedded into 3D "
+        "by a force field, typically a high-energy, off-minimum geometry -- or "
+        "any other rough/unoptimized xyz guess. Basin-hopping from a non-minimum "
+        "seed still works (the first round's acceptance test just compares "
+        "against a higher-energy baseline), but starting from a genuine minimum "
+        "is usually what's intended.",
+    ),
     dr: float = typer.Option(
         0.1, "--dr",
-        help="Target per-atom RMS displacement (bohr). Effective mode "
-        "displacement is dr * sqrt(n_atoms), which keeps this size-invariant "
-        "(a fixed per-mode displacement in bohr would otherwise give "
-        "systematically weaker per-atom kicks for larger molecules).",
+        help="Target per-atom RMS displacement (bohr), used when "
+        "--amplitude-policy=fixed-cartesian. Effective mode displacement is "
+        "dr * sqrt(n_atoms), which keeps this size-invariant (a fixed "
+        "per-mode displacement in bohr would otherwise give systematically "
+        "weaker per-atom kicks for larger molecules).",
+    ),
+    amplitude_policy: str = typer.Option(
+        "fixed-cartesian", "--amplitude-policy",
+        help="How far each mode is displaced, every round. 'fixed-cartesian' "
+        "(default): every mode gets the same Cartesian distance (--dr), "
+        "unaware of how stiff or soft it is. 'energy': --target-energy-kcal "
+        "is a target harmonic displacement energy instead -- each mode's "
+        "amplitude is calibrated (from its own harmonic force constant) so "
+        "displacing it costs roughly that much energy, regardless of "
+        "stiffness -- useful here since later rounds sample modes of "
+        "whatever minimum was just accepted, which can be much stiffer or "
+        "softer than the original seed.",
+    ),
+    target_energy_kcal: float = typer.Option(
+        25.0, "--target-energy-kcal",
+        help="Target harmonic displacement energy (kcal/mol), used when "
+        "--amplitude-policy=energy.",
+    ),
+    imaginary_mode_amplitude: float = typer.Option(
+        0.3, "--imaginary-mode-amplitude",
+        help="Fixed displacement (bohr) for an imaginary (negative-frequency) "
+        "mode under --amplitude-policy=energy, where harmonic calibration is "
+        "undefined.",
     ),
     max_candidates: int = typer.Option(
         100, "--max-candidates",
@@ -471,14 +631,46 @@ def hessian_global(
         "Omit for non-deterministic acceptance.",
     ),
     full_dr_scan: bool = typer.Option(
-        False, "--full-dr-scan/--no-full-dr-scan",
+        False, "--full-dr-scan/--no-full-dr-scan", "-D/-noD",
         help="Use the expensive Hessian-global scan: every round, displace by all "
-        "--dr-scan-values (instead of just --dr) per source minimum.",
+        "--dr-scan-values (instead of just --dr) per source minimum. Only used "
+        "with --amplitude-policy=fixed-cartesian.",
     ),
     dr_scan_values: str = typer.Option(
-        "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0", "--dr-scan-values",
+        "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0", "--dr-scan-values", "-dv",
         help="Comma-separated displacement factors for --full-dr-scan. Each value is "
         "capped independently at --max-candidates.",
+    ),
+    full_energy_scan: bool = typer.Option(
+        False, "--full-energy-scan/--no-full-energy-scan", "-E/-noE",
+        help="Use the expensive Hessian-global scan: every round, displace by all "
+        "--energy-scan-values-kcal (instead of just --target-energy-kcal) per "
+        "source minimum. Only used with --amplitude-policy=energy.",
+    ),
+    energy_scan_values_kcal: str = typer.Option(
+        "25,50,100,200,400", "--energy-scan-values-kcal", "-ev",
+        help="Comma-separated target harmonic displacement energies (kcal/mol) for "
+        "--full-energy-scan. Each value is capped independently at --max-candidates.",
+    ),
+    validate_minima_with_hessian: bool = typer.Option(
+        False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="Every round, before a Hessian-sampled candidate reaches the "
+        "acceptance test, verify it's a genuine minimum by computing its own "
+        "Hessian and checking for imaginary frequencies -- a geometry "
+        "optimization can converge to a saddle point, especially for an "
+        "aggressive displacement. A candidate that fails is rescued once "
+        "(displaced along its lowest-frequency mode and reoptimized, see "
+        "--hessian-minima-rescue-displacement) before being dropped instead "
+        "of ever being considered for acceptance.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff",
+        help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="Displacement (bohr) along the lowest-frequency mode when "
+        "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
     output: Path = typer.Option(
         Path("mepd_hessian_global_output"), "--output", "-o",
@@ -489,12 +681,22 @@ def hessian_global(
     from every accepted minimum found so far, accepting new minima via a
     Metropolis/Boltzmann criterion, until the search exhausts itself or
     --max-rounds is reached."""
-    from mepd.cli import _echo_run_inputs_summary, _load_structure_from_smiles_or_xyz
+    from mepd.cli import (
+        _echo_run_inputs_summary,
+        _load_structure_from_smiles_or_xyz,
+        _minimize_single_node,
+    )
     from mepd.discovery.hessian_sample import run_hessian_global_optimization
     from mepd.nodes.node import StructureNode
 
+    amplitude_policy_internal = _resolve_amplitude_policy(
+        amplitude_policy, full_dr_scan=full_dr_scan, full_energy_scan=full_energy_scan,
+    )
+    amplitude_policy = "energy" if amplitude_policy_internal == "energy" else "fixed-cartesian"
     if dr <= 0:
         raise typer.BadParameter("--dr must be positive.")
+    if target_energy_kcal <= 0:
+        raise typer.BadParameter("--target-energy-kcal must be positive.")
     if max_candidates <= 0:
         raise typer.BadParameter("--max-candidates must be a positive integer.")
     if maxiter <= 0:
@@ -507,25 +709,42 @@ def hessian_global(
         raise typer.BadParameter(
             "--acceptance-baseline must be 'seed', 'connected', or 'running_best'."
         )
-    dr_scan_values_list = _parse_dr_scan_values(dr_scan_values) if full_dr_scan else None
+    dr_scan_values_list = (
+        _parse_scan_values(dr_scan_values, flag="--dr-scan-values") if full_dr_scan else None
+    )
+    energy_scan_values_list = (
+        _parse_scan_values(energy_scan_values_kcal, flag="--energy-scan-values-kcal")
+        if full_energy_scan else None
+    )
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
-    _echo_run_inputs_summary(run_inputs)
+    _echo_run_inputs_summary(run_inputs, mode="discovery")
 
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
+
+    if minimize_seed:
+        seed_node = _minimize_single_node(seed_node, run_inputs, label="seed", flag="--minimize-seed")
 
     output.mkdir(parents=True, exist_ok=True)
     write_qcio = bool(getattr(run_inputs, "write_qcio", False))
     accepted_fp = output / "accepted_minima.xyz"
 
-    dr_label = (
-        f"dr_scan_values={','.join(f'{v:g}' for v in dr_scan_values_list)}"
-        if full_dr_scan
-        else f"dr={dr:g}"
-    )
+    if amplitude_policy_internal == "fixed_cartesian":
+        dr_label = (
+            f"dr_scan_values={','.join(f'{v:g}' for v in dr_scan_values_list)}"
+            if full_dr_scan
+            else f"dr={dr:g}"
+        )
+    else:
+        dr_label = (
+            f"energy_scan_values_kcal={','.join(f'{v:g}' for v in energy_scan_values_list)}"
+            if full_energy_scan
+            else f"target_energy_kcal={target_energy_kcal:g}"
+        )
     typer.echo(
-        f"Running basin-hopping global optimization ({dr_label}, max_candidates={max_candidates}, "
+        f"Running basin-hopping global optimization ({dr_label}, "
+        f"amplitude_policy={amplitude_policy}, max_candidates={max_candidates}, "
         f"temperature={temperature:g}K, max_rounds={max_rounds})..."
     )
     try:
@@ -545,6 +764,10 @@ def hessian_global(
                 run_inputs.engine,
                 dr=dr,
                 dr_values=dr_scan_values_list,
+                amplitude_policy=amplitude_policy_internal,
+                target_energy_kcal=target_energy_kcal,
+                target_energy_kcal_values=energy_scan_values_list,
+                imaginary_mode_amplitude=imaginary_mode_amplitude,
                 max_candidates=max_candidates,
                 maxiter=maxiter,
                 temperature=temperature,
@@ -553,6 +776,9 @@ def hessian_global(
                 random_seed=random_seed,
                 chain_inputs=run_inputs.chain_inputs,
                 acceptance_baseline=acceptance_baseline,
+                validate_minima_with_hessian=validate_minima_with_hessian,
+                hessian_minimum_frequency_cutoff=hessian_minimum_frequency_cutoff,
+                hessian_minima_rescue_displacement=hessian_minima_rescue_displacement,
                 on_event=_on_event,
             )
     except Exception as exc:
@@ -577,9 +803,15 @@ def hessian_global(
     summary_payload = {
         "structure": structure,
         "inputs": str(inputs) if inputs is not None else None,
+        "minimize_seed": minimize_seed,
         "dr": dr,
         "full_dr_scan": full_dr_scan,
         "dr_scan_values": dr_scan_values_list if full_dr_scan else [],
+        "amplitude_policy": amplitude_policy,
+        "target_energy_kcal": target_energy_kcal,
+        "full_energy_scan": full_energy_scan,
+        "energy_scan_values_kcal": energy_scan_values_list if full_energy_scan else [],
+        "imaginary_mode_amplitude": imaginary_mode_amplitude,
         "max_candidates": max_candidates,
         "maxiter": maxiter,
         "temperature": temperature,
@@ -587,6 +819,9 @@ def hessian_global(
         "max_rounds": max_rounds,
         "random_seed": random_seed,
         "acceptance_baseline": acceptance_baseline,
+        "validate_minima_with_hessian": validate_minima_with_hessian,
+        "hessian_minimum_frequency_cutoff": hessian_minimum_frequency_cutoff,
+        "hessian_minima_rescue_displacement": hessian_minima_rescue_displacement,
         "start_energy": result.start_energy,
         "rounds_run": result.rounds_run,
         "stopped_reason": result.stopped_reason,

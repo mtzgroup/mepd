@@ -191,6 +191,107 @@ def test_run_hessian_global_optimization_forwards_dr_values_to_each_round(monkey
     assert all(dr_values == [0.5] for dr_values in seen_dr_values)
 
 
+def test_run_hessian_global_optimization_forwards_hessian_validation_kwargs_to_each_round(monkeypatch):
+    import mepd.discovery.hessian_sample as hessian_sample_module
+
+    seen_kwargs = []
+    original = hessian_sample_module.run_hessian_sample
+
+    def spy(*args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", spy)
+
+    engine = _FakeMultiWellEngine()
+    result = run_hessian_global_optimization(
+        _seed(), engine, dr=1.0, max_candidates=2, max_rounds=3, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        validate_minima_with_hessian=True,
+        hessian_minimum_frequency_cutoff=7.5,
+        hessian_minima_rescue_displacement=0.42,
+    )
+
+    assert result.rounds_run >= 1
+    assert seen_kwargs  # at least one round ran
+    assert all(kwargs["validate_minima_with_hessian"] is True for kwargs in seen_kwargs)
+    assert all(kwargs["hessian_minimum_frequency_cutoff"] == 7.5 for kwargs in seen_kwargs)
+    assert all(kwargs["hessian_minima_rescue_displacement"] == 0.42 for kwargs in seen_kwargs)
+
+
+def test_run_hessian_global_optimization_forwards_amplitude_policy_to_each_round(monkeypatch):
+    import mepd.discovery.hessian_sample as hessian_sample_module
+
+    seen_kwargs = []
+    original = hessian_sample_module.run_hessian_sample
+
+    def spy(*args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", spy)
+
+    engine = _FakeMultiWellEngine()
+    result = run_hessian_global_optimization(
+        _seed(), engine, max_candidates=2, max_rounds=3, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        amplitude_policy="energy", target_energy_kcal=12.0, imaginary_mode_amplitude=0.4,
+    )
+
+    assert result.rounds_run >= 1
+    assert seen_kwargs
+    assert all(kwargs["amplitude_policy"] == "energy" for kwargs in seen_kwargs)
+    assert all(kwargs["target_energy_kcal"] == 12.0 for kwargs in seen_kwargs)
+    assert all(kwargs["imaginary_mode_amplitude"] == 0.4 for kwargs in seen_kwargs)
+
+
+def test_run_hessian_global_optimization_rejects_invalid_amplitude_policy():
+    engine = _FakeMultiWellEngine()
+    with pytest.raises(ValueError):
+        run_hessian_global_optimization(_seed(), engine, amplitude_policy="nonsense")
+
+
+def test_run_hessian_global_optimization_rejects_dr_values_with_energy_policy():
+    engine = _FakeMultiWellEngine()
+    with pytest.raises(ValueError):
+        run_hessian_global_optimization(
+            _seed(), engine, amplitude_policy="energy", dr_values=[0.1, 0.2],
+        )
+
+
+def test_run_hessian_global_optimization_rejects_target_energy_kcal_values_with_fixed_cartesian_policy():
+    engine = _FakeMultiWellEngine()
+    with pytest.raises(ValueError):
+        run_hessian_global_optimization(
+            _seed(), engine, amplitude_policy="fixed_cartesian",
+            target_energy_kcal_values=[50.0, 100.0],
+        )
+
+
+def test_run_hessian_global_optimization_forwards_target_energy_kcal_values_to_each_round(monkeypatch):
+    import mepd.discovery.hessian_sample as hessian_sample_module
+
+    seen_kwargs = []
+    original = hessian_sample_module.run_hessian_sample
+
+    def spy(*args, **kwargs):
+        seen_kwargs.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hessian_sample_module, "run_hessian_sample", spy)
+
+    engine = _FakeMultiWellEngine()
+    result = run_hessian_global_optimization(
+        _seed(), engine, max_candidates=2, max_rounds=3, random_seed=123,
+        chain_inputs=ChainInputs(node_rms_thre=1.0, node_ene_thre=1.0),
+        amplitude_policy="energy", target_energy_kcal_values=[50.0, 100.0],
+    )
+
+    assert result.rounds_run >= 1
+    assert seen_kwargs
+    assert all(kwargs["target_energy_kcal_values"] == [50.0, 100.0] for kwargs in seen_kwargs)
+
+
 def test_run_hessian_global_optimization_rejects_nonpositive_temperature():
     engine = _FakeMultiWellEngine()
     with pytest.raises(ValueError):

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from mepd.neb import NEB
 from pathlib import Path
+from typing import Any
 import numpy as np
 import networkx as nx
 import shutil
@@ -9,6 +10,19 @@ from mepd.chain import Chain
 from mepd.inputs import ChainInputs, NEBInputs, GIInputs
 from mepd.optimizers.vpo import VelocityProjectedOptimizer
 from mepd.nodes.nodehelpers import is_identical
+from mepd.tsopt import TSOptResult
+
+
+@dataclass
+class GreedyTSOptCandidate:
+    """One TS-guess drawn from `TreeNode.get_optimization_history()` and the
+    outcome of optimizing it. `source_index` is the position of its source
+    NEB within `get_optimization_history()` (stable for a given tree, useful
+    for labeling output files)."""
+
+    source_index: int
+    ts_guess: Any
+    result: TSOptResult
 
 
 @dataclass
@@ -257,6 +271,60 @@ class TreeNode:
             return opt_history
         else:
             return self.get_optimization_history(node=self)
+
+    def greedy_tsopt(
+        self,
+        engine: Any,
+        *,
+        run_irc: bool = False,
+        dedup: bool = True,
+        chain_inputs: ChainInputs = None,
+    ) -> list["GreedyTSOptCandidate"]:
+        """Greedily TS-opt (and optionally IRC) a guess from *every* NEB run
+        in this tree's optimization history, not just the elem-step leaves.
+
+        For each `neb` in `self.get_optimization_history()` with a non-empty
+        `chain_trajectory`, takes `neb.chain_trajectory[-1].get_ts_node()` as
+        a TS guess and attempts `tsopt.optimize_ts_and_irc` on it. This is a
+        wider net than leaf-only TS-opt (e.g. `mepd run --use-tsopt`): it
+        doesn't trust the tree's own elem-step/leaf classification and just
+        lets TS-opt itself succeed or fail on every candidate.
+
+        With `dedup=True` (default), a guess geometrically identical to one
+        already attempted (per `ChainInputs.node_rms_thre`/`node_ene_thre`)
+        is skipped -- multiple tree nodes commonly converge to the same
+        underlying structure. Entries with falsy/missing `data` (failed
+        splits) or an empty `chain_trajectory` are always skipped.
+
+        Never raises: each candidate's outcome is captured in its
+        `GreedyTSOptCandidate.result` (a `TSOptResult`), so one failure
+        doesn't stop the rest.
+        """
+        from mepd.tsopt import optimize_ts_and_irc
+
+        parameters = chain_inputs if chain_inputs is not None else ChainInputs()
+
+        candidates: list[GreedyTSOptCandidate] = []
+        seen_guesses: list = []
+        for source_index, neb in enumerate(self.get_optimization_history()):
+            if not neb or not getattr(neb, "chain_trajectory", None):
+                continue
+            guess = neb.chain_trajectory[-1].get_ts_node()
+
+            if dedup and any(
+                self._nodes_match(guess, seen, parameters) for seen in seen_guesses
+            ):
+                continue
+            seen_guesses.append(guess)
+
+            result = optimize_ts_and_irc(guess, engine, run_irc=run_irc)
+            candidates.append(
+                GreedyTSOptCandidate(
+                    source_index=source_index, ts_guess=guess, result=result
+                )
+            )
+
+        return candidates
 
     def get_adj_mat_leaves_indices(self):
         matrix = self.adj_matrix
