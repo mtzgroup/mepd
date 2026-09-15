@@ -206,7 +206,12 @@ def map_smiles_pair(
     chemistry-aware extension (`slapmapper.aam.SlapAAM.map_smiles`) is for.
     """
     _require_slapmapper()
+    from rdkit import Chem
     from slapmapper.aam import SlapAAM
+
+    for smi in (smi_start, smi_end):
+        if Chem.MolFromSmiles(smi) is None:
+            raise ValueError(f"{smi!r} is not a valid SMILES string.")
 
     mapper = SlapAAM(binary=True)
     mapper.map_smiles(f"{smi_start}>>{smi_end}")

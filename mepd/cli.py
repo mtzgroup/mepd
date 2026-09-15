@@ -694,11 +694,17 @@ def run(
         )
         from mepd.atom_mapping import map_smiles_pair
 
-        start_structure, end_structure = map_smiles_pair(
-            start, end,
-            charge_start=charge, charge_end=charge,
-            multiplicity_start=multiplicity or 1, multiplicity_end=multiplicity or 1,
-        )
+        try:
+            start_structure, end_structure = map_smiles_pair(
+                start, end,
+                charge_start=charge, charge_end=charge,
+                multiplicity_start=multiplicity or 1, multiplicity_end=multiplicity or 1,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"--start ({start!r}) and --end ({end!r}) don't exist as files, and "
+                f"couldn't be parsed as a SMILES pair either: {exc}"
+            )
     else:
         start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
         end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
