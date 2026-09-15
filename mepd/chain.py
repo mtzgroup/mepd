@@ -89,24 +89,41 @@ class Chain(BaseModel):
         if grad_shape_path_old.exists() and not grad_shape_path.exists():
             grad_shape_path = grad_shape_path_old
 
-        if energies_fp.exists() and grad_path.exists() and grad_shape_path.exists():
+        has_gradients = grad_path.exists() and grad_shape_path.exists()
+
+        if energies_fp.exists():
             # np.loadtxt collapses a file with a single value (e.g. a
             # one-node chain) to a 0-d array, which isn't iterable below.
             energies = np.atleast_1d(np.loadtxt(energies_fp))
-            gradients_flat = np.atleast_1d(np.loadtxt(grad_path))
-            gradients_shape = np.atleast_1d(np.loadtxt(grad_shape_path)).astype(int)
 
-            gradients = gradients_flat.reshape(gradients_shape).tolist()
+            gradients = None
+            if has_gradients:
+                gradients_flat = np.atleast_1d(np.loadtxt(grad_path))
+                gradients_shape = np.atleast_1d(
+                    np.loadtxt(grad_shape_path)
+                ).astype(int)
+                gradients = gradients_flat.reshape(gradients_shape).tolist()
 
-            for i, (node, (ene, grad)) in enumerate(zip(chain.nodes, zip(energies, gradients))):
-                qcio_fp = Path(str(fp.stem)+f"_node_{i}.qcio")
+            for i, node in enumerate(chain.nodes):
+                ene = energies[i]
+                grad = gradients[i] if gradients is not None else None
+
+                qcio_fp = Path(str(fp.stem) + f"_node_{i}.qcio")
                 if qcio_fp.exists():
                     result = ProgramOutput.open(qcio_fp)
+                elif grad is not None:
+                    # FakeQCIOResults.gradient is required -- only build a
+                    # cached result when we actually have one; a node with
+                    # energy but no gradient (e.g. GSM's final converged
+                    # chain, reconstructed from its own energy profile
+                    # without an extra gradient pass) still gets its energy
+                    # via `_cached_energy` below, just no `_cached_result`.
+                    fake_res = FakeQCIOResults.model_validate(
+                        {"energy": ene, "gradient": grad}
+                    )
+                    result = FakeQCIOOutput.model_validate({"results": fake_res})
                 else:
-                    fake_res = FakeQCIOResults.model_validate({
-                        "energy": ene, "gradient": grad})
-                    result = FakeQCIOOutput.model_validate(
-                        {"results": fake_res})
+                    result = None
                 node._cached_result = result
                 node._cached_energy = ene
                 node._cached_gradient = grad
