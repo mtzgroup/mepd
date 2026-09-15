@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -330,7 +331,9 @@ class GSM(PathMinimizer):
 
             server_proc = self._start_engine_server(workdir)
             self._log("Running molecularGSM (DE-GSM)...")
-            self._run_gsm(workdir, reactant, e_reactant, chain.parameters)
+            live_history = self._run_gsm(
+                workdir, reactant, product, e_reactant, chain.parameters
+            )
 
             n_calls = counter_fp.read_text().count("\n")
             self.grad_calls_made += n_calls
@@ -339,7 +342,15 @@ class GSM(PathMinimizer):
             final_chain = self._parse_stringfile(
                 workdir, reactant, e_reactant, chain.parameters
             )
-            self.chain_trajectory = [self.initial_chain.copy(), final_chain]
+            # live_history is a real snapshot per node update the engine
+            # server reported (see _run_gsm), not just the two bookend
+            # entries -- gives a GSM run genuine intermediate-step history,
+            # the same way NEB's chain_trajectory already does.
+            self.chain_trajectory = [
+                self.initial_chain.copy(),
+                *live_history,
+                final_chain,
+            ]
             # Every other PathMinimizer sets this after a successful optimize_chain()
             # -- msmep.run_minimize_chain reads it unconditionally right afterward.
             self.optimized = final_chain
@@ -508,6 +519,37 @@ class GSM(PathMinimizer):
         engine_server_py.write_text(_ENGINE_SERVER_SOURCE)
         engine_server_py.chmod(0o755)
 
+    @staticmethod
+    def _start_stdout_drain(proc: subprocess.Popen) -> list[str]:
+        """Continuously read `proc.stdout` in a background thread for the
+        life of the process, returning the (still being appended to) list of
+        captured lines.
+
+        Necessary because a Popen with `stdout=PIPE` deadlocks once the OS
+        pipe buffer (~64KB) fills if nothing ever reads it: the child blocks
+        on its own `write()` call and never gets to exit, so a parent that
+        only checks `proc.poll()` waits forever while the child waits
+        forever too. Both the `gsm` binary itself (over the course of a full
+        run) and `engine_server.py` (if e.g. a warnings-module message fires
+        on enough individual node requests) can produce enough output to hit
+        this -- confirmed as the cause of mepd appearing to hang on GSM runs
+        that happened to produce more output before an early stop than a
+        normal run produces before finishing.
+        """
+        chunks: list[str] = []
+
+        def _drain() -> None:
+            if proc.stdout is None:
+                return
+            try:
+                for line in proc.stdout:
+                    chunks.append(line)
+            except (ValueError, OSError):
+                pass
+
+        threading.Thread(target=_drain, daemon=True).start()
+        return chunks
+
     def _start_engine_server(self, workdir: Path) -> subprocess.Popen:
         """Launch the long-lived engine server `grad.py` clients talk to
         (see the module-level comment on `_ENGINE_SERVER_SOURCE`), and block
@@ -521,16 +563,16 @@ class GSM(PathMinimizer):
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self._server_stdout_chunks = self._start_stdout_drain(proc)
 
         timeout = 30.0
         poll_interval = 0.01
         waited = 0.0
         while not ready_marker.exists():
             if proc.poll() is not None:
-                out = proc.stdout.read() if proc.stdout else ""
                 raise ElectronicStructureError(
                     msg="GSM engine server exited before it was ready.",
-                    obj=out,
+                    obj="".join(self._server_stdout_chunks),
                 )
             if waited >= timeout:
                 proc.kill()
@@ -563,8 +605,16 @@ class GSM(PathMinimizer):
             proc.wait(timeout=5.0)
 
     def _run_gsm(
-        self, workdir: Path, reactant, e_reactant: float, chain_parameters
-    ) -> None:
+        self, workdir: Path, reactant, product, e_reactant: float, chain_parameters
+    ) -> list[Chain]:
+        """Run the compiled binary to completion, live-printing and
+        accumulating a real `Chain` snapshot (see `_build_live_chain`) every
+        time the engine server reports new node data, and return that
+        history in run order. The caller folds it into `self.chain_trajectory`
+        so a GSM run gets genuine intermediate-snapshot history -- not just
+        the two bookend entries -- for visualization, and it's the same data
+        a future persistent-minima early-stop check would monitor.
+        """
         executable = self._resolve_executable()
         # `./grad.py` is invoked by GSM via a bare `system("./grad.py ...")`
         # relying on its shebang + $PATH; grad.py itself only needs stdlib
@@ -596,10 +646,17 @@ class GSM(PathMinimizer):
                 )
             ) from exc
 
+        # Drain stdout continuously (see _start_stdout_drain's docstring) --
+        # GSM produces substantial output over a run, and without an active
+        # reader the OS pipe buffer fills and the child deadlocks blocked on
+        # its own write(), which then makes proc.poll() below never return.
+        stdout_chunks = self._start_stdout_drain(proc)
+
         # GSM's own optimization loop is entirely inside the compiled binary,
         # so polling the live-snapshot file the engine server rewrites after
         # every node request (see _ENGINE_SERVER_SOURCE) is the only way to
         # show progress -- there's nothing to await synchronously otherwise.
+        history: list[Chain] = []
         start_time = time.time()
         last_mtime = None
         while proc.poll() is None:
@@ -615,44 +672,82 @@ class GSM(PathMinimizer):
                 mtime = None
             if mtime is not None and mtime != last_mtime:
                 last_mtime = mtime
-                self._print_live_chain(live_path, reactant, e_reactant, chain_parameters)
+                live_chain = self._build_live_chain(
+                    live_path, reactant, product, e_reactant, chain_parameters
+                )
+                if live_chain is not None:
+                    history.append(live_chain)
+                    self._print_live_chain(live_chain)
             time.sleep(poll_interval)
 
-        # One last refresh in case a final write raced the process exit.
-        self._print_live_chain(live_path, reactant, e_reactant, chain_parameters)
+        # One last refresh in case a final write raced the process exit --
+        # only if the file actually changed since our last in-loop capture
+        # (_build_live_chain always returns a fresh object, so comparing the
+        # chains themselves can't detect "nothing new happened here").
+        try:
+            mtime = live_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime != last_mtime:
+            live_chain = self._build_live_chain(
+                live_path, reactant, product, e_reactant, chain_parameters
+            )
+            if live_chain is not None:
+                history.append(live_chain)
+                self._print_live_chain(live_chain)
 
-        stdout = proc.stdout.read() if proc.stdout else ""
         if proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists():
             raise ElectronicStructureError(
                 msg=f"GSM calculation failed with exit code {proc.returncode}.",
-                obj=stdout,
+                obj="".join(stdout_chunks),
             )
 
-    def _print_live_chain(
-        self, live_path: Path, reactant, e_reactant: float, chain_parameters
-    ) -> None:
-        """Render whatever of the string the engine server has reported so
-        far as a live, in-place-updating ASCII profile -- the GSM analogue of
-        the live chain view NEB already gets via mepd.progress.print_chain_step
-        after every optimizer step. Best-effort: a snapshot file that's
-        missing, empty, or (despite the atomic rename in
-        _ENGINE_SERVER_SOURCE) caught mid-write just skips this refresh
-        rather than raising out of a background poll loop.
+        return history
+
+    def _print_live_chain(self, live_chain: Chain) -> None:
+        """Render an already-built live chain (see `_build_live_chain`) as a
+        live, in-place-updating ASCII profile -- the GSM analogue of the live
+        chain view NEB already gets via mepd.progress.print_chain_step after
+        every optimizer step.
+        """
+        from mepd.progress import print_chain_step
+
+        nnodes_target = int(getattr(self.parameters, "nnodes", 9))
+        print_chain_step(
+            live_chain,
+            caption=f"GSM live string ({len(live_chain)}/{nnodes_target} nodes seen)",
+        )
+
+    def _build_live_chain(
+        self, live_path: Path, reactant, product, e_reactant: float, chain_parameters
+    ) -> Chain | None:
+        """Reconstruct a `Chain` from whatever of the string the engine
+        server has reported so far. Returns `None` if there's nothing usable
+        to build from yet (missing/empty/malformed snapshot -- transient
+        states any poller hitting this mid-write can see).
+
+        The reactant/product endpoints are always pinned to the real,
+        already-known nodes rather than whatever currently holds the lowest/
+        highest seen node index in the live snapshot -- during growth, GSM
+        inserts new interior nodes over time, so an index's *meaning* can
+        shift, and a partial snapshot's nominal "first"/"last" entries can
+        both still be close to the reactant (not yet differentiated into the
+        product) -- letting that leak into e.g. the live view's start/end
+        SMILES gave the misleading impression the endpoints were identical.
         """
         try:
             text = live_path.read_text()
         except OSError:
-            return
+            return None
         if not text.strip():
-            return
+            return None
         try:
             blocks = self._parse_string_blocks(text, len(reactant.symbols))
         except Exception:
-            return
+            return None
         if not blocks:
-            return
+            return None
 
-        from mepd.progress import print_chain_step
         from qcconst.constants import ANGSTROM_TO_BOHR
 
         nodes = []
@@ -661,14 +756,10 @@ class GSM(PathMinimizer):
             node = reactant.update_coords(coords_bohr)
             node._cached_energy = e_reactant + v_kcal / _KCAL_PER_HARTREE
             nodes.append(node)
-        live_chain = Chain.model_validate(
-            {"nodes": nodes, "parameters": chain_parameters}
-        )
-        nnodes_target = int(getattr(self.parameters, "nnodes", 9))
-        print_chain_step(
-            live_chain,
-            caption=f"GSM live string ({len(nodes)}/{nnodes_target} nodes seen)",
-        )
+        if len(nodes) >= 2:
+            nodes[0] = reactant
+            nodes[-1] = product
+        return Chain.model_validate({"nodes": nodes, "parameters": chain_parameters})
 
     @staticmethod
     def _parse_string_blocks(
