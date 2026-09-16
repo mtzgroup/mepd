@@ -64,6 +64,33 @@ def test_generate_conformers_are_pairwise_distinct_by_rmsd():
             assert rmsd >= inputs.rmsd_cutoff
 
 
+def test_subselect_conformers_discards_a_distorted_embedding_instead_of_crashing(monkeypatch):
+    """Regression test: a distorted ETKDG embedding can drift far enough
+    that qcinf's own geometry-based connectivity perception disagrees with
+    an already-kept conformer's, and `snap_rmsd` raises ValueError
+    ("Structures not isomorphic. Same connectivity required.") -- that
+    candidate must be dropped, not allowed to crash the whole run."""
+    import mepd.conformers as conformers_module
+
+    node = _butane_node()
+    candidates = [node] + [node.copy() for _ in range(3)]
+
+    def fake_snap_rmsd(a, b, **kwargs):
+        fake_snap_rmsd.calls += 1
+        if fake_snap_rmsd.calls == 2:
+            # Simulates a distorted candidate whose geometry-perceived
+            # connectivity disagrees with an already-kept conformer's.
+            raise ValueError("Structures not isomorphic. Same connectivity required.")
+        return 1.0  # otherwise always "distinct enough" to keep
+
+    fake_snap_rmsd.calls = 0
+    monkeypatch.setattr(conformers_module.qcinf, "snap_rmsd", fake_snap_rmsd)
+
+    # Must not raise, and the poisoned candidate must simply be excluded.
+    result = conformers_module._subselect_conformers(candidates, n_max=10, rmsd_cutoff=0.5)
+    assert len(result) == len(candidates) - 1
+
+
 def test_generate_conformers_unknown_backend_raises():
     node = _butane_node()
     with pytest.raises(ValueError):

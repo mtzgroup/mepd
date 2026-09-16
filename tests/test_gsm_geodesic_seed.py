@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 from qcdata import Structure
 
+from mepd.chain import Chain
 from mepd.nodes.node import StructureNode
 from mepd.pathminimizers.gsm import GSM, _inpfileq_text
 from qcconst.constants import ANGSTROM_TO_BOHR
@@ -72,6 +73,39 @@ def test_write_string_blocks_reactant_energy_is_zero_reference(tmp_path):
 
     v_kcal, _ = GSM._parse_string_blocks(fp.read_text(), natoms_expected=3)[0]
     assert abs(v_kcal) < 1e-8
+
+
+class _FakeEnergyEngine:
+    def compute_energies(self, nodes):
+        for node in nodes:
+            if node._cached_energy is None:
+                node._cached_energy = -0.4
+
+
+def test_build_geodesic_seed_reuses_initial_chain_nodes_without_recomputing():
+    """`_build_geodesic_seed` must reuse the geodesic-interpolated chain
+    already built upstream (`self.initial_chain`, i.e. `chain_trajectory[0]`)
+    as GSM's RESTART seed as-is -- not silently recompute a second, possibly
+    differently-sized interpolation between the same two endpoints, which
+    would make `chain_trajectory[0]` (what the user sees) and what GSM
+    actually starts from silently diverge."""
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    mid1 = _hcn_node(1.4, 1.9, energy=None)
+    mid2 = _hcn_node(1.8, 1.5, energy=None)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate(
+        {"nodes": [reactant, mid1, mid2, product], "parameters": {}}
+    )
+
+    gsm = GSM(initial_chain=chain, engine=_FakeEnergyEngine())
+    seed_nodes = gsm._build_geodesic_seed(chain, reactant, product)
+
+    assert len(seed_nodes) == len(chain.nodes)
+    # Interior nodes are the exact same objects already on `chain` -- proof
+    # no fresh interpolation was built.
+    assert seed_nodes[1] is mid1
+    assert seed_nodes[2] is mid2
+    assert all(n._cached_energy is not None for n in seed_nodes)
 
 
 def test_inpfileq_text_restart_and_nnodes_override():

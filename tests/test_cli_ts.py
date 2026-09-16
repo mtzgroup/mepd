@@ -228,6 +228,33 @@ def test_ts_scan_with_irc_writes_irc_per_guess(tmp_path, monkeypatch):
     assert (output_dir / "ts_leaf_0_irc.xyz").exists()
 
 
+def test_ts_writes_an_energy_sidecar_for_the_optimized_ts_structure(tmp_path, monkeypatch):
+    """`mepd visualize` reads a TS structure's energy from a `<label>.energies`
+    sidecar next to `<label>.xyz` (see `Chain.from_xyz`) -- so the optimized
+    TS node's cached energy must actually be written to disk, not dropped."""
+
+    def fake_compute_transition_state(self, node, keywords=None):
+        node._cached_energy = -76.05
+        return node
+
+    monkeypatch.setattr(GXTBCalculator, "compute_transition_state", fake_compute_transition_state)
+
+    neb = _make_neb([[-76.0, -75.6, -76.05], [-76.0, -75.4, -76.1]])
+    tree = TreeNode(data=neb, children=[], index=0)
+    tree_dir = tmp_path / "tree"
+    tree.write_to_disk(tree_dir)
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "ts_out"
+    _call_ts(guess=tree_dir, inputs=inputs_fp, output=output_dir)
+
+    energies_fp = output_dir / "ts_leaf_0.energies"
+    assert energies_fp.exists()
+    assert np.loadtxt(energies_fp) == pytest.approx(-76.05)
+
+
 def test_ts_rejects_directory_with_no_recognizable_shape(tmp_path):
     empty_dir = tmp_path / "not_a_result"
     empty_dir.mkdir()

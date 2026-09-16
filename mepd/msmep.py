@@ -1716,7 +1716,31 @@ class MSMEP:
         elif split_method == "maxima":
             chains = self._do_maxima_based_split(chain, minimization_results)
 
+        if getattr(getattr(self.inputs, "atom_mapping_inputs", None), "recheck_on_split", False):
+            chains = [self._maybe_realign_chain_endpoints(c) for c in chains]
+
         return chains
+
+    def _maybe_realign_chain_endpoints(self, chain: Chain) -> Chain:
+        """`--atom-mapping-recheck-splits`: re-run the same best-of-N
+        atom-mapping selection `--atom-mapping` runs once on the original
+        --start/--end pair, but on THIS split's (reactant, product) pair.
+        A no-op for splits whose pair has no SLAPMapper-detectable
+        alternative mapping -- see `maybe_realign_pair`."""
+        from mepd.atom_mapping_selection import maybe_realign_pair
+        from mepd.nodes.node import StructureNode
+
+        try:
+            realigned_structure, changed = maybe_realign_pair(
+                chain[0].structure, chain[-1].structure, self.inputs
+            )
+        except Exception:
+            return chain
+        if changed:
+            if _get_verbose(self.inputs):
+                print("--atom-mapping-recheck-splits: reindexed a split's product-side atoms.")
+            chain.nodes = [chain.nodes[0], StructureNode(structure=realigned_structure)]
+        return chain
 
 
 def _parallel_recursive_step_worker(

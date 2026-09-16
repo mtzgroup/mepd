@@ -144,11 +144,18 @@ def _chain_path_lengths(chain: Chain) -> list[float]:
     if n <= 1:
         return [0.0] * n
     try:
-        return [float(x) for x in chain.integrated_path_length]
+        path_lengths = [float(x) for x in chain.integrated_path_length]
+        if not all(np.isfinite(x) for x in path_lengths):
+            raise ValueError("non-finite path length")
+        return path_lengths
     except Exception:
         # Degenerate geometry (e.g. a distance function that chokes on some
-        # frame pair) -- fall back to even spacing rather than failing the
-        # whole visualization over an x-axis metric.
+        # frame pair, or -- for two very dissimilar frames, such as an IRC's
+        # endpoints when they're genuinely different species -- an alignment
+        # that divides by a near-zero norm and comes back NaN) -- fall back
+        # to even spacing rather than failing the whole visualization, or
+        # emitting a NaN that breaks the page's embedded JSON, over an
+        # x-axis metric.
         return [i / (n - 1) for i in range(n)]
 
 
@@ -239,8 +246,8 @@ def _network_edges_payload(pot) -> list[dict]:
 
 
 @dataclass
-class ConformerNetworkResult:
-    """The on-disk output of `mepd conformers` (conformer pools + one
+class ChannelsResult:
+    """The on-disk output of `mepd channels` (conformer pools + one
     completed MSMEP tree per reactant/product conformer pair, optionally an
     aggregated network.json), bundled for `render_visualization_html` to
     show as one clickable page: reactant conformers, product conformers,
@@ -252,20 +259,30 @@ class ConformerNetworkResult:
     network: Optional[object] = None  # Pot | None
 
 
-def _single_structure_payload(node) -> dict:
-    """One bare structure (e.g. a conformer, not an optimization frame) as a
-    single-frame chain payload -- reuses `_chain_payload`'s energy handling
-    (shows a relative energy if this node was minimized) but drops the "TS
-    guess" framing, which doesn't mean anything for a single structure."""
+def _single_structure_payload(node, energy_baseline: Optional[float] = None) -> dict:
+    """One bare structure (e.g. a conformer or TS structure, not an
+    optimization frame) as a single-frame chain payload -- drops the "TS
+    guess" framing, which doesn't mean anything for a single structure.
+
+    `_chain_payload`'s own energy handling never fires here (it requires
+    more than one frame, since a lone frame has no profile to plot), so this
+    computes the displayed energy itself: relative to `energy_baseline`
+    (e.g. the lowest-energy structure among several being compared) when
+    given, otherwise relative to the node's own energy (always 0.0, just
+    confirming an energy is known) if none is given."""
     from mepd.inputs import ChainInputs
 
     chain = Chain.model_validate({"nodes": [node], "parameters": ChainInputs()})
     payload = _chain_payload(chain)
     payload["ts_index"] = None
+    energy = node._cached_energy
+    if energy is not None:
+        baseline = energy if energy_baseline is None else energy_baseline
+        payload["frames"][0]["energy_kcal"] = (energy - baseline) * 627.5
     return payload
 
 
-def _conformer_network_nodes_payload(result: ConformerNetworkResult) -> list[dict]:
+def _channels_nodes_payload(result: ChannelsResult) -> list[dict]:
     nodes: list[dict] = []
 
     def add(group: str, label: str, trajectory: list[dict]) -> None:
@@ -300,10 +317,39 @@ class TsOutputResult:
     more optimized transition-state structures (<label>.xyz), each optionally
     paired with an IRC path (<label>_irc.xyz, or irc.xyz for the bare "ts"
     label), bundled for `render_visualization_html` to show as one clickable
-    page: TS structures and IRC paths, each its own group."""
+    page: TS structures and IRC paths, each its own group.
+
+    `group_labels` (label -> "Channel <k>"/"Alternate route <k>") is
+    populated when this `ts/` directory sits inside a `mepd channels`
+    output alongside its `channels/`/`alternate-routes/` classification
+    folders -- when present, it overrides the generic
+    `_irc_endpoint_match_label` self-consistency grouping below with the
+    real classification `mepd channels` already computed (IRC-verified
+    against the actual --start/--end pair, not just "are this IRC's own
+    two ends different from each other")."""
 
     structures: list = field(default_factory=list)  # list[tuple[str, Node]]
     irc_paths: list = field(default_factory=list)  # list[tuple[str, Chain]]
+    group_labels: dict = field(default_factory=dict)  # label -> "Channel <k>" | "Alternate route <k>"
+
+
+def _irc_endpoint_match_label(chain: Chain) -> str:
+    """Whether this IRC's own two endpoints (its first and last frame) are
+    the same molecular species, by connectivity (bond-isomorphism) -- the
+    same check `mepd.irc_network.build_irc_network` uses to skip degenerate
+    "connectivity-identical endpoints" IRCs when building a reaction
+    network. A match usually means a failed/degenerate IRC (relaxed back to
+    the same well on both sides, e.g. a bond-rotation TS) rather than a
+    genuine two-minima elementary step, so this is worth surfacing as its
+    own group rather than mixing it in with real steps."""
+    from mepd.irc_network import _same_connectivity
+
+    if len(chain) < 2:
+        return "endpoints not comparable"
+    start, end = chain.nodes[0], chain.nodes[-1]
+    if getattr(start, "graph", None) is None or getattr(end, "graph", None) is None:
+        return "endpoints not comparable"
+    return "matching endpoints" if _same_connectivity(start, end) else "different endpoints"
 
 
 def _ts_output_nodes_payload(result: TsOutputResult) -> list[dict]:
@@ -321,11 +367,31 @@ def _ts_output_nodes_payload(result: TsOutputResult) -> list[dict]:
             "trajectory": trajectory,
         })
 
+    known_energies = [
+        node._cached_energy for _, node in result.structures if node._cached_energy is not None
+    ]
+    baseline = min(known_energies) if known_energies else None
     for label, node in result.structures:
-        add("TS structures", label, [_single_structure_payload(node)])
+        classification = result.group_labels.get(label)
+        if classification is None and result.group_labels:
+            classification = "unclassified"
+        group = f"TS structures ({classification})" if classification else "TS structures"
+        add(group, label, [_single_structure_payload(node, baseline)])
+
     for label, chain in result.irc_paths:
         if chain is not None and len(chain) > 0:
-            add("IRC paths", label, [_chain_payload(chain)])
+            classification = result.group_labels.get(label)
+            if classification is None and result.group_labels:
+                # This `ts/` directory has real `mepd channels` classification
+                # data, but this particular label isn't in it -- it was
+                # dropped (failed TS-opt/IRC, or an IRC that never reached a
+                # genuine second minimum). Keep the self-consistency label as
+                # a diagnostic instead of hiding why.
+                classification = f"unclassified -- {_irc_endpoint_match_label(chain)}"
+            elif classification is None:
+                classification = _irc_endpoint_match_label(chain)
+            group = f"IRC paths ({classification})"
+            add(group, f"{label} IRC", [_chain_payload(chain)])
 
     return nodes
 
@@ -417,8 +483,8 @@ def render_visualization_html(
         if not nodes:
             raise ValueError("Network has no edges with recoverable chains to visualize.")
         diagram_kind, diagram_obj = "network", (obj, nodes)
-    elif isinstance(obj, ConformerNetworkResult):
-        nodes = _conformer_network_nodes_payload(obj)
+    elif isinstance(obj, ChannelsResult):
+        nodes = _channels_nodes_payload(obj)
         if not nodes:
             raise ValueError(
                 "Nothing recoverable to visualize: no conformers and no "
@@ -444,7 +510,7 @@ def render_visualization_html(
         raise TypeError(
             f"Cannot visualize object of type {type(obj).__name__}; "
             "expected a Chain, a NEB/PathMinimizer, a TreeNode, a Pot, a "
-            "ConformerNetworkResult, a TsOutputResult, or a list of Node objects."
+            "ChannelsResult, a TsOutputResult, or a list of Node objects."
         )
 
     nodes_json = json.dumps(nodes)

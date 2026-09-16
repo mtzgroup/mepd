@@ -1,5 +1,5 @@
 """Conformer generation for a single endpoint (reactant or product), feeding
-the conformer-driven MEP-sampling workflow (`mepd conformer-network`): every
+`mepd channels`'s default `--method conformers` seeding strategy: every
 reactant conformer is paired with every product conformer and each pair gets
 its own recursive MSMEP run.
 
@@ -154,7 +154,16 @@ def _subselect_conformers(
     """Greedily keep conformers (in the given order) whose `qcinf.snap_rmsd`
     (symmetry/permutation-aware, Kabsch-aligned; bohr) is at least
     `rmsd_cutoff` from every conformer already kept, up to a maximum of
-    `n_max`."""
+    `n_max`.
+
+    `snap_rmsd` perceives connectivity from each structure's own 3D geometry
+    and raises `ValueError` if the two don't come out isomorphic. A distorted
+    ETKDG embedding (e.g. a ring that opened up, or two atoms pushed on top
+    of each other) can drift far enough that this disagrees with an
+    already-kept, presumably-good conformer of the same molecule -- that
+    candidate isn't a real conformer of `node`'s molecule, so it's discarded
+    rather than letting one bad embedding crash the whole run.
+    """
     if not conformers:
         return []
 
@@ -162,9 +171,13 @@ def _subselect_conformers(
     for candidate in conformers[1:]:
         if len(selected) >= n_max:
             break
-        if all(
-            qcinf.snap_rmsd(candidate.structure, kept.structure) >= rmsd_cutoff
-            for kept in selected
-        ):
+        try:
+            distinct_from_all_kept = all(
+                qcinf.snap_rmsd(candidate.structure, kept.structure) >= rmsd_cutoff
+                for kept in selected
+            )
+        except ValueError:
+            continue
+        if distinct_from_all_kept:
             selected.append(candidate)
     return selected

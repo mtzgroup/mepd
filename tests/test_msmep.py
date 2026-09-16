@@ -218,3 +218,74 @@ def test_recursive_minimize_runs_real_toy_potential_end_to_end():
     assert len(history.ordered_leaves) >= 1
     output_chain = history.output_chain
     assert len(output_chain) >= 2
+
+
+def _msmep_for_split_test(recheck_on_split: bool = False) -> MSMEP:
+    inputs = SimpleNamespace(
+        path_min_method="NEB",
+        path_min_inputs=SimpleNamespace(v=False),
+        atom_mapping_inputs=SimpleNamespace(recheck_on_split=recheck_on_split),
+    )
+    return MSMEP(inputs=inputs)
+
+
+def _split_test_chain() -> Chain:
+    nodes = [
+        StructureNode(structure=_structure([[0.0, 0.0, 0.0], [0.0, 0.0, 0.7]])),
+        StructureNode(structure=_structure([[1.0, 0.0, 0.0], [1.0, 0.0, 1.7]])),
+    ]
+    return Chain.model_validate({"nodes": nodes, "parameters": ChainInputs()})
+
+
+def test_make_sequence_of_chains_recheck_on_split_realigns_when_changed(monkeypatch):
+    import mepd.atom_mapping_selection as selection_module
+
+    m = _msmep_for_split_test(recheck_on_split=True)
+    chain = _split_test_chain()
+    monkeypatch.setattr(m, "_do_minima_based_split", lambda chain, minimization_results: [chain])
+
+    new_structure = _structure([[9.0, 0.0, 0.0], [9.0, 0.0, 1.7]])
+    monkeypatch.setattr(
+        selection_module, "maybe_realign_pair",
+        lambda start, end, run_inputs: (new_structure, True),
+    )
+
+    result = m.make_sequence_of_chains(chain=chain, split_method="minima", minimization_results=[])
+
+    assert len(result) == 1
+    assert np.allclose(np.asarray(result[0][-1].structure.geometry), np.asarray(new_structure.geometry))
+
+
+def test_make_sequence_of_chains_no_recheck_by_default(monkeypatch):
+    import mepd.atom_mapping_selection as selection_module
+
+    m = _msmep_for_split_test(recheck_on_split=False)
+    chain = _split_test_chain()
+    monkeypatch.setattr(m, "_do_minima_based_split", lambda chain, minimization_results: [chain])
+
+    calls = []
+
+    def spying_maybe_realign_pair(start, end, run_inputs):
+        calls.append((start, end))
+        return end, True
+
+    monkeypatch.setattr(selection_module, "maybe_realign_pair", spying_maybe_realign_pair)
+
+    result = m.make_sequence_of_chains(chain=chain, split_method="minima", minimization_results=[])
+
+    assert calls == []
+    assert result == [chain]
+
+
+def test_make_sequence_of_chains_recheck_on_split_missing_atom_mapping_inputs_is_a_no_op(monkeypatch):
+    """A bare `inputs` with no `atom_mapping_inputs` field at all (e.g. an
+    older/minimal test fixture) must not crash -- the nested `getattr`
+    default just treats it as `recheck_on_split=False`."""
+    inputs = SimpleNamespace(path_min_method="NEB")
+    m = MSMEP(inputs=inputs)
+    chain = _split_test_chain()
+    monkeypatch.setattr(m, "_do_minima_based_split", lambda chain, minimization_results: [chain])
+
+    result = m.make_sequence_of_chains(chain=chain, split_method="minima", minimization_results=[])
+
+    assert result == [chain]

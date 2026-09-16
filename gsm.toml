@@ -1,0 +1,37 @@
+engine_name = "gxtb"
+path_min_method = "GSM"
+[gxtb_engine_kwds]
+executable = "/Users/janestrada/xtbinstall/bin/gxtb"
+n_threads = 1
+
+[nanoreactor_inputs]
+
+[path_min_inputs]
+executable = "/Users/janestrada/gsminstall/bin/gsm"
+[chain_inputs]
+k = 0.1
+delta_k = 0.09
+do_parallel = true
+use_geodesic_interpolation = true
+node_freezing = true
+fraction_freeze = 0.1
+node_rms_thre = 5.0
+node_ene_thre = 5.0
+frozen_atom_indices = ""
+
+[gi_inputs]
+nimages = 10
+friction = 0.001
+nudge = 0.1
+random_seed = 0
+align = true
+
+[gi_inputs.extra_kwds]
+
+[ase_engine_kwds]
+
+
+[geometry_optimizer_kwds]
+
+[optimizer_kwds]
+name = "cg"

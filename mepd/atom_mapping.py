@@ -146,6 +146,74 @@ def suggest_atom_mapping(
     )
 
 
+def suggest_atom_mapping_candidates(
+    struct_start: Structure, struct_end: Structure, *, binary: bool = True, max_candidates: int = 5
+) -> list["AtomMapping"]:
+    """Like `suggest_atom_mapping`, but keeps up to `max_candidates` of
+    SLAPMapper's equal-minimal-cost candidate mappings instead of only the
+    first (`mapper.results` is already filtered to ties at the minimum
+    WL/LAP cost -- these candidates are NOT ranked by quality among
+    themselves, SLAPMapper gives no further signal to order them by).
+
+    Passes every atom index as a `break_sym_targets` candidate so
+    SLAPMapper both (a) explores genuinely distinct tied-cost orderings
+    its un-branched single pass would otherwise miss, and (b) dedupes
+    results that are mere relabelings of each other under the same
+    symmetry (`_remove_isomorphic_results`, only run when
+    `break_sym_targets` is given) -- so this doesn't waste downstream
+    geodesic-interpolation calls on redundant symmetry-equivalent
+    candidates. `_break_sym` only actually branches on label groups that
+    turn out to have size > 1, so this doesn't force unnecessary
+    branching on atoms with no real symmetry.
+
+    Returns an empty list under the same conditions `suggest_atom_mapping`
+    returns `None` (unbalanced atomic-number multisets, or no mapping
+    found at all).
+    """
+    _require_slapmapper()
+
+    mol_start = structure_to_molecule(struct_start)
+    mol_end = structure_to_molecule(struct_end)
+
+    if sorted(_atomic_numbers(mol_start)) != sorted(_atomic_numbers(mol_end)):
+        return []
+
+    lg_start = molecule_to_labeled_graph(mol_start)
+    lg_end = molecule_to_labeled_graph(mol_end)
+
+    mapper = SlapMapper(binary=binary)
+    mapper.get_maps([lg_start, lg_end], break_sym_targets=list(range(len(lg_start.labels))))
+    if not mapper.results:
+        return []
+
+    n_alternatives = len(mapper.results)
+    max_candidates = max(int(max_candidates), 0)
+    candidates: list[AtomMapping] = []
+    seen_orders: set[tuple[int, ...]] = set()
+    for result in mapper.results:
+        if len(candidates) >= max_candidates:
+            break
+
+        label2idxs_start = result["lgp"][0].label2idxs
+        label2idxs_end = result["lgp"][1].label2idxs
+
+        mapping: dict[int, int] = {}
+        for label, idxs_start in label2idxs_start.items():
+            idxs_end = label2idxs_end[label]
+            for a, b in zip(sorted(idxs_start), sorted(idxs_end)):
+                mapping[a] = b
+
+        order = tuple(mapping[i] for i in range(len(mapping)))
+        if order in seen_orders:
+            continue
+        seen_orders.add(order)
+
+        candidates.append(
+            AtomMapping(mapping=mapping, cost=result["val"], n_alternatives=n_alternatives)
+        )
+    return candidates
+
+
 def check_atom_mapping(
     struct_start: Structure, struct_end: Structure, *, binary: bool = True
 ) -> Optional[AtomMapping]:

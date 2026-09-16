@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 import typer
 from qcdata import Structure
 
+from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
 from mepd.chain import Chain
 from mepd.inputs import NetworkInputs, RunInputs
 
@@ -318,19 +320,86 @@ def _minimize_endpoints(start_node, end_node, run_inputs: RunInputs):
     return endpoints[0], endpoints[1]
 
 
+def _dump_atom_mapping_candidates(
+    candidates: list,
+    metric: str,
+    start_structure: Structure,
+    run_inputs: "RunInputs",
+    debug_dump_dir: Path,
+):
+    """`--debug-dump` variant of candidate scoring: computes ALL THREE
+    metrics (`mepd.atom_mapping_selection.METRICS`) for every candidate --
+    not just the selected one -- and writes each candidate's
+    geodesic-interpolated path (with energies) plus a `scores.txt` summary
+    table under `debug_dump_dir`, so a real run's --debug-dump doubles as
+    comparative data across metrics. Returns a `SelectionResult` using
+    `metric` for the actual decision, same as `select_best_candidate`."""
+    from mepd.atom_mapping_selection import METRICS, SelectionResult, score_candidate_all_metrics
+
+    debug_dump_dir.mkdir(parents=True, exist_ok=True)
+    all_scores: dict[str, dict[str, float]] = {}
+    chains: dict[str, Chain] = {}
+    for candidate in candidates:
+        scores, chain = score_candidate_all_metrics(candidate, start_structure, run_inputs)
+        all_scores[candidate.label] = scores
+        chains[candidate.label] = chain
+        chain.write_to_disk(debug_dump_dir / f"{candidate.label}.xyz")
+
+    identity_label = candidates[0].label
+    best = min(candidates, key=lambda c: all_scores[c.label][metric])
+    veto_margin = run_inputs.atom_mapping_inputs.veto_margin
+    if (
+        best.label != identity_label
+        and all_scores[identity_label][metric] - all_scores[best.label][metric] <= veto_margin
+    ):
+        best = candidates[0]
+
+    lines = ["candidate\t" + "\t".join(METRICS)]
+    for candidate in candidates:
+        row = [candidate.label] + [f"{all_scores[candidate.label][m]:.6f}" for m in METRICS]
+        marker = "  <- selected" if candidate.label == best.label else ""
+        lines.append("\t".join(row) + marker)
+    scores_path = debug_dump_dir / "scores.txt"
+    scores_path.write_text("\n".join(lines) + "\n")
+    typer.echo(f"  --debug-dump: wrote all-candidate, all-metric comparison to {scores_path}")
+
+    return SelectionResult(
+        winner=best,
+        scores={label: scores[metric] for label, scores in all_scores.items()},
+        chains=chains,
+    )
+
+
 def _check_endpoint_atom_mapping(
-    start_structure: Structure, end_structure: Structure, realign_atoms: bool
+    start_structure: Structure,
+    end_structure: Structure,
+    atom_mapping: bool,
+    run_inputs: "RunInputs",
+    *,
+    debug_dump: bool = False,
+    output: Optional[Path] = None,
 ) -> Structure:
     """Sanity-check --start/--end's atom correspondence via SLAPMapper's
     Weisfeiler-Lehman-like/sequential-LAP atom-to-atom mapping (Koda,
     ChemRxiv 2025), warning if it disagrees with the identity mapping
     implied by the two Structures sharing the same atom indexing.
 
-    Returns `end_structure` unchanged, unless `realign_atoms` is set and a
-    disagreeing mapping was found -- in which case `end_structure`'s atoms
-    are reordered to match --start according to that mapping.
+    Returns `end_structure` unchanged, unless `atom_mapping` is set and a
+    disagreeing mapping was found -- in which case up to
+    `run_inputs.atom_mapping_inputs.n_candidates` of SLAPMapper's candidate
+    mappings are each scored (alongside "don't reindex") via
+    `mepd.atom_mapping_selection.select_best_candidate`, and the
+    best-scoring option's `end_structure` is returned.
+
+    When `debug_dump` is set (and output is given), every candidate is
+    additionally scored under all three selection metrics and dumped to
+    `<output>/realign_debug/` -- see `_dump_atom_mapping_candidates`.
     """
     if len(start_structure.symbols) != len(end_structure.symbols):
+        typer.echo(
+            "Note: skipping the --start/--end atom-mapping sanity check "
+            "(--start and --end have different atom counts)."
+        )
         return end_structure
 
     from mepd.atom_mapping import HAS_SLAPMAPPER
@@ -342,7 +411,7 @@ def _check_endpoint_atom_mapping(
         )
         return end_structure
 
-    from mepd.atom_mapping import check_atom_mapping, realign_end_to_start
+    from mepd.atom_mapping import check_atom_mapping
 
     try:
         atom_map = check_atom_mapping(start_structure, end_structure)
@@ -353,17 +422,78 @@ def _check_endpoint_atom_mapping(
         )
         return end_structure
 
-    if atom_map is None or atom_map.is_identity:
+    if atom_map is None:
+        typer.echo(
+            "Note: SLAPMapper could not find any --start/--end atom mapping "
+            "(e.g. mismatched element composition); skipping the reordering check."
+        )
         return end_structure
 
-    if realign_atoms:
+    if atom_map.is_identity:
         typer.echo(
-            "--realign-atoms: reindexing --end's atoms to match the "
-            "SLAPMapper-suggested start<->end atom correspondence."
+            "--start/--end atom-mapping check: SLAPMapper's suggested mapping "
+            "agrees with the existing atom ordering; no reindexing needed."
         )
-        return realign_end_to_start(atom_map, end_structure)
+        return end_structure
 
-    return end_structure
+    if not atom_mapping:
+        return end_structure
+
+    from mepd.atom_mapping import suggest_atom_mapping_candidates
+    from mepd.atom_mapping_selection import build_candidates, select_best_candidate
+
+    n_candidates = run_inputs.atom_mapping_inputs.n_candidates
+    try:
+        atom_maps = suggest_atom_mapping_candidates(
+            start_structure, end_structure, max_candidates=n_candidates
+        )
+    except Exception as exc:
+        typer.echo(
+            f"Could not enumerate --atom-mapping candidate mappings "
+            f"({type(exc).__name__}: {exc}); keeping --end's original atom ordering."
+        )
+        return end_structure
+
+    candidates = build_candidates(start_structure, end_structure, atom_maps)
+    if len(candidates) == 1:
+        # Every candidate SLAPMapper returned was the identity mapping.
+        return end_structure
+
+    metric = run_inputs.atom_mapping_inputs.metric
+    typer.echo(
+        f"--atom-mapping: found {len(candidates) - 1} distinct candidate mapping(s) "
+        f"(of up to {n_candidates} considered). Selecting among 'identity' (don't "
+        f"reindex) and the candidates by --atom-mapping-metric={metric}..."
+    )
+
+    debug_dump_dir = Path(output) / "realign_debug" if debug_dump and output is not None else None
+    try:
+        if debug_dump_dir is not None:
+            result = _dump_atom_mapping_candidates(
+                candidates, metric, start_structure, run_inputs, debug_dump_dir
+            )
+        else:
+            result = select_best_candidate(
+                candidates, metric, start_structure, run_inputs,
+                veto_margin=run_inputs.atom_mapping_inputs.veto_margin,
+            )
+    except Exception as exc:
+        typer.echo(
+            f"Atom-mapping candidate selection failed ({type(exc).__name__}: {exc}); "
+            "keeping --end's original atom ordering."
+        )
+        return end_structure
+
+    for candidate in candidates:
+        marker = "  <- selected" if candidate.label == result.winner.label else ""
+        typer.echo(f"  {candidate.label}: {metric}={result.scores[candidate.label]:.4f}{marker}")
+
+    if result.winner.label == "identity":
+        typer.echo("--atom-mapping: keeping --end's original atom ordering.")
+    else:
+        typer.echo(f"--atom-mapping: reindexing --end's atoms per '{result.winner.label}'.")
+
+    return result.winner.end_structure
 
 
 def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
@@ -412,7 +542,7 @@ def _run_msmep_pairs(
         # it can't leak across pairs and wrongly skip a later, genuinely
         # different pair that merely resembles an earlier one under
         # `is_identical`'s generous default thresholds (this matters most for
-        # conformer-network, where many pairs deliberately share the same
+        # `mepd channels`, where many pairs deliberately share the same
         # reactant/product molecular graph across different conformers).
         setattr(run_inputs.path_min_inputs, "attempted_pairs_payload", [])
         try:
@@ -515,6 +645,12 @@ def _run_network_completion(
     )
 
 
+@dataclass
+class TsIrcResult:
+    ts_node: object
+    irc_chain: Optional[Chain] = None
+
+
 def _optimize_ts_and_irc(
     ts_guess_node,
     run_inputs: RunInputs,
@@ -522,15 +658,17 @@ def _optimize_ts_and_irc(
     *,
     run_irc: bool,
     label: str = "ts",
-):
+) -> Optional["TsIrcResult"]:
     """Optimize a TS-guess node with the engine and, if requested, follow up
     with an IRC -- writes <label>.xyz (and <label>_irc.xyz) into `output`.
 
-    Shared by `ts` and `run --use-tsopt`. Never raises/exits itself: returns
-    the optimized StructureNode, or None on failure/no support, so each
-    caller decides whether that is fatal (a standalone `ts` invocation should
-    exit non-zero; a TS opt launched automatically after `run` should just
-    warn and let the NEB result stand).
+    Shared by `ts`, `run --use-tsopt`, and `channels`. Never raises/exits
+    itself: returns a `TsIrcResult` (with `irc_chain=None` if `run_irc` was
+    False or the IRC itself failed), or None on TS-optimization
+    failure/no support, so each caller decides whether that is fatal (a
+    standalone `ts` invocation should exit non-zero; a TS opt launched
+    automatically after `run` should just warn and let the NEB result
+    stand; `channels` needs the IRC chain itself to classify the result).
     """
     from mepd.nodes.node import StructureNode
 
@@ -559,11 +697,15 @@ def _optimize_ts_and_irc(
     ts_node = result
     output.mkdir(parents=True, exist_ok=True)
     ts_path = output / f"{label}.xyz"
-    ts_path.write_text(ts_node.structure.to_xyz())
+    from mepd.inputs import ChainInputs
+
+    Chain.model_validate(
+        {"nodes": [ts_node], "parameters": ChainInputs()}
+    ).write_to_disk(ts_path)
     typer.echo(f"Wrote optimized TS structure to {ts_path}")
 
     if not run_irc:
-        return ts_node
+        return TsIrcResult(ts_node=ts_node)
 
     typer.echo(f"Computing IRC ({label})...")
     irc_fn = getattr(run_inputs.engine, "compute_irc_chain", None)
@@ -575,12 +717,12 @@ def _optimize_ts_and_irc(
             irc_chain = compute_irc_chain_with_geometric(run_inputs.engine, ts_node)
     except Exception as exc:
         typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
-        return ts_node
+        return TsIrcResult(ts_node=ts_node)
 
     irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
     irc_chain.write_to_disk(irc_path)
     typer.echo(f"Wrote IRC path to {irc_path}")
-    return ts_node
+    return TsIrcResult(ts_node=ts_node, irc_chain=irc_chain)
 
 
 @app.command("run")
@@ -671,8 +813,8 @@ def run(
         False, "--irc",
         help="Follow up each --use-tsopt transition state with an IRC. Requires --use-tsopt.",
     ),
-    realign_atoms: bool = typer.Option(
-        False, "--realign-atoms",
+    atom_mapping: bool = typer.Option(
+        False, "--atom-mapping",
         help="Every run checks whether SLAPMapper's Weisfeiler-Lehman-like/"
         "sequential-LAP atom-to-atom mapping (Koda, ChemRxiv 2025) between "
         "--start and --end agrees with their shared input atom ordering, "
@@ -680,6 +822,48 @@ def run(
         "atoms to match the suggested mapping instead of just warning. "
         "No-op when --start/--end are both SMILES (already mapped "
         "consistently before 3D embedding) or atom counts differ.",
+    ),
+    debug_dump: bool = typer.Option(
+        False, "--debug-dump",
+        help="When --atom-mapping triggers its candidate-mapping selection, "
+        "also write every candidate's interpolated path (xyz + energies) and a "
+        "scores.txt comparing all three selection metrics per candidate to "
+        "<output>/realign_debug/, e.g. for inspecting them with `mepd visualize`.",
+    ),
+    atom_mapping_candidates: int = typer.Option(
+        5, "--atom-mapping-candidates",
+        help="--atom-mapping: how many of SLAPMapper's equal-minimal-cost "
+        "candidate mappings to keep and consider (they're ties, not ranked by "
+        "quality among themselves).",
+    ),
+    atom_mapping_metric: str = typer.Option(
+        "gi-energy", "--atom-mapping-metric",
+        help="--atom-mapping: how each candidate mapping (including 'don't "
+        "reindex') is scored from its geodesic-interpolated path -- "
+        "'gi-energy' (highest QM energy along the path; most expensive, one "
+        "engine energy evaluation per candidate), 'geodesic-distance' (the "
+        "geodesic optimizer's own path length; free), or 'path-rmsd' "
+        "(cumulative per-frame RMSD along the path; free). Which is actually "
+        "the best predictor of a correct mapping isn't settled -- "
+        "--debug-dump records all three per candidate to help compare them.",
+    ),
+    atom_mapping_veto_margin: float = typer.Option(
+        0.0, "--atom-mapping-veto-margin",
+        help="--atom-mapping: a non-identity candidate must beat 'don't "
+        "reindex' by more than this (in --atom-mapping-metric's own units) to "
+        "be adopted; otherwise the original --end ordering is kept even if "
+        "some candidate scored marginally better. Default 0.0 is a pure "
+        "best-of-N with no calibrated stability margin yet.",
+    ),
+    atom_mapping_recheck_splits: bool = typer.Option(
+        False, "--atom-mapping-recheck-splits",
+        help="Experimental: also re-run the same best-of-N atom-mapping "
+        "selection (--atom-mapping-metric etc.) at every new (reactant, "
+        "product) pair MSMEP's recursive splitting discovers, not just the "
+        "original --start/--end pair. Independent of --atom-mapping. Atom "
+        "order is otherwise preserved throughout the recursion, so this only "
+        "changes anything for a split whose own reactant/product pair "
+        "happens to have SLAPMapper-detectable symmetry.",
     ),
     output: Path = typer.Option(
         Path("mepd_output"), "--output", "-o",
@@ -702,6 +886,12 @@ def run(
         raise typer.BadParameter("--irc requires --use-tsopt.")
     if same_pair_split_limit <= 0:
         raise typer.BadParameter("--same-pair-split-limit must be a positive integer.")
+    if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
+        raise typer.BadParameter(
+            f"--atom-mapping-metric must be one of {_ATOM_MAPPING_METRICS}."
+        )
+    if atom_mapping_candidates <= 0:
+        raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
     if network_completion and not recursive and not parallel:
         typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
         recursive = True
@@ -711,12 +901,17 @@ def run(
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
     run_inputs.path_min_inputs.recursive_same_pair_split_limit = same_pair_split_limit
+    run_inputs.atom_mapping_inputs.n_candidates = atom_mapping_candidates
+    run_inputs.atom_mapping_inputs.metric = atom_mapping_metric
+    run_inputs.atom_mapping_inputs.veto_margin = atom_mapping_veto_margin
+    run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     _echo_run_inputs_summary(run_inputs)
 
     start_is_smiles = not Path(start).exists()
     end_is_smiles = not Path(end).exists()
+    both_smiles_pair = start_is_smiles and end_is_smiles
 
-    if start_is_smiles and end_is_smiles:
+    if both_smiles_pair:
         typer.echo(
             "--start/--end are both SMILES strings; computing a SLAPMapper "
             "atom-to-atom mapping to build a consistently-indexed structure pair..."
@@ -737,7 +932,6 @@ def run(
     else:
         start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
         end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
-        end_structure = _check_endpoint_atom_mapping(start_structure, end_structure, realign_atoms)
 
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)
@@ -753,6 +947,19 @@ def run(
             )
     if effective_minimize_ends:
         start_node, end_node = _minimize_endpoints(start_node, end_node, run_inputs)
+
+    # The --atom-mapping sanity check compares geodesic-interpolation path
+    # energies between the unpermuted and permuted --end -- run it AFTER
+    # minimization (rather than on the raw SMILES embedding) so that
+    # comparison reflects real minima, not embedding artifacts/strain that
+    # can otherwise dominate the energy delta the veto decision is based on.
+    if not both_smiles_pair:
+        realigned_end_structure = _check_endpoint_atom_mapping(
+            start_node.structure, end_node.structure, atom_mapping, run_inputs,
+            debug_dump=debug_dump, output=output,
+        )
+        if realigned_end_structure is not end_node.structure:
+            end_node = StructureNode(structure=realigned_end_structure)
 
     seed_chain = Chain.model_validate({
         "nodes": [start_node, end_node],
@@ -898,7 +1105,7 @@ def _collect_ts_guess_tasks(
 
     - a directory with adj_matrix.txt: an MSMEP split-tree (`mepd run
       --recursive`/`--parallel` output) -- one guess per leaf.
-    - a directory with conformers/ and/or pairs/: a `mepd conformers` output
+    - a directory with conformers/ and/or pairs/: a `mepd channels` output
       -- one guess per leaf of each completed pair's tree.
     - a .json file: a network.json (`Pot`) -- one guess per edge.
     - anything else: a single TS-guess xyz file, labeled "ts" (the original,
@@ -946,7 +1153,7 @@ def _collect_ts_guess_tasks(
 
         raise typer.BadParameter(
             f"'{input_path}' is a directory but has neither adj_matrix.txt (a "
-            "split-tree) nor conformers/ or pairs/ (a `mepd conformers` output)."
+            "split-tree) nor conformers/ or pairs/ (a `mepd channels` output)."
         )
 
     if input_path.suffix == ".json":
@@ -964,7 +1171,7 @@ def ts(
         help="Path to a TS-guess input, auto-detected by content: a single "
         "TS-guess xyz file (optimizes just that one guess), an MSMEP "
         "split-tree directory (has adj_matrix.txt, as written by `mepd run "
-        "--recursive`/`--parallel` to <output>/tree), a `mepd conformers` "
+        "--recursive`/`--parallel` to <output>/tree), a `mepd channels` "
         "output directory (has conformers/ and/or pairs/), or a network.json "
         "-- for the latter three, every TS guess found is optimized.",
     ),
@@ -991,7 +1198,7 @@ def ts(
 ) -> None:
     """Optimize transition-state guess(es). `--guess` accepts a single
     TS-guess xyz file, or a whole result to scan for every not-yet-optimized
-    TS guess it contains: an MSMEP split-tree directory, a `mepd conformers`
+    TS guess it contains: an MSMEP split-tree directory, a `mepd channels`
     output directory, or a network.json."""
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
     _echo_run_inputs_summary(run_inputs)
@@ -1017,8 +1224,8 @@ def ts(
             typer.echo(f"Skipping {label}: already optimized ({ts_path}).")
             n_skipped += 1
             continue
-        ts_node = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label=label)
-        if ts_node is None:
+        result = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label=label)
+        if result is None:
             n_failed += 1
         else:
             n_done += 1
@@ -1031,14 +1238,14 @@ def ts(
         raise typer.Exit(code=1)
 
 
-def _load_conformer_network_result(result_path: Path, charge: int, multiplicity: int):
-    """Load a `mepd conformers` output directory (has a conformers/ pool
+def _load_channels_result(result_path: Path, charge: int, multiplicity: int):
+    """Load a `mepd channels` output directory (has a conformers/ pool
     directory and/or a pairs/ directory of per-pair MSMEP trees) into a
-    `ConformerNetworkResult` for `mepd visualize`."""
+    `ChannelsResult` for `mepd visualize`."""
     from mepd.inputs import ChainInputs
     from mepd.pot import Pot
     from mepd.TreeNode import TreeNode
-    from mepd.viz import ConformerNetworkResult
+    from mepd.viz import ChannelsResult
 
     def _load_conformer_pool(fp: Path) -> list:
         if not fp.exists():
@@ -1092,7 +1299,7 @@ def _load_conformer_network_result(result_path: Path, charge: int, multiplicity:
         except Exception:
             network = None
 
-    return ConformerNetworkResult(
+    return ChannelsResult(
         reactant_conformers=reactant_conformers,
         product_conformers=product_conformers,
         pairs=pairs,
@@ -1100,18 +1307,79 @@ def _load_conformer_network_result(result_path: Path, charge: int, multiplicity:
     )
 
 
+def _load_channel_classification(result_path: Path) -> dict[str, str]:
+    """If `result_path` (a `mepd ts`-shaped directory) is the `ts/`
+    subdirectory of a `mepd channels` output, map every TS-guess label
+    (e.g. "ts_pair_0_3_leaf_3") to the channel/alternate-route it was
+    classified into (e.g. "Channel 0"), by reading the `members.txt`
+    `_write_classified_group` already wrote under the sibling
+    `channels/`/`alternate-routes/` folders. Returns an empty dict if
+    `result_path` isn't part of a `mepd channels` output (a plain `mepd ts`
+    output has no such siblings), so callers can fall back to their own
+    generic labeling."""
+    membership: dict[str, str] = {}
+    root = result_path.parent
+    for dirname, prefix in (("channels", "Channel"), ("alternate-routes", "Alternate route")):
+        group_root = root / dirname
+        if not group_root.is_dir():
+            continue
+        for group_dir in sorted(group_root.iterdir()):
+            members_fp = group_dir / "members.txt"
+            if not members_fp.is_file():
+                continue
+            index = group_dir.name.rsplit("_", 1)[-1]
+            for line in members_fp.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("connects:"):
+                    continue
+                membership[line] = f"{prefix} {index}"
+    return membership
+
+
+def _load_channel_reference_reactant(result_path: Path, charge: int, multiplicity: int):
+    """If `result_path` (a `mepd ts`-shaped directory) is the `ts/`
+    subdirectory of a `mepd channels` output, return any one conformer of
+    the original --start endpoint (from the sibling `conformers/start.xyz`
+    pool) as a connectivity reference -- any conformer works, since
+    connectivity matching ignores geometry entirely. Used to reorient each
+    "Channel"-classified IRC so its reactant side is consistently
+    `chain[0]` across every displayed channel, since displayed energies
+    are relative to `chain[0]` (see `Chain.energies_kcalmol`) -- without
+    this, two channels' IRCs could be shown with opposite orientations,
+    making one display a forward barrier and the other a reverse barrier,
+    not directly comparable. Returns `None` if there's no such sibling
+    (e.g. a plain `mepd ts` output), so callers can skip reorientation."""
+    from mepd.inputs import ChainInputs
+
+    start_fp = result_path.parent / "conformers" / "start.xyz"
+    if not start_fp.is_file():
+        return None
+    try:
+        pool = Chain.from_xyz(start_fp, ChainInputs(), charge=charge or 0, spinmult=multiplicity or 1)
+    except Exception:
+        return None
+    return pool[0] if len(pool) > 0 else None
+
+
 def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
     """Load a `mepd ts` (or `mepd run --use-tsopt`) output directory: one or
     more <label>.xyz TS structures, each optionally paired with an IRC path
     (<label>_irc.xyz, or irc.xyz for the bare "ts" label) -- see
     `_optimize_ts_and_irc`, which writes these -- into a `TsOutputResult`
-    for `mepd visualize`."""
+    for `mepd visualize`. If this is a `mepd channels` output's `ts/`
+    directory, also attaches its real channel/alternate-route
+    classification (see `_load_channel_classification`) and reorients every
+    "Channel"-classified IRC so its reactant side is consistently
+    `chain[0]` (see `_load_channel_reference_reactant`)."""
     from mepd.inputs import ChainInputs
     from mepd.viz import TsOutputResult
 
     structures = []
     irc_paths = []
     load_errors = []
+
+    group_labels = _load_channel_classification(result_path)
+    reference_reactant = _load_channel_reference_reactant(result_path, charge, multiplicity)
 
     ts_files = sorted(
         p for p in result_path.glob("ts*.xyz") if not p.stem.endswith("_irc")
@@ -1131,7 +1399,16 @@ def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
         if irc_fp.exists():
             try:
                 irc_chain = Chain.from_xyz(irc_fp, ChainInputs(), charge=charge, spinmult=multiplicity)
-                irc_paths.append((f"{label} IRC", irc_chain))
+                if (
+                    reference_reactant is not None
+                    and group_labels.get(label, "").startswith("Channel")
+                    and len(irc_chain) > 1
+                    and not _connectivity_matches(irc_chain[0], reference_reactant)
+                    and _connectivity_matches(irc_chain[-1], reference_reactant)
+                ):
+                    irc_chain = irc_chain.copy()
+                    irc_chain.nodes.reverse()
+                irc_paths.append((label, irc_chain))
             except Exception as exc:
                 load_errors.append(f"{irc_fp.name}: {type(exc).__name__}: {exc}")
 
@@ -1140,7 +1417,7 @@ def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
         for msg in load_errors:
             typer.echo(f"  - {msg}")
 
-    return TsOutputResult(structures=structures, irc_paths=irc_paths)
+    return TsOutputResult(structures=structures, irc_paths=irc_paths, group_labels=group_labels)
 
 
 def _load_visualization_object(result_path: Path, charge: int, multiplicity: int):
@@ -1148,7 +1425,7 @@ def _load_visualization_object(result_path: Path, charge: int, multiplicity: int
     visualize`: a chain xyz file, a network.json (a `Pot`), a split-tree
     directory (has adj_matrix.txt), a bare NEB history directory (has
     traj_*.xyz but no adj_matrix.txt -- e.g. a manually saved
-    `<name>_history/` folder), a `mepd conformers` output directory (has
+    `<name>_history/` folder), a `mepd channels` output directory (has
     conformers/ and/or pairs/), or a `mepd ts`/`run --use-tsopt` output
     directory (has one or more ts*.xyz files)."""
     from mepd.inputs import ChainInputs
@@ -1170,12 +1447,12 @@ def _load_visualization_object(result_path: Path, charge: int, multiplicity: int
                 multiplicity=multiplicity,
             )
         if (result_path / "conformers").is_dir() or (result_path / "pairs").is_dir():
-            return _load_conformer_network_result(result_path, charge, multiplicity)
+            return _load_channels_result(result_path, charge, multiplicity)
         if list(result_path.glob("ts*.xyz")):
             return _load_ts_output_result(result_path, charge, multiplicity)
         raise typer.BadParameter(
             f"'{result_path}' is a directory but has neither adj_matrix.txt (a split-tree), "
-            "traj_*.xyz files (a NEB history), conformers/ or pairs/ (a `mepd conformers` "
+            "traj_*.xyz files (a NEB history), conformers/ or pairs/ (a `mepd channels` "
             "output), nor ts*.xyz files (a `mepd ts` output)."
         )
 
@@ -1191,7 +1468,7 @@ def visualize(
         ..., exists=True,
         help="Path to a mepd result: a chain xyz file (mep_output.xyz, unique.xyz -- "
         "a matching <stem>.energies sidecar, if present, is used for the energy profile), "
-        "a network.json, a split-tree/NEB-history directory, a `mepd conformers` "
+        "a network.json, a split-tree/NEB-history directory, a `mepd channels` "
         "output directory, or a `mepd ts`/`run --use-tsopt` output directory.",
     ),
     output: Optional[Path] = typer.Option(
@@ -1214,7 +1491,7 @@ def visualize(
     highlighted energy-profile point) for a chain, plus -- for a split-tree
     or network.json -- a diagram of tree nodes/network edges to click
     through, and a trajectory-step slider for whichever one is selected.
-    For a `mepd conformers` output directory, shows reactant conformers,
+    For a `mepd channels` output directory, shows reactant conformers,
     product conformers, and completed MEP outputs as clickable groups. For
     a `mepd ts`/`run --use-tsopt` output directory, shows every optimized
     TS structure and its IRC path (if computed) as clickable groups."""
@@ -1517,10 +1794,203 @@ def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> 
     return optimized
 
 
-@app.command("conformers")
-def conformer_network(
+def _connectivity_matches(a, b) -> bool:
+    """Same molecule (bond connectivity + stereochemistry), ignoring
+    conformation -- mirrors `NetworkBuilder._graph_equivalent`, used here to
+    compare an IRC-recovered endpoint against the originally requested
+    --start/--end structures without caring which conformer it landed on."""
+    from mepd.nodes.nodehelpers import _is_connectivity_identical
+
+    if getattr(a, "graph", None) is None or getattr(b, "graph", None) is None:
+        return False
+    return _is_connectivity_identical(a, b, verbose=False, collect_comparison=False)
+
+
+def _register_route_class(known: list, node) -> int:
+    """Greedily assign `node` to an existing connectivity class in `known`
+    (a list of representative nodes so far), registering a new class if none
+    match. Mirrors `NetworkBuilder._get_ind_td`'s registration pattern."""
+    for i, rep in enumerate(known):
+        if _connectivity_matches(node, rep):
+            return i
+    known.append(node)
+    return len(known) - 1
+
+
+def _cluster_by_ts_identity(candidates: list[tuple], run_inputs: RunInputs) -> list[list[tuple]]:
+    """Greedily cluster `(ts_node, irc_chain, label)` candidates into classes
+    whose TS structures are pairwise `is_identical` -- the same cutoffs
+    `NetworkBuilder._equality_function`/`check_if_elem_step` already use for
+    "are these the same structure"."""
+    from mepd.nodes.nodehelpers import is_identical
+
+    clusters: list[list[tuple]] = []
+    for candidate in candidates:
+        ts_node = candidate[0]
+        for cluster in clusters:
+            if is_identical(
+                ts_node, cluster[0][0],
+                fragment_rmsd_cutoff=run_inputs.chain_inputs.node_rms_thre,
+                kcal_mol_cutoff=run_inputs.chain_inputs.node_ene_thre,
+                verbose=False,
+            ):
+                cluster.append(candidate)
+                break
+        else:
+            clusters.append([candidate])
+    return clusters
+
+
+def _load_ts_and_irc_from_disk(
+    ts_dir: Path, label: str, charge: int, multiplicity: int
+) -> Optional["TsIrcResult"]:
+    """Resume support for `channels`: if a prior run already wrote this
+    label's TS (and IRC) to disk, reload them instead of skip-and-forget --
+    unlike `ts`'s simpler "already done" skip, `channels` needs the actual
+    IRC endpoints to classify this result, not just a done/not-done flag."""
+    from mepd.inputs import ChainInputs
+
+    ts_path = ts_dir / f"{label}.xyz"
+    if not ts_path.exists():
+        return None
+    ts_chain = Chain.from_xyz(ts_path, ChainInputs(), charge=charge, spinmult=multiplicity)
+    ts_node = ts_chain[0]
+
+    irc_path = ts_dir / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
+    irc_chain = None
+    if irc_path.exists():
+        irc_chain = Chain.from_xyz(irc_path, ChainInputs(), charge=charge, spinmult=multiplicity)
+    return TsIrcResult(ts_node=ts_node, irc_chain=irc_chain)
+
+
+def _write_classified_group(
+    candidates: list[tuple],
+    out_dir: Path,
+    prefix: str,
+    index: int,
+    extra_info: Optional[str] = None,
+) -> None:
+    from mepd.inputs import ChainInputs
+
+    group_dir = out_dir / f"{prefix}_{index}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    def _ts_energy(candidate):
+        try:
+            return candidate[0].energy
+        except Exception:
+            return float("inf")
+
+    ts_node, irc_chain, _ = min(candidates, key=_ts_energy)
+    Chain.model_validate(
+        {"nodes": [ts_node], "parameters": ChainInputs()}
+    ).write_to_disk(group_dir / "ts.xyz")
+    irc_chain.write_to_disk(group_dir / "irc.xyz")
+
+    lines = [extra_info] if extra_info else []
+    lines.extend(label for _, _, label in candidates)
+    (group_dir / "members.txt").write_text("\n".join(lines) + "\n")
+
+
+def _discover_channels(
+    output: Path,
+    start_node,
+    end_node,
+    run_inputs: RunInputs,
+    charge: Optional[int],
+    multiplicity: Optional[int],
+) -> None:
+    """TS-opt + IRC every leaf across every completed pair tree in `output`,
+    then classify by IRC endpoints: a leaf whose IRC reconnects the
+    original --start/--end pair (regardless of which conformer/seed
+    produced it) is a channel candidate; a leaf whose IRC connects some
+    other pair of real minima is an alternate-route candidate; a leaf whose
+    TS optimization or IRC failed to converge is dropped from both. Within
+    each bucket, candidates are further deduplicated into distinct TS
+    classes -- this is what turns e.g. 4 conformer-pair runs into "2
+    channels" when 2 of those runs converged to essentially the same TS.
+    """
+    from mepd.NetworkBuilder import _stereochemical_smiles_key
+
+    tree_charge = charge if charge is not None else 0
+    tree_multiplicity = multiplicity if multiplicity is not None else 1
+
+    tasks = _collect_ts_guess_tasks(output, charge, multiplicity)
+    if not tasks:
+        typer.echo("No TS guesses found across completed pairs; no channels to classify.")
+        return
+
+    ts_dir = output / "ts"
+    ts_dir.mkdir(parents=True, exist_ok=True)
+
+    channel_candidates: list[tuple] = []
+    route_classes: list = []
+    route_buckets: dict = {}
+    n_failed = 0
+
+    for label, guess_node in tasks:
+        result = _load_ts_and_irc_from_disk(ts_dir, label, tree_charge, tree_multiplicity)
+        if result is None:
+            result = _optimize_ts_and_irc(guess_node, run_inputs, ts_dir, run_irc=True, label=label)
+        if result is None or result.irc_chain is None or len(result.irc_chain) < 2:
+            n_failed += 1
+            continue
+
+        irc_first, irc_last = result.irc_chain[0], result.irc_chain[-1]
+        candidate = (result.ts_node, result.irc_chain, label)
+        if (
+            _connectivity_matches(irc_first, start_node) and _connectivity_matches(irc_last, end_node)
+        ) or (
+            _connectivity_matches(irc_last, start_node) and _connectivity_matches(irc_first, end_node)
+        ):
+            channel_candidates.append(candidate)
+            continue
+
+        i = _register_route_class(route_classes, irc_first)
+        j = _register_route_class(route_classes, irc_last)
+        if i == j:
+            # IRC collapsed to the same minimum on both sides -- not a
+            # genuine two-minima route.
+            n_failed += 1
+            continue
+        route_buckets.setdefault(frozenset((i, j)), []).append(candidate)
+
+    channels_dir = output / "channels"
+    alt_dir = output / "alternate-routes"
+
+    channel_clusters = _cluster_by_ts_identity(channel_candidates, run_inputs)
+    for k, cluster in enumerate(channel_clusters):
+        _write_classified_group(cluster, channels_dir, "channel", k)
+
+    n_routes = 0
+    for (i, j), bucket_candidates in route_buckets.items():
+        smi_a = _stereochemical_smiles_key(route_classes[i]) or "?"
+        smi_b = _stereochemical_smiles_key(route_classes[j]) or "?"
+        for cluster in _cluster_by_ts_identity(bucket_candidates, run_inputs):
+            _write_classified_group(
+                cluster, alt_dir, "route", n_routes,
+                extra_info=f"connects: {smi_a} <-> {smi_b}",
+            )
+            n_routes += 1
+
+    typer.echo(
+        f"{len(channel_clusters)} channel(s) found for the requested pair "
+        f"({len(channel_candidates)} contributing run(s)), {n_routes} "
+        f"alternate route(s), {n_failed} failed."
+    )
+
+
+@app.command("channels")
+def channels(
     start: str = typer.Option(..., "--start", help="Path to the reactant-endpoint xyz file, or a SMILES string."),
     end: str = typer.Option(..., "--end", help="Path to the product-endpoint xyz file, or a SMILES string."),
+    method: str = typer.Option(
+        "conformers", "--method",
+        help="Seed-generation strategy for perturbing the search to surface "
+        "alternate TS channels between --start and --end. Currently only "
+        "'conformers' (RDKit conformer sampling of each endpoint) is "
+        "implemented; more methods may be added later.",
+    ),
     inputs: Optional[Path] = typer.Option(
         None, "--inputs", "-i", exists=True,
         help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
@@ -1531,8 +2001,8 @@ def conformer_network(
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Override the spin multiplicity on both endpoints."
     ),
-    realign_atoms: bool = typer.Option(
-        False, "--realign-atoms",
+    atom_mapping: bool = typer.Option(
+        False, "--atom-mapping",
         help="Every run checks whether SLAPMapper's Weisfeiler-Lehman-like/"
         "sequential-LAP atom-to-atom mapping (Koda, ChemRxiv 2025) between "
         "--start and --end agrees with their shared input atom ordering, "
@@ -1540,6 +2010,51 @@ def conformer_network(
         "atoms (and therefore every product conformer generated from it) to "
         "match the suggested mapping instead of just warning. No-op when "
         "--start/--end are both SMILES or atom counts differ.",
+    ),
+    debug_dump: bool = typer.Option(
+        False, "--debug-dump",
+        help="Write extra diagnostic structures to disk for inspection (e.g. via "
+        "`mepd visualize`): (1) when --start/--end is SMILES and --minimize-ends "
+        "runs its pre-conformer-sampling minimization, the minimized endpoints go "
+        "to <output>/smiles_minimization_debug/; (2) when --atom-mapping triggers "
+        "its candidate-mapping selection, every candidate's interpolated path "
+        "(xyz + energies) and a scores.txt comparing all three selection metrics "
+        "per candidate go to <output>/realign_debug/.",
+    ),
+    atom_mapping_candidates: int = typer.Option(
+        5, "--atom-mapping-candidates",
+        help="--atom-mapping: how many of SLAPMapper's equal-minimal-cost "
+        "candidate mappings to keep and consider (they're ties, not ranked by "
+        "quality among themselves).",
+    ),
+    atom_mapping_metric: str = typer.Option(
+        "gi-energy", "--atom-mapping-metric",
+        help="--atom-mapping: how each candidate mapping (including 'don't "
+        "reindex') is scored from its geodesic-interpolated path -- "
+        "'gi-energy' (highest QM energy along the path; most expensive, one "
+        "engine energy evaluation per candidate), 'geodesic-distance' (the "
+        "geodesic optimizer's own path length; free), or 'path-rmsd' "
+        "(cumulative per-frame RMSD along the path; free). Which is actually "
+        "the best predictor of a correct mapping isn't settled -- "
+        "--debug-dump records all three per candidate to help compare them.",
+    ),
+    atom_mapping_veto_margin: float = typer.Option(
+        0.0, "--atom-mapping-veto-margin",
+        help="--atom-mapping: a non-identity candidate must beat 'don't "
+        "reindex' by more than this (in --atom-mapping-metric's own units) to "
+        "be adopted; otherwise the original --end ordering is kept even if "
+        "some candidate scored marginally better. Default 0.0 is a pure "
+        "best-of-N with no calibrated stability margin yet.",
+    ),
+    atom_mapping_recheck_splits: bool = typer.Option(
+        False, "--atom-mapping-recheck-splits",
+        help="Experimental: also re-run the same best-of-N atom-mapping "
+        "selection (--atom-mapping-metric etc.) at every new (reactant, "
+        "product) pair MSMEP's recursive splitting discovers, not just the "
+        "original --start/--end pair. Independent of --atom-mapping. Atom "
+        "order is otherwise preserved throughout the recursion, so this only "
+        "changes anything for a split whose own reactant/product pair "
+        "happens to have SLAPMapper-detectable symmetry.",
     ),
     backend: str = typer.Option(
         "rdkit", "--backend",
@@ -1564,11 +2079,16 @@ def conformer_network(
     random_seed: int = typer.Option(0, "--random-seed", help="Random seed for conformer embedding."),
     minimize_ends: bool = typer.Option(
         True, "--minimize-ends/--no-minimize-ends",
-        help="Optimize every generated conformer with the QM engine before pairing. "
-        "On by default: RDKit/MMFF conformers are not QM minima, and every pair's "
-        "MSMEP run otherwise starts from a force-field-quality endpoint rather "
-        "than a real minimum at your input level of theory. A conformer that "
-        "fails to converge is dropped rather than failing the whole run.",
+        help="Optimize endpoint geometries with the QM engine. On by default. "
+        "This governs two separate minimizations: (1) BEFORE conformer sampling, "
+        "if --start/--end was given as SMILES (an RDKit/openbabel-embedded guess, "
+        "not a real minimum), that raw embedded structure is minimized at your "
+        "input level of theory first, so conformer sampling starts from an actual "
+        "minimum rather than an arbitrary embedding; and (2) every generated "
+        "conformer is optimized before pairing, since RDKit/MMFF conformers are "
+        "not QM minima either. A conformer that fails to converge in step (2) is "
+        "dropped rather than failing the whole run; a SMILES endpoint that fails "
+        "to converge in step (1) is a hard stop (see `mepd run --minimize-ends`).",
     ),
     max_pairs: int = typer.Option(
         100, "--max-pairs",
@@ -1603,24 +2123,38 @@ def conformer_network(
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
     output: Path = typer.Option(
-        Path("mepd_conformer_network_output"), "--output", "-o",
-        help="Directory to write conformer-pair trees and the completed network into.",
+        Path("mepd_channels_output"), "--output", "-o",
+        help="Directory to write seed pools, per-seed trees, TS-opt+IRC "
+        "results, classified channels/alternate-routes, and the completed "
+        "byproduct network into.",
     ),
 ) -> None:
-    """Conformer-driven MEP sampling: generate conformers of the --start and
-    --end endpoints, then run a recursive NEB/MSMEP for every (reactant
-    conformer, product conformer) pair, combining the results into one
-    reaction network -- so the network reflects the true lowest-barrier path
-    between the relevant conformers, not just whichever single conformer
-    happened to be given as input."""
+    """Multi-channel TS discovery for a fixed --start/--end pair: generate
+    alternate seed guesses (--method), run a recursive NEB/MSMEP for every
+    seed, optimize a TS and IRC for every resulting leaf, then classify by
+    IRC endpoints -- results whose IRC reconnects the requested --start/--end
+    pair land in <output>/channels/ (deduplicated into distinct TS classes,
+    e.g. 4 conformer-pair runs converging to 2 real channels), results that
+    reconnect some other pair of minima land in <output>/alternate-routes/,
+    and everything completed is also combined into one byproduct network at
+    <output>/network.json."""
+    if method != "conformers":
+        raise typer.BadParameter(f"Unknown --method '{method}'. Known: 'conformers'.")
     if n_conformers <= 0:
         raise typer.BadParameter("--n-conformers must be a positive integer.")
     if n_embed <= 0:
         raise typer.BadParameter("--n-embed must be a positive integer.")
     if max_pairs <= 0:
         raise typer.BadParameter("--max-pairs must be a positive integer.")
+    if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
+        raise typer.BadParameter(
+            f"--atom-mapping-metric must be one of {_ATOM_MAPPING_METRICS}."
+        )
+    if atom_mapping_candidates <= 0:
+        raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
 
-    from mepd.conformers import ConformerInputs, generate_conformers
+    from mepd.conformers import ConformerInputs
+    from mepd.sampling import generate_seed_pairs
     from mepd.nodes.node import StructureNode
     from mepd.NetworkBuilder import NetworkBuilder
 
@@ -1628,13 +2162,52 @@ def conformer_network(
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
+    run_inputs.atom_mapping_inputs.n_candidates = atom_mapping_candidates
+    run_inputs.atom_mapping_inputs.metric = atom_mapping_metric
+    run_inputs.atom_mapping_inputs.veto_margin = atom_mapping_veto_margin
+    run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     _echo_run_inputs_summary(run_inputs)
+
+    start_is_smiles = not Path(start).exists()
+    end_is_smiles = not Path(end).exists()
 
     start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
     end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
-    end_structure = _check_endpoint_atom_mapping(start_structure, end_structure, realign_atoms)
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)
+
+    if minimize_ends and (start_is_smiles or end_is_smiles):
+        typer.echo(
+            "An endpoint was given as SMILES (an RDKit/openbabel-embedded guess, "
+            "not a real minimum); minimizing endpoints at the input level of "
+            "theory before checking the --start/--end atom mapping and "
+            "sampling conformers. Pass --no-minimize-ends to skip."
+        )
+        start_node, end_node = _minimize_endpoints(start_node, end_node, run_inputs)
+        if debug_dump:
+            from mepd.inputs import ChainInputs
+
+            debug_dir = Path(output) / "smiles_minimization_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            Chain.model_validate(
+                {"nodes": [start_node], "parameters": ChainInputs()}
+            ).write_to_disk(debug_dir / "start_minimized.xyz")
+            Chain.model_validate(
+                {"nodes": [end_node], "parameters": ChainInputs()}
+            ).write_to_disk(debug_dir / "end_minimized.xyz")
+            typer.echo(f"  --debug-dump: wrote minimized SMILES endpoints to {debug_dir}")
+
+    # The --atom-mapping sanity check compares geodesic-interpolation path
+    # energies between the unpermuted and permuted --end -- run it AFTER
+    # minimization (rather than on the raw SMILES embedding) so that
+    # comparison reflects real minima, not embedding artifacts/strain that
+    # can otherwise dominate the energy delta the veto decision is based on.
+    realigned_end_structure = _check_endpoint_atom_mapping(
+        start_node.structure, end_node.structure, atom_mapping, run_inputs,
+        debug_dump=debug_dump, output=output,
+    )
+    if realigned_end_structure is not end_node.structure:
+        end_node = StructureNode(structure=realigned_end_structure)
 
     conformer_inputs = ConformerInputs(
         backend=backend,
@@ -1644,13 +2217,14 @@ def conformer_network(
         random_seed=random_seed,
     )
 
-    typer.echo(f"Generating up to {n_conformers} start-endpoint conformers ({backend})...")
-    start_confs = generate_conformers(start_node, conformer_inputs)
-    typer.echo(f"  -> {len(start_confs)} distinct conformer(s).")
-
-    typer.echo(f"Generating up to {n_conformers} end-endpoint conformers ({backend})...")
-    end_confs = generate_conformers(end_node, conformer_inputs)
-    typer.echo(f"  -> {len(end_confs)} distinct conformer(s).")
+    typer.echo(f"Generating seed pairs (--method {method})...")
+    start_confs, end_confs = generate_seed_pairs(
+        method, start_node, end_node, conformer_inputs=conformer_inputs,
+    )
+    typer.echo(
+        f"  -> {len(start_confs)} start-endpoint seed(s), "
+        f"{len(end_confs)} end-endpoint seed(s)."
+    )
 
     if minimize_ends:
         typer.echo("Minimizing start-endpoint conformers...")
@@ -1718,6 +2292,8 @@ def conformer_network(
         f"Wrote network to {network_path} "
         f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
     )
+
+    _discover_channels(output, start_node, end_node, run_inputs, charge, multiplicity)
 
 
 @app.command("make-default-inputs")

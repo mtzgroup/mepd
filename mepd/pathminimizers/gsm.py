@@ -264,14 +264,15 @@ class GSM(PathMinimizer):
     `compute_energies`/`compute_gradients` directly, so GSM is driven by the
     exact same engine (e.g. gxtb) as every other path minimizer in mepd.
 
-    By default GSM grows its own path from scratch using its internal-
-    coordinate scheme (`GSM/icoord.cpp`) -- it needs no starting guess for
-    the interior nodes at all. Setting
-    `path_min_inputs.seed_with_geodesic_interpolation = True` instead seeds
-    the search with a geodesic-interpolated path (`mepd.chainhelpers.run_geodesic`,
-    the same helper NEB/FreezingNEB use) between the same two endpoints, via
-    the compiled binary's native `RESTART` mechanism -- see
-    `_build_geodesic_seed`'s docstring for how that's wired up.
+    By default (`path_min_inputs.seed_with_geodesic_interpolation = True`)
+    the search is seeded with a geodesic-interpolated path
+    (`mepd.chainhelpers.run_geodesic`, the same helper NEB/FreezingNEB use)
+    between the same two endpoints, via the compiled binary's native
+    `RESTART` mechanism -- see `_build_geodesic_seed`'s docstring for how
+    that's wired up. Setting it to `False` instead lets GSM grow its own
+    path from scratch using its internal-coordinate scheme
+    (`GSM/icoord.cpp`), needing no starting guess for the interior nodes
+    at all.
     """
 
     initial_chain: Chain
@@ -319,7 +320,7 @@ class GSM(PathMinimizer):
         e_reactant = float(reactant.energy)
 
         seed_nodes = None
-        if bool(getattr(self.parameters, "seed_with_geodesic_interpolation", False)):
+        if bool(getattr(self.parameters, "seed_with_geodesic_interpolation", True)):
             seed_nodes = self._build_geodesic_seed(chain, reactant, product)
 
         do_elem_step_checks = bool(getattr(self.parameters, "do_elem_step_checks", True))
@@ -456,10 +457,23 @@ class GSM(PathMinimizer):
         return elem_step_results
 
     def _build_geodesic_seed(self, chain: Chain, reactant, product) -> list:
-        """Build a geodesic-interpolated path between `reactant` and `product`
-        and evaluate real energies on every node via `self.engine`, so this
-        path can seed molecularGSM's search via its native `RESTART`
-        mechanism instead of letting it grow its own path from scratch.
+        """Seed molecularGSM's search via its native `RESTART` mechanism
+        with the SAME geodesic-interpolated path already built upstream as
+        `self.initial_chain` (`chain` here, i.e. `chain_trajectory[0]`) --
+        reused as-is, not recomputed from scratch, so what GSM actually
+        starts from is the exact path already shown as the first
+        trajectory entry, and a second interpolation + a second round of
+        energy evaluations aren't wasted recomputing something already on
+        hand.
+
+        Note this means the RESTART string's node count is whatever
+        `chain` already has (`gi_inputs.nimages`), not
+        `path_min_inputs.nnodes` -- consistent with `_write_inputs` already
+        passing `nnodes_override=len(seed_nodes)` (see its call site) to
+        write the input deck's `NNODES` field from the actual seed length
+        rather than the configured `nnodes`. `nnodes` still governs GSM's
+        own from-scratch growth target when `seed_with_geodesic_interpolation`
+        is off.
 
         Why this works -- `RESTART` in the C++ source (all in GSM/gstring.cpp):
         when `inpfileq`'s `RESTART` tag (parsed around line 1232) is nonzero,
@@ -481,47 +495,18 @@ class GSM(PathMinimizer):
         (unlike `RESTART=2`'s use case of overriding a restart file with
         different endpoints than `initial0000.xyz`).
         """
-        import mepd.chainhelpers as ch
+        interpolated_nodes = list(chain.nodes)
+        interpolated_nodes[0] = reactant
+        interpolated_nodes[-1] = product
 
-        seed_chain = Chain.model_validate(
-            {"nodes": [reactant, product], "parameters": chain.parameters}
-        )
-        gi = self.gi_inputs
-        # `path_min_inputs.nnodes` -- not `gi_inputs.nimages` -- is the node
-        # count that actually reaches GSM here: RESTART locks the string size
-        # to however many frames are in the restart file (`restart_string`
-        # sets nn = nnR = nnmax = nrnodes straight from the file; NNODES in
-        # inpfileq is never consulted once RESTART is set), so `nnodes` has to
-        # be what builds this seed, or a user's `nnodes` setting would be
-        # silently ignored whenever seed_with_geodesic_interpolation is on.
-        nimages = int(getattr(self.parameters, "nnodes", gi.nimages))
-        interpolated = ch.run_geodesic(
-            chain=seed_chain,
-            chain_inputs=chain.parameters,
-            nimages=nimages,
-            friction=gi.friction,
-            nudge=gi.nudge,
-            random_seed=gi.random_seed,
-            align=gi.align,
-            **(gi.extra_kwds or {}),
-        )
-        # run_geodesic rebuilds every node fresh (including the endpoints)
-        # from interpolated coordinates, so it has no idea reactant/product
-        # were already evaluated moments ago in optimize_chain -- swap the
-        # already-cached originals back in so compute_energies below only
-        # pays for the genuinely new interior nodes, not two redundant calls
-        # at coordinates it already has the answer for.
-        interpolated.nodes[0] = reactant
-        interpolated.nodes[-1] = product
-
-        n_before = sum(1 for n in interpolated.nodes if n._cached_energy is None)
-        self.engine.compute_energies(interpolated.nodes)
+        n_before = sum(1 for n in interpolated_nodes if n._cached_energy is None)
+        self.engine.compute_energies(interpolated_nodes)
         self.grad_calls_made += n_before
         self._log(
-            f"Seeding molecularGSM with a {len(interpolated.nodes)}-node "
+            f"Seeding molecularGSM with the already-computed {len(interpolated_nodes)}-node "
             "geodesic-interpolated path (RESTART mode)."
         )
-        return list(interpolated.nodes)
+        return interpolated_nodes
 
     @staticmethod
     def _write_string_blocks(fp: Path, nodes: list, e_reference: float) -> None:

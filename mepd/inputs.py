@@ -320,6 +320,45 @@ class GIInputs:
 
 
 @dataclass
+class AtomMappingInputs:
+    """
+    Inputs for `--atom-mapping`'s multi-candidate atom-mapping selection
+    (`mepd/atom_mapping_selection.py`).
+
+    `n_candidates`: how many of SLAPMapper's equal-minimal-cost candidate
+        mappings to keep and consider (default: 5). These are ties, not
+        ranked by quality among themselves.
+
+    `metric`: how each candidate (including "don't reindex") is scored from
+        its geodesic-interpolated path -- one of "gi-energy" (highest QM
+        energy along the path, most expensive), "geodesic-distance" (the
+        geodesic optimizer's own path length, free), or "path-rmsd"
+        (cumulative per-frame RMSD along the path, free). Default:
+        "gi-energy", matching the metric the old single-candidate veto used.
+
+    `veto_margin`: a non-identity candidate must beat "don't reindex" by
+        more than this (in the selected metric's own units) to be adopted;
+        otherwise the original ordering is kept even if some candidate
+        scored marginally better. Default: 0.0 (pure best-of-N, identity
+        wins exact ties) -- unlike `metric`, there is no well-calibrated
+        nonzero default here yet for any of the three metrics.
+
+    `recheck_on_split`: experimental. Also re-run this same selection at
+        every new (reactant, product) pair MSMEP's recursive splitting
+        discovers, not just the original --start/--end pair (default:
+        False). Independent of --atom-mapping.
+    """
+
+    n_candidates: int = 5
+    metric: str = "gi-energy"
+    veto_margin: float = 0.0
+    recheck_on_split: bool = False
+
+    def copy(self) -> AtomMappingInputs:
+        return AtomMappingInputs(**self.__dict__)
+
+
+@dataclass
 class NetworkInputs:
     """
     Inputs for NetworkBuilder (network-completion): builds/dedupes a reaction
@@ -358,6 +397,7 @@ class RunInputs:
 
     chain_inputs: dict = None
     gi_inputs: dict = None
+    atom_mapping_inputs: dict = None
 
     program_kwds: ProgramArgs = None
     ase_engine_kwds: dict = None
@@ -450,7 +490,7 @@ class RunInputs:
                 "product_limit": 100.0,
                 "timeout": None,
                 "keep_workdirs": False,
-                "seed_with_geodesic_interpolation": False,
+                "seed_with_geodesic_interpolation": True,
                 # Stop early once a local minimum in the live string has held
                 # steady for `early_stop_persistence_window` consecutive
                 # updates (only checked once growth has finished). Only ever
@@ -505,6 +545,11 @@ class RunInputs:
             self.gi_inputs = GIInputs()
         else:
             self.gi_inputs = GIInputs(**self.gi_inputs)
+
+        if self.atom_mapping_inputs is None:
+            self.atom_mapping_inputs = AtomMappingInputs()
+        else:
+            self.atom_mapping_inputs = AtomMappingInputs(**self.atom_mapping_inputs)
 
         if self.program_kwds == "":
             # TOML has no native null; to_dict()/save() writes an absent

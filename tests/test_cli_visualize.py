@@ -174,6 +174,181 @@ def test_visualize_handles_single_node_chain(tmp_path):
     assert "NaN" not in html
 
 
+def test_visualize_ts_output_shows_energies_relative_to_lowest(tmp_path):
+    """A `mepd ts` output directory's TS structures should show their known
+    energies, relative to the lowest-energy TS found -- so conformers can be
+    compared at a glance, the same way `test_visualize_labels_ts_guess_and_
+    energies` does for a chain's own frames."""
+    ts_out = tmp_path / "ts_out"
+    ts_out.mkdir()
+    Chain.model_validate(
+        {"nodes": [_water_node(0.0, -76.0)], "parameters": ChainInputs()}
+    ).write_to_disk(ts_out / "ts_leaf_0.xyz")
+    Chain.model_validate(
+        {"nodes": [_water_node(0.2, -75.9)], "parameters": ChainInputs()}
+    ).write_to_disk(ts_out / "ts_leaf_1.xyz")
+
+    _call_visualize(result_path=ts_out)
+
+    html = (tmp_path / "ts_out_visualize.html").read_text()
+    nodes = _extract_nodes_payload(html)
+    assert {n["group"] for n in nodes} == {"TS structures"}
+    by_label = {n["label"]: n for n in nodes}
+
+    e0 = by_label["ts_leaf_0"]["trajectory"][0]["frames"][0]["energy_kcal"]
+    e1 = by_label["ts_leaf_1"]["trajectory"][0]["frames"][0]["energy_kcal"]
+    assert e0 == pytest.approx(0.0)
+    assert e1 == pytest.approx((-75.9 - (-76.0)) * 627.5)
+
+
+def _write_species_xyz(path, atoms: list[tuple[str, float]]) -> None:
+    """A minimal single-frame xyz with atoms spaced along x -- mirrors the
+    fixture convention in test_irc_network.py: atoms 1.4 apart bond into one
+    molecule (openbabel bond perception), atoms several Angstroms apart stay
+    as separate, unbonded species."""
+    path.write_text(
+        "\n".join(
+            [
+                str(len(atoms)),
+                "frame",
+                *(f"{symbol} {x:.6f} 0.0 0.0" for symbol, x in atoms),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_irc_xyz(path, frames: list[list[tuple[str, float]]]) -> None:
+    lines = []
+    for index, atoms in enumerate(frames):
+        lines.extend(
+            [
+                str(len(atoms)),
+                f"frame {index}",
+                *(f"{symbol} {x:.6f} 0.0 0.0" for symbol, x in atoms),
+            ]
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_visualize_groups_irc_paths_by_endpoint_match(tmp_path):
+    """IRCs whose own start/end frames are connectivity-identical (a
+    degenerate/failed IRC that relaxed back to the same species on both
+    sides) must land in a different group than IRCs connecting two
+    genuinely different species -- so a `mepd ts --irc` output with several
+    TS conformers makes it obvious which IRCs found a real elementary step."""
+    bonded_chain = [("C", 0.0), ("C", 1.4), ("C", 2.8)]
+    spread_out = [("C", 0.0), ("C", 4.0), ("C", 8.0)]
+
+    ts_out = tmp_path / "ts_out"
+    ts_out.mkdir()
+    _write_species_xyz(ts_out / "ts_leaf_0.xyz", bonded_chain)
+    _write_species_xyz(ts_out / "ts_leaf_1.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_leaf_0_irc.xyz", [bonded_chain, bonded_chain])
+    _write_irc_xyz(ts_out / "ts_leaf_1_irc.xyz", [bonded_chain, spread_out])
+
+    _call_visualize(result_path=ts_out)
+
+    html = (tmp_path / "ts_out_visualize.html").read_text()
+    nodes = _extract_nodes_payload(html)
+    groups = {n["label"]: n["group"] for n in nodes}
+    assert groups["ts_leaf_0 IRC"] == "IRC paths (matching endpoints)"
+    assert groups["ts_leaf_1 IRC"] == "IRC paths (different endpoints)"
+
+
+def test_visualize_groups_ts_dir_by_channels_classification_when_present(tmp_path):
+    """When `ts_out` is a `mepd channels` output's `ts/` directory (i.e. it
+    has sibling `channels/`/`alternate-routes/` folders with `members.txt`
+    from `_write_classified_group`), grouping must reflect that real,
+    IRC-verified-against---start/--end classification instead of the
+    generic per-IRC self-consistency check -- and a leaf that isn't in any
+    classification folder (e.g. a failed/degenerate IRC) must say so
+    explicitly rather than silently falling back to the generic label."""
+    bonded_chain = [("C", 0.0), ("C", 1.4), ("C", 2.8)]
+    spread_out = [("C", 0.0), ("C", 4.0), ("C", 8.0)]
+
+    output = tmp_path / "channels_out"
+    ts_out = output / "ts"
+    ts_out.mkdir(parents=True)
+    _write_species_xyz(ts_out / "ts_pair_0_1_leaf_0.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_pair_0_1_leaf_0_irc.xyz", [bonded_chain, spread_out])
+    _write_species_xyz(ts_out / "ts_pair_2_3_leaf_0.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_pair_2_3_leaf_0_irc.xyz", [bonded_chain, spread_out])
+    _write_species_xyz(ts_out / "ts_pair_4_5_leaf_0.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_pair_4_5_leaf_0_irc.xyz", [bonded_chain, bonded_chain])
+
+    channel_dir = output / "channels" / "channel_0"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "members.txt").write_text("ts_pair_0_1_leaf_0\n")
+
+    route_dir = output / "alternate-routes" / "route_0"
+    route_dir.mkdir(parents=True)
+    (route_dir / "members.txt").write_text("connects: A <-> B\nts_pair_2_3_leaf_0\n")
+
+    _call_visualize(result_path=ts_out)
+
+    html = (tmp_path / "channels_out" / "ts_visualize.html").read_text()
+    nodes = _extract_nodes_payload(html)
+    groups = {n["label"]: n["group"] for n in nodes}
+
+    assert groups["ts_pair_0_1_leaf_0"] == "TS structures (Channel 0)"
+    assert groups["ts_pair_0_1_leaf_0 IRC"] == "IRC paths (Channel 0)"
+    assert groups["ts_pair_2_3_leaf_0"] == "TS structures (Alternate route 0)"
+    assert groups["ts_pair_2_3_leaf_0 IRC"] == "IRC paths (Alternate route 0)"
+    assert groups["ts_pair_4_5_leaf_0"] == "TS structures (unclassified)"
+    assert groups["ts_pair_4_5_leaf_0 IRC"] == "IRC paths (unclassified -- matching endpoints)"
+
+
+def _last_atom_x(node_entry) -> float:
+    xyz_text = node_entry["trajectory"][0]["frames"][0]["xyz"]
+    last_line = xyz_text.strip().splitlines()[-1]
+    return float(last_line.split()[1])
+
+
+def test_visualize_reorients_channel_irc_so_reactant_is_always_first(tmp_path):
+    """Two different channels' IRCs can come out of GSM in opposite
+    orientations (reactant-to-product vs product-to-reactant) -- since
+    displayed energies are relative to chain[0], both must be shown
+    reactant-first so their (chain[0]-relative) barrier heights are
+    directly comparable, not one forward barrier and one reverse barrier."""
+    bonded_chain = [("C", 0.0), ("C", 1.4), ("C", 2.8)]  # "reactant" molecule
+    spread_out = [("C", 0.0), ("C", 4.0), ("C", 8.0)]  # "product" (unbonded)
+
+    output = tmp_path / "channels_out"
+    ts_out = output / "ts"
+    ts_out.mkdir(parents=True)
+
+    conformers_dir = output / "conformers"
+    conformers_dir.mkdir(parents=True)
+    _write_species_xyz(conformers_dir / "start.xyz", bonded_chain)
+
+    # channel_0's IRC is already stored reactant-first.
+    _write_species_xyz(ts_out / "ts_pair_0_1_leaf_0.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_pair_0_1_leaf_0_irc.xyz", [bonded_chain, spread_out])
+
+    # channel_1's IRC is stored product-first (reversed) -- must be flipped.
+    _write_species_xyz(ts_out / "ts_pair_2_3_leaf_0.xyz", bonded_chain)
+    _write_irc_xyz(ts_out / "ts_pair_2_3_leaf_0_irc.xyz", [spread_out, bonded_chain])
+
+    (output / "channels" / "channel_0").mkdir(parents=True)
+    (output / "channels" / "channel_0" / "members.txt").write_text("ts_pair_0_1_leaf_0\n")
+    (output / "channels" / "channel_1").mkdir(parents=True)
+    (output / "channels" / "channel_1" / "members.txt").write_text("ts_pair_2_3_leaf_0\n")
+
+    _call_visualize(result_path=ts_out)
+
+    html = (tmp_path / "channels_out" / "ts_visualize.html").read_text()
+    nodes = _extract_nodes_payload(html)
+    by_label = {n["label"]: n for n in nodes}
+
+    for label in ("ts_pair_0_1_leaf_0 IRC", "ts_pair_2_3_leaf_0 IRC"):
+        assert _last_atom_x(by_label[label]) == pytest.approx(2.8, abs=0.05), (
+            f"{label} should be shown reactant-first regardless of how its "
+            "IRC file was originally oriented"
+        )
+
+
 def test_render_visualization_html_accepts_a_bare_list_of_nodes():
     """`viz.render_visualization_html` must also accept a plain list of Node
     objects directly (e.g. `run_hessian_sample(...).optimized_nodes`, or the

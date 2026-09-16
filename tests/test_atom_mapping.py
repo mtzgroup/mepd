@@ -14,6 +14,7 @@ from mepd.atom_mapping import (  # noqa: E402
     realign_end_to_start,
     reorder_structure,
     suggest_atom_mapping,
+    suggest_atom_mapping_candidates,
 )
 
 
@@ -117,6 +118,70 @@ def test_suggest_atom_mapping_returns_none_for_unbalanced_structures():
     start = _water()
     end = Structure(symbols=["O", "H"], geometry=start.geometry[:2], charge=0, multiplicity=2)
     assert suggest_atom_mapping(start, end) is None
+
+
+def test_suggest_atom_mapping_candidates_returns_a_list():
+    start = _water()
+    end = _water()
+    candidates = suggest_atom_mapping_candidates(start, end)
+    assert isinstance(candidates, list)
+    assert len(candidates) >= 1
+    assert all(c.is_identity for c in candidates)
+
+
+def test_suggest_atom_mapping_candidates_caps_at_max_candidates():
+    start = _propene()
+    order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    end = Structure(
+        symbols=np.asarray(start.symbols)[order],
+        geometry=np.asarray(start.geometry)[order],
+        charge=0,
+        multiplicity=1,
+    )
+    candidates = suggest_atom_mapping_candidates(start, end, max_candidates=1)
+    assert len(candidates) <= 1
+
+
+def test_suggest_atom_mapping_candidates_empty_for_unbalanced_structures():
+    start = _water()
+    end = Structure(symbols=["O", "H"], geometry=start.geometry[:2], charge=0, multiplicity=2)
+    assert suggest_atom_mapping_candidates(start, end) == []
+
+
+def test_suggest_atom_mapping_candidates_passes_break_sym_targets(monkeypatch):
+    """Passing `break_sym_targets` activates SLAPMapper's own dedup
+    (`_remove_isomorphic_results`) and lets it explore genuinely distinct
+    tied-cost orderings its un-branched default pass would miss -- see
+    `mepd/atom_mapping.py::suggest_atom_mapping_candidates`."""
+    from slapmapper.core import SlapMapper
+
+    captured = {}
+    real_get_maps = SlapMapper.get_maps
+
+    def spying_get_maps(self, lgp, **kwargs):
+        captured["break_sym_targets"] = kwargs.get("break_sym_targets")
+        return real_get_maps(self, lgp, **kwargs)
+
+    monkeypatch.setattr(SlapMapper, "get_maps", spying_get_maps)
+
+    start = _water()
+    end = _water()
+    suggest_atom_mapping_candidates(start, end)
+
+    assert captured["break_sym_targets"] == list(range(len(start.symbols)))
+
+
+def test_suggest_atom_mapping_candidates_dedupes_symmetric_water_swap():
+    """Water's two Hs are topologically interchangeable -- with
+    `break_sym_targets` now active, SLAPMapper's own
+    `_remove_isomorphic_results` must collapse the swapped-H relabeling
+    down to the same representative as the identity mapping, not return
+    both as separate "distinct" candidates."""
+    start = _water()
+    end = _water()
+    candidates = suggest_atom_mapping_candidates(start, end, max_candidates=20)
+    assert len(candidates) == 1
+    assert candidates[0].is_identity
 
 
 def test_reorder_structure_permutes_symbols_and_geometry():

@@ -121,7 +121,12 @@ def _call_run(**overrides):
         same_pair_split_limit=5,
         use_tsopt=False,
         irc=False,
-        realign_atoms=False,
+        atom_mapping=False,
+        debug_dump=False,
+        atom_mapping_candidates=5,
+        atom_mapping_metric="gi-energy",
+        atom_mapping_veto_margin=0.0,
+        atom_mapping_recheck_splits=False,
         output=None,
     )
     kwargs.update(overrides)
@@ -647,6 +652,235 @@ def _propene_xyz(order) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _propene_structure(order) -> Structure:
+    symbols = ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
+    geometry = np.array([
+        [0.000, 1.303, 0.000], [0.000, 0.000, 0.000], [1.501, -0.400, 0.000],
+        [-0.920, 1.860, 0.000], [0.920, 1.860, 0.000], [-0.950, -0.550, 0.000],
+        [1.550, -1.030, 0.870], [1.550, -1.030, -0.870], [2.300, 0.320, 0.000],
+    ])
+    order = list(order)
+    return Structure(
+        symbols=np.asarray(symbols)[order],
+        geometry=geometry[order],
+        charge=0,
+        multiplicity=1,
+    )
+
+
+_PROPENE_SCRAMBLED_ORDER = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+
+
+def _patch_candidate_scores(monkeypatch, *, identity: float, mapping: float):
+    """Stub out `atom_mapping_selection.score_candidate` so
+    `_check_endpoint_atom_mapping`'s best-of-N selection can be tested
+    without running real geodesic interpolation or an electronic-structure
+    engine. Distinguishes the identity vs. mapping candidate by its label
+    (`build_candidates` always labels the unpermuted option "identity" and
+    the first candidate mapping "mapping_0").
+    """
+    import mepd.atom_mapping_selection as selection_module
+
+    def fake_score(candidate, metric, start_structure, run_inputs):
+        value = identity if candidate.label == "identity" else mapping
+        return value, None
+
+    monkeypatch.setattr(selection_module, "score_candidate", fake_score)
+
+
+def test_atom_mapping_keeps_identity_when_mapping_scores_much_worse(monkeypatch):
+    pytest.importorskip("slapmapper")
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    _patch_candidate_scores(monkeypatch, identity=0.0, mapping=60.0)
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+
+    # identity scores better: keep --end's original atom ordering.
+    assert np.allclose(np.asarray(result.geometry), np.asarray(end.geometry))
+
+
+def test_atom_mapping_keeps_identity_even_when_mapping_only_slightly_worse(monkeypatch, capsys):
+    """Best-of-N with the default veto_margin=0.0 picks whichever option
+    scores better, full stop -- there is no "reorder anyway if it's not too
+    much worse" tolerance the old single-candidate veto had."""
+    pytest.importorskip("slapmapper")
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    _patch_candidate_scores(monkeypatch, identity=0.0, mapping=10.0)
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+
+    out = capsys.readouterr().out
+    assert "keeping --end's original atom ordering" in out
+    assert np.allclose(np.asarray(result.geometry), np.asarray(end.geometry))
+
+
+def test_atom_mapping_reindexes_when_mapping_scores_better(monkeypatch, capsys):
+    pytest.importorskip("slapmapper")
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    _patch_candidate_scores(monkeypatch, identity=10.0, mapping=0.0)
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+
+    out = capsys.readouterr().out
+    assert "reindexing --end's atoms" in out
+    assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
+
+
+def test_atom_mapping_veto_margin_keeps_identity_on_small_improvement(monkeypatch):
+    """--atom-mapping-veto-margin requires a non-identity candidate to beat
+    identity by MORE than the margin -- a small improvement within the
+    margin must not switch the ordering."""
+    pytest.importorskip("slapmapper")
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    _patch_candidate_scores(monkeypatch, identity=10.0, mapping=9.0)
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.veto_margin = 5.0
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        result = _check_endpoint_atom_mapping(start, end, True, run_inputs)
+
+    assert np.allclose(np.asarray(result.geometry), np.asarray(end.geometry))
+
+
+def test_cli_run_checks_atom_mapping_after_minimizing_endpoints(tmp_path, monkeypatch):
+    """--atom-mapping' geodesic sanity check compares path energies between
+    the unpermuted and permuted --end -- that comparison should reflect real
+    minima, not raw/unminimized embeddings, so endpoint minimization must run
+    BEFORE the atom-mapping check, not after."""
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+
+    import mepd.cli as cli_module
+    order = []
+    real_minimize_endpoints = cli_module._minimize_endpoints
+    real_check = cli_module._check_endpoint_atom_mapping
+
+    def spying_minimize_endpoints(start_node, end_node, run_inputs):
+        order.append("minimize_endpoints")
+        return real_minimize_endpoints(start_node, end_node, run_inputs)
+
+    def spying_check(*args, **kwargs):
+        order.append("check_endpoint_atom_mapping")
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_minimize_endpoints", spying_minimize_endpoints)
+    monkeypatch.setattr(cli_module, "_check_endpoint_atom_mapping", spying_check)
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    output_dir = tmp_path / "out"
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir,
+        minimize_ends=True,
+    )
+
+    assert order == ["minimize_endpoints", "check_endpoint_atom_mapping"]
+
+
+def test_cli_run_wires_atom_mapping_recheck_splits_flag(tmp_path, monkeypatch):
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    import mepd.cli as cli_module
+
+    seen_run_inputs = []
+    real_check = cli_module._check_endpoint_atom_mapping
+
+    def spying_check(start_structure, end_structure, atom_mapping, run_inputs, **kwargs):
+        seen_run_inputs.append(run_inputs)
+        return real_check(start_structure, end_structure, atom_mapping, run_inputs, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_check_endpoint_atom_mapping", spying_check)
+
+    start_fp = tmp_path / "start.xyz"
+    end_fp = tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(0.05).to_xyz())
+
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+
+    _call_run(
+        start=start_fp, end=end_fp, inputs=inputs_fp, output=tmp_path / "out",
+        atom_mapping_recheck_splits=True,
+    )
+
+    assert len(seen_run_inputs) == 1
+    assert seen_run_inputs[0].atom_mapping_inputs.recheck_on_split is True
+
+
+def test_check_endpoint_atom_mapping_debug_dump_writes_every_candidate(tmp_path, monkeypatch):
+    """--debug-dump should save every candidate's (identity + each mapping)
+    interpolated path to disk, with energies, plus a scores.txt comparing
+    all three selection metrics per candidate -- for later inspection (e.g.
+    via `mepd visualize`) and for comparing metrics against each other."""
+    pytest.importorskip("slapmapper")
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        _check_endpoint_atom_mapping(
+            start, end, True, _run_inputs_for_test(),
+            debug_dump=True, output=tmp_path,
+        )
+
+    debug_dir = tmp_path / "realign_debug"
+    identity_xyz = debug_dir / "identity.xyz"
+    mapping_xyz = debug_dir / "mapping_0.xyz"
+    assert identity_xyz.exists()
+    assert mapping_xyz.exists()
+    assert identity_xyz.with_suffix(".energies").exists()
+    assert mapping_xyz.with_suffix(".energies").exists()
+
+    scores_text = (debug_dir / "scores.txt").read_text()
+    assert "gi-energy" in scores_text
+    assert "geodesic-distance" in scores_text
+    assert "path-rmsd" in scores_text
+    assert "identity" in scores_text
+    assert "mapping_0" in scores_text
+
+
+def test_check_endpoint_atom_mapping_no_debug_dump_by_default(tmp_path, monkeypatch):
+    pytest.importorskip("slapmapper")
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test(), output=tmp_path)
+
+    assert not (tmp_path / "realign_debug").exists()
+
+
 def test_cli_run_warns_on_atom_mapping_mismatch_but_does_not_reorder_by_default(tmp_path, monkeypatch, capsys):
     pytest.importorskip("slapmapper")
     _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
@@ -673,11 +907,11 @@ def test_cli_run_warns_on_atom_mapping_mismatch_but_does_not_reorder_by_default(
     with pytest.warns(UserWarning, match="disagrees"):
         _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir)
 
-    # --realign-atoms wasn't passed, so --end's atoms are untouched.
+    # --atom-mapping wasn't passed, so --end's atoms are untouched.
     assert list(seen_structures[1].symbols) == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
 
 
-def test_cli_run_realign_atoms_reorders_end_to_match_mapping(tmp_path, monkeypatch, capsys):
+def test_cli_run_atom_mapping_reorders_end_to_match_mapping(tmp_path, monkeypatch, capsys):
     pytest.importorskip("slapmapper")
     _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
 
@@ -687,14 +921,22 @@ def test_cli_run_realign_atoms_reorders_end_to_match_mapping(tmp_path, monkeypat
     scrambled_order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
     end_fp.write_text(_propene_xyz(scrambled_order))
 
-    seen_structures = []
-    original_init = StructureNode.__init__
+    # Capture what `_check_endpoint_atom_mapping` was actually handed and what
+    # it handed back, directly -- robust to exactly when/how many
+    # StructureNodes the surrounding CLI code happens to construct around it
+    # (which changed once the check moved to run after endpoint
+    # minimization instead of before it).
+    import mepd.cli as cli_module
+    real_check = cli_module._check_endpoint_atom_mapping
+    captured = {}
 
-    def spying_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        seen_structures.append(self.structure)
+    def spying_check(start_structure, end_structure, *args, **kwargs):
+        result = real_check(start_structure, end_structure, *args, **kwargs)
+        captured["start_structure"] = start_structure
+        captured["result"] = result
+        return result
 
-    monkeypatch.setattr(StructureNode, "__init__", spying_init)
+    monkeypatch.setattr(cli_module, "_check_endpoint_atom_mapping", spying_check)
 
     inputs_fp = tmp_path / "inputs.toml"
     _run_inputs_for_test().save(inputs_fp)
@@ -703,16 +945,15 @@ def test_cli_run_realign_atoms_reorders_end_to_match_mapping(tmp_path, monkeypat
     with pytest.warns(UserWarning, match="disagrees"):
         _call_run(
             start=start_fp, end=end_fp, inputs=inputs_fp, output=output_dir,
-            realign_atoms=True,
+            atom_mapping=True,
         )
 
     out = capsys.readouterr().out
     assert "reindexing --end's atoms" in out
-    start_symbols = list(seen_structures[0].symbols)
-    end_symbols = list(seen_structures[1].symbols)
-    assert start_symbols == end_symbols == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
+    assert list(captured["result"].symbols) == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
     assert np.allclose(
-        np.asarray(seen_structures[1].geometry), np.asarray(seen_structures[0].geometry)
+        np.asarray(captured["result"].geometry),
+        np.asarray(captured["start_structure"].geometry),
     )
 
 
