@@ -146,6 +146,101 @@ def suggest_atom_mapping(
     )
 
 
+def _symmetry_orbits(structure: Structure) -> list[list[int]]:
+    """Groups of atom indices in `structure` that are topologically
+    interchangeable -- same RDKit canonical rank via
+    `Chem.CanonicalRankAtoms(breakTies=False)`, which assigns identical
+    ranks to graph-symmetric atoms (e.g. a methyl group's three Hs, or a
+    symmetric =CH2's two Hs). Only groups of size > 1 are actual degrees
+    of freedom. Returns `[]` if RDKit can't parse/assign bonds -- never
+    raises."""
+    from rdkit import Chem
+    from rdkit.Chem import rdDetermineBonds
+
+    try:
+        mol = Chem.MolFromXYZBlock(structure.to_xyz())
+        rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
+        ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    except Exception:
+        return []
+
+    groups: dict[int, list[int]] = {}
+    for idx, rank in enumerate(ranks):
+        groups.setdefault(rank, []).append(idx)
+    return [idxs for idxs in groups.values() if len(idxs) > 1]
+
+
+def expand_mapping_by_symmetry(
+    atom_map: "AtomMapping",
+    start_structure: Structure,
+    end_structure: Structure,
+    *,
+    max_expansions: int = 10,
+) -> list["AtomMapping"]:
+    """Generate additional candidate mappings from `atom_map` by permuting
+    its correspondence within each side's own symmetry orbit (one orbit
+    permuted at a time, holding the rest of the mapping fixed -- not the
+    full cross-product across multiple orbits at once, to keep this
+    tractable for highly symmetric molecules).
+
+    These are cost-preserving relabelings (same molecule, provably the
+    same LAP cost) -- not mappings from a higher-cost tier (SLAPMapper
+    itself provides no supported way to retrieve those). SLAPMapper's own
+    `_remove_isomorphic_results` already collapses these away as
+    graph-redundant, but two symmetry-equivalent mappings are not
+    necessarily geometrically equivalent for a *specific* input
+    conformer's geodesic interpolation -- e.g. which specific methyl H
+    ends up matched can change how well the resulting path aligns with
+    the actual input reactant geometry, even though the mapping "cost" is
+    identical -- so `mepd.atom_mapping_selection`'s geodesic-metric
+    selection is given the chance to actually try them, rather than
+    silently keeping whichever one SLAPMapper happened to return first.
+
+    A start-side orbit is only permuted if its image under `atom_map`
+    (`{atom_map.mapping[i] for i in orbit}`) is itself a subset of one of
+    `end_structure`'s own orbits -- i.e. only when doing so is verified to
+    still be a valid, cost-preserving relabeling, never guessed. Molecule
+    pairs with no real symmetry return `[]` -- there's only one
+    minimal-cost correspondence, period.
+    """
+    start_orbits = _symmetry_orbits(start_structure)
+    end_orbits = _symmetry_orbits(end_structure)
+
+    def _end_orbit_containing(idxs: set) -> Optional[list[int]]:
+        for orbit in end_orbits:
+            if idxs <= set(orbit):
+                return orbit
+        return None
+
+    import itertools
+
+    expansions: list[AtomMapping] = []
+    for orbit in start_orbits:
+        if len(expansions) >= max_expansions:
+            break
+        image = {atom_map.mapping[i] for i in orbit}
+        end_orbit = _end_orbit_containing(image)
+        if end_orbit is None:
+            continue
+
+        for perm in itertools.permutations(sorted(image)):
+            if len(expansions) >= max_expansions:
+                break
+            new_mapping = dict(atom_map.mapping)
+            for start_idx, end_idx in zip(sorted(orbit), perm):
+                new_mapping[start_idx] = end_idx
+            if new_mapping == atom_map.mapping:
+                continue
+            expansions.append(
+                AtomMapping(
+                    mapping=new_mapping,
+                    cost=atom_map.cost,
+                    n_alternatives=atom_map.n_alternatives,
+                )
+            )
+    return expansions
+
+
 def suggest_atom_mapping_candidates(
     struct_start: Structure, struct_end: Structure, *, binary: bool = True, max_candidates: int = 5
 ) -> list["AtomMapping"]:
@@ -165,6 +260,13 @@ def suggest_atom_mapping_candidates(
     candidates. `_break_sym` only actually branches on label groups that
     turn out to have size > 1, so this doesn't force unnecessary
     branching on atoms with no real symmetry.
+
+    If SLAPMapper's own (deduped) results don't fill `max_candidates`, the
+    remaining budget is filled with `expand_mapping_by_symmetry` expansions
+    of the best candidate -- cost-preserving relabelings within a
+    symmetry orbit that SLAPMapper's dedup already treats as redundant by
+    graph/cost, but which can still correspond differently well to the
+    actual input conformer's geometry (see that function's docstring).
 
     Returns an empty list under the same conditions `suggest_atom_mapping`
     returns `None` (unbalanced atomic-number multisets, or no mapping
@@ -211,6 +313,27 @@ def suggest_atom_mapping_candidates(
         candidates.append(
             AtomMapping(mapping=mapping, cost=result["val"], n_alternatives=n_alternatives)
         )
+
+    # Fill any remaining budget with symmetry-orbit expansions of the best
+    # candidate found so far -- cost-preserving relabelings SLAPMapper's own
+    # dedup already discarded as graph-redundant, but which can still differ
+    # geometrically for this specific input conformer (see
+    # `expand_mapping_by_symmetry`'s docstring). No-op (and no extra
+    # SLAPMapper/QM cost) whenever the budget's already full or there's no
+    # real symmetry to expand.
+    if candidates and len(candidates) < max_candidates:
+        for expansion in expand_mapping_by_symmetry(
+            candidates[0], struct_start, struct_end,
+            max_expansions=max_candidates - len(candidates),
+        ):
+            order = tuple(expansion.mapping[i] for i in range(len(expansion.mapping)))
+            if order in seen_orders:
+                continue
+            seen_orders.add(order)
+            candidates.append(expansion)
+            if len(candidates) >= max_candidates:
+                break
+
     return candidates
 
 

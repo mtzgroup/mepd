@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from qcdata import Structure
 
 from mepd.chain import Chain
@@ -106,6 +107,99 @@ def test_build_geodesic_seed_reuses_initial_chain_nodes_without_recomputing():
     assert seed_nodes[1] is mid1
     assert seed_nodes[2] is mid2
     assert all(n._cached_energy is not None for n in seed_nodes)
+
+
+def test_print_live_chain_reports_restart_seeded_target_not_nnodes(monkeypatch):
+    """The live Monitor's node-count denominator must reflect the actual
+    RESTART seed length (`len(seed_nodes)`), not `path_min_inputs.nnodes`
+    (which only governs from-scratch growth and can silently mismatch the
+    seed's own size, e.g. default nnodes=9 vs default gi_inputs.nimages=10)
+    -- and the caption must say it's RESTART-seeded so a partially-reported
+    live string isn't mistaken for "seeding didn't work"."""
+    import mepd.progress as progress_module
+
+    captured = {}
+    monkeypatch.setattr(
+        progress_module,
+        "print_chain_step",
+        lambda chain, caption: captured.setdefault("captions", []).append(caption),
+    )
+
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    mid = _hcn_node(1.6135, 1.6070, energy=-0.3)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate({"nodes": [reactant, mid, product], "parameters": {}})
+
+    gsm = GSM(
+        initial_chain=chain,
+        engine=None,
+        parameters=SimpleNamespace(nnodes=9, verbosity=1),
+    )
+
+    gsm._print_live_chain(chain, nnodes_target=3, seeded=True)
+    assert "RESTART-seeded at 3 nodes" in captured["captions"][0]
+    assert "3/3 have reported gradients" in captured["captions"][0]
+
+    gsm._print_live_chain(chain, nnodes_target=9, seeded=False)
+    assert "3/9 nodes seen" in captured["captions"][1]
+
+
+def test_execute_gsm_attempt_falls_back_to_native_growth_after_seeded_crash(monkeypatch, capsys):
+    """If molecularGSM fails on a RESTART-seeded (geodesic-interpolated)
+    attempt -- e.g. its internal-coordinate builder segfaulting on a
+    transient near-degenerate geometry along the interpolation -- retry
+    once from scratch (seed_nodes=None) rather than failing the whole
+    attempt, and warn that this happened."""
+    from mepd.errors import ElectronicStructureError
+
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate({"nodes": [reactant, product], "parameters": {}})
+
+    gsm = GSM(initial_chain=chain, engine=_FakeEnergyEngine(), parameters=SimpleNamespace(verbosity=1))
+
+    calls = []
+
+    def fake_execute(chain_, reactant_, product_, e_reactant_, seed_nodes_, allow_early_stop_):
+        calls.append(seed_nodes_)
+        if seed_nodes_:
+            raise ElectronicStructureError(msg="GSM calculation failed with exit code -11.")
+        return "final_chain", ["history"], False
+
+    monkeypatch.setattr(gsm, "_execute_gsm_attempt", fake_execute)
+
+    result = gsm._execute_gsm_attempt_with_fallback(
+        chain, reactant, product, -0.5, [reactant, product], False
+    )
+
+    assert result == ("final_chain", ["history"], False)
+    assert len(calls) == 2
+    assert calls[0] == [reactant, product]
+    assert calls[1] is None
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "RESTART-seeded" in out
+    assert "falling back to its native from-scratch internal-coordinate growth" in out
+
+
+def test_execute_gsm_attempt_no_fallback_when_not_seeded(monkeypatch):
+    """A crash on an unseeded (native growth) attempt must propagate
+    normally -- there's no seed to blame, so no retry."""
+    from mepd.errors import ElectronicStructureError
+
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate({"nodes": [reactant, product], "parameters": {}})
+
+    gsm = GSM(initial_chain=chain, engine=_FakeEnergyEngine(), parameters=SimpleNamespace(verbosity=1))
+
+    def fake_execute(chain_, reactant_, product_, e_reactant_, seed_nodes_, allow_early_stop_):
+        raise ElectronicStructureError(msg="GSM calculation failed with exit code -11.")
+
+    monkeypatch.setattr(gsm, "_execute_gsm_attempt", fake_execute)
+
+    with pytest.raises(ElectronicStructureError):
+        gsm._execute_gsm_attempt_with_fallback(chain, reactant, product, -0.5, None, False)
 
 
 def test_inpfileq_text_restart_and_nnodes_override():

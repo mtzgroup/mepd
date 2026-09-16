@@ -9,13 +9,16 @@ from qcdata.models.structure import Structure
 pytest.importorskip("slapmapper")
 
 from mepd.atom_mapping import (  # noqa: E402
+    AtomMapping,
     check_atom_mapping,
+    expand_mapping_by_symmetry,
     map_smiles_pair,
     realign_end_to_start,
     reorder_structure,
     suggest_atom_mapping,
     suggest_atom_mapping_candidates,
 )
+from mepd.atom_mapping import _symmetry_orbits  # noqa: E402
 
 
 def _water(order=(0, 1, 2)) -> Structure:
@@ -126,7 +129,12 @@ def test_suggest_atom_mapping_candidates_returns_a_list():
     candidates = suggest_atom_mapping_candidates(start, end)
     assert isinstance(candidates, list)
     assert len(candidates) >= 1
-    assert all(c.is_identity for c in candidates)
+    # The identity mapping must always be among the candidates (water's two
+    # Hs are symmetric, so a cost-preserving swapped-H expansion is also
+    # expected -- see test_suggest_atom_mapping_candidates_includes_symmetry_orbit_expansion).
+    assert any(c.is_identity for c in candidates)
+    for c in candidates:
+        assert sorted(c.mapping.values()) == sorted(c.mapping.keys())
 
 
 def test_suggest_atom_mapping_candidates_caps_at_max_candidates():
@@ -171,17 +179,23 @@ def test_suggest_atom_mapping_candidates_passes_break_sym_targets(monkeypatch):
     assert captured["break_sym_targets"] == list(range(len(start.symbols)))
 
 
-def test_suggest_atom_mapping_candidates_dedupes_symmetric_water_swap():
-    """Water's two Hs are topologically interchangeable -- with
-    `break_sym_targets` now active, SLAPMapper's own
-    `_remove_isomorphic_results` must collapse the swapped-H relabeling
-    down to the same representative as the identity mapping, not return
-    both as separate "distinct" candidates."""
+def test_suggest_atom_mapping_candidates_includes_symmetry_orbit_expansion():
+    """Water's two Hs are topologically interchangeable -- SLAPMapper's own
+    `_remove_isomorphic_results` collapses the swapped-H relabeling as
+    graph-redundant with the identity mapping, but `suggest_atom_mapping_candidates`
+    fills unused --atom-mapping-candidates budget with `expand_mapping_by_symmetry`
+    expansions of it anyway, since a symmetry-equivalent mapping isn't
+    necessarily geometrically equivalent for a specific input conformer.
+    So water should yield the identity mapping AND the swapped-H mapping,
+    both at the same (zero) cost."""
     start = _water()
     end = _water()
     candidates = suggest_atom_mapping_candidates(start, end, max_candidates=20)
-    assert len(candidates) == 1
-    assert candidates[0].is_identity
+
+    assert len(candidates) == 2
+    assert any(c.is_identity for c in candidates)
+    assert any(c.mapping == {0: 0, 1: 2, 2: 1} for c in candidates)
+    assert all(c.cost == candidates[0].cost for c in candidates)
 
 
 def test_reorder_structure_permutes_symbols_and_geometry():
@@ -195,3 +209,98 @@ def test_map_smiles_pair_builds_atom_count_consistent_structures():
     start, end = map_smiles_pair("CC=O", "OC=C")
     assert len(start.symbols) == len(end.symbols)
     assert sorted(start.symbols) == sorted(end.symbols)
+
+
+def test_symmetry_orbits_finds_waters_two_equivalent_hs():
+    orbits = _symmetry_orbits(_water())
+    assert orbits == [[1, 2]]
+
+
+def _propene_bohr() -> Structure:
+    """`_propene()`'s geometry is written in Angstrom-scale numbers but
+    stored directly as `Structure.geometry` (which is otherwise always
+    Bohr internally, e.g. `_water()`'s fixture) -- harmless for the
+    graph-only comparisons `suggest_atom_mapping` relies on (self-consistent
+    "wrong" scale on both sides), but `_symmetry_orbits` round-trips through
+    `Structure.to_xyz()` (a real Bohr->Angstrom conversion), which shrinks
+    already-Angstrom-scale numbers down to unphysically short "Angstrom"
+    bond lengths RDKit can't perceive bonds from. Rescale properly for
+    these tests specifically rather than touch the shared fixture."""
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    base = _propene()
+    return Structure(
+        symbols=base.symbols,
+        geometry=np.asarray(base.geometry) * ANGSTROM_TO_BOHR,
+        charge=base.charge,
+        multiplicity=base.multiplicity,
+    )
+
+
+def test_symmetry_orbits_finds_propenes_ch2_and_ch3_groups():
+    """C0 (=CH2, Hs 3,4) and C2 (-CH3, Hs 6,7,8) are each their own orbit,
+    matching this file's own fixture docstring."""
+    orbits = {frozenset(o) for o in _symmetry_orbits(_propene_bohr())}
+    assert frozenset({3, 4}) in orbits
+    assert frozenset({6, 7, 8}) in orbits
+
+
+def test_symmetry_orbits_empty_for_fully_asymmetric_structure():
+    start = _propene_bohr()
+    order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    asymmetric = Structure(
+        symbols=np.asarray(start.symbols)[order],
+        geometry=np.asarray(start.geometry)[order],
+        charge=0,
+        multiplicity=1,
+    )
+    # Still propene under the hood -- same orbits as the original, just
+    # reindexed. Confirms _symmetry_orbits tracks whatever indices this
+    # specific structure's atoms sit at, not a fixed/hardcoded set.
+    orbits = {frozenset(o) for o in _symmetry_orbits(asymmetric)}
+    assert len(orbits) == 2
+
+
+def test_expand_mapping_by_symmetry_swaps_waters_hs():
+    start = _water()
+    end = _water()
+    identity = AtomMapping(mapping={0: 0, 1: 1, 2: 2}, cost=0, n_alternatives=1)
+
+    expansions = expand_mapping_by_symmetry(identity, start, end)
+
+    assert len(expansions) == 1
+    assert expansions[0].mapping == {0: 0, 1: 2, 2: 1}
+    assert expansions[0].cost == identity.cost
+
+
+def test_expand_mapping_by_symmetry_produces_valid_cost_preserving_mappings():
+    start = _propene_bohr()
+    order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    end = Structure(
+        symbols=np.asarray(start.symbols)[order],
+        geometry=np.asarray(start.geometry)[order],
+        charge=0,
+        multiplicity=1,
+    )
+    atom_map = suggest_atom_mapping(start, end)
+    # propene's own orbits (CH2's 2 Hs, CH3's 3 Hs) give real expansions here.
+    expansions = expand_mapping_by_symmetry(atom_map, start, end)
+    assert len(expansions) > 0
+    for expansion in expansions:
+        assert sorted(expansion.mapping.values()) == sorted(expansion.mapping.keys())
+        assert expansion.cost == atom_map.cost
+        assert expansion.mapping != atom_map.mapping
+
+
+def test_expand_mapping_by_symmetry_respects_max_expansions():
+    start = _propene_bohr()
+    order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    end = Structure(
+        symbols=np.asarray(start.symbols)[order],
+        geometry=np.asarray(start.geometry)[order],
+        charge=0,
+        multiplicity=1,
+    )
+    atom_map = suggest_atom_mapping(start, end)
+    expansions = expand_mapping_by_symmetry(atom_map, start, end, max_expansions=1)
+    assert len(expansions) == 1

@@ -332,7 +332,7 @@ class GSM(PathMinimizer):
             getattr(self.parameters, "early_stop_on_minima", True)
         )
 
-        final_chain, history, early_stopped = self._execute_gsm_attempt(
+        final_chain, history, early_stopped = self._execute_gsm_attempt_with_fallback(
             chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
         )
         self.chain_trajectory = [self.initial_chain.copy(), *history, final_chain]
@@ -359,7 +359,7 @@ class GSM(PathMinimizer):
                 "convergence from the same point.",
                 level="warning",
             )
-            final_chain, resume_history, _ = self._execute_gsm_attempt(
+            final_chain, resume_history, _ = self._execute_gsm_attempt_with_fallback(
                 chain, reactant, product, e_reactant, final_chain.nodes, False
             )
             self.chain_trajectory.extend(resume_history)
@@ -372,6 +372,43 @@ class GSM(PathMinimizer):
             )
 
         return elem_step_results
+
+    def _execute_gsm_attempt_with_fallback(
+        self, chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
+    ) -> tuple[Chain, list, bool]:
+        """Wraps `_execute_gsm_attempt`: if it was given a seed (RESTART
+        mode) and the binary fails (crash, bad exit code, timeout -- see
+        `_run_gsm`'s `ElectronicStructureError` raises), retry once from
+        scratch (`seed_nodes=None`, native internal-coordinate growth)
+        instead of failing the whole attempt.
+
+        The compiled `gsm` binary's internal-coordinate builder
+        (`ICoord::ic_create`/`make_torsions`) is not always robust to an
+        externally pre-built geodesic-interpolated path handed to it whole
+        via RESTART -- e.g. a transient near-linear atom triple along the
+        interpolation for a multi-fragment reactant can segfault it --
+        even though its own from-scratch growth (which builds internal
+        coordinates incrementally) handles the same two endpoints fine. A
+        failure on the from-scratch retry itself is not caught here and
+        propagates normally.
+        """
+        try:
+            return self._execute_gsm_attempt(
+                chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
+            )
+        except ElectronicStructureError as exc:
+            if not seed_nodes:
+                raise
+            self._log(
+                "WARNING: molecularGSM failed on the RESTART-seeded "
+                f"geodesic-interpolated path ({type(exc).__name__}: {exc}); "
+                "falling back to its native from-scratch internal-coordinate "
+                "growth for this attempt.",
+                level="warning",
+            )
+            return self._execute_gsm_attempt(
+                chain, reactant, product, e_reactant, None, allow_early_stop
+            )
 
     def _execute_gsm_attempt(
         self, chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
@@ -401,6 +438,7 @@ class GSM(PathMinimizer):
                 e_reactant,
                 chain.parameters,
                 allow_early_stop=allow_early_stop,
+                seed_nodes=seed_nodes,
             )
 
             n_calls = counter_fp.read_text().count("\n")
@@ -666,6 +704,7 @@ class GSM(PathMinimizer):
         e_reactant: float,
         chain_parameters,
         allow_early_stop: bool = False,
+        seed_nodes: list | None = None,
     ) -> tuple[list[Chain], bool]:
         """Run the compiled binary, live-printing and accumulating a real
         `Chain` snapshot (see `_build_live_chain`) every time the engine
@@ -727,7 +766,17 @@ class GSM(PathMinimizer):
         # show progress -- there's nothing to await synchronously otherwise.
         history: list[Chain] = []
         early_stopped = False
-        nnodes_target = int(getattr(self.parameters, "nnodes", 9))
+        # With a RESTART seed, the string's real size is `len(seed_nodes)`
+        # (see `_write_inputs`'s `nnodes_override`) -- NOT `path_min_inputs.nnodes`,
+        # which only governs from-scratch growth and can silently mismatch
+        # the seed (e.g. default `nnodes=9` vs default `gi_inputs.nimages=10`).
+        # Using the wrong denominator here doesn't affect correctness (this
+        # is display-only; `_track_persistent_minima` no longer relies on
+        # exact equality with it), but it does make the live Monitor
+        # misleadingly look like GSM is growing from scratch even when a
+        # RESTART seed is already fully in place.
+        seeded = bool(seed_nodes)
+        nnodes_target = len(seed_nodes) if seeded else int(getattr(self.parameters, "nnodes", 9))
         persistence_window = int(
             getattr(self.parameters, "early_stop_persistence_window", 3)
         )
@@ -759,7 +808,7 @@ class GSM(PathMinimizer):
                 )
                 if live_chain is not None:
                     history.append(live_chain)
-                    self._print_live_chain(live_chain)
+                    self._print_live_chain(live_chain, nnodes_target, seeded)
                     triggered = allow_early_stop and self._track_persistent_minima(
                         live_chain,
                         nnodes_target,
@@ -801,7 +850,7 @@ class GSM(PathMinimizer):
                 )
                 if live_chain is not None:
                     history.append(live_chain)
-                    self._print_live_chain(live_chain)
+                    self._print_live_chain(live_chain, nnodes_target, seeded)
 
             if proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists():
                 raise ElectronicStructureError(
@@ -901,19 +950,32 @@ class GSM(PathMinimizer):
         state["energy_kcal"] = energy
         return state["count"] >= max(1, window)
 
-    def _print_live_chain(self, live_chain: Chain) -> None:
+    def _print_live_chain(self, live_chain: Chain, nnodes_target: int, seeded: bool) -> None:
         """Render an already-built live chain (see `_build_live_chain`) as a
         live, in-place-updating ASCII profile -- the GSM analogue of the live
         chain view NEB already gets via mepd.progress.print_chain_step after
         every optimizer step.
+
+        `nnodes_target`/`seeded` come from `_run_gsm`'s own computation (the
+        real RESTART seed length when seeded, not `path_min_inputs.nnodes`
+        which only governs from-scratch growth). The live count itself is
+        "distinct nodes the engine server has been asked for a gradient on
+        so far" (see `_ENGINE_SERVER_SOURCE`'s `known_nodes`), which looks
+        identical in shape (starts low, fills in) whether GSM is growing a
+        string from scratch or working through gradients for an
+        already-fully-seeded RESTART string -- the caption says which one
+        this is so that isn't mistaken for "seeding didn't work".
         """
         from mepd.progress import print_chain_step
 
-        nnodes_target = int(getattr(self.parameters, "nnodes", 9))
-        print_chain_step(
-            live_chain,
-            caption=f"GSM live string ({len(live_chain)}/{nnodes_target} nodes seen)",
-        )
+        if seeded:
+            caption = (
+                f"GSM live string (RESTART-seeded at {nnodes_target} nodes; "
+                f"{len(live_chain)}/{nnodes_target} have reported gradients so far)"
+            )
+        else:
+            caption = f"GSM live string ({len(live_chain)}/{nnodes_target} nodes seen)"
+        print_chain_step(live_chain, caption=caption)
 
     def _build_live_chain(
         self, live_path: Path, reactant, product, e_reactant: float, chain_parameters

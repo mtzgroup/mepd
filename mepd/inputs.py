@@ -326,15 +326,17 @@ class AtomMappingInputs:
     (`mepd/atom_mapping_selection.py`).
 
     `n_candidates`: how many of SLAPMapper's equal-minimal-cost candidate
-        mappings to keep and consider (default: 5). These are ties, not
-        ranked by quality among themselves.
+        mappings (plus their symmetry-orbit expansions, see
+        `expand_mapping_by_symmetry`) to keep and consider (default: 200).
+        These are ties, not ranked by quality among themselves.
 
     `metric`: how each candidate (including "don't reindex") is scored from
-        its geodesic-interpolated path -- one of "gi-energy" (highest QM
-        energy along the path, most expensive), "geodesic-distance" (the
-        geodesic optimizer's own path length, free), or "path-rmsd"
-        (cumulative per-frame RMSD along the path, free). Default:
-        "gi-energy", matching the metric the old single-candidate veto used.
+        its geodesic-interpolated path -- one of "geodesic-distance" (the
+        geodesic optimizer's own path length, free), "path-rmsd"
+        (cumulative per-frame RMSD along the path, free), or "gi-energy"
+        (highest QM energy along the path, most expensive). Default:
+        "geodesic-distance" -- free to evaluate even across many candidates,
+        unlike "gi-energy" (the metric the old single-candidate veto used).
 
     `veto_margin`: a non-identity candidate must beat "don't reindex" by
         more than this (in the selected metric's own units) to be adopted;
@@ -349,8 +351,8 @@ class AtomMappingInputs:
         False). Independent of --atom-mapping.
     """
 
-    n_candidates: int = 5
-    metric: str = "gi-energy"
+    n_candidates: int = 200
+    metric: str = "geodesic-distance"
     veto_margin: float = 0.0
     recheck_on_split: bool = False
 

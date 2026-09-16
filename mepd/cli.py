@@ -831,20 +831,20 @@ def run(
         "<output>/realign_debug/, e.g. for inspecting them with `mepd visualize`.",
     ),
     atom_mapping_candidates: int = typer.Option(
-        5, "--atom-mapping-candidates",
+        200, "--atom-mapping-candidates",
         help="--atom-mapping: how many of SLAPMapper's equal-minimal-cost "
-        "candidate mappings to keep and consider (they're ties, not ranked by "
-        "quality among themselves).",
+        "candidate mappings (plus their symmetry-orbit expansions) to keep "
+        "and consider (they're ties, not ranked by quality among themselves).",
     ),
     atom_mapping_metric: str = typer.Option(
-        "gi-energy", "--atom-mapping-metric",
+        "geodesic-distance", "--atom-mapping-metric",
         help="--atom-mapping: how each candidate mapping (including 'don't "
         "reindex') is scored from its geodesic-interpolated path -- "
-        "'gi-energy' (highest QM energy along the path; most expensive, one "
-        "engine energy evaluation per candidate), 'geodesic-distance' (the "
-        "geodesic optimizer's own path length; free), or 'path-rmsd' "
-        "(cumulative per-frame RMSD along the path; free). Which is actually "
-        "the best predictor of a correct mapping isn't settled -- "
+        "'geodesic-distance' (the geodesic optimizer's own path length; "
+        "free), 'path-rmsd' (cumulative per-frame RMSD along the path; "
+        "free), or 'gi-energy' (highest QM energy along the path; most "
+        "expensive, one engine energy evaluation per candidate). Which is "
+        "actually the best predictor of a correct mapping isn't settled -- "
         "--debug-dump records all three per candidate to help compare them.",
     ),
     atom_mapping_veto_margin: float = typer.Option(
@@ -2022,20 +2022,20 @@ def channels(
         "per candidate go to <output>/realign_debug/.",
     ),
     atom_mapping_candidates: int = typer.Option(
-        5, "--atom-mapping-candidates",
+        200, "--atom-mapping-candidates",
         help="--atom-mapping: how many of SLAPMapper's equal-minimal-cost "
-        "candidate mappings to keep and consider (they're ties, not ranked by "
-        "quality among themselves).",
+        "candidate mappings (plus their symmetry-orbit expansions) to keep "
+        "and consider (they're ties, not ranked by quality among themselves).",
     ),
     atom_mapping_metric: str = typer.Option(
-        "gi-energy", "--atom-mapping-metric",
+        "geodesic-distance", "--atom-mapping-metric",
         help="--atom-mapping: how each candidate mapping (including 'don't "
         "reindex') is scored from its geodesic-interpolated path -- "
-        "'gi-energy' (highest QM energy along the path; most expensive, one "
-        "engine energy evaluation per candidate), 'geodesic-distance' (the "
-        "geodesic optimizer's own path length; free), or 'path-rmsd' "
-        "(cumulative per-frame RMSD along the path; free). Which is actually "
-        "the best predictor of a correct mapping isn't settled -- "
+        "'geodesic-distance' (the geodesic optimizer's own path length; "
+        "free), 'path-rmsd' (cumulative per-frame RMSD along the path; "
+        "free), or 'gi-energy' (highest QM energy along the path; most "
+        "expensive, one engine energy evaluation per candidate). Which is "
+        "actually the best predictor of a correct mapping isn't settled -- "
         "--debug-dump records all three per candidate to help compare them.",
     ),
     atom_mapping_veto_margin: float = typer.Option(
