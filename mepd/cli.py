@@ -857,38 +857,177 @@ def run(
         _optimize_ts_and_irc(final_chain.get_ts_node(), run_inputs, output, run_irc=irc, label="ts")
 
 
+def _ts_guess_tasks_from_tree(tree, label_prefix: str) -> list[tuple[str, object]]:
+    """Every leaf's TS-guess node from an MSMEP split-tree, labeled
+    `<label_prefix>leaf_<leaf.index>` -- matches the naming `mepd run
+    --use-tsopt` already uses for a bare tree (`ts_leaf_<index>`), so the two
+    commands' outputs land on the same files in a shared --output directory."""
+    tasks = []
+    for leaf in tree.ordered_leaves:
+        if not leaf.data or not leaf.data.chain_trajectory:
+            continue
+        guess_node = leaf.data.chain_trajectory[-1].get_ts_node()
+        tasks.append((f"{label_prefix}leaf_{leaf.index}", guess_node))
+    return tasks
+
+
+def _ts_guess_tasks_from_network(pot) -> list[tuple[str, object]]:
+    """Every edge's TS-guess node(s) from a network.json (`Pot`), labeled
+    `ts_edge_<source>_<target>` (or `..._<i>` if an edge holds more than one
+    NEB chain)."""
+    tasks = []
+    for u, v, data in pot.graph.edges(data=True):
+        nebs = data.get("list_of_nebs") or []
+        for i, chain in enumerate(nebs):
+            try:
+                guess_node = chain.get_ts_node()
+            except Exception:
+                continue
+            suffix = "" if len(nebs) == 1 else f"_{i}"
+            tasks.append((f"ts_edge_{u}_{v}{suffix}", guess_node))
+    return tasks
+
+
+def _collect_ts_guess_tasks(
+    input_path: Path, charge: Optional[int], multiplicity: Optional[int]
+) -> list[tuple[str, object]]:
+    """Scan `input_path` for TS-guess nodes to optimize, auto-detecting its
+    shape (mirrors `_load_visualization_object`'s detection, minus the bare
+    NEB-history-folder and single-chain-xyz cases, which have no leaf/edge
+    structure to pull guesses from):
+
+    - a directory with adj_matrix.txt: an MSMEP split-tree (`mepd run
+      --recursive`/`--parallel` output) -- one guess per leaf.
+    - a directory with conformers/ and/or pairs/: a `mepd conformers` output
+      -- one guess per leaf of each completed pair's tree.
+    - a .json file: a network.json (`Pot`) -- one guess per edge.
+    - anything else: a single TS-guess xyz file, labeled "ts" (the original,
+      pre-rework behavior).
+    """
+    from mepd.inputs import ChainInputs
+    from mepd.nodes.node import StructureNode
+    from mepd.pot import Pot
+    from mepd.TreeNode import TreeNode
+
+    tree_charge = charge if charge is not None else 0
+    tree_multiplicity = multiplicity if multiplicity is not None else 1
+
+    if input_path.is_dir():
+        if (input_path / "adj_matrix.txt").exists():
+            tree = TreeNode.read_from_disk(
+                input_path, chain_parameters=ChainInputs(),
+                charge=tree_charge, multiplicity=tree_multiplicity,
+            )
+            return _ts_guess_tasks_from_tree(tree, "ts_")
+
+        pairs_dir = input_path / "pairs"
+        if pairs_dir.is_dir() or (input_path / "conformers").is_dir():
+            tasks: list[tuple[str, object]] = []
+            if pairs_dir.is_dir():
+                for pair_dir in sorted(pairs_dir.iterdir()):
+                    tree_dir = pair_dir / "tree"
+                    if not (tree_dir / "adj_matrix.txt").exists():
+                        continue
+                    try:
+                        pair_tree = TreeNode.read_from_disk(
+                            tree_dir, chain_parameters=ChainInputs(),
+                            charge=tree_charge, multiplicity=tree_multiplicity,
+                        )
+                    except Exception as exc:
+                        typer.echo(
+                            f"Skipping {pair_dir.name}: could not load tree "
+                            f"({type(exc).__name__}: {exc})"
+                        )
+                        continue
+                    tasks.extend(
+                        _ts_guess_tasks_from_tree(pair_tree, f"ts_{pair_dir.name}_")
+                    )
+            return tasks
+
+        raise typer.BadParameter(
+            f"'{input_path}' is a directory but has neither adj_matrix.txt (a "
+            "split-tree) nor conformers/ or pairs/ (a `mepd conformers` output)."
+        )
+
+    if input_path.suffix == ".json":
+        pot = Pot.read_from_disk(input_path)
+        return _ts_guess_tasks_from_network(pot)
+
+    guess_structure = _load_endpoint(input_path, charge, multiplicity)
+    return [("ts", StructureNode(structure=guess_structure))]
+
+
 @app.command("ts")
 def ts(
-    guess: Path = typer.Option(..., "--guess", exists=True, help="Path to the TS-guess xyz file."),
+    guess: Path = typer.Option(
+        ..., "--guess", exists=True,
+        help="Path to a TS-guess input, auto-detected by content: a single "
+        "TS-guess xyz file (optimizes just that one guess), an MSMEP "
+        "split-tree directory (has adj_matrix.txt, as written by `mepd run "
+        "--recursive`/`--parallel` to <output>/tree), a `mepd conformers` "
+        "output directory (has conformers/ and/or pairs/), or a network.json "
+        "-- for the latter three, every TS guess found is optimized.",
+    ),
     inputs: Optional[Path] = typer.Option(
         None, "--inputs", "-i", exists=True,
         help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
     ),
     charge: Optional[int] = typer.Option(
-        None, "--charge", help="Override the molecular charge on the guess structure."
+        None, "--charge", help="Override the molecular charge on the guess structure(s)."
     ),
     multiplicity: Optional[int] = typer.Option(
-        None, "--multiplicity", help="Override the spin multiplicity on the guess structure."
+        None, "--multiplicity", help="Override the spin multiplicity on the guess structure(s)."
     ),
     irc: bool = typer.Option(
-        False, "--irc", help="Follow up with an IRC from the optimized transition state."
+        False, "--irc", help="Follow up each optimized transition state with an IRC."
     ),
     output: Path = typer.Option(
         Path("mepd_ts_output"), "--output", "-o",
-        help="Directory to write the optimized TS structure (and IRC path) into.",
+        help="Directory to write optimized TS structure(s) (and IRC path(s)) into. "
+        "Resumable: a guess whose <label>.xyz already exists in --output is "
+        "skipped, so re-running against the same --output picks up wherever "
+        "a prior run left off.",
     ),
 ) -> None:
-    """Optimize a transition-state guess structure."""
-    from mepd.nodes.node import StructureNode
-
+    """Optimize transition-state guess(es). `--guess` accepts a single
+    TS-guess xyz file, or a whole result to scan for every not-yet-optimized
+    TS guess it contains: an MSMEP split-tree directory, a `mepd conformers`
+    output directory, or a network.json."""
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
     _echo_run_inputs_summary(run_inputs)
 
-    guess_structure = _load_endpoint(guess, charge, multiplicity)
-    guess_node = StructureNode(structure=guess_structure)
+    try:
+        tasks = _collect_ts_guess_tasks(guess, charge, multiplicity)
+    except typer.BadParameter:
+        raise
+    except Exception as exc:
+        typer.echo(f"Could not load '{guess}': {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
 
-    ts_node = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label="ts")
-    if ts_node is None:
+    if not tasks:
+        typer.echo(f"No TS guesses found in '{guess}'.")
+        raise typer.Exit(code=1)
+
+    output.mkdir(parents=True, exist_ok=True)
+
+    n_done = n_skipped = n_failed = 0
+    for label, guess_node in tasks:
+        ts_path = output / f"{label}.xyz"
+        if ts_path.exists():
+            typer.echo(f"Skipping {label}: already optimized ({ts_path}).")
+            n_skipped += 1
+            continue
+        ts_node = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label=label)
+        if ts_node is None:
+            n_failed += 1
+        else:
+            n_done += 1
+
+    typer.echo(
+        f"Optimized {n_done} TS guess(es), skipped {n_skipped} already-optimized, "
+        f"{n_failed} failed."
+    )
+    if n_done == 0 and n_failed > 0:
         raise typer.Exit(code=1)
 
 
@@ -961,13 +1100,57 @@ def _load_conformer_network_result(result_path: Path, charge: int, multiplicity:
     )
 
 
+def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
+    """Load a `mepd ts` (or `mepd run --use-tsopt`) output directory: one or
+    more <label>.xyz TS structures, each optionally paired with an IRC path
+    (<label>_irc.xyz, or irc.xyz for the bare "ts" label) -- see
+    `_optimize_ts_and_irc`, which writes these -- into a `TsOutputResult`
+    for `mepd visualize`."""
+    from mepd.inputs import ChainInputs
+    from mepd.viz import TsOutputResult
+
+    structures = []
+    irc_paths = []
+    load_errors = []
+
+    ts_files = sorted(
+        p for p in result_path.glob("ts*.xyz") if not p.stem.endswith("_irc")
+    )
+    for ts_fp in ts_files:
+        label = ts_fp.stem
+        try:
+            chain = Chain.from_xyz(ts_fp, ChainInputs(), charge=charge, spinmult=multiplicity)
+            if len(chain) == 0:
+                raise ValueError("empty xyz file")
+        except Exception as exc:
+            load_errors.append(f"{ts_fp.name}: {type(exc).__name__}: {exc}")
+            continue
+        structures.append((label, chain[0]))
+
+        irc_fp = result_path / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
+        if irc_fp.exists():
+            try:
+                irc_chain = Chain.from_xyz(irc_fp, ChainInputs(), charge=charge, spinmult=multiplicity)
+                irc_paths.append((f"{label} IRC", irc_chain))
+            except Exception as exc:
+                load_errors.append(f"{irc_fp.name}: {type(exc).__name__}: {exc}")
+
+    if load_errors:
+        typer.echo(f"Warning: {len(load_errors)} file(s) could not be loaded and are not shown:")
+        for msg in load_errors:
+            typer.echo(f"  - {msg}")
+
+    return TsOutputResult(structures=structures, irc_paths=irc_paths)
+
+
 def _load_visualization_object(result_path: Path, charge: int, multiplicity: int):
     """Load whatever mepd result `result_path` points to, for `mepd
     visualize`: a chain xyz file, a network.json (a `Pot`), a split-tree
     directory (has adj_matrix.txt), a bare NEB history directory (has
     traj_*.xyz but no adj_matrix.txt -- e.g. a manually saved
-    `<name>_history/` folder), or a `mepd conformers` output directory (has
-    conformers/ and/or pairs/)."""
+    `<name>_history/` folder), a `mepd conformers` output directory (has
+    conformers/ and/or pairs/), or a `mepd ts`/`run --use-tsopt` output
+    directory (has one or more ts*.xyz files)."""
     from mepd.inputs import ChainInputs
     from mepd.neb import NEB
     from mepd.pot import Pot
@@ -988,9 +1171,12 @@ def _load_visualization_object(result_path: Path, charge: int, multiplicity: int
             )
         if (result_path / "conformers").is_dir() or (result_path / "pairs").is_dir():
             return _load_conformer_network_result(result_path, charge, multiplicity)
+        if list(result_path.glob("ts*.xyz")):
+            return _load_ts_output_result(result_path, charge, multiplicity)
         raise typer.BadParameter(
             f"'{result_path}' is a directory but has neither adj_matrix.txt (a split-tree), "
-            "traj_*.xyz files (a NEB history), nor conformers/ or pairs/ (a `mepd conformers` output)."
+            "traj_*.xyz files (a NEB history), conformers/ or pairs/ (a `mepd conformers` "
+            "output), nor ts*.xyz files (a `mepd ts` output)."
         )
 
     if result_path.suffix == ".json":
@@ -1005,8 +1191,8 @@ def visualize(
         ..., exists=True,
         help="Path to a mepd result: a chain xyz file (mep_output.xyz, unique.xyz -- "
         "a matching <stem>.energies sidecar, if present, is used for the energy profile), "
-        "a network.json, a split-tree/NEB-history directory, or a `mepd conformers` "
-        "output directory.",
+        "a network.json, a split-tree/NEB-history directory, a `mepd conformers` "
+        "output directory, or a `mepd ts`/`run --use-tsopt` output directory.",
     ),
     output: Optional[Path] = typer.Option(
         None, "--output", "-o",
@@ -1029,7 +1215,9 @@ def visualize(
     or network.json -- a diagram of tree nodes/network edges to click
     through, and a trajectory-step slider for whichever one is selected.
     For a `mepd conformers` output directory, shows reactant conformers,
-    product conformers, and completed MEP outputs as clickable groups."""
+    product conformers, and completed MEP outputs as clickable groups. For
+    a `mepd ts`/`run --use-tsopt` output directory, shows every optimized
+    TS structure and its IRC path (if computed) as clickable groups."""
     try:
         obj = _load_visualization_object(result_path, charge, multiplicity)
     except Exception as exc:

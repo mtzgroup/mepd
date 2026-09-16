@@ -294,11 +294,48 @@ def _conformer_network_nodes_payload(result: ConformerNetworkResult) -> list[dic
     return nodes
 
 
-def _conformer_network_html(nodes: list[dict]) -> str:
+@dataclass
+class TsOutputResult:
+    """The on-disk output of `mepd ts` (or `mepd run --use-tsopt`): one or
+    more optimized transition-state structures (<label>.xyz), each optionally
+    paired with an IRC path (<label>_irc.xyz, or irc.xyz for the bare "ts"
+    label), bundled for `render_visualization_html` to show as one clickable
+    page: TS structures and IRC paths, each its own group."""
+
+    structures: list = field(default_factory=list)  # list[tuple[str, Node]]
+    irc_paths: list = field(default_factory=list)  # list[tuple[str, Chain]]
+
+
+def _ts_output_nodes_payload(result: TsOutputResult) -> list[dict]:
+    nodes: list[dict] = []
+
+    def add(group: str, label: str, trajectory: list[dict]) -> None:
+        if not trajectory:
+            return
+        nodes.append({
+            "index": len(nodes),
+            "depth": 0,
+            "parent": None,
+            "group": group,
+            "label": label,
+            "trajectory": trajectory,
+        })
+
+    for label, node in result.structures:
+        add("TS structures", label, [_single_structure_payload(node)])
+    for label, chain in result.irc_paths:
+        if chain is not None and len(chain) > 0:
+            add("IRC paths", label, [_chain_payload(chain)])
+
+    return nodes
+
+
+def _grouped_nodes_html(nodes: list[dict]) -> str:
     """Grouped clickable list (not a tree/graph diagram): one section per
-    group -- reactant conformers, product conformers, completed MEP outputs,
-    aggregated network edges -- each a row of buttons picking that node as
-    the current selection via the shared `selectNode(index)`."""
+    group -- e.g. reactant conformers, product conformers, completed MEP
+    outputs, aggregated network edges, TS structures, IRC paths -- each a
+    row of buttons picking that node as the current selection via the
+    shared `selectNode(index)`."""
     groups: dict[str, list[dict]] = {}
     for node in nodes:
         groups.setdefault(node["group"], []).append(node)
@@ -388,6 +425,14 @@ def render_visualization_html(
                 "completed MEP outputs found."
             )
         diagram_kind, diagram_obj = "grouped", nodes
+    elif isinstance(obj, TsOutputResult):
+        nodes = _ts_output_nodes_payload(obj)
+        if not nodes:
+            raise ValueError(
+                "Nothing recoverable to visualize: no TS structures or IRC "
+                "paths found."
+            )
+        diagram_kind, diagram_obj = "grouped", nodes
     elif isinstance(obj, PathMinimizer):
         trajectory = _trajectory_payload(obj)
         if not trajectory:
@@ -399,7 +444,7 @@ def render_visualization_html(
         raise TypeError(
             f"Cannot visualize object of type {type(obj).__name__}; "
             "expected a Chain, a NEB/PathMinimizer, a TreeNode, a Pot, a "
-            "ConformerNetworkResult, or a list of Node objects."
+            "ConformerNetworkResult, a TsOutputResult, or a list of Node objects."
         )
 
     nodes_json = json.dumps(nodes)
@@ -411,7 +456,7 @@ def render_visualization_html(
         pot, edge_nodes = diagram_obj
         tree_html = _network_svg(pot, edge_nodes)
     elif diagram_kind == "grouped":
-        tree_html = _conformer_network_html(diagram_obj)
+        tree_html = _grouped_nodes_html(diagram_obj)
 
     return f"""<!doctype html>
 <html>
