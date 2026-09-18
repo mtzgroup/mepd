@@ -705,7 +705,7 @@ def check_cached_xyz_elem_step(
             )
         engine = _CachedOnlyEngine()
     else:
-        from qcdata.models.inputs import ProgramArgs
+        from mepd.program_args import ProgramArgs
         from mepd.engines.qccompute import QCComputeEngine
 
         engine = QCComputeEngine(

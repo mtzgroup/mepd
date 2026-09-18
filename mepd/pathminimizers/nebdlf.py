@@ -519,11 +519,11 @@ class DLFindNEB(PathMinimizer):
         _tcin_text, files = self._build_terachem_input(chain, params=active_params)
         collect_files = bool(active_params.get("collect_files", True))
         file_input = FileInput(
+            program="terachem",
             files=files,
             cmdline_args=["tc.in"],
         )
         return self.engine.compute_func(
-            "terachem",
             file_input,
             collect_files=collect_files,
         )

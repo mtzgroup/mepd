@@ -17,12 +17,13 @@ from pydantic import ValidationError
 from chemcloud import compute as cc_compute
 from chemcloud import configure_client as cc_configure_client
 from qccompute import compute as qccompute_compute
-from qcdata.models.inputs import DualProgramInput, ProgramInput, ProgramArgs, FileInput
-from qcdata import ProgramOutput, Structure
+from qcdata.models.inputs import ProgramInput, ProgramSpec, FileInput
+from qcdata import CalcType, ProgramOutput, Structure
 import shutil
 
 from mepd.chain import Chain
 from mepd.engines.engine import Engine
+from mepd.program_args import ProgramArgs
 from mepd.errors import (
     GradientsNotComputedError,
     ElectronicStructureError,
@@ -288,6 +289,7 @@ class QCComputeEngine(Engine):
             )
             lines.append("$end")
         return FileInput(
+            program="terachem",
             files={
                 "tc.in": "\n".join(lines).rstrip() + "\n",
                 "geometry.xyz": node.structure.to_xyz(),
@@ -437,25 +439,52 @@ class QCComputeEngine(Engine):
 
         return enes
 
-    def compute_func(self, *args, **kwargs):
+    def _gradient_subprogram(self, program: str | None = None) -> ProgramSpec:
+        """Build the child spec that qcdata >=0.19 optimizers look for.
+
+        Replaces the old `DualProgramInput.subprogram`/`subprogram_args` pair.
+        The child is registered under `CalcType.gradient` because that is what
+        the consumers ask for: geomeTRIC resolves it with
+        `input_data.get_subprogram(CalcType.gradient)`, and BigChem builds its
+        hessian by finite-differencing subprogram gradients.
+        """
+        return self.program_args.to_spec(program or self.program, CalcType.gradient)
+
+    @staticmethod
+    def _input_program(inp_obj: Any) -> str:
+        """The program an input targets.
+
+        qcdata >=0.19 carries `program` on the input model itself, so it no
+        longer has to be threaded alongside it.
+        """
+        first = inp_obj[0] if isinstance(inp_obj, list) else inp_obj
+        return str(getattr(first, "program", "") or "")
+
+    def compute_func(self, inp_obj, **kwargs):
+        """Run one input (or, for ChemCloud, a batch) on the configured backend.
+
+        qccompute >=0.14 takes the program from `inp_obj.program`; ChemCloud
+        0.17 still wants it as a separate leading argument, so it is read back
+        off the model here rather than passed in by every caller.
+        """
         if self.compute_program == "qccompute":
             call_kwargs = dict(kwargs)
             if self.print_stdout:
                 call_kwargs.setdefault("print_logs", self.print_stdout)
-            return qccompute_compute(*args, **call_kwargs)
+            return qccompute_compute(inp_obj, **call_kwargs)
         elif self.compute_program == "chemcloud":
             try:
-                call_args = list(args)
-                if len(call_args) >= 2:
-                    call_args[1] = self._chemcloud_input_payload(call_args[1])
+                payload = self._chemcloud_input_payload(inp_obj)
                 call_kwargs = dict(kwargs)
                 call_kwargs.setdefault("queue", self.chemcloud_queue)
-                return self._chemcloud_compute_with_retries(*call_args, **call_kwargs)
+                return self._chemcloud_compute_with_retries(
+                    self._input_program(inp_obj), payload, **call_kwargs
+                )
             except ValidationError as exc:
                 message = str(exc)
                 if "ProgramOutput" not in message:
                     raise
-                program = str(args[0]) if args else self.program
+                program = self._input_program(inp_obj) or self.program
                 raise ExternalProgramError(
                     program=program,
                     message=(
@@ -469,7 +498,7 @@ class QCComputeEngine(Engine):
             except Exception as exc:
                 if not self._is_chemcloud_output_fetch_error(exc):
                     raise
-                program = str(args[0]) if args else self.program
+                program = self._input_program(inp_obj) or self.program
                 request = getattr(exc, "request", None)
                 request_url = str(getattr(request, "url", "") or "")
                 task_id = ""
@@ -528,6 +557,7 @@ class QCComputeEngine(Engine):
 
         # first make sure the program input has calctype set to input calctype
         prog_inp = ProgramInput(
+            program=self.program,
             structure=node_list[0].structure, calctype=calctype, **self.program_args.__dict__)
 
         # now create program inputs for each geometry that is not frozen
@@ -549,7 +579,6 @@ class QCComputeEngine(Engine):
                 else non_frozen_prog_inps[0]
             )
             non_frozen_results = self.compute_func(
-                self.program,
                 batch_or_single,
                 collect_files=self.collect_files,
             )
@@ -588,19 +617,15 @@ class QCComputeEngine(Engine):
             frozen_override = list(self.frozen_atom_indices or [])
         if "terachem" not in self.program:
 
-            dpi = DualProgramInput(
+            dpi = ProgramInput(
+                program=self.geometry_optimizer,
                 calctype="optimization",  # type: ignore
                 structure=node.structure,
-                subprogram=self.program,
-                subprogram_args={
-                    "model": self.program_args.model,
-                    "keywords": self.program_args.keywords,
-                },
+                subprograms=[self._gradient_subprogram()],
                 keywords=keywords,
             )
 
-            output = self.compute_func(
-                self.geometry_optimizer, dpi, collect_files=self.collect_files)
+            output = self.compute_func(dpi, collect_files=self.collect_files)
 
         else:  # DEC162025: Trying again... # OCT062025: bug where terachem optimizations werent being passed.
             tc_keywords = dict(
@@ -619,10 +644,10 @@ class QCComputeEngine(Engine):
                     optimizer_keywords=keywords,
                     frozen_atom_indices=frozen_override,
                 )
-                output = self.compute_func(
-                    "terachem", prog_input, collect_files=True)
+                output = self.compute_func(prog_input, collect_files=True)
             else:
                 prog_input = ProgramInput(
+                    program="terachem",
                     structure=node.structure,
                     # Can be "energy", "gradient", "hessian", "optimization", "transition_state"
                     calctype="optimization",  # type: ignore
@@ -632,7 +657,7 @@ class QCComputeEngine(Engine):
                 )
 
                 output = self.compute_func(
-                    "terachem", prog_input, collect_files=self.collect_files)
+                    prog_input, collect_files=self.collect_files)
 
         return output
 
@@ -715,20 +740,17 @@ class QCComputeEngine(Engine):
 
         def _run_standard_hessian_call():
             proginp = ProgramInput(
+                program=self.program,
                 structure=node.structure,
                 calctype='hessian', **self.program_args.__dict__)
-            return self.compute_func(
-                self.program, proginp, collect_files=collect_files)
+            return self.compute_func(proginp, collect_files=collect_files)
 
         if use_bigchem:
-            dpi = DualProgramInput(
+            dpi = ProgramInput(
+                program="bigchem",
                 calctype="hessian",  # type: ignore
                 structure=node.structure,
-                subprogram=prog,
-                subprogram_args={
-                    "model": self.program_args.model,
-                    "keywords": self.program_args.keywords,
-                },
+                subprograms=[self._gradient_subprogram(prog)],
                 keywords={},
             )
             try:
@@ -808,13 +830,13 @@ class QCComputeEngine(Engine):
             "crest") is not None, "crest not found in path. this currently only works with CREST"
 
         pi = ProgramInput(
+            program="crest",
             calctype="conformer_search",  # type: ignore
             structure=node.structure,
             model=self.program_args.model,
             keywords=self.program_args.keywords,
         )
-        output = self.compute_func(
-            'crest', pi, collect_files=self.collect_files)
+        output = self.compute_func(pi, collect_files=self.collect_files)
         return output
 
     def _compute_ts_result(self, node: StructureNode, keywords={'maxiter': 1000}, use_bigchem=False,
@@ -835,17 +857,16 @@ class QCComputeEngine(Engine):
             kwds = keywords.copy()
             files = {}
 
-        dpi = DualProgramInput(keywords=kwds,
-                               structure=node.structure,
-                               calctype="transition_state",
-                               subprogram=self.program,
-                               subprogram_args={
-                                   "model": self.program_args.model,
-                                   "keywords": self.program_args.keywords,
-                               },
-                               files=files)
+        dpi = ProgramInput(
+            program="geometric",
+            keywords=kwds,
+            structure=node.structure,
+            calctype="transition_state",
+            subprograms=[self._gradient_subprogram()],
+            files=files,
+        )
 
-        return self.compute_func('geometric', dpi, collect_files=self.collect_files)
+        return self.compute_func(dpi, collect_files=self.collect_files)
 
     def compute_sd_irc(self, ts: StructureNode, hessres: ProgramOutput = None, dr=0.1, max_steps=500,
                        use_bigchem=False, ss=1.0, **kwargs) -> List[List[StructureNode], List[StructureNode]]:
@@ -970,14 +991,11 @@ class QCComputeEngine(Engine):
         for node in nodes:
             if "terachem" not in self.program:
                 program_inputs.append(
-                    DualProgramInput(
+                    ProgramInput(
+                        program=self.geometry_optimizer,
                         calctype="optimization",  # type: ignore
                         structure=node.structure,
-                        subprogram=self.program,
-                        subprogram_args={
-                            "model": self.program_args.model,
-                            "keywords": self.program_args.keywords,
-                        },
+                        subprograms=[self._gradient_subprogram()],
                         keywords=keywords,
                     )
                 )
@@ -1002,6 +1020,7 @@ class QCComputeEngine(Engine):
                 else:
                     program_inputs.append(
                         ProgramInput(
+                            program="terachem",
                             structure=node.structure,
                             calctype="optimization",  # type: ignore
                             model=self.program_args.model,
@@ -1011,7 +1030,6 @@ class QCComputeEngine(Engine):
                     )
 
         outputs = self.compute_func(
-            self.geometry_optimizer if "terachem" not in self.program else "terachem",
             program_inputs if len(program_inputs) > 1 else program_inputs[0],
             collect_files=True if ("terachem" in self.program and frozen_override) else self.collect_files,
         )
@@ -1219,8 +1237,8 @@ class QCComputeEngine(Engine):
                 ("\n" if not msreact_input.endswith("\n") else "")
 
         output = self.compute_func(
-            "crest",
-            FileInput(files=files, cmdline_args=cmdline_args),
+            FileInput(program="crest", files=files,
+                      cmdline_args=cmdline_args),
             collect_files=True,
         )
         products_xyz = self._file_text_from_output(
@@ -1279,8 +1297,8 @@ class QCComputeEngine(Engine):
             "end",
         ]
         output = self.compute_func(
-            "terachem",
             FileInput(
+                program="terachem",
                 files={
                     "tc.in": "\n".join(tcin_lines) + "\n",
                     "geometry.xyz": node.structure.to_xyz(),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import shutil
-from qcdata import ProgramArgs
+from mepd.program_args import ProgramArgs
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from dataclasses import is_dataclass, asdict
@@ -561,7 +561,7 @@ class RunInputs:
 
         if self.program_kwds is None:
             if self.engine_name in {"gxtb", "ase"}:
-                # Neither engine uses qccompute/chemcloud's ProgramArgs/QCIO
+                # Neither engine uses the qccompute/chemcloud ProgramArgs/qcdata
                 # input construct -- gxtb shells out directly, and ASEEngine
                 # takes an already-constructed ase.Calculator.
                 program_args = None

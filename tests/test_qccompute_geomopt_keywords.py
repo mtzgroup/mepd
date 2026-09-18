@@ -3,10 +3,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from qcdata import Structure
-from qcdata.models.inputs import FileInput, ProgramArgs
+from qcdata.models.inputs import FileInput
 
 from mepd.engines.qccompute import QCComputeEngine
+from mepd.program_args import ProgramArgs
 from mepd.nodes.node import StructureNode
+
+
+def _program_of(inp_obj):
+    """Read the target program back off an input model (qcdata >=0.19)."""
+    first = inp_obj[0] if isinstance(inp_obj, list) else inp_obj
+    return first.program
 
 
 def _node_at_x(x: float) -> StructureNode:
@@ -30,8 +37,8 @@ def test_terachem_single_geomopt_preserves_program_keywords():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["input"] = inp_obj
         return SimpleNamespace()
 
@@ -57,8 +64,8 @@ def test_terachem_batch_geomopt_preserves_program_keywords():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["inputs"] = inp_obj
         return [SimpleNamespace(), SimpleNamespace()]
 
@@ -88,8 +95,8 @@ def test_terachem_single_geomopt_with_frozen_atoms_uses_constraints_file_input()
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["input"] = inp_obj
         captured["collect_files"] = kwargs.get("collect_files")
         return SimpleNamespace()
@@ -132,8 +139,8 @@ def test_terachem_batch_geomopt_with_frozen_atoms_uses_constraints_file_inputs()
             )
         }
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["inputs"] = inp_obj
         captured["collect_files"] = kwargs.get("collect_files")
         return [_Output(), _Output()]
@@ -177,8 +184,8 @@ def test_non_terachem_geomopt_default_keywords_use_coordsys():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["input"] = inp_obj
         return SimpleNamespace()
 
@@ -209,8 +216,8 @@ def test_non_terachem_geomopt_uses_engine_geometry_optimizer_keywords():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
-        captured["program"] = program
+    def _fake_compute_func(inp_obj, **kwargs):
+        captured["program"] = _program_of(inp_obj)
         captured["input"] = inp_obj
         return SimpleNamespace()
 
@@ -236,7 +243,7 @@ def test_non_terachem_geomopt_call_keywords_override_engine_defaults():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
+    def _fake_compute_func(inp_obj, **kwargs):
         captured["input"] = inp_obj
         return SimpleNamespace()
 
@@ -260,7 +267,7 @@ def test_non_terachem_geomopt_partial_engine_keywords_keep_defaults():
     )
     captured = {}
 
-    def _fake_compute_func(program, inp_obj, **kwargs):
+    def _fake_compute_func(inp_obj, **kwargs):
         captured["input"] = inp_obj
         return SimpleNamespace()
 
