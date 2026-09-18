@@ -95,6 +95,14 @@ class Chain(BaseModel):
             # np.loadtxt collapses a file with a single value (e.g. a
             # one-node chain) to a 0-d array, which isn't iterable below.
             energies = np.atleast_1d(np.loadtxt(energies_fp))
+            # A sidecar that does not describe this many frames is a stale or
+            # truncated file, not a chain -- say so instead of letting the
+            # per-node indexing below fall off the end with an IndexError.
+            if len(energies) != len(chain.nodes):
+                raise ValueError(
+                    f"{fp.name} has {len(chain.nodes)} frames but "
+                    f"{energies_fp.name} has {len(energies)} energies."
+                )
 
             gradients = None
             if has_gradients:
@@ -103,6 +111,11 @@ class Chain(BaseModel):
                     np.loadtxt(grad_shape_path)
                 ).astype(int)
                 gradients = gradients_flat.reshape(gradients_shape).tolist()
+                if len(gradients) != len(chain.nodes):
+                    raise ValueError(
+                        f"{fp.name} has {len(chain.nodes)} frames but "
+                        f"{grad_path.name} has {len(gradients)} gradients."
+                    )
 
             for i, node in enumerate(chain.nodes):
                 ene = energies[i]

@@ -23,7 +23,25 @@ from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
 from mepd.chain import Chain
 from mepd.inputs import NetworkInputs, RunInputs
 
-app = typer.Typer(help="mepd: minimum-energy-path discovery tools.")
+
+def _teardown_live_display(*_args, **_kwargs) -> None:
+    """Tear down the progress printer's live display after every command.
+
+    `ProgressPrinter` starts a rich `Live` lazily (`_render_live_monitors`) and
+    only stops it when something else needs the terminal. Without this, a
+    command returns with the Live still running: rich leaves the cursor hidden,
+    and the stdout redirection it installed on start is only unwound later --
+    against whatever stream happens to be current by then.
+    """
+    from mepd.progress import stop_status
+
+    stop_status()
+
+
+app = typer.Typer(
+    help="mepd: minimum-energy-path discovery tools.",
+    result_callback=_teardown_live_display,
+)
 
 
 def _format_run_inputs_value(value) -> str:

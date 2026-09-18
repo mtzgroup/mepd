@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 from qcdata import Structure
@@ -9,6 +11,21 @@ from mepd.nodes.node import StructureNode
 from mepd.pathminimizers.gsm import GSM, _inpfileq_text
 from qcconst.constants import ANGSTROM_TO_BOHR
 from types import SimpleNamespace
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(captured: str) -> str:
+    """Flatten a rich-rendered warning back to its plain message.
+
+    `ProgressPrinter.print_warning` goes through a rich Console, which wraps at
+    the terminal width and re-emits its colour codes on every wrapped line.
+    Splitting on whitespace alone therefore leaves escape sequences wedged
+    between words, so any asserted phrase that straddles a wrap point fails --
+    and where it wraps depends on the terminal the suite happens to run in.
+    """
+    return " ".join(_ANSI_RE.sub("", captured).split())
 
 
 def _hcn_node(c_pos: float, n_pos: float, energy: float) -> StructureNode:
@@ -152,6 +169,18 @@ def test_execute_gsm_attempt_falls_back_to_native_growth_after_seeded_crash(monk
     attempt, and warn that this happened."""
     from mepd.errors import ElectronicStructureError
 
+    import mepd.progress as progress
+
+    # `get_progress_printer()` hands out a module-level singleton. The `mepd
+    # run` CLI tests call the command functions directly, so nothing tears down
+    # the rich `Live` those runs start, and the first `print_warning` after one
+    # stops it -- which makes rich restore the stdout that was current when the
+    # Live started, over capsys's. A printer of our own has no Live to stop.
+    monkeypatch.setattr(progress, "_default_printer", progress.ProgressPrinter())
+    # Pin the rich Console width so the warning wraps the same way no matter
+    # what terminal the suite runs in; `_plain` handles the colour codes.
+    monkeypatch.setenv("COLUMNS", "200")
+
     reactant = _hcn_node(1.064, 2.220, energy=-0.5)
     product = _hcn_node(2.163, 0.994, energy=-0.52)
     chain = Chain.model_validate({"nodes": [reactant, product], "parameters": {}})
@@ -177,7 +206,7 @@ def test_execute_gsm_attempt_falls_back_to_native_growth_after_seeded_crash(monk
     assert calls[0] == [reactant, product]
     assert calls[1] is None
 
-    out = " ".join(capsys.readouterr().out.split())
+    out = _plain(capsys.readouterr().out)
     assert "RESTART-seeded" in out
     assert "falling back to its native from-scratch internal-coordinate growth" in out
 
