@@ -39,6 +39,8 @@ class Chain(BaseModel):
             yield item
 
     def model_post_init(self, __context):
+        if not self.nodes:
+            raise ValueError("Chain must have at least one node.")
         if np.array(self.velocity).shape != self.coordinates.shape:
             self._zero_velocity()
 

@@ -555,6 +555,8 @@ class Molecule(nx.Graph):
         """
 
         rdmol = Chem.MolFromSmiles(smi)
+        if rdmol is None:
+            raise ValueError(f"{smi!r} is not a valid SMILES string.")
         new_mol = cls.from_rdmol(rdmol, smi, name)
         return new_mol
 

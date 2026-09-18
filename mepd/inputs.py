@@ -277,10 +277,16 @@ class ChainInputs:
     node_ene_thre: float = 5.0  # kcal/mol
     frozen_atom_indices: str = ""
 
-    def _post_init__(self):
-        if len(self.frozen_atom_indices) > 0:
+    def __post_init__(self):
+        if isinstance(self.frozen_atom_indices, str) and len(self.frozen_atom_indices) > 0:
             self.frozen_atom_indices = [
-                int(x) for x in self.frozen_atom_indices.split(" ")]
+                int(x) for x in self.frozen_atom_indices.split()]
+        for name in ("k", "delta_k"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"ChainInputs.{name} must be a number, got {value!r}.")
+            if value < 0:
+                raise ValueError(f"ChainInputs.{name} must be >= 0, got {value}.")
 
     def copy(self) -> ChainInputs:
         return ChainInputs(**self.__dict__)

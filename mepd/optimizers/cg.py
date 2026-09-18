@@ -22,6 +22,8 @@ class ConjugateGradient(Optimizer):
     positive_steps_thre: int = 15
 
     def __post_init__(self):
+        if self.timestep <= 0:
+            raise ValueError(f"ConjugateGradient.timestep must be > 0, got {self.timestep}.")
         self.g_old = None
         self.p_old = None
         self.orig_timestep = self.timestep

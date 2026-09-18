@@ -193,7 +193,10 @@ def _build_path_minimizer(initial_chain: Chain, run_inputs: RunInputs):
 
 
 def _load_endpoint(fp: Path, charge: Optional[int], multiplicity: Optional[int]) -> Structure:
-    structure = Structure.open(str(fp))
+    try:
+        structure = Structure.open(str(fp))
+    except Exception as exc:
+        raise typer.BadParameter(f"Could not load '{fp}': {type(exc).__name__}: {exc}")
     updates = {}
     if charge is not None:
         updates["charge"] = charge
@@ -202,6 +205,15 @@ def _load_endpoint(fp: Path, charge: Optional[int], multiplicity: Optional[int])
     if updates:
         structure = structure.model_copy(update=updates)
     return structure
+
+
+def _open_run_inputs(inputs: Optional[Path]) -> RunInputs:
+    if inputs is None:
+        return RunInputs()
+    try:
+        return RunInputs.open(inputs)
+    except Exception as exc:
+        raise typer.BadParameter(f"Could not load '{inputs}': {type(exc).__name__}: {exc}")
 
 
 def _load_structure_from_smiles_or_xyz(
@@ -241,8 +253,14 @@ def _load_structure_from_smiles_or_xyz(
             errors.append(f"{backend}: {type(exc).__name__}: {exc}")
 
     if structure is None:
+        hint = ""
+        if path.suffix or "/" in value or "\\" in value:
+            hint = (
+                f" (looks like a file path -- check for a typo; '{value}' does "
+                "not exist)"
+            )
         raise typer.BadParameter(
-            f"'{value}' is neither an existing xyz file nor a valid SMILES string.\n"
+            f"'{value}' is neither an existing xyz file nor a valid SMILES string{hint}.\n"
             + "\n".join(errors)
         )
 
@@ -914,7 +932,7 @@ def run(
         typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
         recursive = True
 
-    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs = _open_run_inputs(inputs)
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
@@ -1218,7 +1236,7 @@ def ts(
     TS-guess xyz file, or a whole result to scan for every not-yet-optimized
     TS guess it contains: an MSMEP split-tree directory, a `mepd channels`
     output directory, or a network.json."""
-    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs = _open_run_inputs(inputs)
     _echo_run_inputs_summary(run_inputs)
 
     try:
@@ -1704,7 +1722,7 @@ def network_splits(
     from mepd.nodes.node import StructureNode
     from mepd.NetworkBuilder import NetworkBuilder
 
-    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs = _open_run_inputs(inputs)
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
@@ -1719,6 +1737,24 @@ def network_splits(
     candidates = [
         (i, j) for i in range(len(structures)) for j in range(i + 1, len(structures))
     ]
+
+    identical_pairs = [
+        (i, j) for i, j in candidates
+        if _connectivity_matches(structures[i], structures[j])
+    ]
+    if identical_pairs:
+        for i, j in identical_pairs:
+            typer.echo(
+                f"Skipping pair ({minima[i].name}, {minima[j].name}): "
+                "endpoints are connectivity-identical, nothing to connect."
+            )
+        candidates = [pair for pair in candidates if pair not in identical_pairs]
+        if not candidates:
+            raise typer.BadParameter(
+                "Every candidate pair has connectivity-identical endpoints -- "
+                "provide at least two structurally distinct minima."
+            )
+
     if len(candidates) > max_pairs:
         typer.echo(
             f"{len(candidates)} candidate pairs found (all-to-all over "
@@ -2158,10 +2194,14 @@ def channels(
     <output>/network.json."""
     if method != "conformers":
         raise typer.BadParameter(f"Unknown --method '{method}'. Known: 'conformers'.")
+    if backend not in ("rdkit", "crest"):
+        raise typer.BadParameter(f"Unknown --backend '{backend}'. Known: 'rdkit', 'crest'.")
     if n_conformers <= 0:
         raise typer.BadParameter("--n-conformers must be a positive integer.")
     if n_embed <= 0:
         raise typer.BadParameter("--n-embed must be a positive integer.")
+    if rmsd_cutoff <= 0:
+        raise typer.BadParameter("--rmsd-cutoff must be a positive number.")
     if max_pairs <= 0:
         raise typer.BadParameter("--max-pairs must be a positive integer.")
     if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
@@ -2176,7 +2216,7 @@ def channels(
     from mepd.nodes.node import StructureNode
     from mepd.NetworkBuilder import NetworkBuilder
 
-    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    run_inputs = _open_run_inputs(inputs)
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement

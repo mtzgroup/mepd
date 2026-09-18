@@ -401,8 +401,12 @@ def map_smiles_pair(
     from slapmapper.aam import SlapAAM
 
     for smi in (smi_start, smi_end):
-        if Chem.MolFromSmiles(smi) is None:
-            raise ValueError(f"{smi!r} is not a valid SMILES string.")
+        mol = Chem.MolFromSmiles(smi)
+        # RDKit parses "" as a valid 0-atom Mol rather than returning None;
+        # SlapAAM's native mapper segfaults on an empty-molecule reaction, so
+        # this must be rejected here rather than relying on the None check.
+        if mol is None or mol.GetNumAtoms() == 0:
+            raise ValueError(f"{smi!r} is not a valid (non-empty) SMILES string.")
 
     mapper = SlapAAM(binary=True)
     mapper.map_smiles(f"{smi_start}>>{smi_end}")

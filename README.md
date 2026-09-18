@@ -26,15 +26,15 @@ uv run pytest
 
 ```python
 from mepd import Chain, ChainInputs, NEB, NEBInputs, StructureNode
-from mepd.engines.qcop import QCOPEngine
+from mepd.engines.qccompute import QCComputeEngine
 from mepd.optimizers.cg import ConjugateGradient
 import mepd.chainhelpers as ch
-from qcio import Structure
+from qcdata import Structure
 
-start = Structure.from_xyz("start.xyz")
-end = Structure.from_xyz("end.xyz")
+start = Structure.open("start.xyz")
+end = Structure.open("end.xyz")
 
-engine = QCOPEngine(compute_program="chemcloud")
+engine = QCComputeEngine(compute_program="chemcloud")
 
 start_node = StructureNode(structure=start)
 end_node = StructureNode(structure=end)
