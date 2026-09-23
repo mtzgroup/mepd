@@ -206,7 +206,18 @@ def _generate_conformers_rdkit(
     # Bond perception + stereochemistry from the input 3D geometry (conformer
     # 0) -- this is what lets ETKDG respect the input's existing stereocenters
     # rather than embedding a random/inconsistent one.
-    rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
+    try:
+        rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
+    except Exception as exc:
+        # Bond orders can't always be assigned from a geometry (radicals,
+        # unusual charge states -- several Reaction-QM species). Without
+        # them ETKDG would embed double bonds as single, so rather than
+        # sample garbage, keep just the input geometry for this endpoint.
+        if stats is not None:
+            stats["n_generated"] = 0
+            stats["n_in_window"] = 0
+            stats["rdkit_skipped"] = f"bond orders not perceivable: {exc}"
+        return [node]
     Chem.AssignStereochemistryFrom3D(mol, confId=0)
 
     params = AllChem.ETKDGv3()

@@ -161,6 +161,17 @@ For each conformer pair (`select_per_mechanism`, parallel over `--workers`):
     with the [1,3] shift.
 - The cap of 200 variants truncates the cross product for systems with many
   equivalent groups (three methyls already give 6³ = 216).
+- **Cost: scoring every variant of every mechanism for every pair can
+  dominate a run.** Reaction-QM `RXN_0000104508` (19 atoms, 9 × 21 conformers)
+  spent **3,709 s mapping 189 pairs** (3 workers) to launch 3 path searches,
+  about 60 s per pair, because its hydrogen groups multiply to the 200-variant
+  cap and each variant is a full geodesic interpolation. This is an open
+  problem, and that reaction is a test case for it.
+  - *Rejected:* pre-ranking variants by aligned endpoint RMSD and
+    interpolating only the best few. It was about 30× faster, but it discards
+    variants before they are scored, and so can discard the labeling that
+    leads to the right path. A replacement has to keep every variant in play,
+    or prove the ones it drops can't win.
 - Mechanisms are told apart by openbabel's bonds between the two endpoint
   minima. Mechanisms that break and form the same bonds but differ in
   stereochemistry (e.g. conrotatory versus disrotatory) get the **same key**.

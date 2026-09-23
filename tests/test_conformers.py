@@ -422,3 +422,16 @@ def test_rdkit_backend_samples_s_cis_butadiene_only_without_torsion_prefs():
 
     assert s_cis_count("etkdg") == 0
     assert s_cis_count("both") >= 1
+
+
+def test_rdkit_backend_keeps_the_input_when_bond_orders_cant_be_perceived():
+    """Radicals / odd charge states (e.g. OH radical) make RDKit's bond-order
+    perception raise; that used to crash the whole `channels` run."""
+    node = StructureNode(structure=Structure(
+        symbols=["O", "H"], geometry=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.83]]),
+        charge=0, multiplicity=2,
+    ))
+    stats = {}
+    confs = generate_conformers(node, ConformerInputs(), stats)
+    assert len(confs) == 1 and confs[0] is node
+    assert stats["n_generated"] == 0 and "rdkit_skipped" in stats
