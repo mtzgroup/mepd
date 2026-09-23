@@ -64,11 +64,23 @@ The public CLI exposes path minimization and NEB refinement commands:
 mepd run --start start.xyz --end end.xyz --inputs inputs.toml
 mepd run-refine examples/oxycope.xyz -i expensive.toml -ci cheap.toml --mode neb
 mepd refine previous_result.xyz --inputs expensive.toml --mode neb
-mepd make-default-inputs --name inputs.toml
+mepd init --output inputs.toml
 mepd-elementarystep path.xyz
 ```
 
 Use the Python API for lower-level NEB, MLPGI, MSMEP, and elementary-step workflows.
+
+## Web interface
+
+```bash
+uv sync --extra web          # or: pip install "mepd[web] @ git+https://github.com/mtzgroup/mepd.git"
+mepd web my_workspace
+```
+
+A browser UI over the same commands. You build a structure library and reaction graph from SMILES,
+XYZ or earlier results. You then run TS searches, channel sampling, Hessian exploration or all-pairs
+networks on any selection of structures and edges. Jobs are queued, streamed live, resumable, and
+their results can be pulled back into the graph. See [docs/web.md](docs/web.md).
 
 ## Maintainers
 

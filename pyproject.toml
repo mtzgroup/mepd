@@ -36,6 +36,13 @@ viz = [
 discovery = [
     "rich>=13.0.0",
 ]
+# `mepd web`: browser UI (FastAPI server; Preact, Cytoscape and 3Dmol are
+# vendored under mepd/web/static/vendor, so no JS build step or internet).
+web = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
+]
 # ASEEngine (engine_name="ase") and its SELLA-based TS-opt/IRC support. Not
 # needed for the qc*/chemcloud-backed engines, which are the main workhorse.
 ase = [

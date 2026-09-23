@@ -1,0 +1,487 @@
+"""Registry of the calculations the web UI can launch.
+
+Each `Operation` declares:
+
+* what it acts on (`target`): one structure, a pair (an edge, or two
+  selected structures), or a set of structures;
+* its parameters, as a pydantic model whose fields carry the CLI flag they
+  map to (`cli=`) plus UI hints (`group=`, `advanced=`). The UI renders its
+  forms straight from `model_json_schema()`, so adding a knob here is the
+  only change needed to expose it;
+* how to turn (targets, params, profile) into a `mepd ...` argv.
+
+Adding a new mepd capability to the web UI = one params model + one
+`Operation(...)` entry below (and, if its output layout is new, a collector
+in `mepd.web.results`).
+"""
+
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from mepd.web.workspace import Workspace, WorkspaceError, is_ts
+
+Target = Literal["structure", "pair", "set"]
+
+
+def P(default, title: str, help: str = "", *, cli: Optional[str] = None, kind: str = "value",
+      group: str = "Basic", advanced: bool = False, requires: Optional[str] = None, **kw):
+    """A parameter field. `kind`:
+    * "value"  -> `--flag <value>` (omitted when the value is None)
+    * "switch" -> `--flag` when true, nothing when false
+    * "toggle" -> `--flag` / `--no-flag`
+    * "custom" -> handled by the operation's argv builder
+
+    `requires` names the field this one only matters for -- "other" (other
+    is truthy) or "other=a|b" -- so it is left off the command line and
+    hidden in the form otherwise.
+    """
+    extra = {"cli": cli, "cli_kind": kind, "group": group, "advanced": advanced, "requires": requires}
+    return Field(default, title=title, description=help, json_schema_extra=extra, **kw)
+
+
+class Params(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def requirement_met(params: Params, requires: Optional[str]) -> bool:
+    if not requires:
+        return True
+    name, _, allowed = requires.partition("=")
+    value = getattr(params, name)
+    return str(value) in allowed.split("|") if allowed else bool(value)
+
+
+def generic_flags(params: Params) -> list[str]:
+    argv: list[str] = []
+    for name, finfo in type(params).model_fields.items():
+        extra = finfo.json_schema_extra or {}
+        cli, kind = extra.get("cli"), extra.get("cli_kind", "value")
+        if not cli or kind == "custom" or not requirement_met(params, extra.get("requires")):
+            continue
+        value = getattr(params, name)
+        if kind == "switch":
+            if value:
+                argv.append(cli)
+        elif kind == "toggle":
+            argv.append(cli if value else "--no-" + cli.removeprefix("--"))
+        elif value is not None:
+            argv += [cli, str(value)]
+    return argv
+
+
+# ---------------------------------------------------------------- params
+
+EndpointMode = Literal["auto", "smiles", "xyz"]
+_ENDPOINTS_HELP = (
+    "How endpoints are handed to mepd. 'auto' passes SMILES when both structures were "
+    "entered as SMILES (mepd then builds an atom-mapped pair itself) and the stored "
+    "geometries otherwise."
+)
+
+
+class TsParams(Params):
+    path_mode: Literal["recursive", "single", "parallel"] = P(
+        "recursive", "Path search", "recursive: MSMEP splits multi-step paths into elementary "
+        "steps. single: one path minimization. parallel: recursive with branches run concurrently.",
+        kind="custom")
+    use_tsopt: bool = P(True, "Optimize TS", "Refine each path's highest-energy image to a true saddle.",
+                        cli="--use-tsopt", kind="switch")
+    irc: bool = P(True, "Run IRC", "Follow each optimized TS downhill both ways (needs 'Optimize TS').",
+                  cli="--irc", kind="switch")
+    minimize_ends: Literal["auto", "yes", "no"] = P(
+        "auto", "Minimize endpoints", "auto: minimize unless both endpoints are known minima (e.g. sampled "
+        "minima or relaxed conformers). SMILES embeddings and uploaded geometries get minimized.", kind="custom")
+    atom_mapping: bool = P(True, "Check atom mapping",
+                           "Verify (and fix) the start/end atom correspondence before searching.",
+                           cli="--atom-mapping", kind="switch")
+    endpoints: EndpointMode = P("auto", "Endpoint source", _ENDPOINTS_HELP, kind="custom",
+                                group="Endpoints", advanced=True)
+    atom_mapping_candidates: int = P(200, "Mapping candidates", cli="--atom-mapping-candidates",
+                                     group="Atom mapping", advanced=True, ge=1, requires="atom_mapping")
+    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy"] = P(
+        "geodesic-distance", "Mapping metric", cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
+        requires="atom_mapping")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
+        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        cli="--validate-minima-with-hessian", kind="toggle", requires="path_mode=recursive|parallel")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
+        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        requires="validate_minima_with_hessian", gt=0)
+    same_pair_split_limit: int = P(5, "Same-pair split limit", cli="--same-pair-split-limit",
+                                   group="Recursive splitting", advanced=True, ge=0,
+                                   requires="path_mode=recursive|parallel")
+    parallel_workers: Optional[int] = P(None, "Parallel workers", cli="--parallel-workers",
+                                        group="Recursive splitting", advanced=True, ge=1,
+                                        requires="path_mode=parallel")
+    network_completion: bool = P(False, "Network completion",
+                                 "After the search, also connect intermediates the split tree found.",
+                                 cli="--network-completion", kind="switch", group="Network completion",
+                                 advanced=True)
+    network_completion_mode: Literal["linear", "all-to-all"] = P(
+        "linear", "Completion mode", cli="--network-completion-mode", group="Network completion", advanced=True,
+        requires="network_completion")
+    network_max_followups: int = P(25, "Max follow-ups", cli="--network-max-followups",
+                                   group="Network completion", advanced=True, ge=0, requires="network_completion")
+
+
+class ChannelsParams(Params):
+    backend: Literal["rdkit", "crest"] = P("rdkit", "Conformer backend",
+                                           "Where the reactant/product conformer pools come from.",
+                                           cli="--backend")
+    pairs_per_mechanism: int = P(3, "Searches per mechanism",
+                                 "Best-scoring conformer pairs kept per bond-change mechanism (0 = all).",
+                                 cli="--pairs-per-mechanism", ge=0)
+    workers: int = P(4, "Workers", "Processes for atom mapping, path searches and TS/IRC.",
+                     cli="--workers", ge=1)
+    conformers_only: bool = P(False, "Conformers only", "Stop after conformer pools and pair selection.",
+                              cli="--conformers-only", kind="switch")
+    minimize_ends: bool = P(True, "Minimize endpoints", cli="--minimize-ends", kind="toggle",
+                            group="Endpoints", advanced=True)
+    endpoints: EndpointMode = P("auto", "Endpoint source", _ENDPOINTS_HELP, kind="custom",
+                                group="Endpoints", advanced=True)
+    n_conformers: int = P(0, "Max conformers", "0 = no cap.", cli="--n-conformers",
+                          group="Conformers", advanced=True, ge=0)
+    n_embed: int = P(0, "RDKit embeddings", "0 = automatic by size.", cli="--n-embed",
+                     group="Conformers", advanced=True, ge=0, requires="backend=rdkit")
+    rdkit_ewin: Optional[float] = P(None, "RDKit energy window (kcal/mol)", cli="--rdkit-ewin",
+                                    group="Conformers", advanced=True, requires="backend=rdkit")
+    crest_ewin: float = P(6.0, "CREST energy window (kcal/mol)", cli="--crest-ewin",
+                          group="Conformers", advanced=True, requires="backend=crest")
+    crest_method: Literal["--gfn2", "--gfnff", "--gfn2//gfnff"] = P(
+        "--gfn2", "CREST method", cli="--crest-method", group="Conformers", advanced=True,
+        requires="backend=crest")
+    crest_timeout: float = P(3600.0, "CREST timeout (s)", cli="--crest-timeout", group="Conformers",
+                             advanced=True, requires="backend=crest")
+    rmsd_cutoff: float = P(0.5, "Dedup RMSD (bohr)", cli="--rmsd-cutoff", group="Conformers", advanced=True)
+    random_seed: int = P(0, "Random seed", cli="--random-seed", group="Conformers", advanced=True)
+    max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
+    atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
+                           group="Pairs", advanced=True)
+    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy"] = P(
+        "geodesic-distance", "Mapping metric", cli="--atom-mapping-metric", group="Pairs", advanced=True,
+        requires="atom_mapping")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
+        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        cli="--validate-minima-with-hessian", kind="toggle")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
+        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        requires="validate_minima_with_hessian", gt=0)
+
+
+class TsOptParams(Params):
+    irc: bool = P(True, "Run IRC", cli="--irc", kind="switch")
+
+
+class HessianSampleParams(Params):
+    amplitude_policy: Literal["fixed-cartesian", "energy"] = P(
+        "fixed-cartesian", "Displacement policy",
+        "fixed-cartesian: move every mode by the same RMS distance. energy: move each mode to a "
+        "target harmonic energy.", cli="--amplitude-policy")
+    dr: float = P(0.1, "Displacement (bohr RMS)", cli="--dr", gt=0, requires="amplitude_policy=fixed-cartesian")
+    target_energy_kcal: float = P(25.0, "Target energy (kcal/mol)", cli="--target-energy-kcal", gt=0,
+                                  requires="amplitude_policy=energy")
+    max_candidates: int = P(100, "Max candidates", cli="--max-candidates", ge=1)
+    imaginary_mode_amplitude: float = P(0.3, "Imaginary-mode amplitude (bohr)",
+                                        cli="--imaginary-mode-amplitude", advanced=True, group="Advanced",
+                                        requires="amplitude_policy=energy")
+    maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency; one "
+        "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped "
+        "(listed as rejected) if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        advanced=True, requires="validate_minima_with_hessian", gt=0)
+
+
+class HessianGlobalParams(Params):
+    max_rounds: int = P(100, "Max rounds", cli="--max-rounds", ge=1)
+    temperature: float = P(298.15, "Temperature (K)", "Metropolis acceptance temperature.",
+                           cli="--temperature", gt=0)
+    acceptance_baseline: Literal["connected", "seed", "running_best"] = P(
+        "connected", "Acceptance baseline", cli="--acceptance-baseline")
+    dr: float = P(0.1, "Displacement (bohr RMS)", cli="--dr", gt=0)
+    max_candidates: int = P(100, "Max candidates per source", cli="--max-candidates", ge=1)
+    full_dr_scan: bool = P(False, "Full displacement scan", cli="--full-dr-scan", kind="toggle",
+                           advanced=True, group="Advanced")
+    dr_scan_values: Optional[str] = P(None, "Scan values", "Comma-separated, e.g. 0.1,0.3,0.6",
+                                      cli="--dr-scan-values", advanced=True, group="Advanced",
+                                      requires="full_dr_scan")
+    energy_tolerance_kcal: float = P(1e-4, "Energy tolerance (kcal/mol)", cli="--energy-tolerance-kcal",
+                                     advanced=True, group="Advanced")
+    random_seed: Optional[int] = P(None, "Random seed", cli="--random-seed", advanced=True, group="Advanced")
+    maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency; one "
+        "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped "
+        "(listed as rejected) if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        advanced=True, requires="validate_minima_with_hessian", gt=0)
+
+
+class OptimizeParams(Params):
+    validate_minima_with_hessian: bool = P(
+        True, "Verify minima with Hessian", "After optimizing, require no imaginary frequency; a structure "
+        "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and flagged "
+        "'not a minimum' if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        advanced=True, requires="validate_minima_with_hessian", gt=0)
+
+
+class NetworkSplitsParams(Params):
+    max_pairs: int = P(100, "Max pairs", cli="--max-pairs", ge=1)
+    parallel: bool = P(False, "Parallel branches", cli="--parallel", kind="switch")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
+        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        cli="--validate-minima-with-hessian", kind="toggle")
+    hessian_minimum_frequency_cutoff: float = P(
+        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
+    hessian_minima_rescue_displacement: float = P(
+        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
+        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        requires="validate_minima_with_hessian", gt=0)
+
+    same_pair_split_limit: int = P(5, "Same-pair split limit", cli="--same-pair-split-limit",
+                                   advanced=True, group="Recursive splitting", ge=0)
+
+
+# --------------------------------------------------------------- context
+
+@dataclass
+class JobContext:
+    ws: Workspace
+    job_dir: Path
+    output_dir: Path
+    structures: list[dict]  # resolved structure records, in target order
+    profile: Optional[str]
+
+    def snapshot_structure(self, rec: dict, name: str) -> Path:
+        """Copy a library geometry into the job folder, so the job stays
+        reproducible even if the library entry is later edited/deleted."""
+        dst = self.job_dir / "inputs" / f"{name}.xyz"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.ws.structure_path(rec["id"]), dst)
+        return dst
+
+    def common_flags(self) -> list[str]:
+        first = self.structures[0]
+        argv = ["--charge", str(first["charge"]), "--multiplicity", str(first["multiplicity"])]
+        if self.profile:
+            prof = self.job_dir / "inputs" / "profile.toml"
+            prof.parent.mkdir(parents=True, exist_ok=True)
+            prof.write_text(self.ws.read_profile(self.profile))
+            argv += ["--inputs", str(prof)]
+        return argv
+
+    def level(self) -> dict:
+        """Level of theory this job runs at (its profile's fingerprint)."""
+        return self.ws.level_of(self.profile)
+
+    def at_job_level(self, rec: dict) -> bool:
+        """Is this structure a minimum at the level of theory this job uses?"""
+        lvl = rec.get("level") or {}
+        return bool(rec.get("optimized")) and rec.get("status") == "ready" and lvl.get("key") == self.level()["key"]
+
+    def endpoint_flags(self, mode: str) -> list[str]:
+        a, b = self.structures
+        for key in ("charge", "multiplicity"):
+            if a[key] != b[key]:
+                raise WorkspaceError(f"endpoints disagree on {key}: {a['name']}={a[key]}, {b['name']}={b[key]}")
+        smiles = [rec.get("origin", {}).get("kind") == "smiles" and rec["origin"].get("input") for rec in (a, b)]
+        use_smiles = mode == "smiles" or (mode == "auto" and all(smiles))
+        if use_smiles:
+            if not all(smiles):
+                raise WorkspaceError("endpoint source 'smiles' needs both structures to have been entered as SMILES")
+            return ["--start", smiles[0], "--end", smiles[1]]
+        return ["--start", str(self.snapshot_structure(a, "start")),
+                "--end", str(self.snapshot_structure(b, "end"))]
+
+
+# ----------------------------------------------------------- operations
+
+@dataclass
+class Operation:
+    key: str
+    title: str
+    summary: str
+    target: Target
+    category: str
+    params_model: Optional[type[Params]] = None
+    build: Optional[Callable[[JobContext, Params], list[str]]] = None
+    available: bool = True
+    unavailable_reason: str = ""
+    min_structures: int = 1
+    # What a finished job contributes to the graph (used by the UI's import hints).
+    produces: list[str] = field(default_factory=list)
+
+    def describe(self) -> dict:
+        return {
+            "key": self.key,
+            "title": self.title,
+            "summary": self.summary,
+            "target": self.target,
+            "category": self.category,
+            "available": self.available,
+            "unavailable_reason": self.unavailable_reason,
+            "min_structures": self.min_structures,
+            "produces": self.produces,
+            "schema": self.params_model.model_json_schema() if self.params_model else None,
+        }
+
+    def parse_params(self, raw: Optional[dict]) -> Params:
+        if self.params_model is None:
+            return Params()
+        return self.params_model.model_validate(raw or {})
+
+
+def _build_ts(ctx: JobContext, p: TsParams) -> list[str]:
+    if p.irc and not p.use_tsopt:
+        raise WorkspaceError("'Run IRC' needs 'Optimize TS'")
+    argv = ["run", *ctx.endpoint_flags(p.endpoints), *ctx.common_flags()]
+    if p.path_mode == "recursive" or (p.network_completion and p.path_mode == "single"):
+        argv.append("--recursive")
+    elif p.path_mode == "parallel":
+        argv.append("--parallel")
+    if p.minimize_ends == "auto":
+        # mepd's own auto only fires for SMILES --start/--end; endpoints handed
+        # over as xyz (anything not both-SMILES) would otherwise go into the
+        # path search unrelaxed, which costs far more NEB steps than it saves.
+        # A structure only counts as a minimum at the level it was optimized
+        # at: one from a different profile (or a force-field embedding) is
+        # re-minimized here, so both ends and the path share one PES.
+        needs = not all(ctx.at_job_level(rec) for rec in ctx.structures)
+        argv.append("--minimize-ends" if needs else "--no-minimize-ends")
+    else:
+        argv.append("--minimize-ends" if p.minimize_ends == "yes" else "--no-minimize-ends")
+    argv += generic_flags(p)
+    return argv + ["--output", str(ctx.output_dir)]
+
+
+def _build_channels(ctx: JobContext, p: ChannelsParams) -> list[str]:
+    argv = ["channels", *ctx.endpoint_flags(p.endpoints), *ctx.common_flags(), *generic_flags(p)]
+    return argv + ["--output", str(ctx.output_dir)]
+
+
+def _build_tsopt(ctx: JobContext, p: TsOptParams) -> list[str]:
+    guess = ctx.snapshot_structure(ctx.structures[0], "guess")
+    return ["ts", "--guess", str(guess), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+def _build_discovery(command: str):
+    def build(ctx: JobContext, p: Params) -> list[str]:
+        seed = ctx.snapshot_structure(ctx.structures[0], "seed")
+        return ["discovery", command, str(seed), *ctx.common_flags(), *generic_flags(p),
+                "--output", str(ctx.output_dir)]
+    return build
+
+
+def _build_optimize(ctx: JobContext, p: OptimizeParams) -> list[str]:
+    ts = [r["name"] for r in ctx.structures if is_ts(r)]
+    if ts:
+        raise WorkspaceError(f"{', '.join(ts)}: transition states are not minimized (use 'Optimize TS from guess')")
+    if len({(r["charge"], r["multiplicity"]) for r in ctx.structures}) > 1:
+        raise WorkspaceError("optimize structures with different charge/multiplicity in separate jobs")
+    files = [str(ctx.snapshot_structure(r, f"structure_{i}")) for i, r in enumerate(ctx.structures)]
+    return ["optimize", *files, *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+def _build_network_splits(ctx: JobContext, p: NetworkSplitsParams) -> list[str]:
+    charges = {(r["charge"], r["multiplicity"]) for r in ctx.structures}
+    if len(charges) > 1:
+        raise WorkspaceError("all structures must share charge and multiplicity")
+    natoms = {r["natoms"] for r in ctx.structures}
+    if len(natoms) > 1:
+        raise WorkspaceError("all structures must have the same atoms")
+    minima = [str(ctx.snapshot_structure(r, f"minimum_{i}")) for i, r in enumerate(ctx.structures)]
+    return ["network-splits", *minima, *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+PAIR = "Connect two structures"
+EXPLORE = "Explore around a structure"
+SET = "Across a set of structures"
+
+OPERATIONS: dict[str, Operation] = {op.key: op for op in [
+    Operation(
+        "ts", "Transition state", "Find the minimum-energy path and its transition state(s) between "
+        "two structures, optionally refined by TS optimization and IRC. (`mepd run`)",
+        "pair", PAIR, TsParams, _build_ts, min_structures=2,
+        produces=["transition states", "IRC endpoints", "intermediates"]),
+    Operation(
+        "channels", "Reaction channels", "Sample reactant/product conformers and atom mappings, search "
+        "every distinct mechanism, and classify the TSs into direct, multi-step and off-target "
+        "channels. (`mepd channels`)",
+        "pair", PAIR, ChannelsParams, _build_channels, min_structures=2,
+        produces=["transition states per channel", "conformers", "off-target products"]),
+    Operation(
+        "optimize", "Optimize geometry", "Minimize the selected structures at the chosen profile's level of "
+        "theory, replacing their geometry and energy in place. (`mepd optimize`)",
+        "set", EXPLORE, OptimizeParams, _build_optimize, min_structures=1,
+        produces=["optimized geometries (in place)"]),
+    Operation(
+        "tsopt", "Optimize TS from guess", "Treat the structure as a TS guess: saddle optimization, "
+        "optionally followed by IRC. (`mepd ts`)",
+        "structure", EXPLORE, TsOptParams, _build_tsopt, produces=["transition state", "IRC endpoints"]),
+    Operation(
+        "hessian-sample", "Hessian sampling", "Displace along every normal mode and re-optimize to find "
+        "nearby minima. (`mepd discovery hessian-sample`)",
+        "structure", EXPLORE, HessianSampleParams, _build_discovery("hessian-sample"),
+        produces=["nearby minima"]),
+    Operation(
+        "hessian-global", "Hessian basin hopping", "Repeated Hessian sampling with Metropolis acceptance: "
+        "a global search over minima reachable from the seed. (`mepd discovery hessian-global`)",
+        "structure", EXPLORE, HessianGlobalParams, _build_discovery("hessian-global"),
+        produces=["accepted minima"]),
+    Operation(
+        "nanoreactor", "Nanoreactor", "Reactive MD / CREST msreact products around a structure.",
+        "structure", EXPLORE, available=False,
+        unavailable_reason="The engine can generate nanoreactor candidates "
+        "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
+    Operation(
+        "graph-enumeration", "Graph enumeration", "Enumerate products by bond-breaking/forming rules.",
+        "structure", EXPLORE, available=False,
+        unavailable_reason="Not implemented in mepd yet."),
+    Operation(
+        "network-splits", "All-pairs network", "Run recursive path searches between every pair of the "
+        "selected minima and assemble a reaction network. (`mepd network-splits`)",
+        "set", SET, NetworkSplitsParams, _build_network_splits, min_structures=2,
+        produces=["network edges", "intermediates"]),
+]}
+
+
+def get_operation(key: str) -> Operation:
+    try:
+        op = OPERATIONS[key]
+    except KeyError:
+        raise WorkspaceError(f"unknown operation {key!r}") from None
+    if not op.available:
+        raise WorkspaceError(f"{op.title} is not available: {op.unavailable_reason}")
+    return op
