@@ -197,3 +197,64 @@ def maybe_realign_pair(
         return end_structure, False
 
     return result.winner.end_structure, result.winner.label != "identity"
+
+
+@dataclass
+class MechanismChoice:
+    key: str  # `mepd.atom_mapping.mechanism_key`
+    winner: MappingCandidate  # this mechanism's best-scoring symmetry variant
+    score: float
+    n_variants: int
+
+
+def select_per_mechanism(
+    start_structure: Structure, end_structure: Structure, metric: str, run_inputs,
+    *, max_variants_per_mechanism: int = 200,
+) -> list[MechanismChoice]:
+    """For one (reactant, product) pair: every mechanism SLAPMapper's
+    minimal-cost mappings allow, each represented by its best symmetry
+    variant under `metric` -- i.e. the geodesic score chooses how to label a
+    mechanism's equivalent atoms for THIS pair's geometry, but never chooses
+    between mechanisms. Sorted best-scoring first.
+
+    The current ordering ("identity") is scored as one more variant of
+    whichever mechanism it implies, or as a mechanism of its own if it
+    isn't one of SLAPMapper's. Returns [] if there is nothing to map
+    (slapmapper missing, atom counts or compositions differ)."""
+    from mepd.atom_mapping import (
+        HAS_SLAPMAPPER, mechanism_key, realign_end_to_start, suggest_mechanism_candidates,
+    )
+
+    if not HAS_SLAPMAPPER or len(start_structure.symbols) != len(end_structure.symbols):
+        return []
+    groups = suggest_mechanism_candidates(
+        start_structure, end_structure, max_variants_per_mechanism=max_variants_per_mechanism,
+    )
+    if not groups:
+        return []
+
+    identity_order = tuple(range(len(end_structure.symbols)))
+    by_key: dict[str, list[MappingCandidate]] = {}
+    for key, atom_maps in groups.items():
+        by_key[key] = [
+            MappingCandidate(
+                label=f"{key} #{n}",
+                end_structure=end_structure if tuple(m.as_order()) == identity_order
+                else realign_end_to_start(m, end_structure),
+                atom_map=None if tuple(m.as_order()) == identity_order else m,
+            )
+            for n, m in enumerate(atom_maps)
+        ]
+    if not any(c.atom_map is None for cands in by_key.values() for c in cands):
+        key = mechanism_key(start_structure, end_structure)
+        by_key.setdefault(key, []).append(
+            MappingCandidate(label=f"{key} identity", end_structure=end_structure, atom_map=None)
+        )
+
+    choices = []
+    for key, cands in by_key.items():
+        scored = [(score_candidate(c, metric, start_structure, run_inputs)[0], c) for c in cands]
+        score, best = min(scored, key=lambda sc: sc[0])
+        choices.append(MechanismChoice(key=key, winner=best, score=score, n_variants=len(cands)))
+    choices.sort(key=lambda ch: ch.score)
+    return choices

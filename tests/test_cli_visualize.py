@@ -259,7 +259,8 @@ def test_visualize_groups_irc_paths_by_endpoint_match(tmp_path):
 
 def test_visualize_groups_ts_dir_by_channels_classification_when_present(tmp_path):
     """When `ts_out` is a `mepd channels` output's `ts/` directory (i.e. it
-    has sibling `channels/`/`alternate-routes/` folders with `members.txt`
+    has sibling `channels/`/`alternate-channels/`/`offtarget-exit-channels/`
+    folders with `members.txt`
     from `_write_classified_group`), grouping must reflect that real,
     IRC-verified-against---start/--end classification instead of the
     generic per-IRC self-consistency check -- and a leaf that isn't in any
@@ -282,9 +283,9 @@ def test_visualize_groups_ts_dir_by_channels_classification_when_present(tmp_pat
     channel_dir.mkdir(parents=True)
     (channel_dir / "members.txt").write_text("ts_pair_0_1_leaf_0\n")
 
-    route_dir = output / "alternate-routes" / "route_0"
-    route_dir.mkdir(parents=True)
-    (route_dir / "members.txt").write_text("connects: A <-> B\nts_pair_2_3_leaf_0\n")
+    step_dir = output / "alternate-channels" / "alternate_channel_0" / "step_1"
+    step_dir.mkdir(parents=True)
+    (step_dir / "members.txt").write_text("connects: A <-> B\nts_pair_2_3_leaf_0\n")
 
     _call_visualize(result_path=ts_out)
 
@@ -294,8 +295,8 @@ def test_visualize_groups_ts_dir_by_channels_classification_when_present(tmp_pat
 
     assert groups["ts_pair_0_1_leaf_0"] == "TS structures (Channel 0)"
     assert groups["ts_pair_0_1_leaf_0 IRC"] == "IRC paths (Channel 0)"
-    assert groups["ts_pair_2_3_leaf_0"] == "TS structures (Alternate route 0)"
-    assert groups["ts_pair_2_3_leaf_0 IRC"] == "IRC paths (Alternate route 0)"
+    assert groups["ts_pair_2_3_leaf_0"] == "TS structures (Alternate channel 0 step 1)"
+    assert groups["ts_pair_2_3_leaf_0 IRC"] == "IRC paths (Alternate channel 0 step 1)"
     assert groups["ts_pair_4_5_leaf_0"] == "TS structures (unclassified)"
     assert groups["ts_pair_4_5_leaf_0 IRC"] == "IRC paths (unclassified -- matching endpoints)"
 
@@ -448,3 +449,49 @@ def test_visualize_rejects_unrecognized_directory(tmp_path):
 
     with pytest.raises(typer.Exit):
         _call_visualize(result_path=empty_dir)
+
+
+def _embedded_node(smiles: str):
+    from qcconst.constants import ANGSTROM_TO_BOHR
+    from qcdata.models.structure import Structure
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from mepd.nodes.node import StructureNode
+
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    AllChem.EmbedMolecule(mol, randomSeed=7)
+    AllChem.MMFFOptimizeMolecule(mol)
+    return StructureNode(structure=Structure(
+        geometry=mol.GetConformer().GetPositions() * ANGSTROM_TO_BOHR,
+        symbols=[a.GetSymbol() for a in mol.GetAtoms()], charge=0, multiplicity=1,
+    ))
+
+
+def test_irc_orientation_puts_the_reactant_graph_first_even_across_stereoisomers():
+    """cis-3,4-dimethylcyclobutene run: an IRC from the TRANS ring to the
+    (E,E) diene matches the requested reactant only by connectivity -- it
+    must still be drawn ring-first, like the IRCs that start from the cis
+    reactant itself (the bug: it was left as written, diene-first)."""
+    from mepd.chain import Chain
+    from mepd.cli import _irc_needs_reversal
+    from mepd.inputs import ChainInputs
+
+    cis = _embedded_node("C[C@H]1C=C[C@H]1C")
+    trans = _embedded_node("C[C@H]1C=C[C@@H]1C")
+    ee = _embedded_node("C/C=C/C=C/C")
+    ez = _embedded_node("C/C=C/C=C\\C")
+
+    def irc(a, b):
+        return Chain.model_validate({"nodes": [a, b], "parameters": ChainInputs()})
+
+    # rule 1: the exact reactant goes first
+    assert _irc_needs_reversal(irc(ez, cis), cis, ee) is True
+    assert _irc_needs_reversal(irc(cis, ez), cis, ee) is False
+    # rule 2: same connectivity as the reactant (other stereoisomer) goes first
+    assert _irc_needs_reversal(irc(ee, trans), cis, ee) is True
+    assert _irc_needs_reversal(irc(trans, ee), cis, ee) is False
+    # rule 3: neither end is ring-like -> the product end goes last
+    assert _irc_needs_reversal(irc(ee, ez), cis, ee) is True
+    # nothing tells the ends apart -> left as written
+    assert _irc_needs_reversal(irc(ez, ez), cis, ee) is False

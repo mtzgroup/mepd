@@ -337,6 +337,146 @@ def suggest_atom_mapping_candidates(
     return candidates
 
 
+def expand_mapping_fully(
+    atom_map: "AtomMapping",
+    start_structure: Structure,
+    end_structure: Structure,
+    *,
+    max_variants: int = 200,
+) -> list["AtomMapping"]:
+    """`atom_map` itself plus every cost-preserving relabeling of it: for
+    each start-side symmetry orbit whose image lies inside one end-side
+    orbit (see `expand_mapping_by_symmetry`), every permutation of that
+    image, taken jointly across orbits (the full cross product), up to
+    `max_variants` in total (`atom_map` first).
+
+    These all describe the same mechanism, but not the same path: which of
+    a CH2's two hydrogens goes where decides whether the group has to
+    rotate on the way, so each variant needs its own geodesic score against
+    the actual pair of conformers."""
+    import itertools
+
+    start_orbits = _symmetry_orbits(start_structure)
+    end_orbits = [set(o) for o in _symmetry_orbits(end_structure)]
+
+    free = []  # (sorted start orbit, list of permutations of its image)
+    for orbit in start_orbits:
+        image = sorted(atom_map.mapping[i] for i in orbit)
+        if any(set(image) <= end_orbit for end_orbit in end_orbits):
+            free.append((sorted(orbit), list(itertools.permutations(image))))
+
+    variants = [atom_map]
+    seen = {tuple(atom_map.as_order())}
+    for choice in itertools.product(*(perms for _, perms in free)):
+        if len(variants) >= max_variants:
+            break
+        mapping = dict(atom_map.mapping)
+        for (orbit, _), perm in zip(free, choice):
+            mapping.update(zip(orbit, perm))
+        order = tuple(mapping[i] for i in range(len(mapping)))
+        if order in seen:
+            continue
+        seen.add(order)
+        variants.append(AtomMapping(
+            mapping=mapping, cost=atom_map.cost, n_alternatives=atom_map.n_alternatives,
+        ))
+    return variants
+
+
+def _symmetry_ranks(structure: Structure) -> list[int]:
+    """RDKit canonical rank per atom with ties kept (graph-equivalent atoms
+    share a rank); plain atom indices if RDKit can't perceive the bonding."""
+    from rdkit import Chem
+    from rdkit.Chem import rdDetermineBonds
+
+    try:
+        mol = Chem.MolFromXYZBlock(structure.to_xyz())
+        rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
+        return list(Chem.CanonicalRankAtoms(mol, breakTies=False))
+    except Exception:
+        return list(range(len(structure.symbols)))
+
+
+def mechanism_key(start_structure: Structure, aligned_end_structure: Structure) -> str:
+    """Name the mechanism an atom correspondence implies: the bonds broken
+    and formed going from `start_structure` to `aligned_end_structure`
+    (already reindexed so atom i is the same atom on both sides), each atom
+    written as element + its symmetry class in the start structure.
+
+    Symmetry classes rather than indices, so relabelings of one mechanism
+    (a CH2's hydrogens swapped) and the same mechanism reached from a
+    different pair of conformers get the same key. Bonds are perceived the
+    way SLAPMapper sees them (`structure_to_molecule`, adjacency only)."""
+    symbols = list(start_structure.symbols)
+    ranks = _symmetry_ranks(start_structure)
+
+    def _edges(structure):
+        mol = structure_to_molecule(structure)
+        return {tuple(sorted((u, v))) for u, v in mol.edges()}
+
+    before, after = _edges(start_structure), _edges(aligned_end_structure)
+
+    def _fmt(edges):
+        names = sorted(
+            "-".join(sorted(f"{symbols[a]}{ranks[a]}" for a in edge)) for edge in edges
+        )
+        return ",".join(names) or "none"
+
+    return f"break {_fmt(before - after)} | form {_fmt(after - before)}"
+
+
+def suggest_mechanism_candidates(
+    struct_start: Structure, struct_end: Structure, *, binary: bool = True,
+    max_variants_per_mechanism: int = 200,
+) -> dict[str, list["AtomMapping"]]:
+    """SLAPMapper's equal-minimal-cost mappings, grouped by the mechanism
+    they imply (`mechanism_key`), each fully expanded into its symmetry
+    variants (`expand_mapping_fully`).
+
+    SLAPMapper's own symmetry dedup (`_remove_isomorphic_results`) is kept
+    for what it is good at -- telling genuinely different correspondences
+    apart -- and the relabelings it collapses are regenerated here for
+    EVERY mechanism, so each can be scored against the specific pair's
+    geometry rather than only whichever result SLAPMapper listed first.
+
+    Returns {} when `suggest_atom_mapping_candidates` would return []."""
+    _require_slapmapper()
+
+    mol_start = structure_to_molecule(struct_start)
+    mol_end = structure_to_molecule(struct_end)
+    if sorted(_atomic_numbers(mol_start)) != sorted(_atomic_numbers(mol_end)):
+        return {}
+
+    lg_start = molecule_to_labeled_graph(mol_start)
+    lg_end = molecule_to_labeled_graph(mol_end)
+    mapper = SlapMapper(binary=binary)
+    mapper.get_maps([lg_start, lg_end], break_sym_targets=list(range(len(lg_start.labels))))
+
+    groups: dict[str, list[AtomMapping]] = {}
+    seen: set[tuple[int, ...]] = set()
+    for result in mapper.results:
+        label2idxs_start = result["lgp"][0].label2idxs
+        label2idxs_end = result["lgp"][1].label2idxs
+        mapping = {
+            a: b
+            for label, idxs_start in label2idxs_start.items()
+            for a, b in zip(sorted(idxs_start), sorted(label2idxs_end[label]))
+        }
+        base = AtomMapping(mapping=mapping, cost=result["val"], n_alternatives=len(mapper.results))
+        if tuple(base.as_order()) in seen:
+            continue
+        key = mechanism_key(struct_start, realign_end_to_start(base, struct_end))
+        group = groups.setdefault(key, [])
+        for variant in expand_mapping_fully(
+            base, struct_start, struct_end, max_variants=max_variants_per_mechanism,
+        ):
+            order = tuple(variant.as_order())
+            if order not in seen and len(group) < max_variants_per_mechanism:
+                seen.add(order)
+                group.append(variant)
+    return groups
+
+
 def check_atom_mapping(
     struct_start: Structure, struct_end: Structure, *, binary: bool = True
 ) -> Optional[AtomMapping]:

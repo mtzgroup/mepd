@@ -304,3 +304,69 @@ def test_expand_mapping_by_symmetry_respects_max_expansions():
     atom_map = suggest_atom_mapping(start, end)
     expansions = expand_mapping_by_symmetry(atom_map, start, end, max_expansions=1)
     assert len(expansions) == 1
+
+
+# --- per-mechanism candidates -------------------------------------------------
+
+
+def _claisen():
+    """Allyl vinyl ether -> pent-4-enal: SLAPMapper (binary, bond orders
+    ignored) ties the [3,3] shift with a [1,3] shift."""
+    return map_smiles_pair("C=CCOC=C", "C=CCCC=O")
+
+
+def test_expand_mapping_fully_takes_the_cross_product_of_orbits():
+    from mepd.atom_mapping import expand_mapping_fully
+
+    propene = _propene_bohr()
+    identity = AtomMapping(mapping={i: i for i in range(9)}, cost=0, n_alternatives=1)
+    variants = expand_mapping_fully(identity, propene, propene)
+    # CH2's 2 H (2!) x CH3's 3 H (3!), jointly -- unlike expand_mapping_by_symmetry,
+    # which permutes one orbit at a time
+    assert len(variants) == 12
+    assert variants[0].mapping == identity.mapping
+    assert len({tuple(v.as_order()) for v in variants}) == 12
+    assert len(expand_mapping_fully(identity, propene, propene, max_variants=5)) == 5
+
+
+def test_suggest_mechanism_candidates_keeps_both_claisen_mechanisms_fully_expanded():
+    from mepd.atom_mapping import mechanism_key, suggest_mechanism_candidates
+
+    start, end = _claisen()
+    groups = suggest_mechanism_candidates(start, end)
+    assert len(groups) == 2  # [3,3] and [1,3]
+    for key, maps in groups.items():
+        # every mechanism gets its own symmetry variants, not only the first
+        assert len(maps) > 1
+        for m in maps[:3]:
+            assert mechanism_key(start, realign_end_to_start(m, end)) == key
+
+
+def test_select_per_mechanism_keeps_a_non_slapmapper_ordering_as_its_own_mechanism():
+    """An input ordering that isn't one of SLAPMapper's minimal-cost mappings
+    is still what the user handed in, so it is kept as a separate mechanism
+    rather than silently dropped."""
+    from mepd.atom_mapping_selection import select_per_mechanism
+    from mepd.inputs import RunInputs
+
+    start, end = _claisen()
+    choices = select_per_mechanism(start, end, "geodesic-distance", RunInputs())
+    assert len(choices) == 3
+    assert sum(1 for c in choices if c.winner.atom_map is None) == 1
+
+
+def test_select_per_mechanism_returns_one_best_variant_per_mechanism():
+    from mepd.atom_mapping import mechanism_key
+    from mepd.atom_mapping_selection import select_per_mechanism
+    from mepd.inputs import RunInputs
+
+    start, end = _claisen()
+    # as in `channels`, the product has already been put in one of
+    # SLAPMapper's orderings, so "identity" is a variant of a real mechanism
+    end = realign_end_to_start(suggest_atom_mapping(start, end), end)
+    choices = select_per_mechanism(start, end, "geodesic-distance", RunInputs())
+    assert len(choices) == 2
+    assert [c.score for c in choices] == sorted(c.score for c in choices)
+    for c in choices:
+        assert mechanism_key(start, c.winner.end_structure) == c.key
+        assert c.n_variants > 1

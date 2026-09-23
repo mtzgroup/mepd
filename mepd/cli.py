@@ -532,13 +532,169 @@ def _check_endpoint_atom_mapping(
     return result.winner.end_structure
 
 
+def _expand_pairs_by_mechanism(
+    structures: list,
+    candidates: list[tuple[int, int]],
+    atom_mapping: bool,
+    run_inputs: "RunInputs",
+    *,
+    pairs_per_mechanism: int = 0,
+    workers: int = 1,
+    output: Optional[Path] = None,
+) -> tuple[list, list[tuple[int, int]], dict]:
+    """--atom-mapping for conformer pairs: turn every (reactant, product)
+    conformer pair into one path search PER MECHANISM.
+
+    SLAPMapper's equal-minimal-cost mappings can describe different
+    chemistry -- for a Claisen, the [3,3] shift and a [1,3] shift tie,
+    because bond orders aren't scored -- so a pair is not reduced to one
+    mapping. Within each mechanism, the symmetry-equivalent relabelings
+    (which of a CH2's hydrogens goes where) are all scored against THIS
+    pair's geometry with --atom-mapping-metric and the best is kept, since
+    a bad assignment forces e.g. a CH2 rotation onto the path; across
+    mechanisms, nothing is thrown away (`select_per_mechanism`).
+
+    `pairs_per_mechanism` > 0 then keeps, for each mechanism, only the pairs
+    it scores best on, instead of every pair x every mechanism.
+
+    Each kept (pair, mechanism) gets its own product entry appended to
+    `structures` (the conformer pools on disk stay as sampled), and the
+    table of what each path search is -- reactant/product conformer,
+    mechanism, score -- goes to <output>/pair_mechanisms.json.
+
+    Returns `(structures, candidates, summary)`; a no-op when `atom_mapping`
+    is off."""
+    if not atom_mapping or not candidates:
+        return structures, candidates, {}
+
+    from mepd.atom_mapping_selection import select_per_mechanism
+    from mepd.nodes.node import StructureNode
+
+    metric = run_inputs.atom_mapping_inputs.metric
+    budget = run_inputs.atom_mapping_inputs.n_candidates
+    typer.echo(
+        f"--atom-mapping: finding every mechanism for {len(candidates)} conformer "
+        f"pair(s) (best symmetry variant per mechanism by {metric})..."
+    )
+
+    def _one(pair):
+        i, j = pair
+        try:
+            choices = select_per_mechanism(
+                structures[i].structure, structures[j].structure, metric, run_inputs,
+                max_variants_per_mechanism=budget,
+            )
+        except Exception as exc:
+            return pair, None, f"{type(exc).__name__}: {exc}"
+        return pair, [(c.key, c.score, c.n_variants, c.winner.end_structure, c.winner.atom_map is None)
+                      for c in choices], None
+
+    rows = []  # one per (pair, mechanism)
+    n_failed = 0
+    for (i, j), choices, error in _fork_map(_one, list(candidates), workers):
+        if not choices:
+            if error:
+                typer.echo(f"  pair ({i}, {j}): mechanism enumeration failed ({error}); keeping it as is.")
+                n_failed += 1
+            rows.append({"i": i, "j": j, "key": "unmapped", "score": None,
+                         "n_variants": 0, "structure": None})
+            continue
+        for key, score, n_variants, end_structure, is_identity in choices:
+            rows.append({"i": i, "j": j, "key": key, "score": score, "n_variants": n_variants,
+                         "structure": None if is_identity else end_structure})
+
+    keys = sorted({r["key"] for r in rows})
+    if pairs_per_mechanism > 0:
+        kept = []
+        for key in keys:
+            mine = [r for r in rows if r["key"] == key]
+            mine.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0.0))
+            kept += mine[:pairs_per_mechanism]
+        rows = kept
+
+    new_structures = list(structures)
+    new_candidates = []
+    for r in rows:
+        if r["structure"] is None:
+            r["pair_j"] = r["j"]
+        else:
+            new_structures.append(StructureNode(structure=r["structure"]))
+            r["pair_j"] = len(new_structures) - 1
+        new_candidates.append((r["i"], r["pair_j"]))
+
+    counts = {key: sum(1 for r in rows if r["key"] == key) for key in keys}
+    typer.echo(f"--atom-mapping: {len(keys)} mechanism(s) across the pairs:")
+    for key in keys:
+        typer.echo(f"    {counts[key]:>4} path search(es)  {key}")
+    typer.echo(
+        f"--atom-mapping: {len(candidates)} conformer pair(s) -> {len(new_candidates)} "
+        f"path search(es)"
+        + (f" (best {pairs_per_mechanism} pair(s) per mechanism)" if pairs_per_mechanism > 0 else "")
+        + (f"; {n_failed} enumeration(s) failed." if n_failed else ".")
+    )
+
+    if output is not None:
+        import json
+
+        table = [
+            {"pair": f"pair_{r['i']}_{r['pair_j']}", "start_conformer": r["i"],
+             "end_structure": r["j"], "mechanism": r["key"], "score": r["score"],
+             "n_symmetry_variants": r["n_variants"]}
+            for r in rows
+        ]
+        (output / "pair_mechanisms.json").write_text(json.dumps(table, indent=2) + "\n")
+
+    summary = {"n_mechanisms": len(keys), "path_searches_per_mechanism": counts}
+    return new_structures, new_candidates, summary
+
+
 def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
+    """Pair trees that finished AND have a usable root. A pair whose very
+    first NEB failed still writes a tree (adj_matrix.txt, with the root saved
+    as node_0_failed.xyz) -- enough to mark it done for resuming, but
+    network construction needs node_0.xyz, and one such tree used to sink
+    the whole run's classification."""
     if not completion_dir.is_dir():
         return []
-    return sorted(
+    trees = [
         p / "tree" for p in completion_dir.iterdir()
         if (p / "tree" / "adj_matrix.txt").exists()
-    )
+    ]
+    failed = [t for t in trees if not (t / "node_0.xyz").exists()]
+    if failed:
+        typer.echo(
+            f"Skipping {len(failed)} pair tree(s) whose root NEB failed: "
+            + ", ".join(t.parent.name for t in sorted(failed))
+        )
+    return sorted(t for t in trees if (t / "node_0.xyz").exists())
+
+
+_FORK_JOB: dict = {}
+
+
+def _fork_call(item):
+    return _FORK_JOB["fn"](item)
+
+
+def _fork_map(fn, items: list, workers: int) -> list:
+    """`[fn(x) for x in items]`, across `workers` forked processes when
+    workers > 1. `fn` (and everything it closes over -- structures, the
+    engine, RunInputs) reaches the children through fork rather than
+    pickling; only each item and its return value are pickled."""
+    if workers <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    _FORK_JOB["fn"] = fn
+    try:
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(items)),
+            mp_context=multiprocessing.get_context("fork"),
+        ) as pool:
+            return list(pool.map(_fork_call, items))
+    finally:
+        _FORK_JOB.pop("fn", None)
 
 
 def _run_msmep_pairs(
@@ -549,6 +705,7 @@ def _run_msmep_pairs(
     *,
     parallel: bool,
     parallel_workers: Optional[int],
+    workers: int = 1,
 ) -> None:
     """Runs recursive NEB/MSMEP autosplitting for each (i, j) structure-index
     pair in `candidates`, writing each result to <pairs_dir>/pair_<i>_<j>/tree/.
@@ -559,16 +716,25 @@ def _run_msmep_pairs(
     on disk IS the resume state. Shared by --network-completion (candidates
     seeded from newly-discovered intermediates) and `network-splits`
     (candidates seeded from a user-supplied list of minima).
+
+    `workers` > 1 runs that many pairs at once, each in its own forked
+    process; pairs share nothing but read-only inputs and write to their
+    own pair_<i>_<j>/ directory.
     """
     from mepd.msmep import MSMEP
     import mepd.chainhelpers as ch
 
+    todo = []
     for i, j in candidates:
+        if (pairs_dir / f"pair_{i}_{j}" / "tree" / "adj_matrix.txt").exists():
+            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
+        else:
+            todo.append((i, j))
+
+    def _one(pair) -> None:
+        i, j = pair
         pair_dir = pairs_dir / f"pair_{i}_{j}"
         tree_dir = pair_dir / "tree"
-        if (tree_dir / "adj_matrix.txt").exists():
-            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
-            continue
         pair_dir.mkdir(parents=True, exist_ok=True)
         typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")
         # MSMEP's "endpoints already attempted elsewhere" dedup (meant to stop
@@ -606,7 +772,10 @@ def _run_msmep_pairs(
             pair_history.write_to_disk(tree_dir)
         except Exception as exc:
             typer.echo(f"Pair ({i}, {j}) failed ({type(exc).__name__}: {exc}); skipping.")
-            continue
+
+    if workers > 1 and len(todo) > 1:
+        typer.echo(f"Running {len(todo)} pair(s) across {min(workers, len(todo))} worker process(es).")
+    _fork_map(_one, todo, workers)
 
 
 def _run_network_completion(
@@ -1346,33 +1515,98 @@ def _load_channels_result(result_path: Path, charge: int, multiplicity: int):
 def _load_channel_classification(result_path: Path) -> dict[str, str]:
     """If `result_path` (a `mepd ts`-shaped directory) is the `ts/`
     subdirectory of a `mepd channels` output, map every TS-guess label
-    (e.g. "ts_pair_0_3_leaf_3") to the channel/alternate-route it was
+    (e.g. "ts_pair_0_3_leaf_3") to the channel/alternate-channel/
+    off-target-exit-channel it was
     classified into (e.g. "Channel 0"), by reading the `members.txt`
     `_write_classified_group` already wrote under the sibling
-    `channels/`/`alternate-routes/` folders. Returns an empty dict if
-    `result_path` isn't part of a `mepd channels` output (a plain `mepd ts`
-    output has no such siblings), so callers can fall back to their own
-    generic labeling."""
+    `channels/`/`alternate-channels/`/`offtarget-exit-channels/` folders.
+    Returns an empty dict if `result_path` isn't part of a `mepd channels`
+    output (a plain `mepd ts` output has no such siblings), so callers can
+    fall back to their own generic labeling.
+
+    `alternate-channels/` nests one level deeper than the other two -- a
+    multistep route holds a `step_<n>/` per leg -- so its members are
+    labeled with both the route and which step of it this TS is."""
     membership: dict[str, str] = {}
     root = result_path.parent
-    for dirname, prefix in (("channels", "Channel"), ("alternate-routes", "Alternate route")):
+
+    def _absorb(group_dir: Path, label: str) -> None:
+        members_fp = group_dir / "members.txt"
+        if not members_fp.is_file():
+            return
+        for line in members_fp.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("connects:"):
+                continue
+            membership[line] = label
+
+    for dirname, prefix in (
+        ("channels", "Channel"),
+        ("offtarget-exit-channels", "Off-target exit channel"),
+    ):
         group_root = root / dirname
         if not group_root.is_dir():
             continue
         for group_dir in sorted(group_root.iterdir()):
-            members_fp = group_dir / "members.txt"
-            if not members_fp.is_file():
+            _absorb(group_dir, f"{prefix} {group_dir.name.rsplit('_', 1)[-1]}")
+
+    alt_root = root / "alternate-channels"
+    if alt_root.is_dir():
+        for route_dir in sorted(alt_root.iterdir()):
+            if not route_dir.is_dir():
                 continue
-            index = group_dir.name.rsplit("_", 1)[-1]
-            for line in members_fp.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("connects:"):
+            route_index = route_dir.name.rsplit("_", 1)[-1]
+            for step_dir in sorted(route_dir.iterdir()):
+                if not step_dir.is_dir():
                     continue
-                membership[line] = f"{prefix} {index}"
+                step_index = step_dir.name.rsplit("_", 1)[-1]
+                _absorb(step_dir, f"Alternate channel {route_index} step {step_index}")
     return membership
 
 
-def _load_channel_reference_reactant(result_path: Path, charge: int, multiplicity: int):
+def _irc_needs_reversal(irc_chain, reactant, product) -> bool:
+    """Whether to flip `irc_chain` so every IRC of a `mepd channels` run is
+    drawn from the same molecular graph (energies are shown relative to
+    `chain[0]`, so mixed orientations would mix forward and reverse
+    barriers).
+
+    Decided by the first rule that tells the two ends apart:
+      1. the end that is the requested reactant (connectivity AND
+         stereochemistry) goes first;
+      2. else the end with the reactant's connectivity, stereochemistry
+         ignored (e.g. trans-3,4-dimethylcyclobutene in a run started from
+         the cis isomer) goes first;
+      3. else the end that is the requested product -- again exact, then
+         connectivity only -- goes last.
+    If no rule tells them apart, the IRC is left as written."""
+    from mepd.nodes.nodehelpers import _is_connectivity_identical
+
+    if irc_chain is None or len(irc_chain) < 2:
+        return False
+    first, last = irc_chain[0], irc_chain[-1]
+
+    def _matches(node, ref, disregard_stereochem):
+        if ref is None or getattr(node, "graph", None) is None or getattr(ref, "graph", None) is None:
+            return False
+        try:
+            return _is_connectivity_identical(
+                node, ref, verbose=False, collect_comparison=False,
+                disregard_stereochem=disregard_stereochem,
+            )
+        except Exception:
+            return False
+
+    for ref, want_first in ((reactant, True), (product, False)):
+        for loose in (False, True):
+            a, b = _matches(first, ref, loose), _matches(last, ref, loose)
+            if a != b:
+                return b if want_first else a
+    return False
+
+
+def _load_channel_reference_reactant(
+    result_path: Path, charge: int, multiplicity: int, side: str = "start",
+):
     """If `result_path` (a `mepd ts`-shaped directory) is the `ts/`
     subdirectory of a `mepd channels` output, return any one conformer of
     the original --start endpoint (from the sibling `conformers/start.xyz`
@@ -1387,7 +1621,7 @@ def _load_channel_reference_reactant(result_path: Path, charge: int, multiplicit
     (e.g. a plain `mepd ts` output), so callers can skip reorientation."""
     from mepd.inputs import ChainInputs
 
-    start_fp = result_path.parent / "conformers" / "start.xyz"
+    start_fp = result_path.parent / "conformers" / f"{side}.xyz"
     if not start_fp.is_file():
         return None
     try:
@@ -1403,10 +1637,13 @@ def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
     (<label>_irc.xyz, or irc.xyz for the bare "ts" label) -- see
     `_optimize_ts_and_irc`, which writes these -- into a `TsOutputResult`
     for `mepd visualize`. If this is a `mepd channels` output's `ts/`
-    directory, also attaches its real channel/alternate-route
-    classification (see `_load_channel_classification`) and reorients every
-    "Channel"-classified IRC so its reactant side is consistently
-    `chain[0]` (see `_load_channel_reference_reactant`)."""
+    directory, also attaches its real channel / alternate-channel /
+    off-target-exit-channel classification (see
+    `_load_channel_classification`) and reorients every classified IRC that
+    actually relaxes into the reactant on its far side so that side is
+    consistently `chain[0]` (see `_load_channel_reference_reactant`) -- the
+    first leg of an alternate channel, and an off-target exit off the
+    reactant, want the same orientation a direct channel gets."""
     from mepd.inputs import ChainInputs
     from mepd.viz import TsOutputResult
 
@@ -1416,6 +1653,9 @@ def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
 
     group_labels = _load_channel_classification(result_path)
     reference_reactant = _load_channel_reference_reactant(result_path, charge, multiplicity)
+    reference_product = _load_channel_reference_reactant(
+        result_path, charge, multiplicity, side="end"
+    )
 
     ts_files = sorted(
         p for p in result_path.glob("ts*.xyz") if not p.stem.endswith("_irc")
@@ -1435,13 +1675,7 @@ def _load_ts_output_result(result_path: Path, charge: int, multiplicity: int):
         if irc_fp.exists():
             try:
                 irc_chain = Chain.from_xyz(irc_fp, ChainInputs(), charge=charge, spinmult=multiplicity)
-                if (
-                    reference_reactant is not None
-                    and group_labels.get(label, "").startswith("Channel")
-                    and len(irc_chain) > 1
-                    and not _connectivity_matches(irc_chain[0], reference_reactant)
-                    and _connectivity_matches(irc_chain[-1], reference_reactant)
-                ):
+                if _irc_needs_reversal(irc_chain, reference_reactant, reference_product):
                     irc_chain = irc_chain.copy()
                     irc_chain.nodes.reverse()
                 irc_paths.append((label, irc_chain))
@@ -1848,16 +2082,65 @@ def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> 
     return optimized
 
 
+_TWISTED_RING_ALKENE_DEG = 60.0
+
+
+def _n_trans_small_ring_alkenes(node) -> Optional[int]:
+    """How many C=C bonds inside a 3-7 membered ring are trans/twisted (the
+    ring C-C=C-C dihedral above `_TWISTED_RING_ALKENE_DEG`), from the node's
+    own geometry; None if the bonding can't be perceived.
+
+    SMILES can't express E/Z for a double bond in a ring this small, so
+    stereo SMILES calls cis- and trans-cyclohexene the same molecule. They
+    aren't: trans-cyclohexene is ~50 kcal/mol of strain, reached by an
+    antarafacial Diels-Alder TS that `channels` then counted as a channel to
+    ordinary cyclohexene."""
+    from rdkit import Chem
+    from rdkit.Chem import rdDetermineBonds, rdMolTransforms
+
+    try:
+        mol = Chem.MolFromXYZBlock(node.structure.to_xyz())
+        rdDetermineBonds.DetermineBonds(mol, charge=node.structure.charge)
+    except Exception:
+        return None
+    ring_info = mol.GetRingInfo()
+    n = 0
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.DOUBLE:
+            continue
+        rings = [r for r in ring_info.BondRings() if bond.GetIdx() in r and len(r) <= 7]
+        if not rings:
+            continue
+        ring_atoms = {mol.GetBondWithIdx(k).GetBeginAtomIdx() for k in rings[0]} | {
+            mol.GetBondWithIdx(k).GetEndAtomIdx() for k in rings[0]
+        }
+        a, c = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        na = [x.GetIdx() for x in mol.GetAtomWithIdx(a).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != c]
+        nc = [x.GetIdx() for x in mol.GetAtomWithIdx(c).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != a]
+        if not na or not nc:
+            continue
+        dihedral = rdMolTransforms.GetDihedralDeg(mol.GetConformer(), na[0], a, c, nc[0])
+        n += abs(dihedral) > _TWISTED_RING_ALKENE_DEG
+    return n
+
+
 def _connectivity_matches(a, b) -> bool:
     """Same molecule (bond connectivity + stereochemistry), ignoring
     conformation -- mirrors `NetworkBuilder._graph_equivalent`, used here to
     compare an IRC-recovered endpoint against the originally requested
-    --start/--end structures without caring which conformer it landed on."""
+    --start/--end structures without caring which conformer it landed on.
+
+    Stereo SMILES is blind to E/Z of double bonds in small rings, so the
+    count of trans/twisted small-ring alkenes must match as well
+    (`_n_trans_small_ring_alkenes`)."""
     from mepd.nodes.nodehelpers import _is_connectivity_identical
 
     if getattr(a, "graph", None) is None or getattr(b, "graph", None) is None:
         return False
-    return _is_connectivity_identical(a, b, verbose=False, collect_comparison=False)
+    if not _is_connectivity_identical(a, b, verbose=False, collect_comparison=False):
+        return False
+    na, nb = _n_trans_small_ring_alkenes(a), _n_trans_small_ring_alkenes(b)
+    return na is None or nb is None or na == nb
 
 
 def _register_route_class(known: list, node) -> int:
@@ -1871,22 +2154,63 @@ def _register_route_class(known: list, node) -> int:
     return len(known) - 1
 
 
+_TS_FINGERPRINT_TOL_BOHR = 0.1
+
+
+def _same_ts(a, b, rmsd_cutoff: float, kcal_mol_cutoff: float) -> bool:
+    """Whether two optimized TSs are the same saddle point.
+
+    Unlike `is_identical` (index-wise Kabsch fit, plus a perceived-graph
+    check), this must see through atom relabeling: every conformer pair gets
+    its own --atom-mapping reindexing, so the same TS reached from two pairs
+    routinely comes back with equivalent atoms (e.g. a methylene's two H)
+    swapped, and mirror-image pairs return its mirror image. So: energies
+    within `kcal_mol_cutoff`, then snap-RMSD (permutation-aware) to b or its
+    mirror image under `rmsd_cutoff`. snap-RMSD perceives connectivity from
+    geometry, which is ambiguous at a saddle point's half-formed bonds; when
+    it can't, fall back to the sorted interatomic-distance list, which is
+    itself invariant to permutation, rotation and reflection."""
+    import numpy as np
+    import qcinf
+
+    from mepd.conformers import mirror_image
+
+    try:
+        if abs(a.energy - b.energy) * 627.5 >= kcal_mol_cutoff:
+            return False
+    except Exception:
+        pass
+    try:
+        return min(
+            qcinf.snap_rmsd(a.structure, b.structure),
+            qcinf.snap_rmsd(a.structure, mirror_image(b.structure)),
+        ) < rmsd_cutoff
+    except Exception:
+        pass
+    if list(a.structure.symbols) != list(b.structure.symbols):
+        return False
+
+    def _fingerprint(node):
+        g = np.asarray(node.structure.geometry, dtype=float)
+        d = np.linalg.norm(g[:, None, :] - g[None, :, :], axis=-1)
+        return np.sort(d[np.triu_indices(len(g), 1)])
+
+    return float(np.abs(_fingerprint(a) - _fingerprint(b)).max()) < _TS_FINGERPRINT_TOL_BOHR
+
+
 def _cluster_by_ts_identity(candidates: list[tuple], run_inputs: RunInputs) -> list[list[tuple]]:
     """Greedily cluster `(ts_node, irc_chain, label)` candidates into classes
-    whose TS structures are pairwise `is_identical` -- the same cutoffs
-    `NetworkBuilder._equality_function`/`check_if_elem_step` already use for
-    "are these the same structure"."""
-    from mepd.nodes.nodehelpers import is_identical
-
+    of the same TS (`_same_ts`, with the cutoffs `NetworkBuilder` uses for
+    "are these the same structure": node_rms_thre bohr, node_ene_thre
+    kcal/mol)."""
     clusters: list[list[tuple]] = []
     for candidate in candidates:
         ts_node = candidate[0]
         for cluster in clusters:
-            if is_identical(
+            if _same_ts(
                 ts_node, cluster[0][0],
-                fragment_rmsd_cutoff=run_inputs.chain_inputs.node_rms_thre,
+                rmsd_cutoff=run_inputs.chain_inputs.node_rms_thre,
                 kcal_mol_cutoff=run_inputs.chain_inputs.node_ene_thre,
-                verbose=False,
             ):
                 cluster.append(candidate)
                 break
@@ -1946,6 +2270,90 @@ def _write_classified_group(
     (group_dir / "members.txt").write_text("\n".join(lines) + "\n")
 
 
+_MAX_ALTERNATE_CHANNEL_STEPS = 6
+_MAX_ALTERNATE_CHANNELS = 200
+
+
+def _species_label(node) -> str:
+    """Best-effort SMILES for a discovered minimum, to name it in the
+    human-readable `path.txt`/`members.txt` sidecars.
+
+    Prefers whatever identifiers the structure already carries, and
+    otherwise derives one from the perceived bond graph: a structure
+    reloaded from a bare xyz -- which is exactly what resuming a run gives
+    you -- has no identifiers at all, and a route written out as
+    "? -> ? -> ?" tells you nothing about the chemistry it found."""
+    from mepd.NetworkBuilder import _stereochemical_smiles_key
+
+    try:
+        key = _stereochemical_smiles_key(node)
+        if key:
+            return key
+    except Exception:
+        pass
+    try:
+        smiles = getattr(getattr(node, "graph", None), "smiles", "")
+        if smiles:
+            return str(smiles)
+    except Exception:
+        pass
+    return "?"
+
+
+def _cluster_ts_energy(cluster: list) -> float:
+    """Energy of a TS class, for ranking distinct classes of the same step."""
+    try:
+        return cluster[0][0].energy
+    except Exception:
+        return float("inf")
+
+
+def _write_multistep_group(
+    out_dir: Path,
+    prefix: str,
+    index: int,
+    species_path: list,
+    step_clusters: list,
+    species_labels: list,
+) -> None:
+    """Write one multistep route -- an *alternate channel* -- as a `path.txt`
+    naming the species it walks through plus one `step_<n>/` folder per
+    elementary step, each holding that leg's TS/IRC in exactly the layout a
+    single-step group uses.
+
+    `step_clusters[n]` is every distinct TS class found for leg n. The
+    lowest-barrier one defines the route and goes in `step_<n>/` itself; a
+    leg found with genuinely different TSs keeps the rest alongside it in
+    `step_<n>/alternate_ts_<m>/` rather than dropping them -- they are real
+    mechanisms for that step, just not the cheapest one."""
+    group_dir = out_dir / f"{prefix}_{index}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    arrow = "\n  -> ".join(species_labels[c] for c in species_path)
+    lines = [
+        f"{len(step_clusters)} step(s), {len(species_path) - 2} intermediate(s)",
+        f"  {arrow}",
+    ]
+    for n, clusters in enumerate(step_clusters):
+        ranked = sorted(clusters, key=_cluster_ts_energy)
+        extra_info = (
+            f"connects: {species_labels[species_path[n]]} "
+            f"<-> {species_labels[species_path[n + 1]]}"
+        )
+        _write_classified_group(ranked[0], group_dir, "step", n, extra_info=extra_info)
+        if len(ranked) > 1:
+            lines.append(
+                f"  step_{n}: {len(ranked) - 1} further distinct TS class(es) "
+                f"for this step in step_{n}/alternate_ts_*/"
+            )
+        for m, alternate in enumerate(ranked[1:]):
+            _write_classified_group(
+                alternate, group_dir / f"step_{n}", "alternate_ts", m,
+                extra_info=extra_info,
+            )
+    (group_dir / "path.txt").write_text("\n".join(lines) + "\n")
+
+
 def _discover_channels(
     output: Path,
     start_node,
@@ -1953,18 +2361,35 @@ def _discover_channels(
     run_inputs: RunInputs,
     charge: Optional[int],
     multiplicity: Optional[int],
+    workers: int = 1,
 ) -> None:
     """TS-opt + IRC every leaf across every completed pair tree in `output`,
-    then classify by IRC endpoints: a leaf whose IRC reconnects the
-    original --start/--end pair (regardless of which conformer/seed
-    produced it) is a channel candidate; a leaf whose IRC connects some
-    other pair of real minima is an alternate-route candidate; a leaf whose
-    TS optimization or IRC failed to converge is dropped from both. Within
-    each bucket, candidates are further deduplicated into distinct TS
+    then classify by walking the reaction graph those IRCs span.
+
+    Every converged leaf contributes one elementary step: an edge between
+    the connectivity classes of the two minima its IRC relaxes into. Leaves
+    whose TS-opt or IRC failed to converge, or whose IRC collapsed into the
+    same minimum on both sides, are dropped. Seeding that graph's species
+    list with the requested --start/--end pair means the edges then sort
+    into three buckets:
+
+    * `channels/` -- a single elementary step straight from --start to
+      --end.
+    * `alternate-channels/` -- a *multistep* route from --start to --end: a
+      simple path through one or more discovered intermediates, every leg
+      of it an IRC-verified step. One folder per route, `step_<n>/` per leg.
+    * `offtarget-exit-channels/` -- a step off some discovered minimum for
+      which no onward sequence of steps ever reaches --end. A TS to an
+      intermediate we never found a way forward from is an exit off the
+      reaction path, not a route to the requested product.
+
+    Within a bucket, candidates are further deduplicated into distinct TS
     classes -- this is what turns e.g. 4 conformer-pair runs into "2
     channels" when 2 of those runs converged to essentially the same TS.
     """
-    from mepd.NetworkBuilder import _stereochemical_smiles_key
+    import itertools
+
+    import networkx as nx
 
     tree_charge = charge if charge is not None else 0
     tree_multiplicity = multiplicity if multiplicity is not None else 1
@@ -1977,12 +2402,50 @@ def _discover_channels(
     ts_dir = output / "ts"
     ts_dir.mkdir(parents=True, exist_ok=True)
 
-    channel_candidates: list[tuple] = []
-    route_classes: list = []
-    route_buckets: dict = {}
+    # Species classes, seeded so that --start is class 0 and --end is class 1;
+    # every IRC endpoint is then registered against the same list, which is
+    # what lets a multi-leg route be recognized as reaching the real product.
+    species: list = []
+    start_cls = _register_route_class(species, start_node)
+    end_cls = _register_route_class(species, end_node)
+    degenerate_pair = start_cls == end_cls
+    if degenerate_pair:
+        typer.echo(
+            "WARNING: --start and --end have identical connectivity; no "
+            "channel can be defined for this pair, so every discovered step "
+            "is reported as an off-target exit channel."
+        )
+
+    edge_candidates: dict = {}
     n_failed = 0
 
+    # TS-opt + IRC every leaf not already on disk, `workers` at a time. Each
+    # leaf writes only its own <label>*.xyz, and the classification loop
+    # below reads everything back from disk, so it is identical either way;
+    # leaves whose optimization failed are remembered so they aren't retried.
+    pending = [
+        (label, node) for label, node in tasks
+        if _load_ts_and_irc_from_disk(ts_dir, label, tree_charge, tree_multiplicity) is None
+    ]
+    failed_labels: set = set()
+    if workers > 1 and len(pending) > 1:
+        typer.echo(
+            f"Optimizing {len(pending)} TS guess(es) across "
+            f"{min(workers, len(pending))} worker process(es)."
+        )
+
+        def _opt(task):
+            label, node = task
+            result = _optimize_ts_and_irc(node, run_inputs, ts_dir, run_irc=True, label=label)
+            ok = result is not None and result.irc_chain is not None and len(result.irc_chain) >= 2
+            return label, ok
+
+        failed_labels = {label for label, ok in _fork_map(_opt, pending, workers) if not ok}
+
     for label, guess_node in tasks:
+        if label in failed_labels:
+            n_failed += 1
+            continue
         result = _load_ts_and_irc_from_disk(ts_dir, label, tree_charge, tree_multiplicity)
         if result is None:
             result = _optimize_ts_and_irc(guess_node, run_inputs, ts_dir, run_irc=True, label=label)
@@ -1991,46 +2454,82 @@ def _discover_channels(
             continue
 
         irc_first, irc_last = result.irc_chain[0], result.irc_chain[-1]
-        candidate = (result.ts_node, result.irc_chain, label)
-        if (
-            _connectivity_matches(irc_first, start_node) and _connectivity_matches(irc_last, end_node)
-        ) or (
-            _connectivity_matches(irc_last, start_node) and _connectivity_matches(irc_first, end_node)
-        ):
-            channel_candidates.append(candidate)
-            continue
-
-        i = _register_route_class(route_classes, irc_first)
-        j = _register_route_class(route_classes, irc_last)
+        i = _register_route_class(species, irc_first)
+        j = _register_route_class(species, irc_last)
         if i == j:
             # IRC collapsed to the same minimum on both sides -- not a
-            # genuine two-minima route.
+            # genuine two-minima step.
             n_failed += 1
             continue
-        route_buckets.setdefault(frozenset((i, j)), []).append(candidate)
+        edge_candidates.setdefault(frozenset((i, j)), []).append(
+            (result.ts_node, result.irc_chain, label)
+        )
 
-    channels_dir = output / "channels"
-    alt_dir = output / "alternate-routes"
+    # One graph edge per pair of species; each edge carries the distinct TS
+    # classes found for that step.
+    edge_steps: dict = {
+        key: _cluster_by_ts_identity(cands, run_inputs)
+        for key, cands in edge_candidates.items()
+    }
+    species_labels = [_species_label(node) for node in species]
 
-    channel_clusters = _cluster_by_ts_identity(channel_candidates, run_inputs)
-    for k, cluster in enumerate(channel_clusters):
-        _write_classified_group(cluster, channels_dir, "channel", k)
+    graph = nx.Graph()
+    graph.add_nodes_from(range(len(species)))
+    graph.add_edges_from(tuple(sorted(key)) for key in edge_steps)
 
-    n_routes = 0
-    for (i, j), bucket_candidates in route_buckets.items():
-        smi_a = _stereochemical_smiles_key(route_classes[i]) or "?"
-        smi_b = _stereochemical_smiles_key(route_classes[j]) or "?"
-        for cluster in _cluster_by_ts_identity(bucket_candidates, run_inputs):
-            _write_classified_group(
-                cluster, alt_dir, "route", n_routes,
-                extra_info=f"connects: {smi_a} <-> {smi_b}",
+    # Every simple --start -> --end path; a 1-edge path is a direct channel,
+    # anything longer is an alternate (multistep) channel.
+    routes: list = []
+    if not degenerate_pair and graph.has_node(start_cls) and graph.has_node(end_cls):
+        routes = list(
+            itertools.islice(
+                nx.all_simple_paths(
+                    graph, start_cls, end_cls, cutoff=_MAX_ALTERNATE_CHANNEL_STEPS
+                ),
+                _MAX_ALTERNATE_CHANNELS,
             )
-            n_routes += 1
+        )
+    routes.sort(key=len)
 
+    on_route_edges: set = set()
+    multistep_routes: list = []
+    for path in routes:
+        keys = [frozenset((path[n], path[n + 1])) for n in range(len(path) - 1)]
+        on_route_edges.update(keys)
+        if len(keys) > 1:
+            multistep_routes.append((path, keys))
+
+    direct_key = frozenset((start_cls, end_cls))
+    channel_clusters = [] if degenerate_pair else edge_steps.get(direct_key, [])
+    for k, cluster in enumerate(channel_clusters):
+        _write_classified_group(cluster, output / "channels", "channel", k)
+
+    alt_dir = output / "alternate-channels"
+    for k, (path, keys) in enumerate(multistep_routes):
+        _write_multistep_group(
+            alt_dir, "alternate_channel", k, path,
+            [edge_steps[key] for key in keys], species_labels,
+        )
+
+    offtarget_dir = output / "offtarget-exit-channels"
+    n_offtarget = 0
+    for key in edge_steps:
+        if key in on_route_edges:
+            continue
+        i, j = sorted(key)
+        for cluster in edge_steps[key]:
+            _write_classified_group(
+                cluster, offtarget_dir, "offtarget_exit_channel", n_offtarget,
+                extra_info=f"connects: {species_labels[i]} <-> {species_labels[j]}",
+            )
+            n_offtarget += 1
+
+    n_contributing = sum(len(c) for c in channel_clusters)
     typer.echo(
         f"{len(channel_clusters)} channel(s) found for the requested pair "
-        f"({len(channel_candidates)} contributing run(s)), {n_routes} "
-        f"alternate route(s), {n_failed} failed."
+        f"({n_contributing} contributing run(s)), "
+        f"{len(multistep_routes)} alternate channel(s), "
+        f"{n_offtarget} off-target exit channel(s), {n_failed} failed."
     )
 
 
@@ -2042,7 +2541,7 @@ def channels(
         "conformers", "--method",
         help="Seed-generation strategy for perturbing the search to surface "
         "alternate TS channels between --start and --end. Currently only "
-        "'conformers' (RDKit conformer sampling of each endpoint) is "
+        "'conformers' (conformer sampling of each endpoint, see --backend) is "
         "implemented; more methods may be added later.",
     ),
     inputs: Optional[Path] = typer.Option(
@@ -2056,7 +2555,7 @@ def channels(
         None, "--multiplicity", help="Override the spin multiplicity on both endpoints."
     ),
     atom_mapping: bool = typer.Option(
-        False, "--atom-mapping",
+        True, "--atom-mapping/--no-atom-mapping",
         help="Every run checks whether SLAPMapper's Weisfeiler-Lehman-like/"
         "sequential-LAP atom-to-atom mapping (Koda, ChemRxiv 2025) between "
         "--start and --end agrees with their shared input atom ordering, "
@@ -2112,18 +2611,64 @@ def channels(
     ),
     backend: str = typer.Option(
         "rdkit", "--backend",
-        help="Conformer-generation backend. Currently only 'rdkit' is implemented; "
-        "'crest' is planned as a follow-up.",
+        help="Conformer-generation backend: 'rdkit' (ETKDG embedding + MMFF "
+        "relaxation; cheap) or 'crest' (CREST iterative metadynamics; needs the "
+        "`crest` binary, much more expensive, see --crest-*). Either way the "
+        "candidates are deduplicated by snap-RMSD (--rmsd-cutoff), capped at "
+        "--n-conformers, and re-minimized with the engine (--minimize-ends).",
+    ),
+    crest_method: str = typer.Option(
+        "--gfn2", "--crest-method",
+        help="--backend crest: CREST sampling-level flag, e.g. '--gfn2', "
+        "'--gfnff', or '--gfn2//gfnff'.",
+    ),
+    crest_threads: int = typer.Option(
+        1, "--crest-threads", help="--backend crest: CREST's -T thread count.",
+    ),
+    crest_ewin: float = typer.Option(
+        6.0, "--crest-ewin",
+        help="--backend crest: CREST's --ewin energy window (kcal/mol) for "
+        "retained conformers.",
+    ),
+    crest_timeout: float = typer.Option(
+        3600.0, "--crest-timeout",
+        help="--backend crest: wall-clock limit (s) for one CREST call.",
+    ),
+    crest_nci: bool = typer.Option(
+        True, "--crest-nci/--no-crest-nci",
+        help="--backend crest: run CREST in NCI mode (an ellipsoidal wall that "
+        "keeps a complex together) for endpoints made of more than one molecule.",
+    ),
+    complex_energy_tol: float = typer.Option(
+        0.5, "--complex-energy-tol",
+        help="For endpoints made of more than one molecule: after minimization, "
+        "drop a conformer when every molecule's own conformation matches an "
+        "already-kept one (snap-RMSD < --rmsd-cutoff, molecule by molecule) and "
+        "the energies agree within this many kcal/mol. 0 disables.",
     ),
     n_conformers: int = typer.Option(
-        10, "--n-conformers",
+        0, "--n-conformers",
         help="Maximum number of distinct conformers to keep for EACH endpoint "
-        "after generation and RMSD-based deduplication.",
+        "after generation and RMSD-based deduplication. 0 = no cap: keep every "
+        "distinct conformer the backend's own parameters let through (CREST's "
+        "--crest-ewin; RDKit's --n-embed and --rdkit-ewin).",
     ),
     n_embed: int = typer.Option(
-        50, "--n-embed",
+        0, "--n-embed",
         help="Number of raw conformer embeddings to attempt per endpoint before "
-        "deduplication (rdkit backend only). Should comfortably exceed --n-conformers.",
+        "deduplication (rdkit backend only). Should comfortably exceed --n-conformers. "
+        "0 = pick from rotatable-bond count (50 / 200 / 300 for <=7 / 8-12 / >12).",
+    ),
+    rdkit_torsion_prefs: str = typer.Option(
+        "both", "--rdkit-torsion-prefs",
+        help="--backend rdkit: embed with ETKDG's experimental torsion preferences "
+        "('etkdg'), without them ('none'), or both pooled ('both', default). The "
+        "preferences alone never sample e.g. s-cis dienes.",
+    ),
+    rdkit_ewin: Optional[float] = typer.Option(
+        None, "--rdkit-ewin",
+        help="--backend rdkit: keep only embeddings within this many kcal/mol "
+        "(MMFF94) of the lowest -- the counterpart of --crest-ewin. Default: no window.",
     ),
     rmsd_cutoff: float = typer.Option(
         0.5, "--rmsd-cutoff",
@@ -2145,10 +2690,17 @@ def channels(
         "to converge in step (1) is a hard stop (see `mepd run --minimize-ends`).",
     ),
     max_pairs: int = typer.Option(
-        100, "--max-pairs",
-        help="Hard cap on the total number of reactant x product conformer pairs to "
-        "run (default matches the default 10 x 10 endpoint caps; raise this if more "
-        "compute is available).",
+        0, "--max-pairs",
+        help="Hard cap on the number of reactant x product conformer pairs considered "
+        "(before --atom-mapping expands them per mechanism). 0 (default) = no cap: "
+        "selection is left to --pairs-per-mechanism.",
+    ),
+    conformers_only: bool = typer.Option(
+        False, "--conformers-only",
+        help="Stop after building, minimizing, deduplicating and atom-mapping the "
+        "conformer pools (writes conformers/ and stats.json) -- i.e. before any "
+        "path search. For sizing a run: how many pairs would it take, and what "
+        "did conformer generation cost?",
     ),
     parallel: bool = typer.Option(
         False, "--parallel",
@@ -2159,6 +2711,20 @@ def channels(
         None, "--parallel-workers",
         help="Maximum number of concurrent workers for --parallel. Defaults to "
         "min(4, cpu count).",
+    ),
+    pairs_per_mechanism: int = typer.Option(
+        3, "--pairs-per-mechanism",
+        help="--atom-mapping: every conformer pair is mapped once per mechanism "
+        "SLAPMapper allows (e.g. [3,3] and [1,3] shifts for a Claisen); for each "
+        "mechanism, only the K pairs its geodesic score (--atom-mapping-metric) "
+        "likes best get a path search. 0 = every pair x every mechanism (slow, "
+        "mostly redundant). See docs/channels_candidates.md.",
+    ),
+    workers: int = typer.Option(
+        1, "--workers", "-j",
+        help="Run this many conformer pairs' MSMEP searches at once, and "
+        "afterwards this many TS optimizations + IRCs at once, each in its own "
+        "process. Independent of --parallel (branches within one pair).",
     ),
     validate_minima_with_hessian: bool = typer.Option(
         True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
@@ -2179,39 +2745,66 @@ def channels(
     output: Path = typer.Option(
         Path("mepd_channels_output"), "--output", "-o",
         help="Directory to write seed pools, per-seed trees, TS-opt+IRC "
-        "results, classified channels/alternate-routes, and the completed "
-        "byproduct network into.",
+        "results, classified channels/alternate-channels/offtarget-exit-"
+        "channels, and the completed byproduct network into.",
     ),
 ) -> None:
     """Multi-channel TS discovery for a fixed --start/--end pair: generate
     alternate seed guesses (--method), run a recursive NEB/MSMEP for every
     seed, optimize a TS and IRC for every resulting leaf, then classify by
-    IRC endpoints -- results whose IRC reconnects the requested --start/--end
-    pair land in <output>/channels/ (deduplicated into distinct TS classes,
-    e.g. 4 conformer-pair runs converging to 2 real channels), results that
-    reconnect some other pair of minima land in <output>/alternate-routes/,
-    and everything completed is also combined into one byproduct network at
+    walking the reaction graph those IRCs span.
+
+    A leaf whose IRC reconnects the requested --start/--end pair in one step
+    is a channel, and lands in <output>/channels/ (deduplicated into
+    distinct TS classes, e.g. 4 conformer-pair runs converging to 2 real
+    channels). A *sequence* of steps that gets from --start to --end through
+    discovered intermediates is an alternate channel, and lands in
+    <output>/alternate-channels/ as one folder per route with a step_<n>/
+    per leg. A step that leaves some minimum but from which no onward
+    sequence of discovered steps ever reaches --end is an off-target exit
+    channel, and lands in <output>/offtarget-exit-channels/. Everything
+    completed is also combined into one byproduct network at
     <output>/network.json."""
     if method != "conformers":
         raise typer.BadParameter(f"Unknown --method '{method}'. Known: 'conformers'.")
     if backend not in ("rdkit", "crest"):
         raise typer.BadParameter(f"Unknown --backend '{backend}'. Known: 'rdkit', 'crest'.")
-    if n_conformers <= 0:
-        raise typer.BadParameter("--n-conformers must be a positive integer.")
-    if n_embed <= 0:
-        raise typer.BadParameter("--n-embed must be a positive integer.")
+    if n_conformers < 0:
+        raise typer.BadParameter("--n-conformers must be a non-negative integer (0 = no cap).")
+    if n_embed < 0:
+        raise typer.BadParameter("--n-embed must be a non-negative integer (0 = auto).")
     if rmsd_cutoff <= 0:
         raise typer.BadParameter("--rmsd-cutoff must be a positive number.")
-    if max_pairs <= 0:
-        raise typer.BadParameter("--max-pairs must be a positive integer.")
+    if max_pairs < 0:
+        raise typer.BadParameter("--max-pairs must be a non-negative integer (0 = no cap).")
+    if rdkit_ewin is not None and rdkit_ewin <= 0:
+        raise typer.BadParameter("--rdkit-ewin must be positive.")
     if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
         raise typer.BadParameter(
             f"--atom-mapping-metric must be one of {_ATOM_MAPPING_METRICS}."
         )
     if atom_mapping_candidates <= 0:
         raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
+    if crest_threads <= 0:
+        raise typer.BadParameter("--crest-threads must be a positive integer.")
+    if workers <= 0:
+        raise typer.BadParameter("--workers must be a positive integer.")
+    if pairs_per_mechanism < 0:
+        raise typer.BadParameter("--pairs-per-mechanism must be non-negative (0 = all pairs).")
+    if crest_timeout <= 0:
+        raise typer.BadParameter("--crest-timeout must be positive.")
+    if rdkit_torsion_prefs not in ("both", "etkdg", "none"):
+        raise typer.BadParameter("--rdkit-torsion-prefs must be 'both', 'etkdg' or 'none'.")
+    if complex_energy_tol < 0:
+        raise typer.BadParameter("--complex-energy-tol must be non-negative (0 disables).")
 
-    from mepd.conformers import ConformerInputs
+    import json
+    import time
+
+    from mepd.conformers import (
+        ConformerInputs, CrestInputs, _subselect_conformers,
+        merge_degenerate_complex_conformers, merge_mirror_images,
+    )
     from mepd.sampling import generate_seed_pairs
     from mepd.nodes.node import StructureNode
     from mepd.NetworkBuilder import NetworkBuilder
@@ -2269,50 +2862,110 @@ def channels(
 
     conformer_inputs = ConformerInputs(
         backend=backend,
-        n_conformers=n_conformers,
-        n_embed=n_embed,
+        n_conformers=n_conformers or None,
+        n_embed=n_embed or None,
+        rdkit_ewin_kcal=rdkit_ewin,
+        rdkit_torsion_prefs=rdkit_torsion_prefs,
         rmsd_cutoff=rmsd_cutoff,
         random_seed=random_seed,
+        crest=CrestInputs(
+            method=crest_method,
+            threads=crest_threads,
+            ewin_kcal=crest_ewin,
+            timeout_s=crest_timeout,
+            nci_for_complexes=crest_nci,
+        ),
     )
+
+    # Per-stage yield and wall time, rewritten after every stage so a run
+    # that dies (or a --conformers-only run) still leaves what it measured.
+    run_started = time.perf_counter()
+    stats: dict = {"backend": backend, "workers": workers, "conformers": {}}
+    output.mkdir(parents=True, exist_ok=True)
+
+    def _write_stats() -> None:
+        stats["total_seconds"] = round(time.perf_counter() - run_started, 3)
+        (output / "stats.json").write_text(json.dumps(stats, indent=2) + "\n")
 
     typer.echo(f"Generating seed pairs (--method {method})...")
     start_confs, end_confs = generate_seed_pairs(
         method, start_node, end_node, conformer_inputs=conformer_inputs,
+        stats=stats["conformers"],
     )
     typer.echo(
         f"  -> {len(start_confs)} start-endpoint seed(s), "
         f"{len(end_confs)} end-endpoint seed(s)."
     )
 
-    if minimize_ends:
-        typer.echo("Minimizing start-endpoint conformers...")
-        start_confs = _minimize_conformer_pool(start_confs, "start", run_inputs)
-        typer.echo("Minimizing end-endpoint conformers...")
-        end_confs = _minimize_conformer_pool(end_confs, "end", run_inputs)
+    pools = {"start": start_confs, "end": end_confs}
+    for label in ("start", "end"):
+        side = stats["conformers"].setdefault(label, {})
+        if minimize_ends:
+            typer.echo(f"Minimizing {label}-endpoint conformers...")
+            t0 = time.perf_counter()
+            pools[label] = _minimize_conformer_pool(pools[label], label, run_inputs)
+            side["minimize_seconds"] = round(time.perf_counter() - t0, 3)
+            side["n_minimized"] = len(pools[label])
+            # Distinct starting geometries routinely relax into the same QM
+            # minimum; every duplicate left in would multiply the pair count
+            # with runs that repeat each other, so dedup again at the level
+            # the paths will actually be computed at.
+            pools[label] = _subselect_conformers(pools[label], n_max=None, rmsd_cutoff=rmsd_cutoff)
+            dropped = side["n_minimized"] - len(pools[label])
+            if dropped:
+                typer.echo(
+                    f"  {dropped} {label} conformer(s) minimized into an "
+                    f"already-kept minimum (snap-RMSD < {rmsd_cutoff}); dropped."
+                )
+            # A loosely bound complex's conformers differ mostly in how far
+            # apart the molecules sit; compare molecule by molecule instead.
+            before = len(pools[label])
+            pools[label] = merge_degenerate_complex_conformers(
+                pools[label], rmsd_cutoff, complex_energy_tol,
+            )
+            side["n_complex_degenerate_merged"] = before - len(pools[label])
+            if side["n_complex_degenerate_merged"]:
+                typer.echo(
+                    f"  {side['n_complex_degenerate_merged']} {label} conformer(s) of the "
+                    f"complex match a kept one fragment by fragment within "
+                    f"{complex_energy_tol} kcal/mol; dropped."
+                )
+
+    # Mirror-image conformers of an achiral molecule give mirror-image paths,
+    # so pairs built from them repeat each other -- but they can only be
+    # merged in ONE of the two pools. With {R, R*} x {P, P*}, (R, P) mirrors
+    # (R*, P*) while (R, P*) mirrors (R*, P): two genuinely different
+    # combinations, and merging both pools would keep only (R, P) and lose
+    # the other. Merging one pool drops exactly the redundant pairs; pick
+    # whichever leaves fewer.
+    merged = {label: merge_mirror_images(pools[label], rmsd_cutoff) for label in pools}
+    n_if = {
+        "start": len(merged["start"]) * len(pools["end"]),
+        "end": len(pools["start"]) * len(merged["end"]),
+    }
+    mirror_side = min(n_if, key=n_if.get)
+    n_mirrors = len(pools[mirror_side]) - len(merged[mirror_side])
+    if n_mirrors:
+        typer.echo(
+            f"  {n_mirrors} {mirror_side} conformer(s) are mirror images of another "
+            f"(achiral molecule); merged, {len(pools['start']) * len(pools['end'])} "
+            f"-> {n_if[mirror_side]} pairs."
+        )
+        pools[mirror_side] = merged[mirror_side]
+    for label in pools:
+        stats["conformers"][label]["n_mirror_images_merged"] = n_mirrors if label == mirror_side else 0
+        stats["conformers"][label]["n_final"] = len(pools[label])
+    start_confs, end_confs = pools["start"], pools["end"]
+    _write_stats()
 
     if not start_confs or not end_confs:
         typer.echo("No usable conformers for one or both endpoints; nothing to run.")
         raise typer.Exit(code=1)
 
-    structures = start_confs + end_confs
-    n_start = len(start_confs)
-    candidates = [
-        (i, n_start + j) for i in range(n_start) for j in range(len(end_confs))
-    ]
-
-    if len(candidates) > max_pairs:
-        typer.echo(
-            f"{len(candidates)} candidate reactant x product conformer pairs found "
-            f"({n_start} x {len(end_confs)}), capping at --max-pairs={max_pairs}."
-        )
-        candidates = candidates[:max_pairs]
-
-    output.mkdir(parents=True, exist_ok=True)
-
-    # Persisted so `mepd visualize <output>` can show the actual conformer
-    # pools used for pairing (post-minimization, if --minimize-ends), not
-    # just the completed pairs -- otherwise there'd be no way to see e.g. a
-    # reactant conformer that never made it into any --max-pairs-capped pair.
+    # Persisted as soon as the pools are final -- before pairing and
+    # mapping, which can take a long time for big pools, so an interrupted
+    # run still keeps its (expensive) conformers -- and so `mepd visualize
+    # <output>` can show every conformer, not just those in searched pairs.
     from mepd.inputs import ChainInputs
 
     conformers_dir = output / "conformers"
@@ -2324,13 +2977,52 @@ def channels(
         {"nodes": end_confs, "parameters": ChainInputs()}
     ).write_to_disk(conformers_dir / "end.xyz")
 
+    structures = start_confs + end_confs
+    n_start = len(start_confs)
+    candidates = [
+        (i, n_start + j) for i in range(n_start) for j in range(len(end_confs))
+    ]
+    stats["n_pairs_possible"] = len(candidates)
+
+    if max_pairs and len(candidates) > max_pairs:
+        typer.echo(
+            f"{len(candidates)} candidate reactant x product conformer pairs found "
+            f"({n_start} x {len(end_confs)}), capping at --max-pairs={max_pairs}."
+        )
+        candidates = candidates[:max_pairs]
+    stats["n_pairs"] = len(candidates)
+
+    # The endpoint-level --atom-mapping check above ran on the two input
+    # structures, before any conformer existed; which mechanism a pair can
+    # follow, and how its equivalent atoms are best labeled, depend on that
+    # pair's own geometry. Map every pair, one path search per mechanism.
+    t0 = time.perf_counter()
+    structures, candidates, mechanism_summary = _expand_pairs_by_mechanism(
+        structures, candidates, atom_mapping, run_inputs,
+        pairs_per_mechanism=pairs_per_mechanism, workers=workers, output=output,
+    )
+    stats["pair_atom_mapping_seconds"] = round(time.perf_counter() - t0, 3)
+    stats.update(mechanism_summary)
+    stats["n_path_searches"] = len(candidates)
+    _write_stats()
+
+    if conformers_only:
+        typer.echo(
+            f"--conformers-only: {len(start_confs)} x {len(end_confs)} conformers, "
+            f"{len(candidates)} pair(s); stopping before path search."
+        )
+        return
+
     pairs_dir = output / "pairs"
     pairs_dir.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.perf_counter()
     _run_msmep_pairs(
         structures, candidates, pairs_dir, run_inputs,
-        parallel=parallel, parallel_workers=parallel_workers,
+        parallel=parallel, parallel_workers=parallel_workers, workers=workers,
     )
+    stats["msmep_seconds"] = round(time.perf_counter() - t0, 3)
+    _write_stats()
 
     tree_dirs = _completed_tree_dirs(pairs_dir)
     if not tree_dirs:
@@ -2351,7 +3043,12 @@ def channels(
         f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
     )
 
-    _discover_channels(output, start_node, end_node, run_inputs, charge, multiplicity)
+    t0 = time.perf_counter()
+    _discover_channels(
+        output, start_node, end_node, run_inputs, charge, multiplicity, workers=workers,
+    )
+    stats["ts_discovery_seconds"] = round(time.perf_counter() - t0, 3)
+    _write_stats()
 
 
 @app.command("make-default-inputs")

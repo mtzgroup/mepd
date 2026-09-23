@@ -319,10 +319,11 @@ class TsOutputResult:
     label), bundled for `render_visualization_html` to show as one clickable
     page: TS structures and IRC paths, each its own group.
 
-    `group_labels` (label -> "Channel <k>"/"Alternate route <k>") is
-    populated when this `ts/` directory sits inside a `mepd channels`
-    output alongside its `channels/`/`alternate-routes/` classification
-    folders -- when present, it overrides the generic
+    `group_labels` (label -> "Channel <k>"/"Alternate channel <k> step
+    <n>"/"Off-target exit channel <k>") is populated when this `ts/`
+    directory sits inside a `mepd channels` output alongside its
+    `channels/`/`alternate-channels/`/`offtarget-exit-channels/`
+    classification folders -- when present, it overrides the generic
     `_irc_endpoint_match_label` self-consistency grouping below with the
     real classification `mepd channels` already computed (IRC-verified
     against the actual --start/--end pair, not just "are this IRC's own
@@ -330,7 +331,7 @@ class TsOutputResult:
 
     structures: list = field(default_factory=list)  # list[tuple[str, Node]]
     irc_paths: list = field(default_factory=list)  # list[tuple[str, Chain]]
-    group_labels: dict = field(default_factory=dict)  # label -> "Channel <k>" | "Alternate route <k>"
+    group_labels: dict = field(default_factory=dict)  # label -> "Channel <k>" | "Alternate channel <k> step <n>" | "Off-target exit channel <k>"
 
 
 def _irc_endpoint_match_label(chain: Chain) -> str:
