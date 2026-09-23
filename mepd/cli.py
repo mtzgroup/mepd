@@ -1044,13 +1044,18 @@ def run(
     atom_mapping_metric: str = typer.Option(
         "geodesic-distance", "--atom-mapping-metric",
         help="--atom-mapping: how each candidate mapping (including 'don't "
-        "reindex') is scored from its geodesic-interpolated path -- "
-        "'geodesic-distance' (the geodesic optimizer's own path length; "
-        "free), 'path-rmsd' (cumulative per-frame RMSD along the path; "
-        "free), or 'gi-energy' (highest QM energy along the path; most "
-        "expensive, one engine energy evaluation per candidate). Which is "
-        "actually the best predictor of a correct mapping isn't settled -- "
-        "--debug-dump records all three per candidate to help compare them.",
+        "reindex') is scored -- 'geodesic-distance' (the geodesic optimizer's "
+        "own path length; needs a full interpolation per candidate) or "
+        "'path-rmsd' (cumulative per-frame RMSD along the path; same cost) are "
+        "the defaults' cost class; 'gi-energy' (highest QM energy along the "
+        "path) adds one engine evaluation per candidate on top of that; "
+        "'endpoint-rmsd' (Kabsch RMSD between the two fixed endpoints, no "
+        "interpolation at all -- orders of magnitude cheaper, but knows "
+        "nothing about what happens ALONG the path, so it's the weakest "
+        "signal of the four; EXPERIMENTAL, see docs/channels_candidates.md's "
+        "open-problem note on mapping cost before relying on it). Which "
+        "actually best predicts a correct mapping isn't settled -- "
+        "--debug-dump records all four per candidate to help compare them.",
     ),
     atom_mapping_veto_margin: float = typer.Option(
         0.0, "--atom-mapping-veto-margin",
@@ -2583,13 +2588,18 @@ def channels(
     atom_mapping_metric: str = typer.Option(
         "geodesic-distance", "--atom-mapping-metric",
         help="--atom-mapping: how each candidate mapping (including 'don't "
-        "reindex') is scored from its geodesic-interpolated path -- "
-        "'geodesic-distance' (the geodesic optimizer's own path length; "
-        "free), 'path-rmsd' (cumulative per-frame RMSD along the path; "
-        "free), or 'gi-energy' (highest QM energy along the path; most "
-        "expensive, one engine energy evaluation per candidate). Which is "
-        "actually the best predictor of a correct mapping isn't settled -- "
-        "--debug-dump records all three per candidate to help compare them.",
+        "reindex') is scored -- 'geodesic-distance' (the geodesic optimizer's "
+        "own path length; needs a full interpolation per candidate) or "
+        "'path-rmsd' (cumulative per-frame RMSD along the path; same cost) are "
+        "the defaults' cost class; 'gi-energy' (highest QM energy along the "
+        "path) adds one engine evaluation per candidate on top of that; "
+        "'endpoint-rmsd' (Kabsch RMSD between the two fixed endpoints, no "
+        "interpolation at all -- orders of magnitude cheaper, but knows "
+        "nothing about what happens ALONG the path, so it's the weakest "
+        "signal of the four; EXPERIMENTAL, see docs/channels_candidates.md's "
+        "open-problem note on mapping cost before relying on it). Which "
+        "actually best predicts a correct mapping isn't settled -- "
+        "--debug-dump records all four per candidate to help compare them.",
     ),
     atom_mapping_veto_margin: float = typer.Option(
         0.0, "--atom-mapping-veto-margin",
@@ -2647,11 +2657,17 @@ def channels(
         "the energies agree within this many kcal/mol. 0 disables.",
     ),
     n_conformers: int = typer.Option(
-        0, "--n-conformers",
-        help="Maximum number of distinct conformers to keep for EACH endpoint "
-        "after generation and RMSD-based deduplication. 0 = no cap: keep every "
-        "distinct conformer the backend's own parameters let through (CREST's "
-        "--crest-ewin; RDKit's --n-embed and --rdkit-ewin).",
+        50, "--n-conformers",
+        help="Maximum number of distinct conformers to keep for EACH endpoint, "
+        "after generation and RMSD-based deduplication run to completion "
+        "uncapped. If dedup still leaves more than this, the pool is capped by "
+        "farthest-point selection (maximize each new pick's distance to the "
+        "nearest already-kept conformer) rather than truncation, so a capped "
+        "pool still spans the conformational landscape broadly instead of "
+        "clustering around the low-energy end. 0 = no cap: keep every distinct "
+        "conformer the backend's own parameters let through (CREST's "
+        "--crest-ewin; RDKit's --n-embed and --rdkit-ewin) -- some molecules "
+        "are combinatorially flexible enough that this is thousands of pairs.",
     ),
     n_embed: int = typer.Option(
         0, "--n-embed",
@@ -3051,18 +3067,37 @@ def channels(
     _write_stats()
 
 
-@app.command("make-default-inputs")
-@app.command("defaults")
+_DEFAULT_INPUTS_PATH_METHODS = ("NEB", "FNEB", "NEB-DLF", "GEOMETRIC-NEB", "GSM")
+
+
+@app.command("init")
 def make_default_inputs(
     output: Path = typer.Option(
         Path("mepd_inputs.toml"), "--output", "-o",
         help="Path to write a starter RunInputs TOML file to.",
     ),
+    method: str = typer.Option(
+        "NEB", "--method", "-m",
+        help="Path-minimization method the starter file's [path_min_inputs] "
+        f"section should default to: {', '.join(_DEFAULT_INPUTS_PATH_METHODS)} "
+        "(case-insensitive; underscores/spaces normalize to '-', so 'geometric_neb' "
+        "and 'neb-dlf'/'dlfind' also work). Each method's own defaults -- e.g. GSM's "
+        "executable/nnodes/conv_tol vs NEB's tol/climbing-image settings -- are used, "
+        "matching what `mepd run --path-min-method` would fall back on.",
+    ),
 ) -> None:
-    """Write a starter RunInputs TOML file reflecting the package defaults."""
-    run_inputs = RunInputs()
+    """Write a starter RunInputs TOML file reflecting the package defaults for
+    --method's path minimizer, ready to hand-edit."""
+    from mepd.inputs import _normalized_path_method
+
+    normalized = _normalized_path_method(method)
+    if normalized not in _DEFAULT_INPUTS_PATH_METHODS:
+        raise typer.BadParameter(
+            f"Unknown --method '{method}'. Known: {', '.join(_DEFAULT_INPUTS_PATH_METHODS)}."
+        )
+    run_inputs = RunInputs(path_min_method=normalized)
     run_inputs.save(output)
-    typer.echo(f"Wrote default inputs to {output}")
+    typer.echo(f"Wrote default inputs ({normalized} path minimizer) to {output}")
 
 
 try:

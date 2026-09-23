@@ -61,7 +61,7 @@ def mepd_cli_without_discovery():
 
 def test_mepd_cli_imports_without_mepd_discovery(mepd_cli_without_discovery):
     command_names = {c.name for c in mepd_cli_without_discovery.app.registered_commands}
-    assert {"run", "ts", "network-build", "defaults", "visualize"} <= command_names
+    assert {"run", "ts", "network-build", "init", "visualize"} <= command_names
     assert "discovery" in command_names
     assert not mepd_cli_without_discovery.app.registered_groups
 

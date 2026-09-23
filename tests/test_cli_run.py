@@ -983,3 +983,36 @@ def test_cli_run_accepts_smiles_for_start_and_end(tmp_path, monkeypatch):
     start_structure, end_structure = seen_structures[0], seen_structures[1]
     assert len(start_structure.symbols) == len(end_structure.symbols)
     assert sorted(start_structure.symbols) == sorted(end_structure.symbols)
+
+
+# --- make-default-inputs / init -----------------------------------------------
+
+
+def test_make_default_inputs_writes_method_specific_path_min_inputs(tmp_path):
+    from mepd.cli import make_default_inputs
+
+    gsm_fp, neb_fp = tmp_path / "gsm.toml", tmp_path / "neb.toml"
+    make_default_inputs(output=gsm_fp, method="GSM")
+    make_default_inputs(output=neb_fp, method="NEB")
+
+    gsm_inputs = RunInputs.open(gsm_fp)
+    neb_inputs = RunInputs.open(neb_fp)
+    assert hasattr(gsm_inputs.path_min_inputs, "nnodes")  # GSM-only field
+    assert not hasattr(neb_inputs.path_min_inputs, "nnodes")
+    assert hasattr(neb_inputs.path_min_inputs, "climb")  # NEB-only field
+    assert not hasattr(gsm_inputs.path_min_inputs, "climb")
+
+
+def test_make_default_inputs_method_is_case_and_alias_insensitive(tmp_path):
+    from mepd.cli import make_default_inputs
+
+    fp = tmp_path / "inputs.toml"
+    make_default_inputs(output=fp, method="dlfind")
+    assert hasattr(RunInputs.open(fp).path_min_inputs, "dlfind_keywords")  # NEB-DLF-only field
+
+
+def test_make_default_inputs_rejects_unknown_method(tmp_path):
+    from mepd.cli import make_default_inputs
+
+    with pytest.raises(typer.BadParameter):
+        make_default_inputs(output=tmp_path / "x.toml", method="not-a-method")

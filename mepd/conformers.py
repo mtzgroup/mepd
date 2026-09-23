@@ -121,7 +121,7 @@ class ConformerInputs:
     """
 
     backend: str = "rdkit"
-    n_conformers: Optional[int] = None
+    n_conformers: Optional[int] = 50
     n_embed: Optional[int] = None
     rdkit_ewin_kcal: Optional[float] = None
     rdkit_torsion_prefs: str = "both"
@@ -595,14 +595,58 @@ def merge_degenerate_complex_conformers(
     return [n for n, _ in kept] + [n for n, e in with_e if e is None]
 
 
+def _diverse_subset(conformers: list[StructureNode], n_max: int) -> list[StructureNode]:
+    """Greedy farthest-point (max-min) selection down to `n_max`: repeatedly
+    add whichever remaining conformer has the largest snap-RMSD to its
+    NEAREST already-kept conformer, so a capped pool spans the
+    conformational landscape broadly instead of clustering around whichever
+    end of the energy-sorted list happened to survive a truncation.
+
+    `conformers[0]` (the input geometry) is always kept and seeds the
+    selection. Every candidate must already be mutually isomorphic (i.e.
+    have been through `_subselect_conformers`'s dedup first) -- distance is
+    otherwise undefined and such a candidate is just never selected."""
+    if len(conformers) <= n_max:
+        return list(conformers)
+
+    selected = [conformers[0]]
+    remaining = list(conformers[1:])
+    min_dist = []
+    for cand in remaining:
+        try:
+            min_dist.append(qcinf.snap_rmsd(cand.structure, selected[0].structure))
+        except ValueError:
+            min_dist.append(-1.0)
+
+    while len(selected) < n_max and remaining:
+        i_best = max(range(len(remaining)), key=lambda i: min_dist[i])
+        if min_dist[i_best] < 0:
+            break  # nothing left is even isomorphic to what's already kept
+        picked = remaining.pop(i_best)
+        min_dist.pop(i_best)
+        selected.append(picked)
+        for i, cand in enumerate(remaining):
+            try:
+                d = qcinf.snap_rmsd(cand.structure, picked.structure)
+            except ValueError:
+                continue
+            if d < min_dist[i]:
+                min_dist[i] = d
+    return selected
+
+
 def _subselect_conformers(
     conformers: list[StructureNode], n_max: Optional[int], rmsd_cutoff: float,
     stats: dict | None = None,
 ) -> list[StructureNode]:
-    """Greedily keep conformers (in the given order) whose `qcinf.snap_rmsd`
-    (symmetry/permutation-aware, Kabsch-aligned; bohr) is at least
-    `rmsd_cutoff` from every conformer already kept, up to a maximum of
-    `n_max` (None: no maximum).
+    """Keep every conformer whose `qcinf.snap_rmsd` (symmetry/permutation-aware,
+    Kabsch-aligned; bohr) is at least `rmsd_cutoff` from every conformer
+    already kept -- run to completion, uncapped, so capping never depends on
+    where in the (energy-sorted) input order the threshold happened to be
+    hit. If that leaves more than `n_max` (None: no maximum), only THEN is
+    the pool capped, by `_diverse_subset` rather than truncation, so a small
+    budget still covers the conformational landscape broadly instead of
+    clustering around the low-energy end.
 
     `snap_rmsd` perceives connectivity from each structure's own 3D geometry
     and raises `ValueError` if the two don't come out isomorphic. A distorted
@@ -618,8 +662,6 @@ def _subselect_conformers(
     selected = [conformers[0]]
     n_not_isomorphic = 0
     for candidate in conformers[1:]:
-        if n_max is not None and len(selected) >= n_max:
-            break
         try:
             distinct_from_all_kept = all(
                 qcinf.snap_rmsd(candidate.structure, kept.structure) >= rmsd_cutoff
@@ -634,4 +676,6 @@ def _subselect_conformers(
         # Reported rather than swallowed: a pool that loses most of its
         # candidates here is a generation failure, not a rigid molecule.
         stats["n_rejected_not_isomorphic"] = n_not_isomorphic
+    if n_max is not None and len(selected) > n_max:
+        selected = _diverse_subset(selected, n_max)
     return selected

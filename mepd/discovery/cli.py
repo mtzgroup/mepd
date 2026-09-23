@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 import typer
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
@@ -627,3 +628,364 @@ def hessian_global(
 
     if not result.accepted_minima:
         typer.echo("No new minima were accepted.")
+
+
+class _VRIProgress:
+    """Renders `scan_irc_for_vrt` / `find_bifurcation_products` events."""
+
+    def __init__(self, progress: Progress) -> None:
+        self._progress = progress
+        self._task: Optional[int] = None
+
+    def _replace(self, description: str, total: Optional[int]) -> None:
+        if self._task is not None:
+            self._progress.remove_task(self._task)
+        self._task = self._progress.add_task(description, total=total)
+
+    def __call__(self, event: str, payload: dict) -> None:
+        p = self._progress
+        if event == "ts_hessian":
+            self._replace("TS1 Hessian...", None)
+        elif event == "branch_start":
+            self._replace(f"Projected Hessians along {payload['branch']} IRC", payload["total"] or None)
+        elif event in ("point_done", "bisect_done"):
+            if self._task is not None:
+                p.update(self._task, completed=payload["index"], total=payload["total"])
+        elif event == "bisecting":
+            self._replace(f"Bisecting VRT on {payload['branch']} branch", payload["total"] or None)
+        elif event == "optimizing_endpoint":
+            self._replace(f"Optimizing {payload['branch']} IRC endpoint", None)
+        elif event == "pushing":
+            self._replace(
+                f"Pushing along ridge mode ({payload['total']} optimizations, {payload['branch']})", None,
+            )
+
+    def finish(self) -> None:
+        if self._task is not None:
+            self._progress.remove_task(self._task)
+            self._task = None
+
+
+def _run_vri_irc(engine, ts_node, *, irc_step: float, irc_fmax: float) -> Chain:
+    """IRC with tighter settings than mepd's default: projected frequencies
+    are only meaningful on an accurate steepest-descent path. The step and
+    fmax apply to the Sella backend (g-xTB/ASE engines); other engines use
+    their own IRC defaults."""
+    from mepd.engines.ase import ASEEngine
+    from mepd.engines.gxtb import GXTBCalculator
+    from mepd.irc import compute_irc_chain_with_geometric
+
+    irc_fn = getattr(engine, "compute_irc_chain", None)
+    if isinstance(engine, (ASEEngine, GXTBCalculator)):
+        return irc_fn(ts_node, keywords={"dx": irc_step, "fmax": irc_fmax})
+    if callable(irc_fn):
+        return irc_fn(ts_node)
+    return compute_irc_chain_with_geometric(engine, ts_node)
+
+
+def _locate_ts2(p1, p2, run_inputs: RunInputs, output: Path, label: str):
+    """TS2 between the two products: geodesic interpolation -> path
+    minimizer -> TS optimization + IRC, reusing `mepd run`'s machinery."""
+    import copy
+
+    import mepd.chainhelpers as ch
+    from mepd.cli import _build_path_minimizer, _optimize_ts_and_irc
+
+    seed_chain = Chain.model_validate({
+        "nodes": [p1.copy(), p2.copy()],
+        "parameters": copy.deepcopy(run_inputs.chain_inputs),
+    })
+    initial_chain = ch.run_geodesic(
+        chain=seed_chain,
+        chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
+        nimages=run_inputs.gi_inputs.nimages,
+        friction=run_inputs.gi_inputs.friction,
+        nudge=run_inputs.gi_inputs.nudge,
+        random_seed=run_inputs.gi_inputs.random_seed,
+        align=run_inputs.gi_inputs.align,
+        **(run_inputs.gi_inputs.extra_kwds or {}),
+    )
+    minimizer = _build_path_minimizer(initial_chain, run_inputs)
+    try:
+        minimizer.optimize_chain()
+    except Exception as exc:
+        typer.echo(f"P1 -> P2 path did not fully converge ({label}): {exc}")
+    final_chain = minimizer.chain_trajectory[-1] if minimizer.chain_trajectory else initial_chain
+    run_inputs.engine.compute_energies(final_chain)
+    final_chain.write_to_disk(output / f"{label}_path.xyz")
+    return _optimize_ts_and_irc(final_chain.get_ts_node(), run_inputs, output, run_irc=True, label=label)
+
+
+def _ridge_mode_frames(node, mode, amplitude: float, n_frames: int = 21) -> list:
+    from mepd.discovery.vri import push_along_mode
+
+    frames = []
+    for phase in np.sin(np.linspace(0.0, 2.0 * np.pi, n_frames)):
+        if abs(phase) < 1e-12:
+            frames.append(node.copy())
+        else:
+            plus, minus = push_along_mode(node, mode, amplitude * abs(phase))
+            frames.append(plus if phase > 0 else minus)
+    return frames
+
+
+@discovery_app.command("vri")
+def vri_search(
+    ts: str = typer.Argument(..., help="Optimized TS1 structure (xyz file)."),
+    irc: Optional[Path] = typer.Option(
+        None, "--irc", exists=True,
+        help="Existing IRC through TS1 (xyz + .energies/.gradients sidecars, as `mepd ts --irc` writes). "
+        "Computed if omitted.",
+    ),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", exists=True,
+        help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
+    ),
+    charge: Optional[int] = typer.Option(None, "--charge", help="Override the molecular charge."),
+    multiplicity: Optional[int] = typer.Option(None, "--multiplicity", help="Override the spin multiplicity."),
+    irc_step: float = typer.Option(
+        0.05, "--irc-step",
+        help="IRC step (Sella dx, Å·amu^1/2). Smaller than mepd's usual IRC so the VRT is resolved.",
+    ),
+    irc_fmax: float = typer.Option(0.01, "--irc-fmax", help="IRC stopping force (Sella fmax, eV/Å)."),
+    stride: int = typer.Option(1, "--stride", help="Compute a Hessian at every Nth IRC point."),
+    n_bisect: int = typer.Option(4, "--n-bisect", help="Bisection steps to refine the VRT between IRC points."),
+    vrt_threshold: float = typer.Option(
+        20.0, "--vrt-threshold",
+        help="A projected frequency must drop below -this (cm^-1) to count as imaginary.",
+    ),
+    persist: int = typer.Option(
+        2, "--persist", help="Consecutive imaginary points required to call a VRT (rejects noise).",
+    ),
+    imaginary_cutoff: float = typer.Option(
+        50.0, "--imaginary-cutoff",
+        help="Frequencies below -this (cm^-1) count as imaginary at stationary points.",
+    ),
+    grad_floor: float = typer.Option(
+        1e-4, "--grad-floor",
+        help="Below this gradient norm (Eh/bohr) the path tangent comes from the chain, not the gradient.",
+    ),
+    push_amplitude: float = typer.Option(
+        0.3, "--push-amplitude",
+        help="Displacement along the ridge mode when searching for P2 (bohr, largest single-atom move).",
+    ),
+    n_push_points: int = typer.Option(
+        3, "--n-push-points", help="Points past the VRT (including the VRT) to push from.",
+    ),
+    branches: str = typer.Option("both", "--branches", help="IRC branches to scan: both, forward or reverse."),
+    skip_ts2: bool = typer.Option(
+        False, "--skip-ts2/--find-ts2", help="Skip the NEB + TS optimization search for TS2.",
+    ),
+    output: Path = typer.Option(Path("mepd_vri_output"), "--output", "-o", help="Directory to write results into."),
+) -> None:
+    """Search for a valley-ridge inflection (post-TS bifurcation) along the IRC of a TS.
+
+    Scans path-projected frequencies along the IRC for a valley-ridge
+    transition, then looks for the second product and the TS2 between the
+    products, and reports a verdict."""
+    from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
+
+    from mepd.cli import _echo_run_inputs_summary, _geometry_optimizer_keywords, _load_structure_from_smiles_or_xyz
+    from mepd.discovery import vri
+    from mepd.inputs import ChainInputs
+    from mepd.nodes.node import StructureNode
+
+    branch_names = {"both": ("forward", "reverse"), "forward": ("forward",), "reverse": ("reverse",)}.get(branches)
+    if branch_names is None:
+        raise typer.BadParameter("--branches must be 'both', 'forward' or 'reverse'.")
+    for name, value in (("--irc-step", irc_step), ("--irc-fmax", irc_fmax), ("--push-amplitude", push_amplitude)):
+        if value <= 0:
+            raise typer.BadParameter(f"{name} must be positive.")
+    if stride <= 0 or n_push_points <= 0 or persist <= 0 or n_bisect < 0:
+        raise typer.BadParameter("--stride, --n-push-points and --persist must be positive; --n-bisect >= 0.")
+
+    run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
+    _echo_run_inputs_summary(run_inputs)
+    engine = run_inputs.engine
+    output.mkdir(parents=True, exist_ok=True)
+    write_qcio = bool(getattr(run_inputs, "write_qcio", False))
+    hartree_to_kcal = float(HARTREE_TO_KCAL_PER_MOL)
+
+    ts_structure = _load_structure_from_smiles_or_xyz(ts, charge, multiplicity)
+    ts_node = StructureNode(structure=ts_structure)
+
+    def _write(nodes, filename: str) -> Optional[str]:
+        if not nodes:
+            return None
+        fp = output / filename
+        Chain.model_validate({
+            "nodes": [n.copy() for n in nodes], "parameters": run_inputs.chain_inputs,
+        }).write_to_disk(fp, write_qcio=write_qcio)
+        return str(fp)
+
+    typer.echo("Checking TS1 curvature...")
+    try:
+        ts_modes = vri.stationary_point_modes(ts_node, engine)
+    except Exception as exc:
+        typer.echo(f"TS1 Hessian failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+    ts_n_imag = ts_modes.n_imaginary(imaginary_cutoff)
+    if ts_n_imag == 0:
+        typer.echo("TS1 has no imaginary frequency; it is not a transition state. Optimize it first (`mepd ts`).")
+        raise typer.Exit(code=1)
+    if ts_n_imag > 1:
+        typer.echo(f"Warning: TS1 has {ts_n_imag} imaginary frequencies; the IRC may not start cleanly.")
+
+    output_files: dict = {}
+    if irc is not None:
+        irc_chain = Chain.from_xyz(
+            irc, ChainInputs(), charge=ts_structure.charge, spinmult=ts_structure.multiplicity,
+        )
+    else:
+        typer.echo(f"Computing IRC (step {irc_step:g}, fmax {irc_fmax:g})...")
+        try:
+            irc_chain = _run_vri_irc(engine, ts_node, irc_step=irc_step, irc_fmax=irc_fmax)
+        except Exception as exc:
+            typer.echo(f"IRC failed: {type(exc).__name__}: {exc}")
+            raise typer.Exit(code=1)
+    irc_nodes = list(irc_chain.nodes)
+
+    typer.echo(f"Scanning projected frequencies along {len(irc_nodes)} IRC points (stride {stride})...")
+    try:
+        with _progress() as progress:
+            reporter = _VRIProgress(progress)
+            scan = vri.scan_irc_for_vrt(
+                irc_nodes, engine, branches=branch_names, stride=stride, n_bisect=n_bisect,
+                vrt_threshold=vrt_threshold, persist=persist, grad_floor=grad_floor, on_event=reporter,
+            )
+            reporter.finish()
+    except Exception as exc:
+        typer.echo(f"VRT scan failed: {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=1)
+    if irc is None:
+        output_files["irc"] = _write(irc_nodes, "irc.xyz")
+    freqs_fp = output / "projected_freqs.json"
+    freqs_fp.write_text(json.dumps(scan.to_dict(), indent=2))
+    output_files["projected_freqs"] = str(freqs_fp)
+
+    ts1 = irc_nodes[scan.ts_index]
+    opt_keywords = _geometry_optimizer_keywords(run_inputs)
+    branch_results: dict = {}
+    verdicts: List[str] = []
+    for name in branch_names:
+        branch = scan.branches[name]
+        products = None
+        if branch.vrt is not None:
+            output_files[f"vrt_{name}"] = _write([branch.vrt.node], f"vrt_{name}.xyz")
+            output_files[f"ridge_mode_{name}"] = _write(
+                _ridge_mode_frames(branch.vrt.node, branch.vrt.ridge_mode_cart, push_amplitude),
+                f"ridge_mode_{name}.xyz",
+            )
+            # The other IRC endpoint (reactant side) never counts as a second product.
+            other_end = vri.split_irc_branches(irc_nodes, scan.ts_index)
+            reference = [other_end["reverse" if name == "forward" else "forward"][-1]]
+            typer.echo(f"VRT on the {name} branch at s = {branch.vrt.s:.3f}; searching for products...")
+            try:
+                with _progress() as progress:
+                    reporter = _VRIProgress(progress)
+                    products = vri.find_bifurcation_products(
+                        scan, name, engine, opt_keywords=opt_keywords, reference_nodes=reference,
+                        push_amplitude=push_amplitude, n_push_points=n_push_points,
+                        imaginary_cutoff=imaginary_cutoff, on_event=reporter,
+                    )
+                    reporter.finish()
+            except Exception as exc:
+                typer.echo(f"Product search failed on the {name} branch: {type(exc).__name__}: {exc}")
+
+            if products is not None:
+                output_files[f"p1_{name}"] = _write([products.p1] if products.p1 else [], f"p1_{name}.xyz")
+                output_files[f"p2_{name}"] = _write([products.p2] if products.p2 else [], f"p2_{name}.xyz")
+                if products.p2 is not None and products.ts2 is None and not skip_ts2:
+                    label = f"ts2_{name}"
+                    typer.echo(f"Locating TS2 between P1 and P2 ({name} branch)...")
+                    try:
+                        found = _locate_ts2(products.p1, products.p2, run_inputs, output, label)
+                    except Exception as exc:
+                        found = None
+                        typer.echo(f"TS2 search failed: {type(exc).__name__}: {exc}")
+                    if found is not None:
+                        products.ts2 = found.ts_node
+                        products.ts2_source = "neb"
+                        irc_ts2 = list(found.irc_chain.nodes) if found.irc_chain is not None else None
+                        products.ts2_checks = vri.verify_ts2(
+                            found.ts_node, irc_ts2, products.p1, products.p2, ts1, engine,
+                            imaginary_cutoff=imaginary_cutoff,
+                        )
+                        products.ts2_verified = products.ts2_checks["verified"]
+                        output_files[label] = str(output / f"{label}.xyz")
+                elif products.ts2 is not None:
+                    output_files[f"ts2_{name}"] = _write([products.ts2], f"ts2_{name}.xyz")
+
+        verdict = vri.branch_verdict(branch, products)
+        verdicts.append(verdict)
+        branch_results[name] = {
+            "verdict": verdict,
+            "vrt": branch.vrt.to_dict() if branch.vrt else None,
+            "valley_reforms": branch.valley_reforms,
+            "transient_dips_s": branch.transient_dips,
+            "products": products.to_dict() if products else None,
+        }
+
+    ts1_energy = float(ts1._cached_energy)
+
+    def _rel(e):
+        return None if e is None else (e - ts1_energy) * hartree_to_kcal
+
+    for res in branch_results.values():
+        prod = res["products"]
+        if prod:
+            for key in ("p1", "p2", "ts2"):
+                prod[f"{key}_rel_ts1_kcal_mol"] = _rel(prod[f"{key}_energy"])
+        if res["vrt"]:
+            res["vrt"]["rel_ts1_kcal_mol"] = _rel(res["vrt"]["energy"])
+
+    overall = vri.overall_verdict(verdicts)
+    summary = {
+        "verdict": overall,
+        "ts": ts,
+        "irc": str(irc) if irc is not None else None,
+        "inputs": str(inputs) if inputs is not None else None,
+        "ts1_energy": ts1_energy,
+        "ts1_n_imaginary": ts_n_imag,
+        "ts1_lowest_freqs_cm": [float(f) for f in ts_modes.freqs[:4]],
+        "n_irc_points": len(irc_nodes),
+        "n_hessians": scan.n_hessians + 1,
+        "settings": {
+            "irc_step": irc_step, "irc_fmax": irc_fmax, "stride": stride, "n_bisect": n_bisect,
+            "vrt_threshold": vrt_threshold, "persist": persist, "imaginary_cutoff": imaginary_cutoff,
+            "grad_floor": grad_floor, "push_amplitude": push_amplitude, "n_push_points": n_push_points,
+            "branches": list(branch_names), "skip_ts2": skip_ts2,
+        },
+        "branches": branch_results,
+        "output_files": {k: v for k, v in output_files.items() if v},
+    }
+    summary_fp = output / "summary.json"
+    summary_fp.write_text(json.dumps(summary, indent=2))
+
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    table = Table(box=box.ROUNDED, show_header=False)
+    table.add_column(style="bold cyan")
+    table.add_column(style="white")
+    table.add_row("Verdict", overall)
+    for name, res in branch_results.items():
+        vrt_desc = "none"
+        if res["vrt"]:
+            vrt_desc = f"s = {res['vrt']['s']:.3f}"
+            if res["vrt"]["rel_ts1_kcal_mol"] is not None:
+                vrt_desc += f", {res['vrt']['rel_ts1_kcal_mol']:+.1f} kcal/mol vs TS1"
+        table.add_row(f"{name} branch", f"{res['verdict']} (VRT: {vrt_desc})")
+        prod = res["products"]
+        if prod and prod.get("ts2_rel_ts1_kcal_mol") is not None:
+            table.add_row(
+                f"  TS2 ({prod['ts2_source']})",
+                f"{prod['ts2_rel_ts1_kcal_mol']:+.1f} kcal/mol vs TS1, verified={prod['ts2_verified']}",
+            )
+        if prod and prod.get("degenerate") is not None:
+            table.add_row("  P1/P2 isomorphic", str(prod["degenerate"]))
+    table.add_row("Hessians", str(summary["n_hessians"]))
+    table.add_row("Summary", str(summary_fp))
+    Console().print(Panel(table, title="[bold green]VRI Search Complete[/bold green]", border_style="green"))

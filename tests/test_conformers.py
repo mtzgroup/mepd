@@ -435,3 +435,60 @@ def test_rdkit_backend_keeps_the_input_when_bond_orders_cant_be_perceived():
     confs = generate_conformers(node, ConformerInputs(), stats)
     assert len(confs) == 1 and confs[0] is node
     assert stats["n_generated"] == 0 and "rdkit_skipped" in stats
+
+
+def test_diverse_subset_keeps_input_first_and_maximizes_spread():
+    """A line of 6 equally-spaced points on a synthetic 1D-like axis
+    (encoded as butane conformers with an artificial ordering): capping to 3
+    via farthest-point selection must keep the two ends and something in
+    the middle, not just the first 3 in the given order."""
+    import numpy as np
+    from mepd.conformers import _diverse_subset
+
+    base = _butane_node(smiles="CCCCC")
+    nodes = []
+    for i in range(6):
+        shifted = base.structure.model_copy(
+            update={"geometry": np.asarray(base.structure.geometry) + i * np.array([0.3, 0, 0])}
+        )
+        nodes.append(StructureNode(structure=shifted))
+
+    kept = _diverse_subset(nodes, n_max=3)
+    assert len(kept) == 3
+    assert kept[0] is nodes[0]  # input geometry always kept, seeds selection
+    # farthest-point selection should reach for the far end, not stay clustered near node 0
+    kept_positions = {nodes.index(k) if k in nodes else None for k in kept}
+    assert 5 in kept_positions or 4 in kept_positions
+
+
+def test_diverse_subset_noop_when_already_within_budget():
+    from mepd.conformers import _diverse_subset
+
+    confs = generate_conformers(_butane_node(smiles="CCCCC"), ConformerInputs(n_conformers=None, n_embed=30))
+    assert _diverse_subset(confs, n_max=len(confs) + 5) == confs
+
+
+def test_subselect_conformers_caps_via_diversity_not_truncation():
+    """Regression: capping used to be greedy truncation in (energy-sorted)
+    input order, which could silently favor whichever candidates happened
+    to survive dedup first rather than spanning the pool broadly."""
+    import mepd.conformers as conformers_module
+
+    node = _butane_node(smiles="CCCCCC")
+    uncapped = generate_conformers(node, ConformerInputs(n_conformers=None, n_embed=60))
+    assert len(uncapped) > 5  # otherwise this test can't distinguish the two strategies
+
+    capped = generate_conformers(node, ConformerInputs(n_conformers=5, n_embed=60))
+    truncated = uncapped[:5]
+    assert len(capped) == 5
+    assert [c.structure.geometry.tolist() for c in capped] != [
+        c.structure.geometry.tolist() for c in truncated
+    ] or len(uncapped) <= 5
+
+
+def test_generate_conformers_default_caps_at_50_via_diverse_selection():
+    node = _butane_node(smiles="CCCCCCCC")  # flexible enough to exceed 50 pre-cap
+    stats = {}
+    confs = generate_conformers(node, None, stats)  # default ConformerInputs()
+    assert len(confs) <= 50
+    assert confs[0].structure.geometry.tolist() == node.structure.geometry.tolist()

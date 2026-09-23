@@ -24,7 +24,7 @@ from qcdata.models.structure import Structure
 from mepd.atom_mapping import AtomMapping, realign_end_to_start
 from mepd.chain import Chain
 
-METRICS = ("gi-energy", "geodesic-distance", "path-rmsd")
+METRICS = ("gi-energy", "geodesic-distance", "path-rmsd", "endpoint-rmsd")
 
 
 @dataclass
@@ -70,6 +70,24 @@ def build_candidates(
     return candidates
 
 
+def _aligned_rmsd(a: Structure, b: Structure) -> float:
+    """Kabsch-aligned RMSD (bohr) between two identically-indexed
+    structures -- no interpolation, no engine, microseconds not seconds.
+    Backs the "endpoint-rmsd" metric: unlike the other three, it says
+    nothing about what happens ALONG the path between `a` and `b`, only
+    how far apart the two fixed endpoints are."""
+    import numpy as np
+
+    x = np.asarray(a.geometry, dtype=float)
+    y = np.asarray(b.geometry, dtype=float)
+    x = x - x.mean(axis=0)
+    y = y - y.mean(axis=0)
+    u, _, vt = np.linalg.svd(x.T @ y)
+    d = np.sign(np.linalg.det(u @ vt))
+    r = u @ np.diag([1.0, 1.0, d]) @ vt
+    return float(np.sqrt(((x @ r - y) ** 2).sum(axis=1).mean()))
+
+
 def _interpolate(candidate: MappingCandidate, start_structure: Structure, run_inputs):
     import mepd.chainhelpers as ch
     from mepd.nodes.node import StructureNode
@@ -94,10 +112,17 @@ def _interpolate(candidate: MappingCandidate, start_structure: Structure, run_in
 
 def score_candidate(
     candidate: MappingCandidate, metric: str, start_structure: Structure, run_inputs,
-) -> tuple[float, Chain]:
-    """Runs ONE geodesic interpolation for `candidate` and reduces it to a
-    single score under `metric` -- lower is always "better" for all three
-    metrics (a flatter/shorter/lower-energy path)."""
+) -> tuple[float, Optional[Chain]]:
+    """Reduces `candidate` to a single score under `metric` -- lower is
+    always "better". `endpoint-rmsd` is the odd one out: it skips the
+    geodesic interpolation entirely (returns `chain=None`), so it's orders
+    of magnitude cheaper than the other three but, per its own docstring
+    (`_aligned_rmsd`), a weaker signal -- untested at scale against the
+    others before relying on it for something consequential; see
+    docs/channels_candidates.md's open-problem note on mapping cost."""
+    if metric == "endpoint-rmsd":
+        return _aligned_rmsd(start_structure, candidate.end_structure), None
+
     chain, smoother = _interpolate(candidate, start_structure, run_inputs)
 
     if metric == "geodesic-distance":
@@ -113,17 +138,18 @@ def score_candidate(
 def score_candidate_all_metrics(
     candidate: MappingCandidate, start_structure: Structure, run_inputs,
 ) -> tuple[dict[str, float], Chain]:
-    """Like `score_candidate`, but computes all three metrics from a single
+    """Like `score_candidate`, but computes every metric from a single
     interpolation (geodesic-distance and path-rmsd are free byproducts of
-    it; gi-energy is the only one requiring an extra QM evaluation) -- used
-    for `--debug-dump` so every candidate's data is directly comparable
-    across metrics."""
+    it; gi-energy is the only one requiring an extra QM evaluation;
+    endpoint-rmsd needs no interpolation at all) -- used for `--debug-dump`
+    so every candidate's data is directly comparable across metrics."""
     chain, smoother = _interpolate(candidate, start_structure, run_inputs)
     run_inputs.engine.compute_energies(chain)
     scores = {
         "geodesic-distance": float(smoother.length),
         "path-rmsd": float(chain.path_length[-1]),
         "gi-energy": float(max(chain.energies_kcalmol)),
+        "endpoint-rmsd": _aligned_rmsd(start_structure, candidate.end_structure),
     }
     return scores, chain
 

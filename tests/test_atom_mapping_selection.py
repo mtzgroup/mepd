@@ -109,7 +109,10 @@ def test_score_candidate_returns_a_finite_scalar_for_every_metric(metric):
         score, chain = score_candidate(candidate, metric, start, run_inputs)
         assert isinstance(score, float)
         assert np.isfinite(score)
-        assert len(chain) >= 2
+        if metric == "endpoint-rmsd":
+            assert chain is None  # skips interpolation entirely -- that's the point
+        else:
+            assert len(chain) >= 2
 
 
 def test_score_candidate_unknown_metric_raises():
@@ -210,3 +213,22 @@ def test_maybe_realign_pair_realigns_when_a_mapping_wins(monkeypatch):
 
     assert changed is True
     assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
+
+
+def test_score_candidate_endpoint_rmsd_matches_aligned_rmsd_and_skips_interpolation(monkeypatch):
+    from mepd.atom_mapping_selection import _aligned_rmsd, _interpolate
+
+    start = _propene()
+    end = _scrambled_propene()
+    atom_maps = suggest_atom_mapping_candidates(start, end)
+    candidates = build_candidates(start, end, atom_maps)
+    run_inputs = _run_inputs_for_test()
+
+    def boom(*a, **kw):
+        raise AssertionError("endpoint-rmsd must not interpolate")
+
+    monkeypatch.setattr("mepd.atom_mapping_selection._interpolate", boom)
+    for candidate in candidates:
+        score, chain = score_candidate(candidate, "endpoint-rmsd", start, run_inputs)
+        assert chain is None
+        assert score == pytest.approx(_aligned_rmsd(start, candidate.end_structure))
