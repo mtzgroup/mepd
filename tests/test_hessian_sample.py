@@ -465,3 +465,74 @@ def test_run_hessian_sample_requires_normal_modes():
     engine = _NoModesEngine(["fail"] * 6)
     with pytest.raises(ValueError):
         run_hessian_sample(_seed(), engine, dr=1.0, max_candidates=10)
+
+
+
+def test_validate_unique_minima_rejects_and_rededuplicates(monkeypatch):
+    """Hessian validation of hessian-sample minima: a minimum that stays a
+    saddle is moved to rejected_minima; a rescued one replaces the original
+    and is re-deduplicated against the others."""
+    import mepd.elementarystep as es
+    from mepd.discovery import hessian_sample as hs
+
+    def _simple_node(x):
+        return StructureNode(structure=Structure(
+            symbols=["H", "H"], geometry=np.array([[0.0, 0.0, 0.0], [1.4 + x, 0.0, 0.0]]),
+            charge=0, multiplicity=1,
+        ))
+
+    a, b, c = (_simple_node(x) for x in (0.0, 0.5, 1.0))
+    result = hs.HessianSampleResult(seed_energy=0.0, hessian_result=None, frequencies_wavenumber=[])
+    result.unique_minima = [a, b, c]
+
+    def fake_validate(node, engine, **kw):
+        if node is b:   # saddle that cannot be rescued
+            return node, {"is_minimum": False, "min_frequency": -120.0, "rescued": False, "validation": "saddle"}
+        if node is c:   # rescued onto a's geometry -> duplicate of a
+            return a.copy(), {"is_minimum": True, "min_frequency": 80.0, "rescued": True, "validation": "ok"}
+        return node, {"is_minimum": True, "min_frequency": 90.0, "rescued": False, "validation": "ok"}
+
+    monkeypatch.setattr(es, "validate_minimum_with_rescue", fake_validate)
+    monkeypatch.setattr(hs, "_dedupe_minima_nodes",
+                        lambda nodes, ci: [n for i, n in enumerate(nodes)
+                                           if not any(np.allclose(n.coords, m.coords) for m in nodes[:i])])
+    hs._validate_unique_minima(result, engine=None, chain_inputs=None, frequency_cutoff=0.0, rescue_displacement=0.3)
+    assert len(result.unique_minima) == 1 and np.allclose(result.unique_minima[0].coords, a.coords)
+    assert result.minima_validation == [{"is_minimum": True, "min_frequency": 90.0, "rescued": False, "validation": "ok"}]
+    assert result.rejected_minima == [b] and result.rejected_validation[0]["min_frequency"] == -120.0
+
+
+
+def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
+    """A rescue that fails at the configured push retries at 0.3 and 0.5
+    bohr (both directions), stopping at the first success."""
+    import mepd.elementarystep as es
+
+    node = _fake_structure_node(2)
+    tried = []
+    monkeypatch.setattr(es, "_lowest_frequency_mode", lambda hess, n: (np.ones((2, 3)), -300.0))
+    monkeypatch.setattr(es, "displace_by_dr", lambda node, displacement, dr: tried.append(round(dr, 3)) or node)
+    monkeypatch.setattr(es, "_run_geom_opt", lambda n, engine: [n])
+
+    def validate(n, engine, frequency_cutoff):
+        ok = abs(tried[-1]) >= 0.3
+        return es.HessianMinimaValidation(is_minimum=ok, min_frequency=50.0 if ok else -300.0,
+                                          reason="ok" if ok else "saddle", hessian_result=object())
+
+    monkeypatch.setattr(es, "_validate_hessian_minimum", validate)
+    start = es.HessianMinimaValidation(is_minimum=False, min_frequency=-300.0, hessian_result=object())
+    rescued, check, _ = es._hessian_rescue_failed_candidate(
+        node, engine=None, validation=start, frequency_cutoff=0.0, rescue_displacement=0.1,
+        verbose=False, label="t")
+    assert tried == [0.1, -0.1, 0.3]                     # escalated once, stopped at the first success
+    assert rescued is node and check.is_minimum and "+0.300 bohr push" in check.reason
+
+    tried.clear()
+    monkeypatch.setattr(es, "_validate_hessian_minimum",
+                        lambda n, engine, frequency_cutoff: es.HessianMinimaValidation(
+                            is_minimum=False, min_frequency=-10.0, reason="saddle", hessian_result=object()))
+    rescued, check, _ = es._hessian_rescue_failed_candidate(
+        node, engine=None, validation=start, frequency_cutoff=0.0, rescue_displacement=0.1,
+        verbose=False, label="t")
+    assert tried == [0.1, -0.1, 0.3, -0.3, 0.5, -0.5] and rescued is None and not check.is_minimum
+    assert es._rescue_schedule(0.3) == [0.3, 0.5] and es._rescue_schedule(0.7) == [0.7]

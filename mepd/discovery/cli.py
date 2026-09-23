@@ -21,6 +21,20 @@ from mepd.inputs import RunInputs
 discovery_app = typer.Typer(help="Structure-discovery/global-optimization tools.")
 
 
+def _validation_kwargs(validate, cutoff, displacement) -> dict:
+    """Hessian-validation arguments for run_hessian_*; empty when validation
+    is off, so existing callers/fakes of those functions are unaffected.
+    Tolerates the typer OptionInfo defaults seen when commands are called as
+    plain functions (as the tests do)."""
+    if not isinstance(validate, bool) or not validate:
+        return {}
+    return {
+        "validate_minima_with_hessian": True,
+        "hessian_minimum_frequency_cutoff": float(cutoff) if isinstance(cutoff, (int, float)) else 0.0,
+        "hessian_minima_rescue_displacement": float(displacement) if isinstance(displacement, (int, float)) else 0.1,
+    }
+
+
 def _progress() -> Progress:
     """A `rich.progress.Progress` shared by both commands below: a spinner +
     description for indeterminate stages (e.g. computing a Hessian), a bar +
@@ -44,6 +58,7 @@ class _HessianSampleProgress:
         self._prefix = description_prefix
         self._hessian_task: Optional[int] = None
         self._candidate_task: Optional[int] = None
+        self._validate_task: Optional[int] = None
 
     def __call__(self, event: str, payload: dict) -> None:
         p = self._progress
@@ -65,6 +80,16 @@ class _HessianSampleProgress:
             if self._candidate_task is not None:
                 p.remove_task(self._candidate_task)
                 self._candidate_task = None
+        elif event == "validating_minima":
+            self._validate_task = p.add_task(
+                f"{self._prefix}Hessian-checking {payload['total']} minimum/minima", total=payload["total"] or None,
+            )
+        elif event == "minimum_validated":
+            if self._validate_task is not None:
+                p.update(self._validate_task, completed=payload["index"], total=payload["total"])
+                if payload["index"] >= payload["total"]:
+                    p.remove_task(self._validate_task)
+                    self._validate_task = None
 
 
 class _HessianGlobalProgress(_HessianSampleProgress):
@@ -214,6 +239,20 @@ def hessian_sample(
         500, "--maxiter",
         help="Maximum geometry-optimization steps for each displaced candidate.",
     ),
+    validate_minima_with_hessian: bool = typer.Option(
+        False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="Hessian-check every minimum found: no frequency below "
+        "--hessian-minimum-frequency-cutoff. One that stopped on a saddle point is pushed along "
+        "its lowest mode (both directions) and reoptimized; if it is still not a minimum it is "
+        "dropped from the minima (and written to rejected.xyz).",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="First rescue push along the unstable mode (bohr); escalates to 0.3 and 0.5 if needed.",
+    ),
     output: Path = typer.Option(
         Path("mepd_hessian_sample_output"), "--output", "-o",
         help="Directory to write results into.",
@@ -240,6 +279,9 @@ def hessian_sample(
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
     _echo_run_inputs_summary(run_inputs)
+    validation = _validation_kwargs(
+        validate_minima_with_hessian, hessian_minimum_frequency_cutoff, hessian_minima_rescue_displacement,
+    )
 
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
@@ -266,6 +308,7 @@ def hessian_sample(
                 maxiter=maxiter,
                 chain_inputs=run_inputs.chain_inputs,
                 on_event=_HessianSampleProgress(progress),
+                **validation,
             )
     except Exception as exc:
         typer.echo(f"Hessian sampling failed: {type(exc).__name__}: {exc}")
@@ -302,6 +345,7 @@ def hessian_sample(
     displaced_fp = _write_chain(result.displaced_nodes, "displaced.xyz")
     optimized_fp = _write_chain(result.optimized_nodes, "optimized.xyz")
     unique_fp = _write_chain(result.unique_minima, "unique.xyz")
+    rejected_fp = _write_chain(getattr(result, "rejected_minima", []), "rejected.xyz")
 
     def _candidate_meta_dict(meta) -> dict:
         return {
@@ -334,6 +378,14 @@ def hessian_sample(
             "node_rms_thre": run_inputs.chain_inputs.node_rms_thre,
             "node_ene_thre": run_inputs.chain_inputs.node_ene_thre,
         },
+        "hessian_validation": {
+            "enabled": bool(validation),
+            "frequency_cutoff": validation.get("hessian_minimum_frequency_cutoff"),
+            "rescue_displacement": validation.get("hessian_minima_rescue_displacement"),
+        },
+        "unique_minima_validation": getattr(result, "minima_validation", []),
+        "rejected_minima": len(getattr(result, "rejected_minima", [])),
+        "rejected_minima_validation": getattr(result, "rejected_validation", []),
         "unique_minima_energies_eh": [float(n.energy) for n in result.unique_minima],
         "unique_minima_rel_energies_kcal_mol": [
             (float(n.energy) - result.seed_energy) * float(HARTREE_TO_KCAL_PER_MOL)
@@ -350,6 +402,7 @@ def hessian_sample(
             "displaced": str(displaced_fp) if displaced_fp else None,
             "optimized": str(optimized_fp) if optimized_fp else None,
             "unique": str(unique_fp) if unique_fp else None,
+            "rejected": str(rejected_fp) if rejected_fp else None,
         },
     }
     summary_fp = output / "summary.json"
@@ -368,6 +421,10 @@ def hessian_sample(
     result_table.add_row("Optimized candidates", str(len(result.optimized_nodes)))
     result_table.add_row("Failed candidates", str(len(result.failed_candidates)))
     result_table.add_row("Unique minima", str(len(result.unique_minima)))
+    if validation:
+        n_rescued = sum(1 for r in result.minima_validation if r.get("rescued"))
+        result_table.add_row("Hessian check", f"{len(result.unique_minima)} passed ({n_rescued} after a rescue push), "
+                                              f"{len(result.rejected_minima)} rejected")
     result_table.add_row("Optimization mode", result.optimization_submission_mode)
     if hessian_fp:
         result_table.add_row("Hessian", str(hessian_fp))
@@ -481,6 +538,20 @@ def hessian_global(
         help="Comma-separated displacement factors for --full-dr-scan. Each value is "
         "capped independently at --max-candidates.",
     ),
+    validate_minima_with_hessian: bool = typer.Option(
+        False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
+        help="Hessian-check every minimum found: no frequency below "
+        "--hessian-minimum-frequency-cutoff. One that stopped on a saddle point is pushed along "
+        "its lowest mode (both directions) and reoptimized; if it is still not a minimum it is "
+        "dropped from the minima (and written to rejected.xyz).",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement",
+        help="First rescue push along the unstable mode (bohr); escalates to 0.3 and 0.5 if needed.",
+    ),
     output: Path = typer.Option(
         Path("mepd_hessian_global_output"), "--output", "-o",
         help="Directory to write results into.",
@@ -512,6 +583,9 @@ def hessian_global(
 
     run_inputs = RunInputs.open(inputs) if inputs is not None else RunInputs()
     _echo_run_inputs_summary(run_inputs)
+    validation = _validation_kwargs(
+        validate_minima_with_hessian, hessian_minimum_frequency_cutoff, hessian_minima_rescue_displacement,
+    )
 
     seed_structure = _load_structure_from_smiles_or_xyz(structure, charge, multiplicity)
     seed_node = StructureNode(structure=seed_structure)
@@ -555,6 +629,7 @@ def hessian_global(
                 chain_inputs=run_inputs.chain_inputs,
                 acceptance_baseline=acceptance_baseline,
                 on_event=_on_event,
+                **validation,
             )
     except Exception as exc:
         typer.echo(f"Global optimization failed: {type(exc).__name__}: {exc}")
@@ -592,6 +667,11 @@ def hessian_global(
         "rounds_run": result.rounds_run,
         "stopped_reason": result.stopped_reason,
         "accepted_minima": len(result.accepted_minima),
+        "hessian_validation": {
+            "enabled": bool(validation),
+            "frequency_cutoff": validation.get("hessian_minimum_frequency_cutoff"),
+            "rescue_displacement": validation.get("hessian_minima_rescue_displacement"),
+        },
         "accepted_minima_energies_eh": [float(n.energy) for n in result.accepted_minima],
         "accepted_minima_rel_energies_kcal_mol": [
             (float(n.energy) - result.start_energy) * hartree_to_kcal

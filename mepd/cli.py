@@ -747,6 +747,12 @@ def _run_msmep_pairs(
         # `mepd channels`, where many pairs deliberately share the same
         # reactant/product molecular graph across different conformers).
         setattr(run_inputs.path_min_inputs, "attempted_pairs_payload", [])
+        from mepd import progress as _progress
+
+        # One live-view stream per pair: pairs run concurrently in separate
+        # worker processes and must not overwrite each other's live file.
+        _progress.set_live_stream(f"pair_{i}_{j}")
+        stream_status = "failed"
         try:
             seed_chain = Chain.model_validate({
                 "nodes": [structures[i], structures[j]],
@@ -770,8 +776,11 @@ def _run_msmep_pairs(
             else:
                 pair_history = msmep.run_recursive_minimize(pair_chain)
             pair_history.write_to_disk(tree_dir)
+            stream_status = "done"
         except Exception as exc:
             typer.echo(f"Pair ({i}, {j}) failed ({type(exc).__name__}: {exc}); skipping.")
+        finally:
+            _progress.end_live_stream(stream_status)
 
     if workers > 1 and len(todo) > 1:
         typer.echo(f"Running {len(todo)} pair(s) across {min(workers, len(todo))} worker process(es).")
@@ -3067,6 +3076,139 @@ def channels(
     _write_stats()
 
 
+@app.command("optimize")
+def optimize(
+    structures: List[Path] = typer.Argument(
+        ..., help="xyz file(s) to optimize. A multi-frame xyz contributes every frame."
+    ),
+    inputs: Optional[Path] = typer.Option(
+        None, "--inputs", "-i", help="Path to a RunInputs TOML file (engine / level of theory)."
+    ),
+    charge: Optional[int] = typer.Option(None, "--charge", help="Override the molecular charge."),
+    multiplicity: Optional[int] = typer.Option(None, "--multiplicity", help="Override the spin multiplicity."),
+    validate_minima_with_hessian: bool = typer.Option(
+        False,
+        "--validate-minima-with-hessian/--no-validate-minima-with-hessian",
+        "-H/-noH",
+        help="After optimizing, compute a Hessian and require no frequency below "
+        "--hessian-minimum-frequency-cutoff. A structure that fails is displaced along its "
+        "lowest mode (both directions) and reoptimized once; if it still fails it is reported "
+        "as not a minimum.",
+    ),
+    hessian_minimum_frequency_cutoff: float = typer.Option(
+        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+    ),
+    hessian_minima_rescue_displacement: float = typer.Option(
+        0.1, "--hessian-minima-rescue-displacement", help="Rescue displacement along the unstable mode (bohr)."
+    ),
+    output: Path = typer.Option(
+        Path("mepd_optimize_output"), "--output", "-o", help="Directory to write results into."
+    ),
+) -> None:
+    """Geometry-optimize structures at the level of theory in --inputs.
+
+    Writes opt_<i>.xyz (+ .energies) for every structure that converged, in
+    input order, and summary.json with one record per structure
+    ({index, source, converged, energy, error, and with Hessian validation
+    is_minimum, min_frequency, rescued, validation}). One structure failing
+    does not stop the others; the exit code is 1 only if none converged.
+    """
+    from mepd.errors import GeometryOptimizationNotConvergedError
+    from mepd.inputs import ChainInputs
+    from mepd.nodes.node import StructureNode
+    from mepd.qcdata_structure_helpers import read_multiple_structure_from_file
+
+    run_inputs = RunInputs.open(inputs) if inputs else RunInputs()
+    output.mkdir(parents=True, exist_ok=True)
+
+    nodes, sources = [], []
+    for fp in structures:
+        frames = read_multiple_structure_from_file(fp, charge=charge or 0, spinmult=multiplicity or 1)
+        for k, st in enumerate(frames):
+            updates = {}
+            if charge is not None:
+                updates["charge"] = charge
+            if multiplicity is not None:
+                updates["multiplicity"] = multiplicity
+            nodes.append(StructureNode(structure=st.model_copy(update=updates) if updates else st))
+            sources.append(f"{fp.name}" + (f"[{k}]" if len(frames) > 1 else ""))
+
+    keywords = _geometry_optimizer_keywords(run_inputs)
+    engine = run_inputs.engine
+    results: list = [None] * len(nodes)
+    errors: list = [None] * len(nodes)
+
+    def _single(i: int) -> None:
+        try:
+            try:
+                traj = engine.compute_geometry_optimization(nodes[i], keywords=keywords)
+            except TypeError:
+                traj = engine.compute_geometry_optimization(nodes[i])
+            if traj:
+                results[i] = traj[-1]
+            else:
+                errors[i] = "optimizer returned an empty trajectory"
+        except GeometryOptimizationNotConvergedError as exc:
+            errors[i] = f"did not converge: {exc}"
+        except Exception as exc:
+            errors[i] = f"{type(exc).__name__}: {exc}"
+
+    typer.echo(f"Optimizing {len(nodes)} structure(s) with {type(engine).__name__}...")
+    batch = getattr(engine, "compute_geometry_optimizations", None)
+    batched = False
+    if callable(batch) and len(nodes) > 1:
+        try:
+            try:
+                trajs = batch(nodes, keywords=keywords)
+            except TypeError:
+                trajs = batch(nodes)
+            if isinstance(trajs, (list, tuple)) and len(trajs) == len(nodes):
+                for i, traj in enumerate(trajs):
+                    if traj:
+                        results[i] = traj[-1]
+                    else:
+                        errors[i] = "optimizer returned an empty trajectory"
+                batched = True
+        except Exception as exc:
+            # One bad structure fails a whole batch: redo them one by one so
+            # the failure is attributed and the rest still get optimized.
+            typer.echo(f"Batch optimization failed ({type(exc).__name__}: {exc}); retrying one at a time.")
+    if not batched:
+        for i in range(len(nodes)):
+            _single(i)
+            typer.echo(f"  [{i + 1}/{len(nodes)}] {sources[i]}: {'ok' if results[i] is not None else errors[i]}")
+
+    validations: list = [None] * len(nodes)
+    if validate_minima_with_hessian:
+        from mepd.elementarystep import validate_minimum_with_rescue
+
+        for i, node in enumerate(results):
+            if node is None:
+                continue
+            results[i], validations[i] = validate_minimum_with_rescue(
+                node, engine, frequency_cutoff=hessian_minimum_frequency_cutoff,
+                rescue_displacement=hessian_minima_rescue_displacement, label=sources[i],
+            )
+            typer.echo(f"  Hessian check {sources[i]}: {validations[i]['validation']}")
+
+    summary = []
+    for i, node in enumerate(results):
+        rec = {"index": i, "source": sources[i], "converged": node is not None, "energy": None, "error": errors[i]}
+        if validations[i] is not None:
+            rec.update(validations[i])
+        if node is not None:
+            chain = Chain.model_validate({"nodes": [node], "parameters": ChainInputs()})
+            chain.write_to_disk(output / f"opt_{i}.xyz")
+            energy = getattr(node, "_cached_energy", None)
+            rec["energy"] = float(energy) if energy is not None else None
+        summary.append(rec)
+    (output / "summary.json").write_text(json.dumps({"structures": summary}, indent=1))
+    n_ok = sum(r["converged"] for r in summary)
+    typer.echo(f"Optimized {n_ok}/{len(summary)} structure(s); results in {output}")
+    if n_ok == 0:
+        raise typer.Exit(code=1)
+
+
 _DEFAULT_INPUTS_PATH_METHODS = ("NEB", "FNEB", "NEB-DLF", "GEOMETRIC-NEB", "GSM")
 
 
@@ -3098,6 +3240,127 @@ def make_default_inputs(
     run_inputs = RunInputs(path_min_method=normalized)
     run_inputs.save(output)
     typer.echo(f"Wrote default inputs ({normalized} path minimizer) to {output}")
+
+
+@app.command("web")
+def web(
+    workspace: Path = typer.Argument(
+        Path("mepd_workspace"),
+        help="Workspace directory (structure library, reaction graph, profiles, job outputs). Created if missing.",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind. Use 0.0.0.0 to serve other machines."),
+    port: int = typer.Option(8765, "--port", help="Port to serve on."),
+    max_jobs: int = typer.Option(
+        2, "--max-jobs", help="How many mepd jobs may run at once; the rest wait in the queue."
+    ),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not open a browser tab."),
+    auth: Optional[bool] = typer.Option(
+        None, "--auth/--no-auth",
+        help="Require a login token. On by default whenever --host is not localhost; turn it on "
+        "explicitly when a proxy on this machine (e.g. `tailscale serve`) exposes the port.",
+    ),
+    new_token: bool = typer.Option(False, "--new-token", help="Rotate the access token (logs every device out)."),
+    demo: bool = typer.Option(
+        False, "--demo",
+        help="Public demo mode: WORKSPACE is the demo root; anyone with the shared password gets private "
+        "workspaces there, with read-only admin profiles (WORKSPACE/profiles), no filesystem access and "
+        "size/time limits. Run it in the container from deploy/demo/.",
+    ),
+    demo_password: Optional[str] = typer.Option(
+        None, "--demo-password", envvar="MEPD_DEMO_PASSWORD",
+        help="Shared demo password (default: generated once, stored in WORKSPACE/.demo_password).",
+    ),
+) -> None:
+    """Serve the mepd web interface over a workspace directory."""
+    try:
+        import uvicorn
+
+        from mepd.web.app import create_app
+    except ImportError as exc:
+        typer.echo(f"mepd web needs the `web` extra (pip install 'mepd[web]'): {exc}")
+        raise typer.Exit(code=1)
+
+    local_only = host in ("127.0.0.1", "localhost", "::1")
+    if demo:
+        _serve_demo(workspace, host, port, max_jobs, demo_password)
+        return
+    if auth is None:
+        auth = not local_only
+    if not auth and not local_only:
+        typer.echo("Refusing to serve beyond localhost without --auth: anyone who can reach the port "
+                   "could run jobs as you and read your files.")
+        raise typer.Exit(code=1)
+    token = None
+    if auth:
+        from mepd.web.auth import load_or_create_token, token_path
+
+        token = load_or_create_token(rotate=new_token)
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
+    typer.echo(f"mepd web: workspace {workspace.resolve()} -> {url}")
+    if token:
+        typer.echo(f"Login required. Token (also in {token_path()}): {token}")
+        typer.echo(f"One-click login link: {url}/login?token={token}")
+        ts_name = _tailscale_dns_name()
+        if ts_name:
+            typer.echo(f"Over Tailscale, after `tailscale serve --bg {port}`: https://{ts_name}/login?token={token}")
+        url = f"{url}/login?token={token}"
+    if not no_open:
+        import threading
+        import webbrowser
+
+        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
+    uvicorn.run(create_app(workspace, max_concurrent=max_jobs, auth_token=token), host=host, port=port,
+                log_level="warning", proxy_headers=True, forwarded_allow_ips="127.0.0.1")
+
+
+def _serve_demo(root: Path, host: str, port: int, max_jobs: int, password: Optional[str]) -> None:
+    import os
+    import secrets
+    import subprocess
+    import sys
+
+    import uvicorn
+
+    from mepd.web.app import create_app
+    from mepd.web.demo import DemoPolicy
+
+    root = root.resolve()
+    (root / "profiles").mkdir(parents=True, exist_ok=True)
+    if not list((root / "profiles").glob("*.toml")):
+        # Starter profiles the admin can edit on disk (visitors cannot).
+        for name, method in (("default", "NEB"), ("gsm", "GSM")):
+            subprocess.run([sys.executable, "-m", "mepd.cli", "init", "--method", method,
+                            "--output", str(root / "profiles" / f"{name}.toml")], check=False, capture_output=True)
+    pw_file = root / ".demo_password"
+    if not password:
+        if pw_file.exists():
+            password = pw_file.read_text().strip()
+        else:
+            password = secrets.token_urlsafe(9)
+            pw_file.write_text(password + "\n")
+            os.chmod(pw_file, 0o600)
+    policy = DemoPolicy()
+    typer.echo(f"mepd web DEMO: root {root} -> http://{host}:{port}")
+    typer.echo(f"  password: {password}")
+    typer.echo(f"  profiles (read-only for visitors): {', '.join(p.stem for p in sorted((root / 'profiles').glob('*.toml')))}")
+    typer.echo(f"  limits: {policy.max_atoms} atoms/structure, {policy.max_active_jobs} active jobs/visitor, "
+               f"{policy.global_concurrency} running overall, {policy.job_timeout_s / 60:.0f} min/job")
+    uvicorn.run(create_app(root, max_concurrent=max_jobs, demo=policy, demo_password=password),
+                host=host, port=port, log_level="warning", proxy_headers=True, forwarded_allow_ips="*")
+
+
+def _tailscale_dns_name() -> Optional[str]:
+    """This machine's MagicDNS name, if Tailscale is running (for the hint)."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("tailscale"):
+        return None
+    try:
+        out = subprocess.run(["tailscale", "status", "--self", "--json"], capture_output=True, text=True, timeout=5)
+        return json.loads(out.stdout)["Self"]["DNSName"].rstrip(".") or None
+    except Exception:
+        return None
 
 
 try:

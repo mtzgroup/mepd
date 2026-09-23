@@ -82,15 +82,84 @@ def _append_progress_log(message: str) -> None:
         return
 
 
-def _write_progress_chain_payload(payload: dict | None) -> None:
+def _chain_geometry_payload(chain, energies: list) -> dict | None:
+    """Current path geometry for a live viewer: every image's xyz text plus
+    the index of the current TS guess (highest-energy interior image).
+    Only built when a MEPD_DRIVE_CHAIN_JSON consumer is attached, so plain
+    CLI runs never pay for it."""
+    try:
+        frames = [node.structure.to_xyz() for node in chain.nodes]
+    except Exception:
+        return None
+    ts_index = None
+    if len(energies) == len(frames) and len(frames) > 2:
+        interior = range(1, len(frames) - 1)
+        ts_index = max(interior, key=lambda i: energies[i])
+    return {"frames": frames, "ts_index": ts_index}
+
+
+# Name of the path search this process is currently reporting (e.g.
+# "pair_3_12" in `mepd channels`). With MEPD_DRIVE_CHAIN_DIR set, every
+# stream gets its own <dir>/<stream>.json, so concurrent path searches (one
+# per worker process) no longer overwrite each other's live view.
+_live_stream: str = "main"
+
+
+def _live_hook_enabled() -> bool:
+    return bool(os.environ.get("MEPD_DRIVE_CHAIN_DIR", "").strip() or os.environ.get("MEPD_DRIVE_CHAIN_JSON", "").strip())
+
+
+def _chain_payload_path() -> Path | None:
+    directory = os.environ.get("MEPD_DRIVE_CHAIN_DIR", "").strip()
+    if directory:
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in _live_stream) or "main"
+        return Path(directory) / f"{safe}.json"
     fp = os.environ.get("MEPD_DRIVE_CHAIN_JSON", "").strip()
-    if not fp or payload is None:
+    return Path(fp) if fp else None
+
+
+def set_live_stream(name: str) -> None:
+    """Start reporting a new, separately viewable path search. Clears the
+    per-monitor plot/geometry state so it doesn't inherit the previous
+    stream's history (serial runs reuse one process for many pairs)."""
+    global _live_stream
+    _live_stream = str(name or "main")
+    printer = get_progress_printer()
+    with printer._lock:
+        printer._monitor_states.clear()
+
+
+def end_live_stream(status: str = "done") -> None:
+    """Mark the current stream finished (its file stays, flagged), so a
+    viewer can tell completed path searches from running ones."""
+    fp = _chain_payload_path()
+    if fp is None or not fp.exists():
         return
     try:
-        path = Path(fp)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
+        payload = json.loads(fp.read_text())
+        payload.update(finished=True, status=status, updated=time.time())
+        _atomic_json_write(fp, payload)
+    except Exception:
+        return
+
+
+def _atomic_json_write(path: Path, payload: dict) -> None:
+    # Readers poll these files while they are rewritten every step: write a
+    # temp file and rename, so a reader never sees half a JSON document.
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp, path)
+
+
+def _write_progress_chain_payload(payload: dict | None) -> None:
+    fp = _chain_payload_path()
+    if fp is None or payload is None:
+        return
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**payload, "stream": _live_stream, "updated": time.time(), "finished": False}
+        _atomic_json_write(fp, payload)
     except Exception:
         return
 
@@ -512,6 +581,7 @@ class ProgressPrinter:
                 "detail_lines": list(state.get("detail_lines") or []),
                 "plot": state.get("chain_plot_payload"),
                 "history": list(state.get("chain_plot_history") or []),
+                "geometry": state.get("chain_geometry"),
                 "status_message": state.get("status_message"),
                 "active": monitor_id in self._active_monitor_ids,
             }
@@ -525,6 +595,7 @@ class ProgressPrinter:
                 "detail_lines": list(state.get("detail_lines") or []),
                 "plot": state.get("chain_plot_payload"),
                 "history": list(state.get("chain_plot_history") or []),
+                "geometry": state.get("chain_geometry"),
                 "monitor_id": monitor_id,
                 "monitors": self._monitors_payload(),
             }
@@ -844,6 +915,10 @@ class ProgressPrinter:
                 "product_smiles": end_smiles if end_smiles != "N/A" else "",
             }
             state["chain_plot_payload"] = chain_plot_payload
+            # Kept outside chain_plot_history on purpose: geometry for the
+            # last 120 steps would make every progress write ~100x larger.
+            if _live_hook_enabled():
+                state["chain_geometry"] = _chain_geometry_payload(chain, y_vals)
             if x_vals and y_vals and len(x_vals) == len(y_vals):
                 history = list(state.get("chain_plot_history") or [])
                 history.append(chain_plot_payload)
@@ -863,6 +938,7 @@ class ProgressPrinter:
                 "detail_lines": list(state.get("detail_lines") or []),
                 "plot": state.get("chain_plot_payload"),
                 "history": list(state.get("chain_plot_history") or []),
+                "geometry": state.get("chain_geometry"),
                 "monitor_id": monitor_id,
                 "monitors": self._monitors_payload(),
             }

@@ -240,3 +240,52 @@ def test_inpfileq_text_restart_and_nnodes_override():
     default_text = _inpfileq_text(params)
     assert "RESTART                 0" in default_text
     assert "NNODES                  9" in default_text
+
+
+
+def test_gsm_run_without_any_gradient_call_is_an_error_not_a_path(monkeypatch, tmp_path):
+    """If molecularGSM never reaches mepd (its ./grad.py helper cannot run),
+    its string holds placeholder energies (0 kcal/mol everywhere). That must
+    raise, and must not trigger the RESTART -> native-growth retry."""
+    import pytest
+
+    from mepd.pathminimizers.gsm import GSMHelperError
+
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate({"nodes": [reactant, product], "parameters": {}})
+    gsm = GSM(initial_chain=chain, engine=_FakeEnergyEngine(), parameters=SimpleNamespace(verbosity=1))
+
+    monkeypatch.setattr(gsm, "_write_inputs", lambda workdir, *a, **k: (workdir / "grad_calls.count").write_text(""))
+    monkeypatch.setattr(gsm, "_start_engine_server", lambda workdir: None)
+    monkeypatch.setattr(gsm, "_stop_engine_server", lambda proc, workdir: None)
+    monkeypatch.setattr(gsm, "_run_gsm", lambda *a, **k: ([], False))   # finished, zero calls counted
+    attempts = []
+    real = gsm._execute_gsm_attempt
+    monkeypatch.setattr(gsm, "_execute_gsm_attempt", lambda *a: attempts.append(a[4]) or real(*a))
+    with pytest.raises(GSMHelperError, match="without making a single energy/gradient call"):
+        gsm._execute_gsm_attempt_with_fallback(chain, reactant, product, -0.5, [reactant, product], False)
+    assert len(attempts) == 1          # no pointless from-scratch retry
+
+
+def test_gsm_refuses_a_noexec_working_directory(monkeypatch):
+    import os
+
+    import pytest
+
+    import mepd.pathminimizers.gsm as gsm_mod
+    from mepd.pathminimizers.gsm import GSMHelperError
+
+    reactant = _hcn_node(1.064, 2.220, energy=-0.5)
+    product = _hcn_node(2.163, 0.994, energy=-0.52)
+    chain = Chain.model_validate({"nodes": [reactant, product], "parameters": {}})
+    gsm = GSM(initial_chain=chain, engine=_FakeEnergyEngine(), parameters=SimpleNamespace(verbosity=1))
+    real_statvfs = os.statvfs
+
+    class _NoExec:
+        def __init__(self, st):
+            self.f_flag = st.f_flag | getattr(os, "ST_NOEXEC", 8)
+
+    monkeypatch.setattr(gsm_mod.os, "statvfs", lambda p: _NoExec(real_statvfs(p)))
+    with pytest.raises(GSMHelperError, match="noexec"):
+        gsm._execute_gsm_attempt(chain, reactant, product, -0.5, None, False)

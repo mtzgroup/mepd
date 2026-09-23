@@ -76,6 +76,13 @@ class HessianSampleResult:
     optimized_metadata: List[HessianSampleCandidate] = field(default_factory=list)
     failed_candidates: List[dict] = field(default_factory=list)
     unique_minima: List[Node] = field(default_factory=list)
+    # With validate_minima_with_hessian: one record per unique_minima entry
+    # ({is_minimum, min_frequency, rescued, validation}), plus the optimized
+    # structures that were still not minima after the rescue push (dropped
+    # from unique_minima) and their records.
+    minima_validation: List[dict] = field(default_factory=list)
+    rejected_minima: List[Node] = field(default_factory=list)
+    rejected_validation: List[dict] = field(default_factory=list)
 
 
 def _effective_dr(seed_node: Node, dr: float) -> float:
@@ -348,6 +355,9 @@ def run_hessian_sample(
     maxiter: int = 500,
     chain_inputs: ChainInputs | None = None,
     on_event: OnEvent = None,
+    validate_minima_with_hessian: bool = False,
+    hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
 ) -> HessianSampleResult:
     """Explore minima near `seed_node` by displacing along Hessian normal modes.
 
@@ -559,8 +569,58 @@ def run_hessian_sample(
         on_event, "candidates_optimized",
         n_optimized=len(optimized_nodes), n_failed=len(failed_candidates),
     )
+    if validate_minima_with_hessian and result.unique_minima:
+        _validate_unique_minima(
+            result, engine, chain_inputs,
+            frequency_cutoff=hessian_minimum_frequency_cutoff,
+            rescue_displacement=hessian_minima_rescue_displacement,
+            on_event=on_event,
+        )
 
     return result
+
+
+def _validate_unique_minima(
+    result: HessianSampleResult,
+    engine: Engine,
+    chain_inputs: ChainInputs,
+    *,
+    frequency_cutoff: float,
+    rescue_displacement: float,
+    on_event: OnEvent = None,
+) -> None:
+    """Hessian-check every unique minimum (optimizers can stop on a saddle
+    point, e.g. an eclipsed rotor). Rescued ones replace the original; the
+    list is then re-deduplicated, since a rescue can land on a minimum that
+    is already in it. Ones still not minima move to `rejected_minima`."""
+    from mepd.elementarystep import validate_minimum_with_rescue
+
+    total = len(result.unique_minima)
+    _emit(on_event, "validating_minima", total=total)
+    kept, kept_records = [], []
+    for i, node in enumerate(result.unique_minima):
+        node, record = validate_minimum_with_rescue(
+            node, engine, frequency_cutoff=frequency_cutoff,
+            rescue_displacement=rescue_displacement, label=f"minimum {i}",
+        )
+        if record["is_minimum"]:
+            kept.append(node)
+            kept_records.append(record)
+        else:
+            result.rejected_minima.append(node)
+            result.rejected_validation.append(record)
+        _emit(on_event, "minimum_validated", index=i + 1, total=total, is_minimum=record["is_minimum"])
+    deduped = _dedupe_minima_nodes(kept, chain_inputs)
+    # Keep each surviving node's own record (dedupe keeps first occurrences, as copies).
+    records, used = [], set()
+    for node in deduped:
+        for j, original in enumerate(kept):
+            if j not in used and np.allclose(np.asarray(original.coords), np.asarray(node.coords)):
+                records.append(kept_records[j])
+                used.add(j)
+                break
+    result.unique_minima = deduped
+    result.minima_validation = records
 
 
 def _boltzmann_acceptance_probability(delta_kcal: float, temperature_kelvin: float) -> float:
@@ -610,6 +670,9 @@ def run_hessian_global_optimization(
     chain_inputs: ChainInputs | None = None,
     acceptance_baseline: str = "connected",
     on_event: OnEvent = None,
+    validate_minima_with_hessian: bool = False,
+    hessian_minimum_frequency_cutoff: float = 0.0,
+    hessian_minima_rescue_displacement: float = 0.1,
 ) -> HessianGlobalOptResult:
     """Basin-hopping-style global optimization built on repeated Hessian
     sampling.
@@ -712,6 +775,10 @@ def run_hessian_global_optimization(
                 sample = run_hessian_sample(
                     source_node, engine, dr=dr, dr_values=dr_values, max_candidates=max_candidates,
                     maxiter=maxiter, chain_inputs=chain_inputs, on_event=on_event,
+                    # Only validated minima get accepted -- and so seed later rounds.
+                    validate_minima_with_hessian=validate_minima_with_hessian,
+                    hessian_minimum_frequency_cutoff=hessian_minimum_frequency_cutoff,
+                    hessian_minima_rescue_displacement=hessian_minima_rescue_displacement,
                 )
             except Exception as exc:
                 # A source failing outright (e.g. its Hessian computation

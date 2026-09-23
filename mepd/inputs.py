@@ -171,8 +171,10 @@ class NEBInputs:
     `hessian_minimum_frequency_cutoff`: minimum allowed frequency, in cm^-1 when
         frequencies are available, for Hessian-validated minima
 
-    `hessian_minima_rescue_displacement`: displacement, in bohr, applied along the
-        lowest-frequency mode when attempting to rescue a Hessian-rejected minimum
+    `hessian_minima_rescue_displacement`: first displacement, in bohr, applied along
+        the lowest-frequency mode when attempting to rescue a Hessian-rejected
+        minimum; if that fails the rescue escalates to 0.3 and 0.5 bohr
+        (elementarystep.RESCUE_ESCALATION_BOHR)
 
     `recursive_same_pair_split_limit`: during recursive autosplitting, if a branch
         repeats the exact same (start, end) endpoint pair this many times in a row
@@ -499,15 +501,15 @@ class RunInputs:
                 "timeout": None,
                 "keep_workdirs": False,
                 "seed_with_geodesic_interpolation": True,
-                # Stop early once a local minimum in the live string has held
-                # steady for `early_stop_persistence_window` consecutive
-                # updates (only checked once growth has finished). Only ever
-                # actually arms when do_elem_step_checks is also True -- see
-                # GSM._run_gsm's docstring for why (no native DE-GSM
-                # equivalent exists to lean on instead) and optimize_chain's
-                # resume logic for what happens if check_if_elem_step
-                # disagrees with the early-stop signal.
-                "early_stop_on_minima": True,
+                # Off by default: when on, GSM is killed once a local minimum
+                # in the live string has held steady for
+                # `early_stop_persistence_window` consecutive updates (only
+                # checked once growth has finished, and only when
+                # do_elem_step_checks is also True -- see GSM._run_gsm). In
+                # practice it cut runs short too often; the elementary-step
+                # check on the fully converged string still splits real
+                # multi-step paths.
+                "early_stop_on_minima": False,
                 "early_stop_persistence_window": 3,
                 "early_stop_minima_rtol": 0.02,
                 "early_stop_minima_min_depth_kcal": 1.0,

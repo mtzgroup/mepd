@@ -19,6 +19,12 @@ from mepd.chain import Chain
 from mepd.elementarystep import ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
+
+
+class GSMHelperError(ElectronicStructureError):
+    """molecularGSM could not get energies/gradients from mepd at all (its
+    `./grad.py` helper never ran). Retrying GSM differently cannot help, so
+    this is never caught by the RESTART -> native-growth fallback."""
 from mepd.inputs import RunInputs
 from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.progress import get_progress_printer
@@ -329,7 +335,7 @@ class GSM(PathMinimizer):
         # only ever be as trustworthy as the check that verifies it --
         # never arm it without do_elem_step_checks also on.
         allow_early_stop = do_elem_step_checks and bool(
-            getattr(self.parameters, "early_stop_on_minima", True)
+            getattr(self.parameters, "early_stop_on_minima", False)
         )
 
         final_chain, history, early_stopped = self._execute_gsm_attempt_with_fallback(
@@ -396,6 +402,8 @@ class GSM(PathMinimizer):
             return self._execute_gsm_attempt(
                 chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
             )
+        except GSMHelperError:
+            raise
         except ElectronicStructureError as exc:
             if not seed_nodes:
                 raise
@@ -423,6 +431,16 @@ class GSM(PathMinimizer):
         workdir = Path(tempfile.mkdtemp(prefix="gsm-"))
         server_proc = None
         try:
+            # GSM runs `./grad.py` from its working directory for every energy
+            # and gradient; on a noexec filesystem (e.g. Docker's default
+            # --tmpfs /tmp) that silently fails and GSM "converges" with every
+            # uncomputed energy left at 0.
+            if os.statvfs(workdir).f_flag & getattr(os, "ST_NOEXEC", 0):
+                raise GSMHelperError(msg=(
+                    f"The GSM working directory {workdir} is on a filesystem mounted noexec, so "
+                    "molecularGSM cannot run its ./grad.py helper to get energies. Point TMPDIR at a "
+                    "directory where programs may be executed."
+                ))
             self._write_inputs(
                 workdir, reactant, product, e_reactant, seed_nodes=seed_nodes
             )
@@ -444,6 +462,16 @@ class GSM(PathMinimizer):
             n_calls = counter_fp.read_text().count("\n")
             self.grad_calls_made += n_calls
             self._log(f"molecularGSM made {n_calls} gradient/energy calls", verbose=2)
+            if n_calls == 0:
+                # Even a RESTART from a finished string needs gradients, so
+                # zero calls means GSM never reached mepd: its string's
+                # energies are placeholders, not results. Refuse it.
+                raise GSMHelperError(msg=(
+                    "molecularGSM finished without making a single energy/gradient call, so its path "
+                    "energies are meaningless (its ./grad.py helper could not run -- check that the "
+                    f"working directory {workdir} allows executing programs and that GSM's output "
+                    "reports no errors)."
+                ))
 
             if early_stopped:
                 # A killed process never writes stringfile.xyz0000 -- the

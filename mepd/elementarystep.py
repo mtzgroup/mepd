@@ -471,6 +471,20 @@ def _emit_hessian_validation_message(
         update_status("Checking if elementary step")
 
 
+# Pushes tried after the configured one, in bohr, when a rescue fails. A
+# single small push is not always enough: eclipsed ethane re-optimizes
+# straight back onto its torsional saddle from +-0.1 bohr but reaches
+# staggered from +-0.3.
+RESCUE_ESCALATION_BOHR = (0.3, 0.5)
+
+
+def _rescue_schedule(first: float) -> list[float]:
+    """The pushes to try, smallest first: the configured one, then each
+    escalation step larger than it."""
+    first = float(first)
+    return [first] + [d for d in RESCUE_ESCALATION_BOHR if d > first + 1e-9]
+
+
 def _hessian_rescue_failed_candidate(
     node: Node,
     engine: Engine,
@@ -481,6 +495,11 @@ def _hessian_rescue_failed_candidate(
     verbose: bool,
     label: str,
 ) -> tuple[Node | None, HessianMinimaValidation | None, int]:
+    """Push a Hessian-rejected structure along its lowest mode, both ways,
+    and reoptimize -- first by `rescue_displacement`, then by each larger step
+    of RESCUE_ESCALATION_BOHR -- stopping at the first reoptimized geometry
+    that passes the Hessian check. Returns (rescued node or None, best
+    validation seen, gradient calls spent)."""
     mode, mode_frequency = _lowest_frequency_mode(validation.hessian_result, node)
     if mode is None:
         msg = (
@@ -490,16 +509,18 @@ def _hessian_rescue_failed_candidate(
         _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
         return None, None, 0
 
+    schedule = _rescue_schedule(rescue_displacement)
     msg = (
         f"Attempting Hessian rescue for {label} split candidate: displacing "
-        f"±{float(rescue_displacement):.3f} bohr along lowest-frequency "
-        f"mode ({mode_frequency:.3f} cm^-1) and reoptimizing."
+        f"along lowest-frequency mode ({mode_frequency:.3f} cm^-1) by "
+        f"{', '.join(f'±{d:.3f}' for d in schedule)} bohr (in that order, until one "
+        "reoptimizes to a minimum)."
     )
     _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
 
     rescue_grad_calls = 0
     best_validation: HessianMinimaValidation | None = None
-    for signed_dr in (float(rescue_displacement), -float(rescue_displacement)):
+    for signed_dr in [s * d for d in schedule for s in (1.0, -1.0)]:
         try:
             displaced = displace_by_dr(node=node, displacement=mode, dr=signed_dr)
             opt_traj = _run_geom_opt(displaced, engine=engine)
@@ -533,6 +554,7 @@ def _hessian_rescue_failed_candidate(
         ):
             best_validation = rescued_validation
         if rescued_validation.is_minimum:
+            rescued_validation.reason += f" (rescued with a {signed_dr:+.3f} bohr push)"
             msg = (
                 f"Hessian rescue accepted {label} split candidate after "
                 f"{signed_dr:+.3f} bohr displacement: {rescued_validation.reason}"
@@ -547,6 +569,39 @@ def _hessian_rescue_failed_candidate(
         _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
 
     return None, best_validation, rescue_grad_calls
+
+
+def validate_minimum_with_rescue(
+    node: Node,
+    engine: Engine,
+    *,
+    frequency_cutoff: float = 0.0,
+    rescue_displacement: float = 0.1,
+    label: str = "structure",
+) -> tuple[Node, dict]:
+    """Hessian-check that `node` is a minimum; if it is not, push it along
+    its lowest mode (both directions) and reoptimize, escalating the push
+    (see _hessian_rescue_failed_candidate) until one attempt succeeds.
+
+    Returns (node to keep, record). `record` has is_minimum, min_frequency,
+    rescued and validation (a human-readable reason). When the rescue
+    succeeds the returned node is the rescued geometry; otherwise it is the
+    input node, with is_minimum False (callers decide whether to drop it).
+    """
+    check = _validate_hessian_minimum(node, engine, frequency_cutoff=frequency_cutoff)
+    rescued = False
+    if not check.is_minimum and check.hessian_result is not None:
+        new_node, new_check, _ = _hessian_rescue_failed_candidate(
+            node, engine, validation=check, frequency_cutoff=frequency_cutoff,
+            rescue_displacement=rescue_displacement, verbose=False, label=label,
+        )
+        if new_node is not None and new_check is not None and new_check.is_minimum:
+            node, check, rescued = new_node, new_check, True
+        elif (new_check is not None and check.min_frequency is not None
+              and new_check.min_frequency is not None and new_check.min_frequency > check.min_frequency):
+            check = new_check  # report the closest we got
+    return node, {"is_minimum": bool(check.is_minimum), "min_frequency": check.min_frequency,
+                  "rescued": rescued, "validation": check.reason}
 
 
 def _validate_hessian_split_candidates(
