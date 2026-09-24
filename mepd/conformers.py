@@ -27,6 +27,7 @@ from qcconst.constants import ANGSTROM_TO_BOHR
 from qcdata.models.structure import Structure
 
 from mepd.nodes.node import StructureNode
+from mepd.rigid_alignment import kabsch_align
 
 
 @dataclass
@@ -281,7 +282,7 @@ def _generate_conformers_rdkit(
             positions = conf.GetPositions()
             for frag in fragments:
                 idx = list(frag)
-                positions[idx] = _kabsch_onto(positions[idx], reference[idx])
+                positions[idx] = kabsch_align(positions[idx], reference[idx])
             for i, xyz in enumerate(positions):
                 conf.SetAtomPosition(i, xyz.tolist())
 
@@ -313,20 +314,6 @@ def _generate_conformers_rdkit(
 
     scored.sort(key=lambda item: (item[0], item[1]))
     return [node] + [n for _, _, n in scored]
-
-
-def _kabsch_onto(mobile, target):
-    """`mobile` (n x 3) rigidly rotated and translated to best overlay
-    `target` (n x 3), without reflection."""
-    mobile = np.asarray(mobile, dtype=float)
-    target = np.asarray(target, dtype=float)
-    mc, tc = mobile.mean(axis=0), target.mean(axis=0)
-    if len(mobile) < 2:
-        return mobile - mc + tc
-    u, _, vt = np.linalg.svd((mobile - mc).T @ (target - tc))
-    d = np.sign(np.linalg.det(u @ vt))
-    rotation = u @ np.diag([1.0, 1.0, d]) @ vt
-    return (mobile - mc) @ rotation + tc
 
 
 def _parse_multiframe_xyz(text: str) -> list[tuple[list[str], list[list[float]], Optional[float]]]:

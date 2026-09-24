@@ -78,14 +78,14 @@ def _aligned_rmsd(a: Structure, b: Structure) -> float:
     how far apart the two fixed endpoints are."""
     import numpy as np
 
+    from mepd.rigid_alignment import kabsch_align
+
     x = np.asarray(a.geometry, dtype=float)
     y = np.asarray(b.geometry, dtype=float)
     x = x - x.mean(axis=0)
     y = y - y.mean(axis=0)
-    u, _, vt = np.linalg.svd(x.T @ y)
-    d = np.sign(np.linalg.det(u @ vt))
-    r = u @ np.diag([1.0, 1.0, d]) @ vt
-    return float(np.sqrt(((x @ r - y) ** 2).sum(axis=1).mean()))
+    aligned = kabsch_align(x, y)
+    return float(np.sqrt(((aligned - y) ** 2).sum(axis=1).mean()))
 
 
 def _interpolate(candidate: MappingCandidate, start_structure: Structure, run_inputs):

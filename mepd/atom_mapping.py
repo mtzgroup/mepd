@@ -148,24 +148,13 @@ def suggest_atom_mapping(
 
 def _symmetry_orbits(structure: Structure) -> list[list[int]]:
     """Groups of atom indices in `structure` that are topologically
-    interchangeable -- same RDKit canonical rank via
-    `Chem.CanonicalRankAtoms(breakTies=False)`, which assigns identical
-    ranks to graph-symmetric atoms (e.g. a methyl group's three Hs, or a
-    symmetric =CH2's two Hs). Only groups of size > 1 are actual degrees
-    of freedom. Returns `[]` if RDKit can't parse/assign bonds -- never
+    interchangeable, via `_symmetry_ranks` (e.g. a methyl group's three Hs,
+    or a symmetric =CH2's two Hs). Only groups of size > 1 are actual
+    degrees of freedom. `[]` if RDKit can't parse/assign bonds (each atom
+    then has its own unique rank, so no group exceeds size 1) -- never
     raises."""
-    from rdkit import Chem
-    from rdkit.Chem import rdDetermineBonds
-
-    try:
-        mol = Chem.MolFromXYZBlock(structure.to_xyz())
-        rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
-        ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=False))
-    except Exception:
-        return []
-
     groups: dict[int, list[int]] = {}
-    for idx, rank in enumerate(ranks):
+    for idx, rank in enumerate(_symmetry_ranks(structure)):
         groups.setdefault(rank, []).append(idx)
     return [idxs for idxs in groups.values() if len(idxs) > 1]
 
