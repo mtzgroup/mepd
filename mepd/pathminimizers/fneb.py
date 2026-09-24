@@ -215,7 +215,9 @@ class FreezingNEB(PathMinimizer):
             self.optimized = self.chain_trajectory[-1]
             self._log(f"Converged? {converged}")
 
-        if self.parameters.do_elem_step_checks:
+        # With no interior node there is no barrier to split on: growth
+        # found the path monotonic, or its barrier below barrier_thre.
+        if self.parameters.do_elem_step_checks and len(chain) > 2:
             short_chain = Chain.model_validate(
                 {"nodes": [chain[0], chain.get_ts_node(), chain[-1]], "parameters": chain.parameters})
             elem_step_results = check_if_elem_step(
@@ -262,7 +264,17 @@ class FreezingNEB(PathMinimizer):
         self._log(f"Invalid geodesic tangent{which}; using linear tangent.", level="warning")
         return _linear_tangent(chain, ind)
 
-    def _pair_geodesic_tangents(self, raw_chain: Chain, ind_node1: int, ind_node2: int):
+    def _pair_tangents(self, raw_chain: Chain, ind_node1: int, ind_node2: int):
+        """Tangents at two nodes being minimized together, by `tangent`."""
+        if self.parameters.tangent == 'linear':
+            n_nodes = len(raw_chain.nodes)
+
+            def _two_point(i):
+                t = raw_chain[min(i + 1, n_nodes - 1)].coords - raw_chain[max(i - 1, 0)].coords
+                return t / np.linalg.norm(t)
+            return _two_point(ind_node1), _two_point(ind_node2)
+        if self.parameters.tangent != 'geodesic':
+            raise ValueError(f"Invalid tangent type {self.parameters.tangent} specified. Select 'geodesic' or 'linear'.")
         return (
             self._valid_or_linear(self._geodesic_tangent(raw_chain, ind_node1) / 2,
                                   raw_chain, ind_node1, " for left node"),
@@ -286,15 +298,7 @@ class FreezingNEB(PathMinimizer):
             self._log("Invalid node indices for node-pair minimization.", level="error")
             return raw_chain
 
-        if self.parameters.tangent == 'geodesic':
-            tangent1, tangent2 = self._pair_geodesic_tangents(raw_chain, ind_node1, ind_node2)
-        elif self.parameters.tangent == 'linear':
-            def _two_point(i):
-                t = raw_chain[min(i + 1, n_nodes - 1)].coords - raw_chain[max(i - 1, 0)].coords
-                return t / np.linalg.norm(t)
-            tangent1, tangent2 = _two_point(ind_node1), _two_point(ind_node2)
-        else:
-            raise ValueError(f"Invalid tangent type {self.parameters.tangent} specified. Select 'geodesic' or 'linear'.")
+        tangent1, tangent2 = self._pair_tangents(raw_chain, ind_node1, ind_node2)
 
         phi = float(getattr(self.parameters, "phi", PHI))
         nsteps = 1  # Account for an implicit initial gradient call if this is part of a larger process
@@ -319,13 +323,18 @@ class FreezingNEB(PathMinimizer):
                     self._log("Invalid tangent after fallback; stopping node-pair minimization.", level="warning")
                     return raw_chain
 
-                direction1 = ch.get_nudged_pe_grad(unit_tangent=unit_tan1, gradient=node1_opt.gradient)
-                direction2 = ch.get_nudged_pe_grad(unit_tangent=unit_tan2, gradient=node2_opt.gradient)
-                # The step uses the nudged gradients as is; the rigid-body
-                # projection only enters the convergence check.
-                step_gradients = np.array([direction1, direction2])
-                grad_inf_norm1 = np.amax(abs(project_rigid_body_forces(node1_opt.coords, direction1, masses=None)))
-                grad_inf_norm2 = np.amax(abs(project_rigid_body_forces(node2_opt.coords, direction2, masses=None)))
+                direction1 = project_rigid_body_forces(
+                    node1_opt.coords,
+                    ch.get_nudged_pe_grad(unit_tangent=unit_tan1, gradient=node1_opt.gradient),
+                    masses=None,
+                )
+                direction2 = project_rigid_body_forces(
+                    node2_opt.coords,
+                    ch.get_nudged_pe_grad(unit_tangent=unit_tan2, gradient=node2_opt.gradient),
+                    masses=None,
+                )
+                grad_inf_norm1 = np.amax(abs(direction1))
+                grad_inf_norm2 = np.amax(abs(direction2))
                 combined = max(grad_inf_norm1, grad_inf_norm2)
                 self._log(
                     f"MIN: Node1 Grad: {grad_inf_norm1:.4f} | Node2 Grad: {grad_inf_norm2:.4f} | Combined Max Grad: {combined:.4f}",
@@ -336,7 +345,7 @@ class FreezingNEB(PathMinimizer):
 
                 out_chain = self.optimizer.optimize_step(
                     chain=Chain.model_validate({"nodes": [node1_opt, node2_opt]}),
-                    chain_gradients=step_gradients,
+                    chain_gradients=np.array([direction1, direction2]),
                 )
                 new_node1, new_node2 = out_chain.nodes[0], out_chain.nodes[1]
                 self.engine.compute_energies([new_node1, new_node2])
@@ -345,9 +354,7 @@ class FreezingNEB(PathMinimizer):
                 raw_chain.nodes[ind_node2] = new_node2
                 self._append_chain_snapshot(raw_chain, f"FNEB node-pair minimize step {nsteps}")
                 nsteps += 1
-                # Tangents are always refreshed geodesically after a step,
-                # whatever `tangent` selected for the first one.
-                tangent1, tangent2 = self._pair_geodesic_tangents(raw_chain, ind_node1, ind_node2)
+                tangent1, tangent2 = self._pair_tangents(raw_chain, ind_node1, ind_node2)
             except Exception:
                 self._log(traceback.format_exc(), level="error", verbose=2)
                 return raw_chain
@@ -399,7 +406,7 @@ class FreezingNEB(PathMinimizer):
 
     def minimize_node_maxene(self, chain: Chain, node_ind: int):
         chain_opt = self._min_node(chain.copy(), tangent=None, ind_node=node_ind)
-        self.engine.g_old = None  # reset the conjugate gradient memory
+        self.optimizer.g_old = None  # reset the conjugate gradient memory
         return chain_opt
 
     def grow_nodes(self, chain: Chain, dr: float, indices: tuple = None):
@@ -513,14 +520,14 @@ class FreezingNEB(PathMinimizer):
 
         left, n_left = self._max_energy_node(
             chain, chain[last_grown_ind-1], chain[last_grown_ind], nimg, nudge)
-        right, _ = self._max_energy_node(
+        right, n_right = self._max_energy_node(
             chain, chain[last_grown_ind], chain[last_grown_ind+1], nimg, nudge)
         e_max = chain.energies.max()
         if all((d['node'].energy - e_max)*627.5 < self.parameters.barrier_thre for d in (left, right)):
             left_converged = right_converged = True
         else:
             left_converged = left['index'] in (0, n_left - 1)
-            right_converged = right['index'] == 0
+            right_converged = right['index'] in (0, n_right - 1)
         if not left_converged and not right_converged:
             self._log("Two potential directions found. Choosing highest ascent")
             if left['node'].energy > right['node'].energy:

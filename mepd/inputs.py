@@ -435,7 +435,7 @@ class RunInputs:
                 "barrier_thre": 5,  # kcal/mol,
                 "tangent": 'geodesic',
                 "tangent_alpha": 1.0,  # mixing coefficient for tangents,
-                "use_xtb_grow": True,
+                "use_xtb_grow": False,
                 "distance_metric": "GEODESIC",
                 "min_images": 10,
                 "todd_way": True,
