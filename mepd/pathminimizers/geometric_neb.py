@@ -12,20 +12,13 @@ from qcdata import Structure
 
 from mepd.chain import Chain
 from qcconst.constants import ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM
-from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
+from mepd.elementarystep import IS_ELEM_STEP, elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
 from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.progress import print_persistent, update_status
 
-IS_ELEM_STEP = ElemStepResults(
-    is_elem_step=True,
-    is_concave=True,
-    splitting_criterion=None,
-    minimization_results=None,
-    number_grad_calls=0,
-)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

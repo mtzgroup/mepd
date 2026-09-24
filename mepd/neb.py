@@ -13,7 +13,7 @@ from mepd.errors import ExternalProgramError
 
 import mepd.chainhelpers as ch
 from mepd.chain import Chain
-from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
+from mepd.elementarystep import IS_ELEM_STEP, elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines import Engine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs
@@ -35,12 +35,6 @@ except ImportError:
 
 
 pybel.ob.obErrorLog.SetOutputLevel(0)
-IS_ELEM_STEP = ElemStepResults(
-    is_elem_step=True,
-    is_concave=True,
-    splitting_criterion=None,
-    minimization_results=None,
-    number_grad_calls=0,)
 
 
 MAX_NRETRIES = 3
@@ -346,10 +340,7 @@ class NEB(PathMinimizer):
             f"Adaptive resolution inserted an image between nodes {seg_index} and "
             f"{seg_index + 1} (MAX RMS_GPERP is the limiting convergence criterion)."
         )
-        if self.parameters.v:
-            print(msg)
-        else:
-            update_status(msg)
+        self._say(msg)
         return refined_chain, True
 
     def _get_climbing_pair_indices(self, chain: Chain) -> tuple[int, int]:
@@ -415,10 +406,7 @@ class NEB(PathMinimizer):
             f"Running post-convergence climbing-image refinement on node {climb_index} "
             f"(inserted between nodes {left_idx} and {right_idx})."
         )
-        if self.parameters.v:
-            print(msg)
-        else:
-            update_status(msg)
+        self._say(msg)
 
         grad_threshold = float(getattr(self.parameters, "ts_grad_thre", self.parameters.rms_grad_thre))
         for ci_step in range(1, CLIMBING_IMAGE_MAX_STEPS + 1):
@@ -428,10 +416,7 @@ class NEB(PathMinimizer):
                     f"Climbing-image refinement converged in {ci_step - 1} steps "
                     f"(max |g_perp|={ci_grad:.4e} <= {grad_threshold:.4e})."
                 )
-                if self.parameters.v:
-                    print(done_msg)
-                else:
-                    update_status(done_msg)
+                self._say(done_msg)
                 return refined_chain
 
             refined_chain = self.update_chain(chain=refined_chain)
@@ -443,10 +428,7 @@ class NEB(PathMinimizer):
             f"Climbing-image refinement reached {CLIMBING_IMAGE_MAX_STEPS} steps "
             f"(max |g_perp|={final_grad:.4e}, threshold={grad_threshold:.4e})."
         )
-        if self.parameters.v:
-            print(end_msg)
-        else:
-            update_status(end_msg)
+        self._say(end_msg)
         return refined_chain
 
     def _do_early_stop_check(self, chain: Chain) -> Tuple[bool, ElemStepResults]:
@@ -545,6 +527,20 @@ class NEB(PathMinimizer):
 
     # @Jan: This should be a more general function so that the
     # lower level of theory can be whatever the user wants.
+    def _say(self, msg: str) -> None:
+        if self.parameters.v:
+            print(msg)
+        else:
+            update_status(msg)
+
+    def _elem_step_check(self, chain: Chain) -> ElemStepResults:
+        results = check_if_elem_step(
+            inp_chain=chain, engine=self.engine, verbose=self.parameters.v,
+            **elem_step_check_kwargs(self.parameters),
+        )
+        self.geom_grad_calls_made += results.number_grad_calls
+        return results
+
     def optimize_chain(self) -> ElemStepResults:
         """
         Main function. After an NEB object has been created, running this function will
@@ -597,10 +593,7 @@ class NEB(PathMinimizer):
                 force_check = nsteps_minima_present >= NMINIMA_STEPS
                 if force_check and not already_forced_check:
                     msg = f"A local minimum has been present for {nsteps_minima_present} steps, forcing early stop check."
-                    if self.parameters.v:
-                        print(msg)
-                    else:
-                        update_status(msg)
+                    self._say(msg)
                     nsteps_minima_present = 0
                     already_forced_check = True
                 elif already_forced_check:
@@ -616,10 +609,7 @@ class NEB(PathMinimizer):
 
                 if nsteps_strained_node >= NSTEPS_STRAIN:
                     msg = f"Node {most_strained_node} has been the most strained for {nsteps_strained_node} steps, upsampling chain"
-                    if self.parameters.v:
-                        print(msg)
-                    else:
-                        update_status(msg)
+                    self._say(msg)
                     chain_previous = ch.upsample_chain(
                         chain_previous, engine=self.engine, nimages=NADD)
 
@@ -716,13 +706,7 @@ class NEB(PathMinimizer):
 
                 final_chain = new_chain
                 if self.parameters.do_elem_step_checks:
-                    elem_step_results = check_if_elem_step(
-                        inp_chain=final_chain,
-                        engine=self.engine,
-                        verbose=self.parameters.v,
-                        **elem_step_check_kwargs(self.parameters),
-                    )
-                    self.geom_grad_calls_made += elem_step_results.number_grad_calls
+                    elem_step_results = self._elem_step_check(final_chain)
                 else:
                     elem_step_results = IS_ELEM_STEP
 
@@ -759,13 +743,7 @@ class NEB(PathMinimizer):
             detail_prefix_lines=self._optimizer_detail_lines(),
         ):
             if self.parameters.climb and self.parameters.do_elem_step_checks:
-                elem_step_results = check_if_elem_step(
-                    inp_chain=new_chain,
-                    engine=self.engine,
-                    verbose=self.parameters.v,
-                    **elem_step_check_kwargs(self.parameters),
-                )
-                self.geom_grad_calls_made += elem_step_results.number_grad_calls
+                elem_step_results = self._elem_step_check(new_chain)
                 if elem_step_results.is_elem_step:
                     self.optimized = self._run_post_convergence_climbing_refinement(new_chain)
                     return elem_step_results

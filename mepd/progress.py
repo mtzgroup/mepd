@@ -1256,6 +1256,17 @@ def start_status(message: str):
     printer.start_status(message)
 
 
+def log_at_level(message: str, level: str = "info") -> None:
+    """Route `message` to the progress printer's warning/error/success
+    output, or to the live status line for any other `level`."""
+    printer = get_progress_printer()
+    {
+        "warning": printer.print_warning,
+        "error": printer.print_error,
+        "success": printer.print_convergence,
+    }.get(level, printer.update_status)(message)
+
+
 def update_status(message: str):
     """Convenience function to update a spinner status."""
     printer = get_progress_printer()

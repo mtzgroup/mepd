@@ -12,9 +12,9 @@ from mepd.nodes.node import StructureNode
 from mepd.helper_functions import RMSD, get_maxene_node, project_rigid_body_forces
 from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.optimizers.optimizer import Optimizer
-from mepd.elementarystep import elem_step_check_kwargs, check_if_elem_step, ElemStepResults
+from mepd.elementarystep import IS_ELEM_STEP, elem_step_check_kwargs, check_if_elem_step
 from mepd.inputs import RunInputs
-from mepd.progress import get_progress_printer, print_chain_step
+from mepd.progress import log_at_level, print_chain_step
 
 import traceback
 
@@ -23,12 +23,6 @@ PHI = 0.5
 
 
 DISTANCE_METRICS = ["GEODESIC", "RMSD", "LINEAR"]
-IS_ELEM_STEP = ElemStepResults(
-    is_elem_step=True,
-    is_concave=True,
-    splitting_criterion=None,
-    minimization_results=None,
-    number_grad_calls=0,)
 
 
 def _valid_tangent(tangent: np.ndarray | None) -> bool:
@@ -69,16 +63,7 @@ class FreezingNEB(PathMinimizer):
     def _log(self, *parts, level: str = "info", verbose: int = 1):
         if self.parameters.verbosity < verbose:
             return
-        message = " ".join(str(p) for p in parts)
-        printer = get_progress_printer()
-        if level == "warning":
-            printer.print_warning(message)
-        elif level == "error":
-            printer.print_error(message)
-        elif level == "success":
-            printer.print_convergence(message)
-        else:
-            printer.update_status(message)
+        log_at_level(" ".join(str(p) for p in parts), level)
 
     def _append_chain_snapshot(self, chain: Chain, caption: str) -> None:
         snapshot = chain.copy()

@@ -947,6 +947,15 @@ def _prepare_nodes_for_comparison(nodes: list[Node], prepare_node) -> list[Node]
     return [_prepare_node_for_comparison(node, prepare_node) for node in nodes]
 
 
+IS_ELEM_STEP = ElemStepResults(
+    is_elem_step=True,
+    is_concave=True,
+    splitting_criterion=None,
+    minimization_results=None,
+    number_grad_calls=0,
+)
+
+
 def elem_step_check_kwargs(parameters) -> dict:
     """`check_if_elem_step`'s Hessian/stereochemistry settings, read off a path
     minimizer's parameters (an attribute namespace or a dict)."""

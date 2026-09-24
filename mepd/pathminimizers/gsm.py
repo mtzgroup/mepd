@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from mepd.chain import Chain
-from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
+from mepd.elementarystep import IS_ELEM_STEP, elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 
@@ -27,7 +27,7 @@ class GSMHelperError(ElectronicStructureError):
     this is never caught by the RESTART -> native-growth fallback."""
 from mepd.inputs import RunInputs
 from mepd.pathminimizers.pathminimizer import PathMinimizer
-from mepd.progress import get_progress_printer
+from mepd.progress import log_at_level
 
 # Same magic numbers the C++ ASE driver (GSM/ase.cpp) uses to convert between
 # its internal eV/Angstrom-ish bookkeeping and Hartree -- match them exactly
@@ -35,13 +35,6 @@ from mepd.progress import get_progress_printer
 _HARTREE_TO_EV = 27.2114
 _KCAL_PER_HARTREE = 627.5
 
-IS_ELEM_STEP = ElemStepResults(
-    is_elem_step=True,
-    is_concave=True,
-    splitting_criterion=None,
-    minimization_results=None,
-    number_grad_calls=0,
-)
 
 # `./grad.py <endstr> <ncpu> <charge>` is what the compiled `gsm` binary
 # (built with -DGSM_ENABLE_ASE=1) actually shells out to, once per node
@@ -300,16 +293,7 @@ class GSM(PathMinimizer):
     def _log(self, *parts, level: str = "info", verbose: int = 1):
         if getattr(self.parameters, "verbosity", 1) < verbose:
             return
-        message = " ".join(str(p) for p in parts)
-        printer = get_progress_printer()
-        if level == "warning":
-            printer.print_warning(message)
-        elif level == "error":
-            printer.print_error(message)
-        elif level == "success":
-            printer.print_convergence(message)
-        else:
-            printer.update_status(message)
+        log_at_level(" ".join(str(p) for p in parts), level)
 
     def _resolve_executable(self) -> str:
         executable = getattr(self.parameters, "executable", None)

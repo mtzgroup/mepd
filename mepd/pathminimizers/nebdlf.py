@@ -10,7 +10,7 @@ from qcdata import FileInput, Structure
 
 from mepd.chain import Chain
 from qcconst.constants import ANGSTROM_TO_BOHR
-from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
+from mepd.elementarystep import IS_ELEM_STEP, elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.qccompute import QCComputeEngine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
@@ -18,13 +18,6 @@ from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.progress import print_persistent, update_status
 
 
-IS_ELEM_STEP = ElemStepResults(
-    is_elem_step=True,
-    is_concave=True,
-    splitting_criterion=None,
-    minimization_results=None,
-    number_grad_calls=0,
-)
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:
@@ -110,25 +103,6 @@ def _parse_xyz_structures(
     return structures
 
 
-def _extract_output_files(output: Any) -> dict[str, Any]:
-    for files_obj in (
-        getattr(output, "files", None),
-        getattr(getattr(output, "results", None), "files", None),
-        getattr(getattr(output, "data", None), "files", None),
-    ):
-        if not files_obj:
-            continue
-        if isinstance(files_obj, dict):
-            return dict(files_obj)
-        if hasattr(files_obj, "items"):
-            return dict(files_obj.items())
-        if hasattr(files_obj, "model_dump"):
-            dumped = files_obj.model_dump()
-            if isinstance(dumped, dict):
-                return dumped
-        with contextlib.suppress(Exception):
-            return dict(files_obj)
-    return {}
 
 
 def _decode_text(value: Any) -> str:
@@ -529,7 +503,7 @@ class DLFindNEB(PathMinimizer):
         )
 
     def _chain_from_output(self, output: Any, chain: Chain) -> tuple[Chain, list[Chain]]:
-        files = _extract_output_files(output)
+        files = QCComputeEngine._extract_output_files(output)
         path_xyz = _find_file_text(
             files,
             "scr/nebpath.xyz",
