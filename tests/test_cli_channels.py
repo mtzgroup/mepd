@@ -347,7 +347,7 @@ def test_channels_rejects_negative_pairs_per_mechanism(tmp_path):
 def test_completed_tree_dirs_skips_a_tree_whose_root_failed(tmp_path):
     """A pair whose first NEB failed leaves adj_matrix.txt plus
     node_0_failed.xyz; it must not reach network construction."""
-    import mepd.cli as cli_module
+    import mepd.cli_common as cli_module
 
     good = tmp_path / "pair_0_1" / "tree"
     bad = tmp_path / "pair_0_2" / "tree"
@@ -412,7 +412,7 @@ def test_connectivity_matches_tells_cis_from_trans_cyclohexene():
     trans-cyclohexene used to count as the same molecule, and an
     antarafacial Diels-Alder TS to trans-cyclohexene was classified as a
     channel to ordinary cyclohexene."""
-    import mepd.cli as cli_module
+    import mepd.cli_common as cli_module
 
     cis = _node_from_atoms(_CIS_CYCLOHEXENE)
     trans = _node_from_atoms(_TRANS_CYCLOHEXENE)
@@ -425,7 +425,7 @@ def test_connectivity_matches_tells_cis_from_trans_cyclohexene():
 
 
 def test_fork_map_matches_serial_map():
-    from mepd.cli import _fork_map
+    from mepd.cli_common import _fork_map
 
     offset = 7  # closed over, reaches the children through fork
     assert _fork_map(lambda x: x * x + offset, list(range(6)), 3) == [x * x + offset for x in range(6)]
@@ -502,7 +502,7 @@ def _molecule_node(smiles: str, seed: int = 1) -> StructureNode:
 
 
 def test_connectivity_matches_ignores_conformer_but_not_molecule():
-    import mepd.cli as cli_module
+    import mepd.cli_common as cli_module
 
     butane_a = _molecule_node("CCCC", seed=1)
     butane_b = _molecule_node("CCCC", seed=2)  # different conformer, same molecule
@@ -513,7 +513,7 @@ def test_connectivity_matches_ignores_conformer_but_not_molecule():
 
 
 def test_cluster_by_ts_identity_separates_distinct_ts_geometries():
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     run_inputs = RunInputs()
     ts_a = _molecule_node("CCCC", seed=1)
@@ -534,7 +534,7 @@ def test_cluster_by_ts_identity_merges_relabeled_and_mirrored_copies():
     relabeled, and mirror-image conformer pairs hand back its mirror image;
     both are the same saddle point and must land in one class, while a
     same-graph TS at a different energy must not."""
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
     from mepd.conformers import mirror_image
 
     run_inputs = RunInputs()
@@ -605,7 +605,7 @@ def _write_fake_pair_tree(output, pair_name: str) -> None:
 
 
 def test_discover_channels_classifies_channel_vs_offtarget_exit(tmp_path, monkeypatch):
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     output = tmp_path / "out"
     _write_fake_pair_tree(output, "pair_0_1")
@@ -669,7 +669,7 @@ def test_discover_channels_chains_steps_into_multistep_alternate_channel(tmp_pat
     Everything here is C5H12 or its cracking products, so that each IRC is
     a well-formed equal-atom-count chain; what the classifier actually keys
     on is which IRC endpoints fall into the same connectivity class."""
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     output = tmp_path / "out"
     _write_fake_pair_tree(output, "pair_0_1")
@@ -745,7 +745,7 @@ def test_alternate_channel_keeps_every_distinct_ts_for_a_leg(tmp_path, monkeypat
     mechanisms for that step. The cheaper one defines the route, but the
     other must survive next to it instead of being silently dropped -- it is
     neither off-target (it is on the route) nor a duplicate."""
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     output = tmp_path / "out"
     for pair in ("pair_0_1", "pair_2_3", "pair_6_7"):
@@ -800,7 +800,7 @@ def test_alternate_channel_keeps_every_distinct_ts_for_a_leg(tmp_path, monkeypat
 
 
 def test_discover_channels_resumes_from_disk_without_recomputing(tmp_path, monkeypatch):
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     output = tmp_path / "out"
     _write_fake_pair_tree(output, "pair_0_1")
@@ -836,7 +836,7 @@ def test_discover_channels_resumes_from_disk_without_recomputing(tmp_path, monke
 def test_channels_wires_atom_mapping_flags_into_run_inputs(tmp_path, monkeypatch):
     _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
 
-    import mepd.cli as cli_module
+    import mepd.cli_channels as cli_module
 
     seen_run_inputs = []
     real_check = cli_module._check_endpoint_atom_mapping
