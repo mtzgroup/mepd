@@ -118,7 +118,6 @@ class TreeNode:
 
     @property
     def adj_matrix(self):
-        # mat = np.zeros((self.total_nodes, self.total_nodes))
         mat = np.zeros((self.max_index + 1, self.max_index + 1))
         mat = self._update_adj_matrix(matrix=mat, node=self)
 

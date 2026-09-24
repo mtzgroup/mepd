@@ -35,7 +35,6 @@ except ImportError:
 
 
 SLOPE_THRESH = 0.1
-# SLOPE_THRESH = 20
 
 
 def _get_ts_neighbor_pair_indices(chain: Chain) -> tuple[int, int] | None:
@@ -1333,14 +1332,10 @@ def _converges_to_an_endpoints(
         slopes_to_ref2 = distances[-1][1] - distances[0][1]
         if np.isclose(distances[-1][1], 0, atol=0.001, rtol=0.001):
             slopes_to_ref2 = np.inf
-        # print("slope1", slopes_to_ref1, "slope2", slopes_to_ref2)
 
         slope1_conv = abs(slopes_to_ref1) / slope_thresh > 1
         slope2_conv = abs(slopes_to_ref2) / slope_thresh > 1
 
-        # print(f"{slope1_conv=} {slope2_conv=}")
-        # slope1_conv = 1
-        # slope2_conv = 1
 
         done = slope1_conv and slope2_conv
         if len(total_traj) - 1 >= max_grad_calls and not done:
@@ -1405,7 +1400,6 @@ def _run_geom_opt(node: Node, engine: Engine):
             )
         )
     # except AttributeError:
-    #     opt_traj = engine.steepest_descent(node, max_steps=500, ss=0.001)
 
     return opt_traj
 
@@ -1468,7 +1462,6 @@ def _chain_is_concave(
         minimas_is_r_or_p = []
         try:
             for i in ind_minima:
-                # print("chemcloud" not in engine.engine_name.lower(), engine.engine_name.lower())
                 compute_program = str(
                     getattr(engine, "compute_program", "") or ""
                 ).lower()
@@ -1494,7 +1487,6 @@ def _chain_is_concave(
 
                     slope1_conv = abs(slopes_to_ref1) / min_slope_thre > 1
                     slope2_conv = abs(slopes_to_ref2) / min_slope_thre > 1
-                    # print(f"{slope1_conv=} {slope2_conv=}")
 
                     done = slope1_conv and slope2_conv
                 else:
@@ -1597,8 +1589,6 @@ def _chain_is_concave(
                 rejected_minimization_results=rejected_opt_results,
             )
         else:
-            # assert len(
-            #     opt_results) > 0, "chain is not elementary step but minima were not stored"
             return ConcavityResults(
                 is_concave=False,
                 minimization_results=opt_results,

@@ -51,8 +51,6 @@ def _check_springgrad_converged(spring_forces: NDArray, threshold: float) -> Tup
             grad_norms_components.append(0.0)
             bools.append(True)
             continue
-        # grad_norm = np.dot(grad.flatten(), grad.flatten()) / N
-        # grad_norms_components.append(grad_norm)
         grad_norm = np.amax(np.abs(grad))
         grad_norms_components.append(grad_norm)
         bools.append(grad_norm < threshold)
@@ -151,7 +149,6 @@ def chain_converged(
     ind_ts_node = chain_new.energies.argmax()
     # never freeze TS node
     converged_nodes_indices = converged_nodes_indices[converged_nodes_indices != ind_ts_node]
-    # print(f"{len(converged_nodes_indices)}=")
     if chain_new.parameters.node_freezing:
         _update_node_convergence(
             chain=chain_new, indices=converged_nodes_indices, prev_chain=chain_prev)
@@ -255,7 +252,6 @@ def _update_node_convergence(chain: Chain, indices: np.array, prev_chain: Chain)
     for i, (node, prev_node) in enumerate(zip(chain, prev_chain)):
         if i in indices or i in endpoints_indices:
             if prev_node._cached_gradient is not None:
-                # print(f"node{i} is frozen with _cached res: {prev_node._cached_result}")
                 node.converged = True
                 node._cached_gradient = prev_node._cached_gradient
                 node._cached_energy = prev_node._cached_energy

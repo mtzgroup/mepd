@@ -257,7 +257,6 @@ class Engine(ABC):
         grad_thre: float = 1e-4,
         mass_weighted: bool = False,
     ) -> list[Node]:
-        # print("************\n\n\n\nRUNNING STEEPEST DESCENT\n\n\n\nn***********")
         history = []
         last_node = node.copy()
         # make sure the node isn't frozen so it returns a gradient
@@ -287,7 +286,6 @@ class Engine(ABC):
                                 for atom, mass in zip(grad, masses)])
 
             grad_mag = np.linalg.norm(grad) / np.sqrt(natom)
-            # print(f"Step {curr_step}: Gradient magnitude {grad_mag:.4e}")
             if grad_mag > ss:
                 logging.getLogger(__name__).debug(
                     "Step %s: gradient magnitude %.4e greater than step size %.4e; scaling step.",

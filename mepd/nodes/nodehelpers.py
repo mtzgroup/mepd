@@ -520,7 +520,6 @@ def _is_connectivity_identical(
     checks graphs of both nodes and returns whether they are isomorphic
     to each other.
     """
-    # print("different graphs")
     connectivity_identical = self.graph.remove_Hs().is_bond_isomorphic_to(
         other.graph.remove_Hs()
     )

@@ -735,7 +735,6 @@ class RunInputs:
         with open(fp, 'rb') as f:
             data = tomli.load(f)
 
-        # data_dict = json.loads(data)
         obj = cls(**data)
         if hasattr(obj.program_kwds, 'files') and obj.program_kwds.files is not None:
             file_keys = obj.program_kwds.files.keys()

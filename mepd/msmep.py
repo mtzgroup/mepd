@@ -8,7 +8,6 @@ import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-import sys
 import numpy as np
 from mepd.helper_functions import pairwise
 from typing import Any, Tuple, List
@@ -81,61 +80,6 @@ def _empty_leaf(index: int, status: str) -> TreeNode:
     node = TreeNode(data=None, children=[], index=index)
     setattr(node, "leaf_status", status)
     return node
-
-
-def _run_recursive_step_with_optional_depth(
-    runner: Any,
-    *,
-    input_chain: Chain,
-    tree_node_index: int,
-    tree_depth: int,
-    max_depth: int | None,
-) -> tuple[TreeNode, list[Chain]]:
-    try:
-        return runner._run_recursive_step(
-            input_chain=input_chain,
-            tree_node_index=tree_node_index,
-            tree_depth=tree_depth,
-            max_depth=max_depth,
-        )
-    except TypeError as exc:
-        msg = str(exc)
-        if "tree_depth" not in msg and "max_depth" not in msg:
-            raise
-        return runner._run_recursive_step(
-            input_chain=input_chain,
-            tree_node_index=tree_node_index,
-        )
-
-
-def _call_parallel_recursive_step_worker(
-    worker_fn: Any,
-    run_inputs: RunInputs,
-    input_chain: Chain,
-    tree_node_index: int,
-    tree_depth: int,
-    max_depth: int | None,
-    attempted_pairs_payload: list[dict[str, Any]],
-) -> tuple[TreeNode, list[Chain]]:
-    try:
-        return worker_fn(
-            run_inputs,
-            input_chain,
-            tree_node_index,
-            tree_depth,
-            max_depth,
-            attempted_pairs_payload,
-        )
-    except TypeError as exc:
-        msg = str(exc)
-        if "positional" not in msg and "argument" not in msg:
-            raise
-        return worker_fn(
-            run_inputs,
-            input_chain,
-            tree_node_index,
-            attempted_pairs_payload,
-        )
 
 
 def _failed_leaf(
@@ -609,6 +553,16 @@ class MSMEP:
     def _endpoint_connectivity_status(self, chain: Chain) -> str:
         return "Checking endpoint connectivity"
 
+    def _say(self, msg: str, *, snapshot: bool = False, warn: bool = False) -> None:
+        """Print `msg` in verbose mode; otherwise show it as the live status
+        line, or keep it in the scrollback (`snapshot`)."""
+        if _get_verbose(self.inputs):
+            print(f"Warning! {msg}" if warn else msg, flush=True)
+        elif snapshot:
+            preserve_chain_snapshot(note=msg)
+        else:
+            update_status(msg)
+
     def run_recursive_minimize(
         self,
         input_chain: Chain,
@@ -635,201 +589,54 @@ class MSMEP:
                 {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
         if attempted_pairs_payload is not None:
             self._set_attempted_pairs_payload(attempted_pairs_payload)
-        resolved_max_depth = self._resolve_recursive_split_max_depth(max_depth)
-        self._disable_molecular_graphs(input_chain)
-        if self._skip_chain_due_to_attempted_history(input_chain):
-            msg = "Endpoints already attempted elsewhere. Skipping chain."
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
-            return _empty_leaf(tree_node_index, status="attempted_elsewhere")
-
-        if getattr(self.inputs.path_min_inputs, "skip_identical_graphs", True) and input_chain[0].has_molecular_graph:
-            if not _get_verbose(self.inputs):
-                update_status(self._endpoint_connectivity_status(input_chain))
-            if _is_connectivity_identical(
-                input_chain[0],
-                input_chain[-1],
-                verbose=_get_verbose(self.inputs),
-                disregard_stereochem=_disregard_stereochem(self.inputs),
-            ):
-                msg = "Endpoints are identical. Returning nothing"
-                if _get_verbose(self.inputs):
-                    print(msg)
-                else:
-                    update_status(msg)
-                return _empty_leaf(tree_node_index, status="identical_endpoints")
-
+        max_depth = self._resolve_recursive_split_max_depth(max_depth)
         try:
-            ch._reset_node_convergence(input_chain)
-            self.inputs.engine.compute_gradients(input_chain)
-
-            if is_identical(
-                self=input_chain[0],
-                other=input_chain[-1],
-                fragment_rmsd_cutoff=self.inputs.chain_inputs.node_rms_thre,
-                kcal_mol_cutoff=self.inputs.chain_inputs.node_ene_thre,
-                verbose=False,
-                disregard_stereochem=_disregard_stereochem(self.inputs),
-            ):
-                msg = "Endpoints are identical. Returning nothing"
-                if _get_verbose(self.inputs):
-                    print(msg)
-                else:
-                    update_status(msg)
-                return _empty_leaf(tree_node_index, status="identical_endpoints")
-
-            attempt_payload = self._record_attempted_pair(input_chain)
-            root_neb_obj, elem_step_results = self.run_minimize_chain(
-                input_chain=input_chain
+            history, sequence_of_chains = self._run_recursive_step(
+                input_chain, tree_node_index, tree_depth=tree_depth, max_depth=max_depth
             )
-            self._mark_attempted_pair_result(
-                attempt_payload, root_neb_obj, elem_step_results
-            )
-            history = TreeNode(data=root_neb_obj, children=[], index=tree_node_index)
-
-            if elem_step_results.is_elem_step:
-                return history
-
-            same_pair_split_count = self._consecutive_same_pair_split_count(
-                input_chain
-            )
-            same_pair_split_limit = self._resolve_same_pair_split_limit()
-            setattr(
-                history,
-                "consecutive_same_pair_splits",
-                int(same_pair_split_count),
-            )
-            if attempt_payload is not None:
-                attempt_payload["consecutive_same_pair_splits"] = int(
-                    same_pair_split_count
-                )
-            if same_pair_split_count >= same_pair_split_limit and not elem_step_results.new_structures:
-                # Only enforce the stop when this attempt itself found nothing
-                # chemically new (genuinely unproductive repetition) -- a
-                # split that DID discover a new molecule/conformer this
-                # generation is real progress and must not be discarded just
-                # because prior generations repeated the same pair.
-                msg = self._same_pair_split_limit_message(same_pair_split_count)
-                if _get_verbose(self.inputs):
-                    print(f"Warning! {msg}")
-                else:
-                    preserve_chain_snapshot(note=msg)
-                setattr(history, "leaf_status", "same_pair_split_limit_reached")
-                setattr(
-                    history,
-                    "consecutive_same_pair_splits",
-                    int(same_pair_split_count),
-                )
-                return history
-
-            if resolved_max_depth is not None and tree_depth >= resolved_max_depth:
-                setattr(history, "leaf_status", "max_depth_reached")
-                return history
-
-            msg = f"Splitting chains based on: {elem_step_results.splitting_criterion}"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                preserve_chain_snapshot(note=msg)
-
-            # the last chain in the minimization
-            chain = root_neb_obj.chain_trajectory[-1]
-            sequence_of_chains = self.make_sequence_of_chains(
-                chain=chain,
-                split_method=elem_step_results.splitting_criterion,
-                minimization_results=elem_step_results.minimization_results,
-            )
-            self._set_child_same_pair_split_lineage(
-                sequence_of_chains,
-                input_chain,
-                same_pair_split_count + 1,
-            )
-            setattr(
-                history,
-                "consecutive_same_pair_splits",
-                int(same_pair_split_count + 1),
-            )
-            if attempt_payload is not None:
-                attempt_payload["consecutive_same_pair_splits"] = int(
-                    same_pair_split_count + 1
-                )
-
-            new_tree_node_index = tree_node_index + 1
-            for i, chain_frag in enumerate(sequence_of_chains, start=1):
-                msg = f"On chain {i} of {len(sequence_of_chains)}..."
-                if _get_verbose(self.inputs):
-                    print(msg)
-                else:
-                    update_status(msg)
-                try:
-                    out_history = self.run_recursive_minimize(
-                        chain_frag,
-                        tree_node_index=new_tree_node_index,
-                        tree_depth=tree_depth + 1,
-                        max_depth=resolved_max_depth,
-                    )
-                except Exception as child_exc:
-                    if _get_verbose(self.inputs):
-                        print(traceback.format_exc())
-                        print(
-                            f"Warning! Recursive branch {new_tree_node_index} failed "
-                            f"({type(child_exc).__name__}: {child_exc}). Continuing."
-                        )
-                    else:
-                        update_status(
-                            f"Branch {new_tree_node_index} failed; continuing recursive search."
-                        )
-                    out_history = _failed_leaf(
-                        new_tree_node_index,
-                        status="path_minimization_error",
-                        exc=child_exc,
-                        chain=chain_frag,
-                    )
-
-                history.children.append(out_history)
-
-                # increment the node indices
-                new_tree_node_index = out_history.max_index + 1
-            return history
-
         except ElectronicStructureError as e:
-            msg = (
+            self._say(
                 f"Electronic structure error in recursive branch {tree_node_index}: "
                 f"{format_exception_message(e)}"
             )
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
             obj = getattr(e, "obj", None)
             if hasattr(obj, "save"):
                 with contextlib.suppress(Exception):
                     obj.save("/tmp/failed_output.qcio")
             return _failed_leaf(
-                tree_node_index,
-                status="electronic_structure_error",
-                exc=e,
-                chain=input_chain,
+                tree_node_index, status="electronic_structure_error", exc=e, chain=input_chain
             )
         except Exception as e:
-            if _get_verbose(self.inputs):
-                print(traceback.format_exc())
-                print(
-                    f"Warning! Recursive branch {tree_node_index} failed "
-                    f"({type(e).__name__}: {e}). Continuing."
+            return self._branch_failed(tree_node_index, e, input_chain)
+
+        new_tree_node_index = tree_node_index + 1
+        for i, chain_frag in enumerate(sequence_of_chains, start=1):
+            self._say(f"On chain {i} of {len(sequence_of_chains)}...")
+            try:
+                out_history = self.run_recursive_minimize(
+                    chain_frag,
+                    tree_node_index=new_tree_node_index,
+                    tree_depth=tree_depth + 1,
+                    max_depth=max_depth,
                 )
-            else:
-                update_status(
-                    f"Branch {tree_node_index} failed with {type(e).__name__}; continuing recursive search."
-                )
-            return _failed_leaf(
-                tree_node_index,
-                status="path_minimization_error",
-                exc=e,
-                chain=input_chain,
+            except Exception as child_exc:
+                out_history = self._branch_failed(new_tree_node_index, child_exc, chain_frag)
+            history.children.append(out_history)
+            new_tree_node_index = out_history.max_index + 1
+        return history
+
+    def _branch_failed(self, index: int, exc: Exception, chain: Chain) -> TreeNode:
+        if _get_verbose(self.inputs):
+            print(traceback.format_exc())
+            print(
+                f"Warning! Recursive branch {index} failed "
+                f"({type(exc).__name__}: {exc}). Continuing."
             )
+        else:
+            update_status(
+                f"Branch {index} failed with {type(exc).__name__}; continuing recursive search."
+            )
+        return _failed_leaf(index, status="path_minimization_error", exc=exc, chain=chain)
 
     def _run_recursive_step(
         self,
@@ -845,8 +652,10 @@ class MSMEP:
         resolved_max_depth = self._resolve_recursive_split_max_depth(max_depth)
         self._disable_molecular_graphs(input_chain)
         if self._skip_chain_due_to_attempted_history(input_chain):
+            self._say("Endpoints already attempted elsewhere. Skipping chain.")
             return _empty_leaf(tree_node_index, status="attempted_elsewhere"), []
 
+        identical_msg = "Endpoints are identical. Returning nothing"
         if getattr(self.inputs.path_min_inputs, "skip_identical_graphs", True) and input_chain[0].has_molecular_graph:
             if not _get_verbose(self.inputs):
                 update_status(self._endpoint_connectivity_status(input_chain))
@@ -856,6 +665,7 @@ class MSMEP:
                 verbose=_get_verbose(self.inputs),
                 disregard_stereochem=_disregard_stereochem(self.inputs),
             ):
+                self._say(identical_msg)
                 return _empty_leaf(tree_node_index, status="identical_endpoints"), []
 
         ch._reset_node_convergence(input_chain)
@@ -869,6 +679,7 @@ class MSMEP:
             verbose=False,
             disregard_stereochem=_disregard_stereochem(self.inputs),
         ):
+            self._say(identical_msg)
             return _empty_leaf(tree_node_index, status="identical_endpoints"), []
 
         attempt_payload = self._record_attempted_pair(input_chain)
@@ -883,60 +694,49 @@ class MSMEP:
         if elem_step_results.is_elem_step:
             return history_node, []
 
+        def _record_split_count(n: int) -> None:
+            history_node.consecutive_same_pair_splits = int(n)
+            if attempt_payload is not None:
+                attempt_payload["consecutive_same_pair_splits"] = int(n)
+
         same_pair_split_count = self._consecutive_same_pair_split_count(input_chain)
-        same_pair_split_limit = self._resolve_same_pair_split_limit()
-        setattr(
-            history_node,
-            "consecutive_same_pair_splits",
-            int(same_pair_split_count),
-        )
-        if attempt_payload is not None:
-            attempt_payload["consecutive_same_pair_splits"] = int(
-                same_pair_split_count
+        _record_split_count(same_pair_split_count)
+        if (
+            same_pair_split_count >= self._resolve_same_pair_split_limit()
+            and not elem_step_results.new_structures
+        ):
+            # Only enforce the stop when this attempt itself found nothing
+            # chemically new (genuinely unproductive repetition) -- a split
+            # that DID discover a new molecule/conformer this generation is
+            # real progress and must not be discarded just because prior
+            # generations repeated the same pair.
+            self._say(
+                self._same_pair_split_limit_message(same_pair_split_count),
+                snapshot=True, warn=True,
             )
-        if same_pair_split_count >= same_pair_split_limit and not elem_step_results.new_structures:
-            # See the identical guard in run_recursive_minimize: only enforce
-            # the stop when this attempt itself found nothing chemically new.
-            msg = self._same_pair_split_limit_message(same_pair_split_count)
-            if _get_verbose(self.inputs):
-                print(f"Warning! {msg}")
-            else:
-                preserve_chain_snapshot(note=msg)
-            setattr(history_node, "leaf_status", "same_pair_split_limit_reached")
-            setattr(
-                history_node,
-                "consecutive_same_pair_splits",
-                int(same_pair_split_count),
-            )
+            history_node.leaf_status = "same_pair_split_limit_reached"
             return history_node, []
 
         if resolved_max_depth is not None and tree_depth >= resolved_max_depth:
-            setattr(history_node, "leaf_status", "max_depth_reached")
+            history_node.leaf_status = "max_depth_reached"
             return history_node, []
 
         chain_trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
         if not chain_trajectory:
             return history_node, []
-        split_chain = chain_trajectory[-1]
+        self._say(
+            f"Splitting chains based on: {elem_step_results.splitting_criterion}",
+            snapshot=True,
+        )
         sequence_of_chains = self.make_sequence_of_chains(
-            chain=split_chain,
+            chain=chain_trajectory[-1],
             split_method=elem_step_results.splitting_criterion,
             minimization_results=elem_step_results.minimization_results,
         )
         self._set_child_same_pair_split_lineage(
-            sequence_of_chains,
-            input_chain,
-            same_pair_split_count + 1,
+            sequence_of_chains, input_chain, same_pair_split_count + 1
         )
-        setattr(
-            history_node,
-            "consecutive_same_pair_splits",
-            int(same_pair_split_count + 1),
-        )
-        if attempt_payload is not None:
-            attempt_payload["consecutive_same_pair_splits"] = int(
-                same_pair_split_count + 1
-            )
+        _record_split_count(same_pair_split_count + 1)
         return history_node, sequence_of_chains
 
     def run_parallel_recursive_minimize(
@@ -950,9 +750,8 @@ class MSMEP:
         if attempted_pairs_payload is not None:
             self._set_attempted_pairs_payload(attempted_pairs_payload)
         resolved_max_depth = self._resolve_recursive_split_max_depth()
-        cpu_cap = max(1, int(os.cpu_count() or 1))
         if max_workers is None:
-            bounded_workers = min(4, cpu_cap)
+            bounded_workers = min(4, max(1, int(os.cpu_count() or 1)))
         else:
             # Honor explicit user-requested parallelism. `os.cpu_count()` can
             # under-report available capacity in constrained launch contexts.
@@ -961,32 +760,19 @@ class MSMEP:
         progress_printer = get_progress_printer()
         progress_printer.clear_path_so_far()
         with progress_monitor(f"branch-{int(tree_node_index)}"):
-            root_history, root_children = _run_recursive_step_with_optional_depth(
-                self,
+            root_history, root_children = self._run_recursive_step(
                 input_chain=input_chain,
                 tree_node_index=tree_node_index,
                 tree_depth=0,
                 max_depth=resolved_max_depth,
             )
         if not root_children:
-            setattr(root_history, "parallel_failures", [])
+            root_history.parallel_failures = []
             return root_history
 
         next_tree_index = tree_node_index + 1
         completed_leaf_chains_by_index: dict[int, Chain] = {}
-        pending: dict[
-            concurrent.futures.Future, tuple[
-                TreeNode,
-                int,
-                int,
-                int,
-                Chain,
-                int,
-                float,
-                list[dict[str, Any]],
-                dict[str, Any] | None,
-            ]
-        ] = {}
+        pending: dict[concurrent.futures.Future, SimpleNamespace] = {}
         branch_failures: list[str] = []
         max_worker_attempts = 2
         engine_name = str(getattr(self.inputs, "engine_name", "") or "").strip().lower()
@@ -997,29 +783,42 @@ class MSMEP:
         run_inputs_payload = (
             _run_inputs_payload_for_worker(self.inputs) if use_process_workers else None
         )
+        set_status = getattr(progress_printer, "set_monitor_status", None)
+
+        def _submit(executor: concurrent.futures.Executor, job: SimpleNamespace) -> None:
+            job.submitted_at = time.time()
+            if use_process_workers:
+                future = executor.submit(
+                    _parallel_recursive_step_worker_from_payload,
+                    run_inputs_payload, _chain_payload_for_worker(job.chain),
+                    job.index, job.depth, resolved_max_depth, job.worker_payload,
+                )
+            else:
+                future = executor.submit(
+                    _parallel_recursive_step_worker,
+                    self.inputs, job.chain,
+                    job.index, job.depth, resolved_max_depth, job.worker_payload,
+                )
+            pending[future] = job
 
         def _submit_children(
             executor: concurrent.futures.Executor,
             parent_node: TreeNode,
             child_fragments: list[Chain],
             parent_depth: int,
-            attempt: int = 1,
         ) -> None:
             nonlocal next_tree_index
             parent_node.children = [None] * len(child_fragments)
+            child_depth = parent_depth + 1
             for child_position, child_chain in enumerate(child_fragments):
-                child_depth = parent_depth + 1
-                if resolved_max_depth is not None and child_depth > resolved_max_depth:
-                    parent_node.children[child_position] = _empty_leaf(
-                        next_tree_index, status="max_depth_reached"
-                    )
-                    next_tree_index += 1
-                    continue
                 child_index = next_tree_index
                 next_tree_index += 1
-                worker_attempted_payload = copy.deepcopy(
-                    self._get_attempted_pairs_payload()
-                )
+                if resolved_max_depth is not None and child_depth > resolved_max_depth:
+                    parent_node.children[child_position] = _empty_leaf(
+                        child_index, status="max_depth_reached"
+                    )
+                    continue
+                worker_payload = copy.deepcopy(self._get_attempted_pairs_payload())
                 if self._skip_chain_due_to_attempted_history(child_chain):
                     parent_node.children[child_position] = _empty_leaf(
                         child_index, status="attempted_elsewhere"
@@ -1027,55 +826,23 @@ class MSMEP:
                     continue
                 attempt_payload = self._record_attempted_pair(child_chain)
                 progress_printer.mark_monitor_active(f"branch-{child_index}")
-                if hasattr(progress_printer, "set_monitor_status"):
-                    progress_printer.set_monitor_status(
+                if set_status:
+                    set_status(
                         f"branch-{child_index}",
-                        "Running in worker process"
-                        if use_process_workers
-                        else "Running",
+                        "Running in worker process" if use_process_workers else "Running",
                     )
-                if use_process_workers:
-                    child_payload = _chain_payload_for_worker(child_chain)
-                    future = executor.submit(
-                        _parallel_recursive_step_worker_from_payload,
-                        run_inputs_payload,
-                        child_payload,
-                        child_index,
-                        child_depth,
-                        resolved_max_depth,
-                        worker_attempted_payload,
-                    )
-                else:
-                    future = executor.submit(
-                        _call_parallel_recursive_step_worker,
-                        _parallel_recursive_step_worker,
-                        self.inputs,
-                        child_chain,
-                        child_index,
-                        child_depth,
-                        resolved_max_depth,
-                        worker_attempted_payload,
-                    )
-                pending[future] = (
-                    parent_node,
-                    child_position,
-                    child_index,
-                    child_depth,
-                    child_chain,
-                    int(attempt),
-                    time.time(),
-                    worker_attempted_payload,
-                    attempt_payload,
-                )
+                _submit(executor, SimpleNamespace(
+                    parent=parent_node, position=child_position, index=child_index,
+                    depth=child_depth, chain=child_chain, attempt=1,
+                    worker_payload=worker_payload, attempt_payload=attempt_payload,
+                ))
 
         executor_cls = (
             concurrent.futures.ProcessPoolExecutor
             if use_process_workers
             else concurrent.futures.ThreadPoolExecutor
         )
-        with executor_cls(
-            max_workers=bounded_workers
-        ) as executor:
+        with executor_cls(max_workers=bounded_workers) as executor:
             _submit_children(executor, root_history, root_children, parent_depth=0)
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -1084,170 +851,77 @@ class MSMEP:
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 if not done:
-                    if use_process_workers and hasattr(progress_printer, "set_monitor_status"):
+                    if use_process_workers and set_status:
                         now = time.time()
-                        for (
-                            _parent_node,
-                            _child_position,
-                            child_index,
-                            child_depth,
-                            _child_chain,
-                            attempt,
-                            submitted_at,
-                            _worker_attempted_payload,
-                            _attempt_payload,
-                        ) in pending.values():
-                            elapsed = max(0, int(now - float(submitted_at)))
-                            progress_printer.set_monitor_status(
-                                f"branch-{child_index}",
-                                f"Running in worker process (attempt {attempt}/{max_worker_attempts}, {elapsed}s)",
+                        for job in pending.values():
+                            elapsed = max(0, int(now - job.submitted_at))
+                            set_status(
+                                f"branch-{job.index}",
+                                f"Running in worker process (attempt {job.attempt}/{max_worker_attempts}, {elapsed}s)",
                             )
                     continue
                 for future in done:
-                    (
-                        parent_node,
-                        child_position,
-                        child_index,
-                        child_depth,
-                        child_chain,
-                        attempt,
-                        _submitted_at,
-                        worker_attempted_payload,
-                        attempt_payload,
-                    ) = pending.pop(
-                        future
-                    )
+                    job = pending.pop(future)
                     try:
                         child_history, child_children = future.result()
                     except Exception as worker_exc:
                         worker_trace = traceback.format_exc().strip()
-                        if attempt < max_worker_attempts:
-                            retry_attempt = attempt + 1
-                            if hasattr(progress_printer, "set_monitor_status"):
-                                progress_printer.set_monitor_status(
-                                    f"branch-{child_index}",
-                                    f"Retrying (attempt {retry_attempt}/{max_worker_attempts})",
+                        if job.attempt < max_worker_attempts:
+                            job.attempt += 1
+                            if set_status:
+                                set_status(
+                                    f"branch-{job.index}",
+                                    f"Retrying (attempt {job.attempt}/{max_worker_attempts})",
                                 )
-                            if use_process_workers:
-                                retry_payload = _chain_payload_for_worker(child_chain)
-                                retry_future = executor.submit(
-                                    _parallel_recursive_step_worker_from_payload,
-                                    run_inputs_payload,
-                                    retry_payload,
-                                    child_index,
-                                    child_depth,
-                                    resolved_max_depth,
-                                    worker_attempted_payload,
-                                )
-                            else:
-                                retry_future = executor.submit(
-                                    _call_parallel_recursive_step_worker,
-                                    _parallel_recursive_step_worker,
-                                    self.inputs,
-                                    child_chain,
-                                    child_index,
-                                    child_depth,
-                                    resolved_max_depth,
-                                    worker_attempted_payload,
-                                )
-                            pending[retry_future] = (
-                                parent_node,
-                                child_position,
-                                child_index,
-                                child_depth,
-                                child_chain,
-                                retry_attempt,
-                                time.time(),
-                                worker_attempted_payload,
-                                attempt_payload,
-                            )
+                            _submit(executor, job)
                             continue
                         branch_failures.append(
-                            f"branch-{child_index}: worker failed after {attempt} attempt(s) "
+                            f"branch-{job.index}: worker failed after {job.attempt} attempt(s) "
                             f"({type(worker_exc).__name__}: {worker_exc})\n"
                             f"worker traceback:\n{worker_trace}"
                         )
                         child_history = _failed_leaf(
-                            child_index,
-                            status="worker_failure",
-                            exc=worker_exc,
-                            chain=child_chain,
+                            job.index, status="worker_failure", exc=worker_exc, chain=job.chain,
                         )
                         child_children = []
-                    parent_node.children[child_position] = child_history
-                    if child_children:
-                        self._mark_attempted_pair_result(
-                            attempt_payload,
-                            getattr(child_history, "data", None),
-                            SimpleNamespace(is_elem_step=False),
-                        )
-                    else:
-                        leaf_status = str(
-                            getattr(child_history, "leaf_status", "") or ""
-                        )
-                        is_elem_step = bool(getattr(child_history, "data", None)) and (
-                            leaf_status
-                            not in {
-                                "max_depth_reached",
-                                "same_pair_split_limit_reached",
-                            }
-                        )
-                        self._mark_attempted_pair_result(
-                            attempt_payload,
-                            getattr(child_history, "data", None),
-                            SimpleNamespace(is_elem_step=is_elem_step),
-                        )
-                    progress_printer.mark_monitor_inactive(f"branch-{child_index}")
-                    if not child_children:
-                        leaf_chain = _leaf_chain_from_tree_node(child_history)
-                        if leaf_chain is not None:
-                            completed_leaf_chains_by_index[child_index] = leaf_chain
-                            ordered_leaf_chains = [
-                                completed_leaf_chains_by_index[idx]
-                                for idx in sorted(completed_leaf_chains_by_index.keys())
-                            ]
-                            path_so_far = _concat_leaf_chains(
-                                ordered_leaf_chains, self.inputs.chain_inputs
-                            )
-                            progress_printer.update_path_so_far(
-                                path_so_far,
-                                caption=f"{len(ordered_leaf_chains)} completed branch(es)",
-                            )
+                    job.parent.children[job.position] = child_history
+                    leaf_status = str(getattr(child_history, "leaf_status", "") or "")
+                    is_elem_step = (
+                        not child_children
+                        and bool(getattr(child_history, "data", None))
+                        and leaf_status not in {"max_depth_reached", "same_pair_split_limit_reached"}
+                    )
+                    self._mark_attempted_pair_result(
+                        job.attempt_payload,
+                        getattr(child_history, "data", None),
+                        SimpleNamespace(is_elem_step=is_elem_step),
+                    )
+                    progress_printer.mark_monitor_inactive(f"branch-{job.index}")
                     if child_children:
                         _submit_children(
-                            executor,
-                            child_history,
-                            child_children,
-                            parent_depth=child_depth,
+                            executor, child_history, child_children, parent_depth=job.depth,
+                        )
+                        continue
+                    leaf_chain = _leaf_chain_from_tree_node(child_history)
+                    if leaf_chain is not None:
+                        completed_leaf_chains_by_index[job.index] = leaf_chain
+                        ordered_leaf_chains = [
+                            completed_leaf_chains_by_index[idx]
+                            for idx in sorted(completed_leaf_chains_by_index)
+                        ]
+                        progress_printer.update_path_so_far(
+                            _concat_leaf_chains(ordered_leaf_chains, self.inputs.chain_inputs),
+                            caption=f"{len(ordered_leaf_chains)} completed branch(es)",
                         )
 
-        setattr(root_history, "parallel_failures", branch_failures)
+        root_history.parallel_failures = branch_failures
         return root_history
 
     def _create_interpolation(self, chain: Chain):
         logger = logging.getLogger(
             'mepd.geodesic_interpolation2.interpolation')
         logger.propagate = False
-        # if chain.parameters.frozen_atom_indices:
-        #     chain_original = chain.copy()
-        #     all_indices = list(range(len(chain[0].coords)))
 
-        #     inds_frozen = np.array(
-        #         chain.parameters.frozen_atom_indices.split(), dtype=int
-        #     )
-        #     subsys_inds = np.setdiff1d(all_indices, inds_frozen)
-        #     subsys_coords = [node.coords[subsys_inds] for node in chain]
-
-        #     subsys_symbs = [chain[0].structure.symbols[i] for i in subsys_inds]
-        #     subsys_structs = [Structure(geometry=c, symbols=subsys_symbs,
-        #                                 charge=chain[0].structure.charge,
-        #                                 multiplicity=chain[0].structure.multiplicity) for c in subsys_coords]
-
-        #     subsys_nodes = [StructureNode(structure=s) for s in subsys_structs]
-
-        #     print(f"{all_indices=} {subsys_inds=} {inds_frozen=}")
-        #     chain = Chain.model_validate({
-        #         "nodes": subsys_nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
 
         if self.inputs.chain_inputs.use_geodesic_interpolation:
             if chain.parameters.frozen_atom_indices:
@@ -1288,31 +962,14 @@ class MSMEP:
             interpolation = Chain.model_validate({
                 "nodes": nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
 
-        # if chain.parameters.frozen_atom_indices:
-        #     # need to reinsert the frozen atoms into the interpolation
-        #     new_nodes = []
-        #     for node in interpolation:
-        #         new_geom = np.zeros_like(chain_original[0].coords)
-        #         new_geom[subsys_inds] = node.coords
-        #         new_geom[inds_frozen] = chain_original[0].coords[inds_frozen]
-        #         new_node = chain_original[0].update_coords(new_geom)
-        #         new_nodes.append(new_node)
 
-        #     interpolation = Chain.model_validate({
-        #         "nodes": new_nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
-        #     interpolation._zero_velocity()
         return interpolation
 
     def _construct_path_minimizer(self, initial_chain: Chain):
         path_method = _normalize_path_method(self.inputs.path_min_method)
         if path_method == "NEB":
 
-            msg = "Using in-house NEB optimizer"
-            if _get_verbose(self.inputs):
-                print(msg)
-                sys.stdout.flush()
-            else:
-                update_status(msg)
+            self._say("Using in-house NEB optimizer")
             optimizer = self._build_neb_optimizer()
 
             n = NEB(
@@ -1322,19 +979,9 @@ class MSMEP:
                 engine=self.inputs.engine,
             )
         # elif self.inputs.path_min_method.upper() == "PYGSM":
-        #     print("Using PYGSM optimizer")
-        #     n = PYGSM(
-        #         initial_chain=initial_chain,
-        #         engine=self.inputs.engine,
-        #         pygsm_kwds=self.inputs.path_min_inputs,
-        #     )
 
         elif path_method == "FNEB":
-            msg = "Using Freezing NEB optimizer"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
+            self._say("Using Freezing NEB optimizer")
             optimizer = self._build_neb_optimizer()
             n = FreezingNEB(
                 initial_chain=initial_chain,
@@ -1346,33 +993,21 @@ class MSMEP:
 
         elif path_method == "MLPGI":
             from mepd.pathminimizers.mlpgi import MLPGI
-            msg = "Using MLP Geodesic Optimizer"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
+            self._say("Using MLP Geodesic Optimizer")
             n = MLPGI(
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,
                 parameters=self.inputs.path_min_inputs,
             )
         elif path_method == "NEB-DLF":
-            msg = "Using DL-Find NEB optimizer via TeraChem/QCCompute"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
+            self._say("Using DL-Find NEB optimizer via TeraChem/QCCompute")
             n = DLFindNEB(
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,
                 parameters=self.inputs.path_min_inputs,
             )
         elif path_method == "GEOMETRIC-NEB":
-            msg = "Using geomeTRIC NEB optimizer"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
+            self._say("Using geomeTRIC NEB optimizer")
             n = GeometricNEB(
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,
@@ -1380,11 +1015,7 @@ class MSMEP:
             )
         elif path_method == "GSM":
             from mepd.pathminimizers.gsm import GSM
-            msg = "Using molecularGSM (Zimmerman lab growing string method)"
-            if _get_verbose(self.inputs):
-                print(msg)
-            else:
-                update_status(msg)
+            self._say("Using molecularGSM (Zimmerman lab growing string method)")
             n = GSM(
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,
@@ -1481,7 +1112,6 @@ class MSMEP:
             setattr(n, "converged", False)
             setattr(n, "failure_reason", "electronic_structure_error")
             setattr(n, "failure_exception", e)
-            # print(traceback.format_exc())
 
             print(
                 "\nWarning! A chain has electronic structure errors. \
@@ -1523,23 +1153,13 @@ class MSMEP:
     def _make_chain_frag(self, chain: Chain, geom_pair, ind_pair):
         start_ind, end_ind = ind_pair
         opt_start, opt_end = geom_pair
-        # chain_frag_nodes = chain.nodes[start_ind: end_ind + 1]
-        # chain_frag = Chain(
-        #     nodes=[opt_start] + chain_frag_nodes + [opt_end],
-        #     parameters=self.inputs.chain_inputs,
-        # )
 
         # JDEP 01132025: Going to not recycle fragment nodes. Want a fresh
         # interpolation
         chain_frag = chain.model_copy(update={
             "nodes": [opt_start, opt_end],
             "parameters": self.inputs.chain_inputs})
-        # opt_start = chain[start].do_geometry_optimization()
-        # opt_end = chain[end].do_geometry_optimization()
 
-        # chain_frag.insert(0, opt_start)
-        # chain_frag.append(opt_end)
-        # print(f"using a frag of {len(chain_frag)} nodes")
         return chain_frag
 
     def _do_minima_based_split(self, chain: Chain, minimization_results: List[Node]):
@@ -1766,8 +1386,7 @@ def _parallel_recursive_step_worker(
         runner = MSMEP(inputs=local_inputs)
         if attempted_pairs_payload is not None:
             runner._set_attempted_pairs_payload(copy.deepcopy(attempted_pairs_payload))
-        history, child_chains = _run_recursive_step_with_optional_depth(
-            runner,
+        history, child_chains = runner._run_recursive_step(
             input_chain=local_chain,
             tree_node_index=tree_node_index,
             tree_depth=tree_depth,

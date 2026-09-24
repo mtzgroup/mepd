@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from mepd.optimizers.optimizer import Optimizer
-from mepd.errors import ElectronicStructureError
 
 import numpy as np
 
@@ -26,7 +25,6 @@ class VelocityProjectedOptimizer(Optimizer):
     def optimize_step(self, chain, chain_gradients):
         from mepd.chain import Chain
         prev_velocity = chain.velocity
-        # print(f"\n{np.linalg.norm(prev_velocity)=}")
         new_force = -(chain_gradients)
         force_norm = np.linalg.norm(new_force)
         if force_norm <= 1e-16:
@@ -45,7 +43,6 @@ class VelocityProjectedOptimizer(Optimizer):
                 orig_shape = new_force.shape
                 prev_velocity_flat = prev_velocity.flatten()
 
-                # print(f"{prev_velocity=}\n{new_force_unit=}")
                 projection = np.dot(prev_velocity_flat,
                                     new_force_unit.flatten())
 
@@ -53,7 +50,6 @@ class VelocityProjectedOptimizer(Optimizer):
                 vj = vj_flat.reshape(orig_shape)
                 for i, (vel, force) in enumerate(zip(vj, new_force)):
                     if np.all(np.isclose(vel, 0)):
-                        # print(i, vel, force)
                         vj[i] = force
 
                 if projection < 0:
@@ -76,10 +72,7 @@ class VelocityProjectedOptimizer(Optimizer):
                 vj = np.zeros_like(new_force)
                 force = timestep * new_force
 
-            # print(f"force: {force}")
             scaling = 1
-            # if np.linalg.norm(force) > max_disp: # if step size is too large
-            #     scaling = (1/(np.linalg.norm(force)))*max_disp
 
             new_chain_coordinates = chain.coordinates + force * scaling
             new_nodes = []
@@ -99,18 +92,9 @@ class VelocityProjectedOptimizer(Optimizer):
 
             # else:
             #     new_vel = vj + timestep*(-(chain_gradients))
-            # new_chain.velocity = new_vel
             new_chain.velocity = force*scaling
             new_chain_gradients_fails = False
 
             # except Exception:
-            #     print(
-            #         "VPO: Gradients failed with displacement. Resetting velocity, shrinking by 50%"
-            #     )
-            #     prev_velocity = new_force_unit  # has to be the gradient of the geometry so the projection is 1 and we just take a steepest descent. If it is 0, we will get stuck ehre forever.
-            #     timestep *= 0.5
-            #     retry_count += 1
 
-        # if new_chain_gradients_fails:
-        #     raise ElectronicStructureError(msg="Electronic structure of chain failed.")
         return new_chain

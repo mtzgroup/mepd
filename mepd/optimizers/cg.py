@@ -104,7 +104,6 @@ class ConjugateGradient(Optimizer):
         if self.g_old is not None:
             g = self.g_old.flatten().copy()
             # Fletcher-Reeves formula
-            # beta = np.dot(g_new, g_new) / np.dot(g, g)
             if g_new.shape != g.shape:
                 print("Warning: Gradient shapes do not match. Resetting the optimizer.")
                 self.reset()

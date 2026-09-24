@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 
-# from openeye import oechem
 import warnings
 import re
 from pathlib import Path
@@ -340,25 +339,6 @@ __ATOM_LIST__ = [
     "np",
     "pu",
 ]
-
-
-# def steepest_descent(node, engine: Engine, ss=1, max_steps=10) -> list[Node]:
-#     history = []
-#     last_node = node.copy()
-#     # make sure the node isn't frozen so it returns a gradient
-#     last_node.converged = False
-#     try:
-#         for i in range(max_steps):
-#             grad = last_node.gradient
-#             new_coords = last_node.coords - 1*ss*grad
-#             node_new = last_node.update_coords(new_coords)
-#             engine.compute_gradients([node_new])
-#             history.append(node_new)
-#             last_node = node_new.copy()
-#     except Exception:
-#         raise ElectronicStructureError(
-#             trajectory=[], msg='Error while minimizing in early stop check.')
-#     return history
 
 
 def give_me_free_index(natural, graph):

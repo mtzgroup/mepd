@@ -16,7 +16,6 @@ from mepd.chain import Chain
 from mepd.elementarystep import ElemStepResults, check_if_elem_step
 from mepd.engines import Engine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
-# from mepd.gsm_helper import minimal_wrapper_de_gsm, gsm_to_ase_atoms
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs
 from mepd.nodes.node import Node
 from mepd.optimizers.optimizer import Optimizer
@@ -124,10 +123,6 @@ class NEB(PathMinimizer):
         for attr in ("negative_steps_thre", "positive_steps_thre"):
             if hasattr(self.optimizer, attr) and hasattr(self.parameters, attr):
                 setattr(self.optimizer, attr, getattr(self.parameters, attr))
-        # if self.parameters.frozen_atom_indices is not None:
-        #     if isinstance(self.parameters.frozen_atom_indices, str):
-        #         self.parameters.frozen_atom_indices = [
-        #             int(x) for x in self.parameters.frozen_atom_indices.split(",") if x]
 
     def _reset_optimizer_history(self) -> None:
         reset_fn = getattr(self.optimizer, "reset", None)
@@ -631,7 +626,6 @@ class NEB(PathMinimizer):
                     nsteps_strained_node = 0
 
                 if nsteps_strained_node >= NSTEPS_STRAIN:
-                    # print(f"Node {most_strained_node} has been the most strained for {nsteps_strained_node} steps, adding a bead before and after.")
                     msg = f"Node {most_strained_node} has been the most strained for {nsteps_strained_node} steps, upsampling chain"
                     if self.parameters.v:
                         print(msg)
@@ -664,14 +658,6 @@ class NEB(PathMinimizer):
                 self.optimizer.reset()
                 new_chain = self.update_chain(chain=chain_previous)
 
-                # if self.parameters.do_elem_step_checks:
-                #     elem_step_results = check_if_elem_step(
-                #         inp_chain=chain_previous, engine=self.engine
-                #     )
-                # else:
-                #     elem_step_results = IS_ELEM_STEP
-                # raise ElectronicStructureError(msg="QCCompute failed.",
-                #                                obj=e.program_output)
 
             max_rms_grad_val = np.amax(new_chain.rms_gradients)
             ind_ts_guess = np.argmax(new_chain.energies)

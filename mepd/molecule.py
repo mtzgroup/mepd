@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import networkx as nx
 
-# from openeye import oechem, oedepict
 from mepd.isomorphism_tools import SubGraphMatcher
 from mepd.helper_functions import (
     graph_to_smiles,
@@ -222,7 +221,6 @@ class Molecule(nx.Graph):
         assert isinstance(
             rdmol, Chem.rdchem.Mol), "rdmol must be Rdkit molecule"
 
-        # atom_list = [(x.GetTotalNumHs(), x.GetAtomicNum()) for x in rdmol.GetAtoms()]
         atom_list = [
             (atom.GetAtomicNum(), atom.GetFormalCharge(), atom.GetTotalNumHs())
             for atom in rdmol.GetAtoms()

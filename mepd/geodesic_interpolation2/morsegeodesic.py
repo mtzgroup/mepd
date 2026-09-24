@@ -657,7 +657,6 @@ class MorseGeodesic(object):
                     # image offsets within the varied segment
                     image_offsets = np.arange(num_varied_images, dtype=np.int32)
                     # Compute all column indices to zero
-                    # cols = [s*num_cart_coords + a*3 + c for s in image_offsets for a in ia_arr for c in (0,1,2)]
                     cols = (image_offsets[:, None] * self.num_cart_coords)[..., None] + (ia_arr[None, :, None] * 3) + np.array([0, 1, 2], dtype=np.int32)
                     cols_flat = cols.ravel()
                     # Create a boolean mask for diag_indices that are in cols_flat
@@ -1302,41 +1301,8 @@ class MorseGeodesic(object):
 
 
 # def run_geodesic_py(
-#     trajectory,
-#     tol=2e-3,
-#     nudge=0.1,
-#     ntries=1,
-#     scaling=1.7,
-#     dist_cutoff=3,
-#     friction=1e-2,
-#     sweep=None,
-#     maxiter=15,
-#     microiter=20,
-#     reconstruct=None,
-#     nimages=5,
-#     min_neighbors=4,
-#     align=True,
 
 # ):
-#     from .interpolation import redistribute
-
-#     symbols, X = trajectory.symbols, trajectory.coords
-#     if len(X) < 2:
-#         raise ValueError("Need at least two initial geometries.")
-
-#     # First redistribute number of images.  Perform interpolation if too few and subsampling if too many
-#     # images are given
-#     raw = redistribute(symbols, X, nimages=nimages,
-#                        tol=tol * 5, nudge=nudge, ntries=ntries, align=align)
-#     # Perform smoothing by minimizing distance in Cartesian coordinates with redundant internal metric
-#     # to find the appropriate geodesic curve on the hyperspace.
-#     smoother = MorseGeodesic(symbols, raw, scaling, threshold=dist_cutoff,
-#                              friction=friction, min_neighbors=min_neighbors, align=align,
-#                              ignore_atoms=ignore_atoms)
-#     try:
-#         smoother.smooth(tol=tol, max_iter=maxiter)
-#     finally:
-#         return smoother.path
 
 
 def run_geodesic_get_smoother(
@@ -1403,7 +1369,6 @@ def run_geodesic_get_smoother(
         rng=rng,
     )
 
-    # return smoother
 
     try:
 
@@ -1413,4 +1378,3 @@ def run_geodesic_get_smoother(
         # process, or there is an error
 
         return smoother
-        # write_xyz(output, symbols, smoother.path)

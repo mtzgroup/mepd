@@ -118,7 +118,6 @@ class XYNode(Node):
 @dataclass
 class StructureNode(Node):
     structure: Structure = None
-    # has_molecular_graph: bool = True
     has_molecular_graph: bool = True  # temp changing it for protein stuff
     converged: bool = False
     _cached_energy: float = None

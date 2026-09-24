@@ -11,9 +11,6 @@ from scipy.signal import argrelextrema
 from mepd.chain import Chain
 from mepd.nodes.node import StructureNode, Node, XYNode
 from mepd.geodesic_interpolation2.coord_utils import align_geom
-# from mepd.geodesic_interpolation.geodesic import (
-#     run_geodesic_get_smoother,
-# )
 
 from mepd.geodesic_interpolation2.morsegeodesic import (
     run_geodesic_get_smoother, MorseGeodesic
@@ -90,12 +87,6 @@ def neighs_grad_func(
     if additional_gradient is not None:
         pe_grad = pe_grad + np.array(additional_gradient)
 
-    # if chain.parameters.frozen_atom_indices:
-    #     inds = np.array(chain.parameters.frozen_atom_indices.split(), dtype=int)
-    #     for index in inds:
-    #         pe_grad[index] = np.array([0.0, 0.0, 0.0])
-    #     non_frozen_inds = [i for i in range(len(pe_grad)) if i not in inds]
-    #     pe_grad = pe_grad - pe_grad[non_frozen_inds[0], :]  # remove force from first non-frozen atom
 
     # # remove rotations and translations
     # # if we have at least 3 atoms
@@ -104,7 +95,6 @@ def neighs_grad_func(
     # #     pe_grad[1, :2] = 0  # this atom can only move in a line
     # #     pe_grad[2, :1] = 0  # this atom can only move in a plane
     # else:
-    #     pe_grad = pe_grad-pe_grad[0, :]  # remove force from 0th atom
 
 
     if current_node.do_climb:
@@ -131,7 +121,6 @@ def neighs_grad_func(
             next_node=next_node,
             unit_tan_path=unit_tan_path,
         )
-
 
 
     return pe_grads_nudged, spring_forces_nudged
@@ -195,12 +184,6 @@ def _k_between_nodes(
         return (1-alpha)*k_upper + alpha*k_lower
     else:
         return k_lower
-    # e_i = max(node1.energy, node0.energy)
-    # if e_i > e_ref:
-    #     new_k = k_max - parameters.delta_k * ((e_max - e_i) / (e_max - e_ref))
-    # elif e_i <= e_ref:
-    #     new_k = k_max - parameters.delta_k
-    # return new_k
 
 
 def compute_NEB_gradient(
@@ -257,9 +240,6 @@ def _create_tangent_path(prev_node: Node, current_node: Node, next_node: Node):
 
         else:
             return 0.5 * (tau_minus + tau_plus)
-            # raise ValueError(
-            #     f"Energies adjacent to current node are identical. {en_2=} {en_0=}"
-            # )
 
         return tan_vec
 
@@ -298,20 +278,13 @@ def get_force_spring_nudged(
         parameters=parameters,
     )
 
-    # tightest_k = max(k12, k01)
 
     force_spring = (k12) * (np.linalg.norm(
         next_node.coords - current_node.coords
     )) - k01 * (np.linalg.norm(current_node.coords - prev_node.coords))
 
-    # force_spring = tightest_k * (np.linalg.norm(
-    #     next_node.coords - current_node.coords
-    # )/sqrtN) - (tightest_k * np.linalg.norm(current_node.coords - prev_node.coords)/sqrtN)
 
     force_vector = force_spring * unit_tan_path
-    # for i, atom in enumerate(force_vector):
-    #     if np.linalg.norm(atom) > chain.parameters.k:
-    #         force_vector[i] = (atom / np.linalg.norm(atom))*chain.parameters.k
     return force_vector
 
 
@@ -443,7 +416,6 @@ def _get_closest_node_ind(xyz_path, reference):
         if dist < smallest_dist:
             smallest_dist = dist
             ind = i
-    # print(smallest_dist)
     return ind
 
 
@@ -564,10 +536,6 @@ def _select_node_at_dist(
     best_node = None
     best_dist_err = 10000.0
 
-    # best_neg_node = None
-    # best_pos_node = None
-    # best_neg_dist_err = 10000.0
-    # best_pos_dist_err = 10000.0
 
     for i, node in enumerate(input_chain[1:-1], start=1):
 
@@ -581,27 +549,6 @@ def _select_node_at_dist(
             best_node = node.copy()
             best_dist_err = abs(curr_dist_err)
 
-        # if abs(curr_dist_err) < best_neg_dist_err and curr_dist_err < 0:
-        #     best_neg_node = input_chain[i]
-        #     best_neg_dist_err = abs(curr_dist_err)
-        #     # print('\t', best_neg_dist_err)
-
-        # if abs(curr_dist_err) < best_pos_dist_err and curr_dist_err > 0:
-        #     best_pos_node = input_chain[i]
-        #     best_pos_dist_err = curr_dist_err
-        #     # print('\t', best_pos_dist_err)
-
-    # if best_neg_node is not None and best_pos_node is not None:
-    #     a = 1
-    #     b = (dist - best_neg_dist_err) / best_pos_dist_err
-    #     best_node_coords = a*best_neg_node.coords + b*best_pos_node.coords
-    #     best_node = best_neg_node.update_coords(best_node_coords)
-    # elif best_neg_node is not None and best_pos_node is None:
-    #     print("Only negative node found, returning it")
-    #     best_node = best_neg_node
-    # elif best_neg_node is None and best_pos_node is not None:
-    #     print("Only positive node found, returning it")
-    #     best_node = best_pos_node
 
     return best_node
 
@@ -682,33 +629,6 @@ def calculate_geodesic_tangent(
     return [new0, ref_node, new2]
 
 
-# def upsample_chain(chain, engine, nimages):
-#     coords = chain.energies_kcalmol
-#     dists = []
-#     max_dist = 0
-#     index = 0
-#     for i, frame_coords in enumerate(coords):
-#         if i == len(coords) - 1:
-#             continue
-#         next_frame = coords[i + 1]
-#         # distance = chain._path_len_dist_func(frame_coords, next_frame)
-#         distance = abs(next_frame - frame_coords)
-#         dists.append(distance)
-#         if distance>max_dist:
-#             max_dist = distance
-#             index = i
-#     node_inds_to_drop = np.argsort(dists)[:nimages]
-
-
-#     node1 = chain[index]
-#     node2 = chain[index+1]
-#     gi = run_geodesic([node1, node2], nimages=(2+nimages), align=False)
-
-#     chain_new = chain.copy()
-#     engine.compute_energies(gi[1:-1])
-#     chain_new.nodes = chain_new.nodes[:index+1] + gi[1:-1] + chain_new.nodes[index+1:]
-
-#     return chain_new
 def upsample_chain(chain, engine, nimages):
     coords = chain.energies_kcalmol
     dists = []
@@ -718,16 +638,12 @@ def upsample_chain(chain, engine, nimages):
         if i == len(coords) - 1:
             continue
         next_frame = coords[i + 1]
-        # distance = chain._path_len_dist_func(frame_coords, next_frame)
         distance = abs(next_frame - frame_coords)
         dists.append(distance)
         if distance>max_dist:
             max_dist = distance
             index = i
     node_inds_to_drop = np.argsort(dists)[:nimages]
-    # print(node_inds_to_drop)
-    # print(index, max_dist)
-    # print(dists)
 
 
     node1 = chain[index]
@@ -736,8 +652,6 @@ def upsample_chain(chain, engine, nimages):
 
     chain_new = chain.copy()
     engine.compute_energies(gi[1:-1])
-
-
 
 
     ####
@@ -757,7 +671,6 @@ def upsample_chain(chain, engine, nimages):
 
     # 2. Sort tasks by index in REVERSE order
     tasks.sort(key=lambda x: x[0], reverse=True)
-    # print(tasks)
 
     # 3. Apply changes to a copy of the list
     new_list = original_list.copy()
@@ -766,16 +679,13 @@ def upsample_chain(chain, engine, nimages):
         action = task[1]
 
         if action == 'drop':
-            # print(f"dropping at {idx}")
             new_list.pop(idx)
         elif action == 'insert':
             val = task[2]
-            # print(f"INSERTING at {idx}, {val.energy}")
             new_list.insert(idx, val)
 
     ###
 
-    # chain_new.nodes = chain_new.nodes[:index+1] + gi[1:-1] + chain_new.nodes[index+1:]
     chain_new.nodes = new_list
 
     return chain_new
