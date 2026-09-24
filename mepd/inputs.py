@@ -176,12 +176,12 @@ class NEBInputs:
         minimum; if that fails the rescue escalates to 0.3 and 0.5 bohr
         (elementarystep.RESCUE_ESCALATION_BOHR)
 
-    `stop_on_validated_ts`: at steps ts_validation_first_step, 2x, 4x, ... optimize
-        the current TS guess and follow its IRC; stop as soon as the IRC connects
-        this chain's endpoints, reporting an elementary step (default: True). Band
-        convergence is otherwise the stopping rule, as before. No-op for engines
-        that can't optimize transition states.
-    `ts_validation_first_step`: first NEB step at which to try that (default: 5)
+    `ts_converged_stop`: stop as soon as the TS region has converged rather than
+        waiting for the whole band (default: True). When the early elementary-step
+        check (TS |g_perp| and TS springs below early_stop_force_thre) finds the
+        chain elementary, NEB stops there; otherwise the chain counts as converged
+        once the interior highest image's |g_perp| <= ts_grad_thre, springs around
+        it <= ts_spring_thre and the barrier has stopped moving (<= barrier_thre).
     `recursive_same_pair_split_limit`: during recursive autosplitting, if a branch
         repeats the exact same (start, end) endpoint pair this many times in a row
         with no new chemistry found (a genuinely unproductive loop -- a split that
@@ -223,8 +223,7 @@ class NEBInputs:
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
     recursive_same_pair_split_limit: int = 5
-    stop_on_validated_ts: bool = True
-    ts_validation_first_step: int = 5
+    ts_converged_stop: bool = True
 
     max_steps: float = 2000
 

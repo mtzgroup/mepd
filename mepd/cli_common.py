@@ -622,29 +622,22 @@ def _optimize_ts_and_irc(
     from mepd.irc import compute_irc_chain_with_geometric
 
     engine = run_inputs.engine
-    precomputed = getattr(ts_guess_node, "validated_ts_irc", None)
-    if precomputed is not None:
-        # The path search already optimized this guess and followed its IRC.
-        ts_node, irc_chain = precomputed
-        typer.echo(f"Reusing the TS and IRC validated during the path search ({label}).")
-    else:
-        compute_ts = getattr(engine, "compute_transition_state", None)
-        if not callable(compute_ts):
-            typer.echo(f"Engine {type(engine).__name__} does not support transition-state optimization.")
-            return None
-        typer.echo(f"Optimizing transition state ({label})...")
-        try:
-            ts_node = compute_ts(node=ts_guess_node)
-        except Exception as exc:
-            typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
-            return None
-        if not isinstance(ts_node, StructureNode):
-            typer.echo(
-                f"Transition-state optimization did not converge to a usable structure "
-                f"({label}; engine returned {type(ts_node).__name__})."
-            )
-            return None
-        irc_chain = None
+    compute_ts = getattr(engine, "compute_transition_state", None)
+    if not callable(compute_ts):
+        typer.echo(f"Engine {type(engine).__name__} does not support transition-state optimization.")
+        return None
+    typer.echo(f"Optimizing transition state ({label})...")
+    try:
+        ts_node = compute_ts(node=ts_guess_node)
+    except Exception as exc:
+        typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
+        return None
+    if not isinstance(ts_node, StructureNode):
+        typer.echo(
+            f"Transition-state optimization did not converge to a usable structure "
+            f"({label}; engine returned {type(ts_node).__name__})."
+        )
+        return None
 
     output.mkdir(parents=True, exist_ok=True)
     ts_path = output / f"{label}.xyz"
@@ -653,14 +646,13 @@ def _optimize_ts_and_irc(
     if not run_irc:
         return TsIrcResult(ts_node=ts_node)
 
-    if irc_chain is None:
-        typer.echo(f"Computing IRC ({label})...")
-        try:
-            irc_fn = getattr(engine, "compute_irc_chain", None)
-            irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
-        except Exception as exc:
-            typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
-            return TsIrcResult(ts_node=ts_node)
+    typer.echo(f"Computing IRC ({label})...")
+    try:
+        irc_fn = getattr(engine, "compute_irc_chain", None)
+        irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
+    except Exception as exc:
+        typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
+        return TsIrcResult(ts_node=ts_node)
 
     irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
     irc_chain.write_to_disk(irc_path)
@@ -678,8 +670,6 @@ def _ts_guess_tasks_from_tree(tree, label_prefix: str) -> list[tuple[str, object
         if not leaf.data or not leaf.data.chain_trajectory:
             continue
         guess_node = leaf.data.chain_trajectory[-1].get_ts_node()
-        if getattr(leaf.data, "validated_ts", None) is not None:
-            guess_node.validated_ts_irc = (leaf.data.validated_ts, leaf.data.validated_irc)
         tasks.append((f"{label_prefix}leaf_{leaf.index}", guess_node))
     return tasks
 

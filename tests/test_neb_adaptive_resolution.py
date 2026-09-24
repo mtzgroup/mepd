@@ -409,6 +409,7 @@ def test_optimize_chain_raises_explicit_plateau_exit_message(monkeypatch):
         initial_chain=chain.copy(),
         optimizer=_FakeOptimizer(),
         parameters=NEBInputs(
+            ts_converged_stop=False,
             adaptive_resolution=False,
             adaptive_plateau_window=1,
             max_steps=5,
@@ -444,6 +445,7 @@ def test_optimize_chain_status_includes_timestep_for_conjugate_gradient(monkeypa
         initial_chain=chain.copy(),
         optimizer=ConjugateGradient(timestep=0.25),
         parameters=NEBInputs(
+            ts_converged_stop=False,
             max_steps=2,
             do_elem_step_checks=False,
             negative_steps_thre=10,

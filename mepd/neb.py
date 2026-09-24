@@ -514,6 +514,17 @@ class NEB(PathMinimizer):
             self.parameters.early_stop_force_thre = (
                 0.0  # setting it to 0 so we don't check it over and over
             )
+            if (
+                not stop_early
+                and early_stop_ready
+                and elem_step_results.is_elem_step
+                and getattr(self.parameters, "ts_converged_stop", False)
+            ):
+                # The TS region has converged and the chain is one elementary
+                # step: the rest of the band won't change either answer.
+                self._say("TS region converged and the chain is an elementary step; stopping.")
+                self.optimized = chain
+                return True, elem_step_results
             return stop_early, elem_step_results
 
         else:
@@ -533,32 +544,16 @@ class NEB(PathMinimizer):
         else:
             update_status(msg)
 
-    def _ts_validation_due(self, nsteps: int) -> bool:
-        """At steps first, 2*first, 4*first, ... when stop_on_validated_ts is on."""
-        first = int(getattr(self.parameters, "ts_validation_first_step", 5) or 0)
-        if not getattr(self.parameters, "stop_on_validated_ts", False) or first <= 0:
+    def _ts_region_converged(self, prev: Chain, new: Chain, ind_ts: int, ts_grad: float) -> bool:
+        """The TS guess is converged even if the rest of the band isn't: an
+        interior highest image whose perpendicular gradient and neighbouring
+        springs are within threshold, with a barrier that has stopped moving."""
+        if not getattr(self.parameters, "ts_converged_stop", False) or ind_ts in (0, len(new) - 1):
             return False
-        if not callable(getattr(self.engine, "compute_transition_state", None)):
-            return False
-        ratio, rem = divmod(nsteps, first)
-        return rem == 0 and ratio > 0 and ratio & (ratio - 1) == 0
-
-    def _validate_ts_guess(self, chain: Chain, nsteps: int) -> ElemStepResults | None:
-        """Optimize the chain's TS guess and follow its IRC; if the IRC connects
-        the chain's endpoints this is an elementary step with a known TS."""
-        from mepd.irc import irc_connects, optimize_ts_and_irc
-
-        if len(chain) < 3:
-            return None
-        self._say(f"Step {nsteps}: checking the TS guess (TS optimization + IRC)...")
-        ts_node, irc_chain = optimize_ts_and_irc(self.engine, chain.get_ts_node().copy())
-        if ts_node is None or irc_chain is None or not irc_connects(irc_chain, chain[0], chain[-1]):
-            return None
-        self.validated_ts, self.validated_irc = ts_node, irc_chain
-        self._say(f"Step {nsteps}: TS guess validated -- its IRC connects this chain's endpoints.")
-        return ElemStepResults(
-            is_elem_step=True, is_concave=True, splitting_criterion=None,
-            minimization_results=None, number_grad_calls=0,
+        return (
+            ts_grad <= self.parameters.ts_grad_thre
+            and new.ts_triplet_gspring_infnorm <= self.parameters.ts_spring_thre
+            and abs(new.get_eA_chain() - prev.get_eA_chain()) <= self.parameters.barrier_thre
         )
 
     def _elem_step_check(self, chain: Chain) -> ElemStepResults:
@@ -693,6 +688,11 @@ class NEB(PathMinimizer):
                 verbose=self.parameters.v,
                 detail_prefix_lines=self._optimizer_detail_lines(),
             )
+            if not converged and self._ts_region_converged(
+                chain_previous, new_chain, ind_ts_guess, ts_guess_grad
+            ):
+                self._say(f"Step {nsteps}: TS region converged; stopping before the rest of the band.")
+                converged = True
 
             n_nodes_frozen = 0
             for node in new_chain:
@@ -725,12 +725,6 @@ class NEB(PathMinimizer):
 
             self.chain_trajectory.append(new_chain)
             self.gradient_trajectory.append(new_chain.gradients)
-
-            if self._ts_validation_due(nsteps):
-                validated = self._validate_ts_guess(new_chain, nsteps)
-                if validated is not None:
-                    self.optimized = new_chain
-                    return validated
 
             if converged:
                 if self.parameters.v:
@@ -912,10 +906,4 @@ class NEB(PathMinimizer):
             optimizer=optimizer,
             engine=engine,
         )
-        ts_fp = fp.with_name(fp.stem + "_validated") / "ts.xyz"
-        irc_fp = fp.with_name(fp.stem + "_validated") / "irc.xyz"
-        if ts_fp.exists() and irc_fp.exists():
-            load = dict(parameters=chain_parameters, charge=charge, spinmult=multiplicity)
-            n.validated_ts = Chain.from_xyz(ts_fp, **load)[0]
-            n.validated_irc = Chain.from_xyz(irc_fp, **load)
         return n
