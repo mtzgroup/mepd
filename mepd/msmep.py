@@ -82,6 +82,16 @@ def _empty_leaf(index: int, status: str) -> TreeNode:
     return node
 
 
+def _renumber_depth_first(node: TreeNode, index: int) -> int:
+    """Number `node`'s subtree in depth-first preorder from `index`; returns
+    the next free index."""
+    node.index = index
+    index += 1
+    for child in node.children:
+        index = _renumber_depth_first(child, index)
+    return index
+
+
 def _failed_leaf(
     index: int,
     status: str,
@@ -120,9 +130,18 @@ def _to_plain_dict(value):
 
 
 def _clone_run_inputs_for_worker(run_inputs: RunInputs) -> RunInputs:
-    """Build an isolated RunInputs instance for a worker thread."""
-    payload = _run_inputs_payload_for_worker(run_inputs)
-    return RunInputs(**payload)
+    """An independent copy of `run_inputs` for one worker thread: the same
+    engine, optimizer and settings as the serial run, with no mutable state
+    (optimizer history, parameter namespaces) shared between branches. The
+    engine is deep-copied when it can be and shared otherwise."""
+    memo = {}
+    engine = getattr(run_inputs, "engine", None)
+    if engine is not None:
+        try:
+            memo[id(engine)] = copy.deepcopy(engine)
+        except Exception:
+            memo[id(engine)] = engine
+    return copy.deepcopy(run_inputs, memo)
 
 
 def _run_inputs_payload_for_worker(run_inputs: RunInputs) -> dict:
@@ -148,6 +167,8 @@ def _run_inputs_payload_for_worker(run_inputs: RunInputs) -> dict:
             getattr(run_inputs, "geometry_optimizer_kwds", None)
         ),
         "optimizer_kwds": _to_plain_dict(getattr(run_inputs, "optimizer_kwds", None)),
+        "atom_mapping_inputs": _to_plain_dict(getattr(run_inputs, "atom_mapping_inputs", None)),
+        "print_stdout": bool(getattr(run_inputs, "print_stdout", False)),
     }
 
 
@@ -590,24 +611,9 @@ class MSMEP:
         if attempted_pairs_payload is not None:
             self._set_attempted_pairs_payload(attempted_pairs_payload)
         max_depth = self._resolve_recursive_split_max_depth(max_depth)
-        try:
-            history, sequence_of_chains = self._run_recursive_step(
-                input_chain, tree_node_index, tree_depth=tree_depth, max_depth=max_depth
-            )
-        except ElectronicStructureError as e:
-            self._say(
-                f"Electronic structure error in recursive branch {tree_node_index}: "
-                f"{format_exception_message(e)}"
-            )
-            obj = getattr(e, "obj", None)
-            if hasattr(obj, "save"):
-                with contextlib.suppress(Exception):
-                    obj.save("/tmp/failed_output.qcio")
-            return _failed_leaf(
-                tree_node_index, status="electronic_structure_error", exc=e, chain=input_chain
-            )
-        except Exception as e:
-            return self._branch_failed(tree_node_index, e, input_chain)
+        history, sequence_of_chains = self._guarded_step(
+            input_chain, tree_node_index, tree_depth=tree_depth, max_depth=max_depth
+        )
 
         new_tree_node_index = tree_node_index + 1
         for i, chain_frag in enumerate(sequence_of_chains, start=1):
@@ -624,6 +630,31 @@ class MSMEP:
             history.children.append(out_history)
             new_tree_node_index = out_history.max_index + 1
         return history
+
+    def _guarded_step(
+        self, input_chain: Chain, tree_node_index: int, tree_depth: int = 0,
+        max_depth: int | None = None,
+    ) -> tuple[TreeNode, list[Chain]]:
+        """`_run_recursive_step`, with a failing branch turned into a failed
+        leaf instead of an exception -- the same in serial and in parallel."""
+        try:
+            return self._run_recursive_step(
+                input_chain, tree_node_index, tree_depth=tree_depth, max_depth=max_depth
+            )
+        except ElectronicStructureError as e:
+            self._say(
+                f"Electronic structure error in recursive branch {tree_node_index}: "
+                f"{format_exception_message(e)}"
+            )
+            obj = getattr(e, "obj", None)
+            if hasattr(obj, "save"):
+                with contextlib.suppress(Exception):
+                    obj.save("/tmp/failed_output.qcio")
+            return _failed_leaf(
+                tree_node_index, status="electronic_structure_error", exc=e, chain=input_chain
+            ), []
+        except Exception as e:
+            return self._branch_failed(tree_node_index, e, input_chain), []
 
     def _branch_failed(self, index: int, exc: Exception, chain: Chain) -> TreeNode:
         if _get_verbose(self.inputs):
@@ -760,7 +791,7 @@ class MSMEP:
         progress_printer = get_progress_printer()
         progress_printer.clear_path_so_far()
         with progress_monitor(f"branch-{int(tree_node_index)}"):
-            root_history, root_children = self._run_recursive_step(
+            root_history, root_children = self._guarded_step(
                 input_chain=input_chain,
                 tree_node_index=tree_node_index,
                 tree_depth=0,
@@ -914,6 +945,9 @@ class MSMEP:
                             caption=f"{len(ordered_leaf_chains)} completed branch(es)",
                         )
 
+        # Branches finish in any order; number the tree depth-first, exactly
+        # as the serial run does, so both write the same node_<i> files.
+        _renumber_depth_first(root_history, tree_node_index)
         root_history.parallel_failures = branch_failures
         return root_history
 
@@ -1334,13 +1368,7 @@ def _parallel_recursive_step_worker(
     max_depth: int | None = None,
     attempted_pairs_payload: list[dict[str, Any]] | None = None,
 ) -> tuple[TreeNode, list[Chain]]:
-    try:
-        local_inputs = _clone_run_inputs_for_worker(run_inputs)
-    except Exception:
-        try:
-            local_inputs = copy.deepcopy(run_inputs)
-        except Exception:
-            local_inputs = run_inputs
+    local_inputs = _clone_run_inputs_for_worker(run_inputs)
 
     try:
         # Keep branch workers in non-verbose mode so transient rich panels from
@@ -1365,7 +1393,7 @@ def _parallel_recursive_step_worker(
         runner = MSMEP(inputs=local_inputs)
         if attempted_pairs_payload is not None:
             runner._set_attempted_pairs_payload(copy.deepcopy(attempted_pairs_payload))
-        history, child_chains = runner._run_recursive_step(
+        history, child_chains = runner._guarded_step(
             input_chain=local_chain,
             tree_node_index=tree_node_index,
             tree_depth=tree_depth,

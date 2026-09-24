@@ -220,6 +220,48 @@ def test_recursive_minimize_runs_real_toy_potential_end_to_end():
     assert len(output_chain) >= 2
 
 
+def _flower_split_msmep():
+    coords = np.linspace([-2.59807434, -1.499999], [2.5980755, 1.49999912], 15)
+    coords[1:-1] += [-1, 1]
+    chain_inputs = ChainInputs(k=10, delta_k=9, use_geodesic_interpolation=False, node_ene_thre=10)
+    neb_inputs = NEBInputs(
+        barrier_thre=5, v=False, max_steps=200, climb=False,
+        do_elem_step_checks=True, early_stop_force_thre=0.1,
+    )
+    chain = Chain.model_validate({
+        "nodes": [XYNode(structure=xy) for xy in coords], "parameters": chain_inputs,
+    })
+    run_inputs = RunInputs(path_min_inputs=neb_inputs.__dict__, chain_inputs=chain_inputs.__dict__)
+    run_inputs.path_min_inputs.recursive_split_max_depth = 2
+    run_inputs.engine = FlowerPotential()
+    run_inputs.optimizer = ConjugateGradient(timestep=0.1)
+    return MSMEP(run_inputs), chain
+
+
+def _tree_signature(node):
+    coords = None
+    if node.data is not None and getattr(node.data, "chain_trajectory", None):
+        coords = np.round(np.asarray(node.data.chain_trajectory[-1].coordinates), 8).tolist()
+    return (
+        node.index, getattr(node, "leaf_status", None), coords,
+        [_tree_signature(child) for child in node.children],
+    )
+
+
+def test_parallel_recursive_minimize_matches_serial():
+    """Branch workers must run with the caller's own engine and settings
+    (they used to be rebuilt from `engine_name`, silently swapping a
+    custom engine for the default one) and number the tree the same way,
+    so a parallel run is indistinguishable from the serial one."""
+    msmep, chain = _flower_split_msmep()
+    serial = msmep.run_recursive_minimize(chain, max_depth=2)
+    msmep, chain = _flower_split_msmep()
+    parallel = msmep.run_parallel_recursive_minimize(chain, max_workers=3)
+
+    assert len(serial.ordered_leaves) > 1
+    assert _tree_signature(parallel) == _tree_signature(serial)
+
+
 def _msmep_for_split_test(recheck_on_split: bool = False) -> MSMEP:
     inputs = SimpleNamespace(
         path_min_method="NEB",
