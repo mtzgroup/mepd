@@ -40,12 +40,6 @@ except ImportError:
     _rich_available = False
 
 
-def _check_en_converged(energies_prev: NDArray, energies_new: NDArray, threshold: float) -> Tuple[NDArray, NDArray]:
-    differences = np.abs(energies_new - energies_prev)
-    indices_converged = np.where(differences <= threshold)
-    return indices_converged[0], differences
-
-
 def _check_springgrad_converged(spring_forces: NDArray, threshold: float) -> Tuple[NDArray, NDArray]:
     bools = []
     grad_norms_components = []

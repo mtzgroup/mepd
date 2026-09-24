@@ -44,7 +44,6 @@ from mepd.pathminimizers.nebdlf import DLFindNEB
 from mepd.inputs import RunInputs
 from mepd.progress import (
     get_progress_printer,
-    print_neb_step,
     preserve_chain_snapshot,
     progress_monitor,
     start_status,
@@ -631,7 +630,6 @@ class MSMEP:
             chain given and its corresponding neb minimization. Children are chains into which
             the root chain was split.
         """
-        import mepd.chainhelpers as ch
         if isinstance(input_chain, list):
             input_chain = Chain.model_validate(
                 {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
@@ -841,7 +839,6 @@ class MSMEP:
         max_depth: int | None = None,
     ) -> tuple[TreeNode, list[Chain]]:
         """Run a single recursive minimization step and return child fragments to continue."""
-        import mepd.chainhelpers as ch
         if isinstance(input_chain, list):
             input_chain = Chain.model_validate(
                 {"nodes": input_chain, "parameters": self.inputs.chain_inputs})
@@ -1228,7 +1225,6 @@ class MSMEP:
         return root_history
 
     def _create_interpolation(self, chain: Chain):
-        import mepd.chainhelpers as ch
         logger = logging.getLogger(
             'mepd.geodesic_interpolation2.interpolation')
         logger.propagate = False
@@ -1546,19 +1542,7 @@ class MSMEP:
         # print(f"using a frag of {len(chain_frag)} nodes")
         return chain_frag
 
-    def _make_chain_pair(self, chain: Chain, pair_of_inds):
-        start, end = pair_of_inds
-        start_opt = chain[start].do_geometry_optimization()
-        end_opt = chain[end].do_geometry_optimization()
-
-        chain_frag = Chain(
-            nodes=[start_opt, end_opt], parameters=self.inputs.chain_inputs
-        )
-
-        return chain_frag
-
     def _do_minima_based_split(self, chain: Chain, minimization_results: List[Node]):
-        import mepd.chainhelpers as ch
 
         ind_minima = list(ch._get_ind_minima(chain))
         if len(ind_minima) == 0:

@@ -19,7 +19,6 @@ from chemcloud import configure_client as cc_configure_client
 from qccompute import compute as qccompute_compute
 from qcdata.models.inputs import ProgramInput, ProgramSpec, FileInput
 from qcdata import CalcType, ProgramOutput, Structure
-import shutil
 
 from mepd.chain import Chain
 from mepd.engines.engine import Engine
@@ -203,9 +202,6 @@ class QCComputeEngine(Engine):
 
     def __post_init__(self):
         self.chemcloud_queue = _resolve_chemcloud_queue(self.chemcloud_queue)
-        self._chemcloud_client_lock = threading.Lock()
-        self._chemcloud_clients_by_thread: dict[int, CCClient] = {}
-        self._chemcloud_client_params: dict[str, Any] = {}
         self.frozen_atom_indices = self._coerce_frozen_atom_indices(
             self.frozen_atom_indices
         )
@@ -215,8 +211,6 @@ class QCComputeEngine(Engine):
                 "written when results are saved to disk. This can consume substantial disk space."
             )
         if self.compute_program == "chemcloud":
-            self._chemcloud_client_params = _chemcloud_client_kwargs(
-                self.chemcloud_queue)
             _configure_chemcloud_client(self.chemcloud_queue)
 
     def _geometry_optimizer_keywords(
@@ -339,22 +333,6 @@ class QCComputeEngine(Engine):
         setattr(prepared, "graph_total_atom_count", len(node.structure.symbols))
         return prepared
 
-    def _get_thread_chemcloud_client(self) -> CCClient:
-        from chemcloud import CCClient
-
-        thread_id = int(threading.get_ident())
-        with self._chemcloud_client_lock:
-            client = self._chemcloud_clients_by_thread.get(thread_id)
-            if client is None:
-                client = CCClient(**dict(self._chemcloud_client_params))
-                self._chemcloud_clients_by_thread[thread_id] = client
-        return client
-
-    def _drop_thread_chemcloud_client(self) -> None:
-        thread_id = int(threading.get_ident())
-        with self._chemcloud_client_lock:
-            self._chemcloud_clients_by_thread.pop(thread_id, None)
-
     @staticmethod
     def _is_retryable_chemcloud_error(exc: Exception) -> bool:
         status_code = getattr(
@@ -400,10 +378,6 @@ class QCComputeEngine(Engine):
                     # A fetch failure means the job was already submitted; retrying here
                     # resubmits duplicate work instead of retrying the fetch.
                     raise
-                lowered = str(exc).lower()
-                if "different event loop" in lowered or "client has been closed" in lowered:
-                    # The underlying async client got tied to another loop/thread.
-                    self._drop_thread_chemcloud_client()
                 retryable = self._is_retryable_chemcloud_error(exc)
                 if attempt >= max_attempts or not retryable:
                     raise
@@ -825,20 +799,6 @@ class QCComputeEngine(Engine):
             output = _run_standard_hessian_call()
         return output
 
-    def _compute_conf_result(self, node: StructureNode):
-        assert shutil.which(
-            "crest") is not None, "crest not found in path. this currently only works with CREST"
-
-        pi = ProgramInput(
-            program="crest",
-            calctype="conformer_search",  # type: ignore
-            structure=node.structure,
-            model=self.program_args.model,
-            keywords=self.program_args.keywords,
-        )
-        output = self.compute_func(pi, collect_files=self.collect_files)
-        return output
-
     def _compute_ts_result(self, node: StructureNode, keywords={'maxiter': 1000}, use_bigchem=False,
                            hessres: ProgramOutput = None):
         if hessres is not None:
@@ -912,10 +872,6 @@ class QCComputeEngine(Engine):
     def compute_hessian(self, node: StructureNode):
         output = self._compute_hessian_result(node)
         return output.return_result
-
-    def compute_conformers(self, node: StructureNode):
-        output = self._compute_conf_result(node)
-        return output.results.conformers
 
     def compute_transition_state(self, node: StructureNode, keywords={'maxiter': 500}):
         output = self._compute_ts_result(node=node)

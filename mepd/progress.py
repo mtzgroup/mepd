@@ -630,12 +630,6 @@ class ProgressPrinter:
             self._progress.update(self._current_task_id,
                                   advance=advance, **kwargs)
 
-    def set_description(self, description: str):
-        """Update the task description."""
-        if self.use_rich and self._progress and self._current_task_id is not None:
-            self._progress.update(self._current_task_id,
-                                  description=description)
-
     def stop(self):
         """Stop the current progress task."""
         if self.use_rich and self._progress:
@@ -700,92 +694,6 @@ class ProgressPrinter:
                 # are not obscured by an active Live renderer.
                 self._live.stop()
                 self._live = None
-
-    def print_step(
-        self,
-        step: int,
-        ts_grad: float,
-        max_rms_grad: float,
-        ts_triplet_gspring: float,
-        nodes_frozen: int = 0,
-        timestep: float = 0.0,
-        grad_corr: str = "",
-        force_update: bool = False
-    ):
-        """
-        Print a formatted progress line for NEB optimization steps.
-
-        This is the main method for displaying optimization progress.
-        """
-        with self._lock:
-            monitor_id = _active_monitor_id()
-            state = self._state_for_monitor(monitor_id)
-            current_time = time.time()
-
-            # Throttle updates to avoid flooding output
-            last_print = float(state.get("last_print_time") or 0.0)
-            if not force_update and (current_time - last_print) < self._throttle:
-                return
-
-            state["last_print_time"] = current_time
-            self._last_print_time = current_time
-
-            if self.use_rich:
-                # Create a rich-formatted status line
-                status_parts = [
-                    (f"[{monitor_id}] ", "magenta"),
-                    ("step ", "cyan"),
-                    (f"{step}", "bold white"),
-                    (" | ", "dim"),
-                    ("TS gperp: ", "yellow"),
-                    (f"{ts_grad:.4f}", "white"),
-                    (" | ", "dim"),
-                    ("max rms: ", "yellow"),
-                    (f"{max_rms_grad:.4f}", "white"),
-                    (" | ", "dim"),
-                    ("tspring: ", "yellow"),
-                    (f"{ts_triplet_gspring:.4f}", "white"),
-                ]
-
-                if nodes_frozen > 0 or timestep > 0:
-                    status_parts.extend([
-                        (" | ", "dim"),
-                        ("frozen: ", "magenta"),
-                        (f"{nodes_frozen}", "white"),
-                    ])
-
-                if timestep > 0:
-                    status_parts.extend([
-                        (" | ", "dim"),
-                        ("dt=", "magenta"),
-                        (f"{timestep:.3f}", "white"),
-                    ])
-
-                if grad_corr:
-                    status_parts.extend([
-                        (" | ", "dim"),
-                        (grad_corr, "green"),
-                    ])
-
-                line = ""
-                for text, style in status_parts:
-                    line += f"[{style}]{text}[/{style}]"
-                _console.print(line, end="\n")
-                sys.stdout.flush()
-            elif not self._silent_terminal:
-                line = (
-                    f"[{monitor_id}] step {step} | TS gperp: {ts_grad:.4f} | "
-                    f"max rms: {max_rms_grad:.4f} | tspring: {ts_triplet_gspring:.4f}"
-                )
-                if nodes_frozen > 0:
-                    line += f" | frozen: {nodes_frozen}"
-                if timestep > 0:
-                    line += f" | dt={timestep:.3f}"
-                if grad_corr:
-                    line += f" | {grad_corr}"
-
-                sys.stdout.write(f"\n{line}{' ' * 20}")
-                sys.stdout.flush()
 
     def print_convergence(self, message: str = "Converged!"):
         """Print convergence message."""
@@ -852,19 +760,6 @@ class ProgressPrinter:
                 sys.stdout.write(f"\n[{monitor_id}] {caption}\n{ascii_plot}\n")
                 sys.stdout.flush()
             self._write_current_payload(monitor_id, state)
-
-    def _update_live_caption(self, message: str):
-        """Update live table caption without repainting duplicate frames."""
-        with self._lock:
-            monitor_id = _active_monitor_id()
-            state = self._state_for_monitor(monitor_id)
-            if message == state.get("status_message"):
-                return
-            state["status_message"] = message
-            state["caption"] = message
-            self._sync_legacy_fields(state)
-            if self._live is not None or self.use_rich:
-                self._render_live_monitors()
 
     def preserve_chain_snapshot(self, note: Optional[str] = None):
         """Persist the current live chain table into scrollback, then reset live mode."""
@@ -996,42 +891,6 @@ def get_progress_printer() -> ProgressPrinter:
     if _default_printer is None:
         _default_printer = ProgressPrinter()
     return _default_printer
-
-
-def print_neb_step(
-    step: int,
-    ts_grad: float,
-    max_rms_grad: float,
-    ts_triplet_gspring: float,
-    nodes_frozen: int = 0,
-    timestep: float = 0.0,
-    grad_corr: str = "",
-    force_update: bool = False
-):
-    """
-    Convenience function to print NEB optimization step progress.
-
-    Args:
-        step: Current optimization step number
-        ts_grad: Maximum tangential gradient at TS guess
-        max_rms_grad: Maximum RMS gradient across chain
-        ts_triplet_gspring: Triplet g-spring value
-        nodes_frozen: Number of frozen nodes
-        timestep: Current timestep
-        grad_corr: Gradient correction indicator
-        force_update: Force update even if throttled
-    """
-    printer = get_progress_printer()
-    printer.print_step(
-        step=step,
-        ts_grad=ts_grad,
-        max_rms_grad=max_rms_grad,
-        ts_triplet_gspring=ts_triplet_gspring,
-        nodes_frozen=nodes_frozen,
-        timestep=timestep,
-        grad_corr=grad_corr,
-        force_update=force_update
-    )
 
 
 def _truncate_label(label: str, max_len: int) -> str:

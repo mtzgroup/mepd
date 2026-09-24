@@ -5,7 +5,6 @@ from mepd.qcdata_structure_helpers import split_structure_into_frags
 from mepd.geodesic_interpolation2.coord_utils import align_geom
 from mepd.errors import EnergiesNotComputedError
 
-import traceback
 from qcinf import structure_to_smiles
 
 # Rich imports for flashy CLI output
@@ -271,68 +270,6 @@ try:
 except ImportError:
     _console = None
     _rich_available = False
-
-
-def _smiles_to_ascii(smiles: str) -> str:
-    """Render SMILES as ASCII art using RDKit."""
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import Draw
-        import io
-        import base64
-
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return smiles
-
-        # Generate 2D coordinates
-        Chem.Compute2DCoords(mol)
-
-        # Draw to PNG bytes
-        img = Draw.MolToImage(mol, size=(300, 150))
-        buffer = io.BytesIO()
-        img.save(buffer, format='PNG')
-        img_bytes = buffer.getvalue()
-
-        # Convert to base64 for display
-        b64 = base64.b64encode(img_bytes).decode('utf-8')
-        return f"[image]data:image/png;base64,{b64}[/image]"
-    except Exception:
-        return smiles
-
-
-def _render_smiles_comparison(smi1: str, smi2: str) -> str:
-    """Render a side-by-side comparison of two SMILES as ASCII art."""
-    if not _rich_available:
-        return f"{smi1} || {smi2}"
-
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import Draw
-        import io
-        import base64
-
-        mol1 = Chem.MolFromSmiles(smi1)
-        mol2 = Chem.MolFromSmiles(smi2)
-
-        if mol1 is None or mol2 is None:
-            return f"[bold cyan]{smi1}[/bold cyan] [dim]||[/dim] [bold yellow]{smi2}[/bold yellow]"
-
-        Chem.Compute2DCoords(mol1)
-        Chem.Compute2DCoords(mol2)
-
-        # Draw both molecules side by side
-        img = Draw.MolsToGridImage(
-            [mol1, mol2], molsPerRow=2, subImgSize=(250, 200))
-
-        buffer = io.BytesIO()
-        img.save(buffer, format='PNG')
-        img_bytes = buffer.getvalue()
-        b64 = base64.b64encode(img_bytes).decode('utf-8')
-
-        return f"[image]data:image/png;base64,{b64}[/image]"
-    except Exception:
-        return f"[bold cyan]{smi1}[/bold cyan] [dim]||[/dim] [bold yellow]{smi2}[/bold yellow]"
 
 
 def is_identical(
@@ -711,21 +648,6 @@ def update_node_cache(node_list, results):
         else:
             node._cached_energy = None
             node._cached_gradient = None
-
-
-def create_pairs_from_smiles(smi1: str, smi2: str, spinmult=1):
-    """Builds a pair of atom-index-consistent Structures from two
-    reaction-endpoint SMILES strings, using SLAPMapper's atom-to-atom
-    mapping (see `mepd.atom_mapping.map_smiles_pair`) to determine the
-    correspondence between `smi1`'s and `smi2`'s atoms.
-
-    Requires the optional `slapmapper` dependency (`pip install mepd[aam]`).
-    """
-    from mepd.atom_mapping import map_smiles_pair
-
-    return map_smiles_pair(
-        smi1, smi2, multiplicity_start=spinmult, multiplicity_end=spinmult
-    )
 
 
 def displace_by_dr(node: Node, displacement: np.array, dr: float = 0.1) -> Node:

@@ -76,33 +76,6 @@ class TreeNode:
     def total_nodes(self):
         return len(self.depth_first_ordered_nodes)
 
-    def get_num_opt_steps(self):
-        return sum(
-            [
-                len(leaf.chain_trajectory)
-                for leaf in self.get_optimization_history()
-                if leaf
-            ]
-        )
-
-    def get_num_grad_calls(self):
-        return sum(
-            [leaf.grad_calls_made for leaf in self.get_optimization_history()
-             if leaf]
-        )
-
-    def get_nodes_at_depth(self, depth):
-        curr_depth = 0
-        nodes_to_iter_through = [self]
-        while curr_depth < depth:
-            new_nodes_to_iter_through = []
-            for node in nodes_to_iter_through:
-                new_nodes_to_iter_through.extend(node.children)
-            curr_depth += 1
-            nodes_to_iter_through = new_nodes_to_iter_through
-
-        return nodes_to_iter_through
-
     def write_to_disk(self, folder_name: Path, write_qcio: bool = False):
         folder_name = Path(folder_name)
 
@@ -257,14 +230,6 @@ class TreeNode:
             return opt_history
         else:
             return self.get_optimization_history(node=self)
-
-    def get_adj_mat_leaves_indices(self):
-        matrix = self.adj_matrix
-        inds = []
-        for i, row in enumerate(matrix):
-            if len(row.nonzero()[0]) == 1:
-                inds.append(i)
-        return inds
 
     @staticmethod
     def _nodes_match(a, b, parameters: ChainInputs) -> bool:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple
@@ -19,14 +18,10 @@ from mepd.engines import Engine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
 # from mepd.gsm_helper import minimal_wrapper_de_gsm, gsm_to_ase_atoms
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs
-from mepd.nodes.node import StructureNode, Node
+from mepd.nodes.node import Node
 from mepd.optimizers.optimizer import Optimizer
 from mepd.pathminimizers.pathminimizer import PathMinimizer
 from mepd.optimizers.vpo import VelocityProjectedOptimizer
-from mepd.qcdata_structure_helpers import (
-    structure_to_ase_atoms,
-    ase_atoms_to_structure,
-)
 from mepd.progress import print_chain_step, format_neb_caption, update_status
 
 # Rich imports for flashy CLI output
@@ -277,16 +272,6 @@ class NEB(PathMinimizer):
             rtol=getattr(self.parameters, "adaptive_plateau_rtol", 0.05),
         )
 
-    def _largest_energy_gap_segment(self, chain: Chain) -> int | None:
-        energies = np.asarray(chain.energies, dtype=float)
-        if energies.size >= 2:
-            return int(np.argmax(np.abs(np.diff(energies))))
-
-        segment_lengths = np.diff(chain.path_length)
-        if segment_lengths.size == 0:
-            return None
-        return int(np.argmax(segment_lengths))
-
     def _segment_around_node(self, chain: Chain, node_index: int) -> int | None:
         if len(chain) < 2:
             return None
@@ -313,21 +298,6 @@ class NEB(PathMinimizer):
         if rms_gperps.size == 0:
             return None
         return self._segment_around_node(chain, int(np.argmax(rms_gperps)))
-
-    def _max_spring_segment(self, chain: Chain) -> int | None:
-        try:
-            springgrads = [
-                float(np.amax(np.abs(springgrad)))
-                for springgrad in chain.springgradients
-            ]
-        except Exception:
-            return None
-        if not springgrads:
-            return None
-
-        node_index = int(np.argmax(springgrads)) + 1
-        return self._segment_around_node(chain, node_index)
-
 
     def _maybe_adapt_chain_resolution(self, chain: Chain, step: int) -> tuple[Chain, bool]:
         if not bool(getattr(self.parameters, "adaptive_resolution", False)):
@@ -386,25 +356,6 @@ class NEB(PathMinimizer):
         else:
             update_status(msg)
         return refined_chain, True
-
-    def set_climbing_nodes(self, chain: Chain) -> None:
-        """Iterates through chain and sets the nodes that should climb.
-
-        Args:
-            chain: chain to set inputs for
-        """
-        if self.parameters.climb:
-            inds_maxima = [chain.energies.argmax()]
-
-            # if self.parameters.v > 0:
-            msg = f"Setting {len(inds_maxima)} nodes to climb"
-            if self.parameters.v:
-                print(f"\n----->{msg}\n")
-            else:
-                update_status(msg)
-
-            for ind in inds_maxima:
-                chain[ind].do_climb = True
 
     def _get_climbing_pair_indices(self, chain: Chain) -> tuple[int, int]:
         energies = np.asarray(chain.energies, dtype=float)
@@ -610,40 +561,6 @@ class NEB(PathMinimizer):
 
     # @Jan: This should be a more general function so that the
     # lower level of theory can be whatever the user wants.
-    def _do_xtb_preopt(self, chain) -> Chain:  #
-        """
-        This function will loosely minimize an input chain using the GFN2-XTB method,
-        then return a new chain which can be used as an initial guess for a higher
-        level of theory calculation
-        """
-
-        xtb_params = chain.parameters.copy()
-        xtb_params.node_class = Node
-        chain_traj = chain.to_trajectory()
-        xtb_chain = Chain.from_traj(chain_traj, parameters=xtb_params)
-        xtb_nbi = NEBInputs(
-            tol=self.parameters.tol * 10, v=True, preopt_with_xtb=False, max_steps=1000
-        )
-
-        opt_xtb = VelocityProjectedOptimizer(timestep=1)
-        n = NEB(initial_chain=xtb_chain, parameters=xtb_nbi, optimizer=opt_xtb)
-        try:
-            _ = n.optimize_chain()
-            print(
-                f"\nConverged an xtb chain in {len(n.chain_trajectory)} steps")
-        except Exception:
-            print(
-                f"\nCompleted {len(n.chain_trajectory)} xtb steps. Did not converge.")
-
-        xtb_seed_tr = n.chain_trajectory[-1].to_trajectory()
-        xtb_seed_tr.update_tc_parameters(chain[0].tdstructure)
-
-        xtb_seed = Chain.from_traj(
-            xtb_seed_tr, parameters=chain.parameters.copy())
-        xtb_seed.gradients  # calling it to cache the values
-
-        return xtb_seed
-
     def optimize_chain(self) -> ElemStepResults:
         """
         Main function. After an NEB object has been created, running this function will
@@ -668,16 +585,6 @@ class NEB(PathMinimizer):
         prev_most_strained_node = 0
         warned_endpoint_energy_inversion = False
 
-        # if self.parameters.preopt_with_xtb:
-        #     chain_previous = self._do_xtb_preopt(self.initial_chain)
-        #     self.chain_trajectory.append(chain_previous)
-
-        #     stop_early, elem_step_results = self._do_early_stop_check(
-        #         chain_previous)
-        #     self.geom_grad_calls_made += elem_step_results.number_grad_calls
-        #     if stop_early:
-        #         return elem_step_results
-        # else:
         chain_previous = self.initial_chain.copy()
         self.chain_trajectory.append(chain_previous)
         chain_previous._zero_velocity()
@@ -730,8 +637,6 @@ class NEB(PathMinimizer):
                         print(msg)
                     else:
                         update_status(msg)
-                    # chain_previous = ch.insert_nodes_around_index(
-                    #     chain_previous, most_strained_node, engine=self.engine)
                     chain_previous = ch.upsample_chain(
                         chain_previous, engine=self.engine, nimages=NADD)
 

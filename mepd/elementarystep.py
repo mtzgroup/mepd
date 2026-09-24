@@ -20,7 +20,7 @@ from mepd.nodes.nodehelpers import (
     is_identical,
 )
 from mepd.progress import stop_status, update_status, print_persistent
-from mepd.errors import ElectronicStructureError, EnergiesNotComputedError
+from mepd.errors import ElectronicStructureError
 from qcinf import structure_to_smiles
 
 # Rich imports for flashy CLI output
@@ -1263,118 +1263,6 @@ def _cache_returned_energies(nodes: list[Node], energies) -> None:
     for node, energy in zip(nodes, energies):
         if getattr(node, "_cached_energy", None) is None:
             node._cached_energy = float(energy)
-
-
-def is_approx_elem_step(
-    chain: Chain,
-    engine: Engine,
-    slope_thresh=SLOPE_THRESH,
-    verbose: bool = True,
-    disregard_stereochem: bool = False,
-) -> Tuple[bool, int]:
-    """Will do at most 50 steepest descent steps  on geometries neighboring the transition state guess
-    and check whether they are approaching the chain endpoints. If function returns False, the geoms
-    will be fully optimized.
-
-    Args:
-        chain (Chain): chain to check on
-        slope_thresh (float, optional): Steepest descent optimization will stop when the slope
-        of the distances of the minimized geometry to the target endpoint is >= threshold.
-        Defaults to 0.1.
-
-    Returns:
-        (bool, int): whether chain seems to be an elementary step, number grad calls it took to do this check
-
-    """
-    if chain.energies_are_monotonic:
-        return True, 0
-
-    pair_indices = _get_ts_neighbor_pair_indices(chain)
-    if pair_indices is None:
-        return True, 0
-    # if len(chain) == 3 or arg_max == 1 or arg_max == len(chain)-2:
-    #     print("Chain TS neighboring nodes need to be approximated. ")
-
-    #     chain_for_opt = _upsample_around_ts_guess(
-    #         chain=chain, ts_index=arg_max)
-
-    #     arg_max = arg_max + 1  # now the TS index is different
-    #     engine.compute_energies(
-    #         [chain_for_opt.nodes[arg_max-1], chain_for_opt.nodes[arg_max+1]])
-
-    # else:
-    chain_for_opt = chain.copy()
-
-    if hasattr(engine, "compute_program") and engine.compute_program.lower() == "chemcloud":
-        if verbose and _rich_available:
-            _console.print(Panel.fit(
-                "[bold blue]☁ Chemcloud detected, skipping approx elem step check[/bold blue]\n[dim]Falling back to full geometry-optimization check[/dim]",
-                border_style="blue",
-            ))
-        elif verbose:
-            print("Chemcloud detected, skipping approx elem step check; falling back to full geometry-optimization check.")
-
-        return False, 0
-
-    try:
-        r_index, p_index = pair_indices
-        r_passes_opt, r_traj = _converges_to_an_endpoints(
-            chain=chain_for_opt,
-            engine=engine,
-            node_index=r_index,
-            direction=-1,
-            slope_thresh=slope_thresh,
-            verbose=verbose,
-        )
-        p_passes_opt, p_traj = _converges_to_an_endpoints(
-            chain=chain_for_opt,
-            engine=engine,
-            node_index=p_index,
-            direction=+1,
-            slope_thresh=slope_thresh,
-            verbose=verbose,
-        )
-    except CachedElementaryStepRequiresEngineError:
-        raise
-    except Exception as e:
-        if _is_backend_execution_error(e):
-            if _is_backend_unavailable_error(e):
-                raise
-            if verbose:
-                print(_backend_probe_failed_msg(e))
-        else:
-            import traceback
-
-            print(traceback.format_exc())
-            print(
-                f"Error in geometry optimization: {e}. Pretending this is an elem step.")
-        return True, 0
-    nodes_have_graph = chain.nodes[0].has_molecular_graph
-    # if we have molecular graphs to work with, make sure the connectivities are
-    # isomorphic to each other. Otherwise, we will decide only based on distance.
-    # (which is bad!!)
-    if nodes_have_graph:
-        r_passes = r_passes_opt and _is_connectivity_identical(
-            r_traj[-1],
-            chain[0],
-            verbose=verbose,
-            disregard_stereochem=disregard_stereochem,
-        )
-        p_passes = p_passes_opt and _is_connectivity_identical(
-            p_traj[-1],
-            chain[-1],
-            verbose=verbose,
-            disregard_stereochem=disregard_stereochem,
-        )
-    else:
-        r_passes = r_passes_opt
-        p_passes = p_passes_opt
-
-    n_grad_calls = len(r_traj) + len(p_traj)
-    if r_passes and p_passes:
-        return True, n_grad_calls
-    else:
-        return False, n_grad_calls
 
 
 def _converges_to_an_endpoints(

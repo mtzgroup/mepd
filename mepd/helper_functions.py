@@ -149,13 +149,6 @@ def get_nudged_pe_grad(unit_tangent, gradient):
     return pe_grad_nudged
 
 
-def get_seeding_chain(neb_obj, force_thre):
-    for c in neb_obj.chain_trajectory:
-        if c.get_maximum_grad_magnitude() <= force_thre:
-            return c
-    return neb_obj.chain_trajectory[-1]
-
-
 def make_copy(obmol):
     copy_obmol = openbabel.OBMol()
     for atom in openbabel.OBMolAtomIter(obmol):
@@ -349,10 +342,6 @@ __ATOM_LIST__ = [
 ]
 
 
-def is_even(n):
-    return not np.mod(n, 2)
-
-
 # def steepest_descent(node, engine: Engine, ss=1, max_steps=10) -> list[Node]:
 #     history = []
 #     last_node = node.copy()
@@ -387,123 +376,6 @@ def naturals(n):
     """
     yield n
     yield from naturals(n + 1)
-
-
-def _load_info_from_tcin(file_path):
-    parsed = parse_terachem_input_file(file_path)
-    return (
-        parsed["method"],
-        parsed["basis"],
-        parsed["charge"],
-        parsed["spinmult"],
-        parsed["keywords"],
-    )
-
-
-def parse_terachem_input_file(file_path: str | Path) -> dict:
-    """
-    Parse a TeraChem input file into a dict of run settings.
-
-    Returns a dictionary with:
-    - method, basis, charge, spinmult
-    - run_type, min_coordinates
-    - prmtop, coordinates, qmindices
-    - keywords: additional key/value pairs
-    - frozen_atom_indices: 0-based atom indices parsed from $constraints
-    """
-    fp = Path(file_path)
-    lines = fp.read_text().splitlines()
-    if len(lines) < 2:
-        raise ValueError("TeraChem input must have at least two lines.")
-
-    parsed = {
-        "method": None,
-        "basis": None,
-        "charge": None,
-        "spinmult": None,
-        "run_type": "gradient",
-        "min_coordinates": "cartesian",
-        "prmtop": None,
-        "coordinates": None,
-        "qmindices": None,
-        "keywords": {},
-        "frozen_atom_indices": [],
-    }
-
-    in_constraints = False
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        lower = line.lower()
-        if lower.startswith("$constraints"):
-            in_constraints = True
-            continue
-        if in_constraints and lower.startswith("$end"):
-            in_constraints = False
-            continue
-        if in_constraints and lower.startswith("$"):
-            in_constraints = False
-
-        if in_constraints:
-            tokens = line.split()
-            if tokens and tokens[0].lower() == "atom" and len(tokens) >= 2:
-                m = re.search(r"-?\d+", tokens[1])
-                if m:
-                    parsed["frozen_atom_indices"].append(int(m.group()) - 1)
-            continue
-
-        if line.startswith("#"):
-            continue
-
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-
-        key = parts[0].lower()
-        val = " ".join(parts[1:])
-
-        if key == "method":
-            parsed["method"] = val
-        elif key == "basis":
-            parsed["basis"] = val
-        elif key == "charge":
-            parsed["charge"] = int(val)
-        elif key == "spinmult":
-            parsed["spinmult"] = int(val)
-        elif key == "run":
-            parsed["run_type"] = val
-        elif key == "min_coordinates":
-            parsed["min_coordinates"] = val
-        elif key == "prmtop":
-            parsed["prmtop"] = val
-        elif key == "coordinates":
-            parsed["coordinates"] = val
-        elif key == "qmindices":
-            parsed["qmindices"] = val
-        elif key != "scrdir":
-            parsed["keywords"][parts[0]] = val
-
-    if parsed["method"] is None or parsed["basis"] is None:
-        raise ValueError(
-            "TeraChem input must include both 'method' and 'basis'.")
-    if parsed["charge"] is None:
-        parsed["charge"] = 0
-    if parsed["spinmult"] is None:
-        parsed["spinmult"] = 1
-
-    parsed["frozen_atom_indices"] = sorted(set(parsed["frozen_atom_indices"]))
-    return parsed
-
-
-def get_fsm_tsg_from_chain(chain):
-    ind_guess = round(len(chain) / 2)
-    ind_guesses = [ind_guess-1, ind_guess, ind_guess+1]
-    enes_guess = [chain.energies[ind_guesses[0]],
-                  chain.energies[ind_guesses[1]], chain.energies[ind_guesses[2]]]
-    ind_tsg = ind_guesses[np.argmax(enes_guess)]
-    return chain[ind_tsg]
 
 
 def _is_qccompute_engine(engine) -> bool:
@@ -829,73 +701,6 @@ def project_rigid_body_forces(R, F, masses=None):
     F = F - masses[:, None] * np.cross(omega, s)
 
     return F
-
-
-def rst7_to_coords_and_indices(data):
-    """
-
-    Args:
-        data (str): rst7 text file, opened
-
-    Returns:
-        tuple(np.array, list): coordinates and indices of atoms in the rst7 file
-    """
-    coords = []
-    indices_coordinates = []
-
-    ind = 0
-    for line in data.split("\n"):
-        if ind == 0:
-            ind += 1
-            continue
-        if ind == 1:
-            natom = int(line.split()[0])
-        if (len(line.split()) == 6) or (len(line.split()) == 3):
-            if len(coords) == natom:
-                break
-            # if ind in qmindices:
-            c = line.split()[:3]
-            c = [float(x) for x in c]
-            coords.append(c)
-
-            c = line.split()[3:]
-            c = [float(x) for x in c]
-            if len(c) > 0:
-                coords.append(c)
-            indices_coordinates.append(ind)
-
-        ind += 1
-    # print(coords)
-    return np.array(coords), indices_coordinates
-
-
-def parse_symbols_from_prmtop(data):
-    """
-
-    Args:
-        data (str): prmtop text file, opened
-
-    Returns:
-        list: symbols of atoms in the prmtop file
-    """
-    symbols = []
-
-    begin = False
-    skipped1line = 0
-    for line in data.split("\n"):
-        if line.strip() == '%FLAG ATOMIC_NUMBER':
-            begin = True
-            continue
-        if begin:
-            if skipped1line:
-                if line[0] == '%':
-                    break
-                symbols.extend(line.split())
-            else:
-                skipped1line = 1
-
-    symbols = [atomic_number_to_symbol(int(n)) for n in symbols]
-    return symbols
 
 
 def parse_hhtda_to_dict(stdout_text):

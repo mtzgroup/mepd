@@ -23,11 +23,6 @@ def scale_step_imagewise(step, max_step_norm: float | None):
     return clipped, large
 
 
-def clip_step_atomwise(step, max_step_norm: float | None):
-    """Compatibility wrapper for the image-wise step scaler."""
-    return scale_step_imagewise(step, max_step_norm)
-
-
 @dataclass
 class Optimizer(ABC):
     @abstractmethod

@@ -69,16 +69,6 @@ class ExternalProgramError(ElectronicStructureError):
         )
 
 
-@dataclass
-class CriticalNEBError(Exception):
-
-    msg: str
-    obj: Any = None
-
-    def __post_init__(self) -> None:
-        super().__init__(self.msg)
-
-
 def _coerce_text(value: Any) -> str:
     if value is None:
         return ""

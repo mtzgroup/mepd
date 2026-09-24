@@ -20,7 +20,6 @@ from mepd.geodesic_interpolation2.morsegeodesic import (
 )
 
 from mepd.errors import ElectronicStructureError
-from mepd.helper_functions import get_mass
 from mepd.inputs import ChainInputs
 from mepd.helper_functions import (
     linear_distance,
@@ -28,44 +27,6 @@ from mepd.helper_functions import (
     project_rigid_body_forces
 )
 from mepd.progress import get_progress_printer
-
-
-def _distance_to_chain(chain1: Chain, chain2: Chain) -> float:
-    """
-    calculates the distance between two chains of same length
-    by summing the RMSD for nodes with shared indices, then
-    normalizing by chain length.
-    """
-    distances = []
-
-    for node1, node2 in zip(chain1.nodes, chain2.nodes):
-        if node1.coords.shape[0] > 2:
-            dist, _ = align_geom(refgeom=node1.coords, geom=node2.coords)
-        else:
-            dist = np.linalg.norm(node1.coords - node2.coords)
-        distances.append(dist)
-
-    return sum(distances) / len(chain1)
-
-
-def _tangent_correlations(chain: Chain, other_chain: Chain) -> float:
-    """
-    returns the vector correlation of unit tangents of two different chains.
-    """
-    chain1_vec = np.array(chain.unit_tangents).flatten()
-    chain2_vec = np.array(other_chain.unit_tangents).flatten()
-    projector = np.dot(chain1_vec, chain2_vec)
-    normalization = np.dot(chain1_vec, chain1_vec)
-
-    return projector / normalization
-
-
-def _gperp_correlation(chain: Chain, other_chain: Chain):
-    gp_chain = get_g_perps(chain)
-    gp_other_chain = get_g_perps(other_chain)
-    dp = np.dot(gp_chain.flatten(), gp_other_chain.flatten())
-    normalization = np.linalg.norm(gp_chain) * np.linalg.norm(gp_other_chain)
-    return dp / normalization
 
 
 def _gradient_correlation(chain: Chain, other_chain: Chain):
@@ -84,15 +45,6 @@ def _gradient_correlation(chain: Chain, other_chain: Chain):
 def _get_ind_minima(chain):
     ind_minima = argrelextrema(chain.energies, np.less, order=1)[0]
     return ind_minima
-
-
-def _get_ind_maxima(chain):
-    maxima_indices = argrelextrema(chain.energies, np.greater, order=1)[0]
-    if len(maxima_indices) > 1:
-        ind_maxima = maxima_indices[0]
-    else:
-        ind_maxima = int(maxima_indices)
-    return ind_maxima
 
 
 def _get_mass_weights(chain: Chain, normalize_weights=True):
@@ -180,13 +132,6 @@ def neighs_grad_func(
             unit_tan_path=unit_tan_path,
         )
 
-        # spring_forces_nudged = get_force_spring_om(
-        #     chain=chain,
-        #     prev_node=prev_node,
-        #     current_node=current_node,
-        #     next_node=next_node,
-        #     unit_tan_path=unit_tan_path,
-        # )
 
 
     return pe_grads_nudged, spring_forces_nudged
@@ -370,85 +315,6 @@ def get_force_spring_nudged(
     return force_vector
 
 
-def get_force_spring_om(
-    chain: Chain,
-    prev_node: Node,
-    current_node: Node,
-    next_node: Node,
-    unit_tan_path: np.array,
-):
-    """
-    Will generate the spring force as per:
-    https://pubs.aip.org/aip/jcp/article/155/7/074103/484665
-    Uses Onsager-machlup action to define the spring force.
-    Args:
-        chain (Chain): _description_
-        prev_node (Node): _description_
-        current_node (Node): _description_
-        next_node (Node): _description_
-        unit_tan_path (np.array): _description_
-
-    Returns:
-        _type_: _description_
-    """
-    natom = len(current_node.coords)
-    parameters = chain.parameters
-    # k_om = k_max*natom
-    timestep = 50
-    freq = 1
-
-    mass = np.zeros((natom, natom))
-    for i in range(natom):
-        mass[i, i] = get_mass(chain.nodes[0].symbols[i])
-
-    k_om = (mass*freq) / (2*timestep)
-
-    invmass = np.zeros((natom, natom))
-    for i in range(natom):
-        invmass[i, i] = 1/get_mass(chain.nodes[0].symbols[i])
-
-    # lagrange_prev = -1*(timestep/(mass*freq))@prev_node.gradient
-    lagrange_prev = -1*(invmass@prev_node.gradient)
-    # print(invmass.shape, prev_node.gradient.shape)
-    # print(f"{lagrange_prev=}")
-    # lagrange_current = -1*(timestep/mass*freq)@current_node.gradient
-    lagrange_current = -1*(invmass@current_node.gradient)
-    # print(f"{k_om=}")
-    f_om = k_om@(next_node.coords + prev_node.coords - 2 *
-                 current_node.coords + lagrange_prev - lagrange_current)
-
-    f_om_parallel = np.dot(
-        f_om.flatten(), unit_tan_path.flatten()) * unit_tan_path
-
-    vec_next = next_node.coords - current_node.coords
-    vec_next /= np.linalg.norm(vec_next)
-
-    vec_prev = current_node.coords - prev_node.coords
-    vec_prev /= np.linalg.norm(vec_prev)
-
-    cosphi = np.dot(vec_next.flatten(), vec_prev.flatten())
-    if np.arccos(cosphi) >= 0 and np.arccos(cosphi) <= (np.pi / 2):
-        f_phi = .5*(1 + np.cos(np.pi*cosphi))
-    else:
-        f_phi = 1
-    f_om_perp = f_phi * (f_om - f_om_parallel)
-
-    # print(f"{np.amax(abs(f_om_parallel))=}|{np.amax(abs(f_om_perp))=}")
-    # print(f_om_parallel + f_om_perp)
-    return f_om_parallel + f_om_perp
-
-
-def _select_split_method(self, conditions: dict, irc_results, concavity_results):
-    all_conditions_met = all([val for key, val in conditions.items()])
-    if all_conditions_met:
-        return None
-
-    if conditions["concavity"] is False:  # prioritize the minima condition
-        return "minima"
-    elif conditions["irc"] is False:
-        return "maxima"
-
-
 def get_nudged_pe_grad(unit_tangent: np.array, gradient: np.array):
     """
     Returns the component of the gradient that acts perpendicular to the path tangent
@@ -613,18 +479,6 @@ def _update_cache(self, chain: Chain, gradients: NDArray, energies: NDArray) -> 
         node._cached_gradient = grad
 
 
-def _calculate_chain_distances(chain_traj: List[Chain]):
-    distances = [None]  # None for the first chain
-    for i, chain in enumerate(chain_traj):
-        if i == 0:
-            continue
-
-        prev_chain = chain_traj[i - 1]
-        dist = _distance_to_chain(prev_chain, chain)
-        distances.append(dist)
-    return np.array(distances)
-
-
 def _reset_node_convergence(chain) -> None:
     """
     sets each node in chain  to `node.converged = False`
@@ -641,18 +495,6 @@ def _reset_cache(chain) -> None:
         node._cached_energy = None
         node._cached_gradient = None
         node._cached_result = None
-
-
-def extend_by_n_frames(list_obj: List, n: int = 2):
-    """
-    will return the same chain where each node has been duplicated by n
-    """
-    orig_list = list_obj
-    new_list = []
-    for value in orig_list:
-        new_list.extend([value] * n)
-
-    return new_list
 
 
 def _path_len_dist_func(coords1, coords2, molecular_system: bool = False):
@@ -699,46 +541,6 @@ def _energies_kcalmol(chain: List[Node]):
     """
     enes = np.array([node.energy for node in chain])
     return (enes - enes[0]) * 627.5
-
-
-def build_covariance_matrix(node_list, ts_vector):
-    node_list = [(node.coords.flatten() - ts_vector) for node in node_list]
-    a = node_list[0]
-    mat = np.zeros(shape=(len(a), len(a)))
-    for i in range(mat.shape[0]):
-        for j in range(mat.shape[0]):
-            products = sum([vec[i]*vec[j]
-                            for vec in node_list]) / len(node_list)
-            sums = sum([vec[i] for vec in node_list])*sum([vec[j]
-                                                           for vec in node_list]) / (len(node_list)**2)
-            mat[i, j] = products - sums
-    return mat
-
-
-def get_rxn_coordinate(c: Chain, ts_vector=None):
-    if ts_vector is None:
-        ts_vector = c.get_ts_node().coords.flatten()
-    mat = build_covariance_matrix(
-        c, ts_vector=ts_vector)
-    # mat = build_correlation_matrix(
-    #     c, ts_vector=c[0].coords.flatten())
-    evals, evecs = np.linalg.eigh(mat)
-    print('eigenvalues: ', evals)
-    return evecs[:, -1]
-
-
-def get_projections(c: Chain, eigvec, ts_geom=None):
-    if ts_geom is None:
-        ind_ts = c.energies.argmax()
-        ts_geom = c[ind_ts]
-
-    all_dists = []
-    for i, node in enumerate(c):
-        displacement = c[i].coords.flatten() - ts_geom.coords.flatten()
-        all_dists.append(np.dot(displacement, eigvec))
-    # plt.plot(all_dists)
-    return all_dists
-
 
 
 def _select_node_at_dist(
@@ -879,21 +681,6 @@ def calculate_geodesic_tangent(
 
     return [new0, ref_node, new2]
 
-
-def insert_nodes_around_index(chain, most_strained_node, engine):
-    node = chain[most_strained_node]
-    fwd_gi = run_geodesic([node, chain[most_strained_node+1]], nimages=3, align=False)
-    fwd_node = fwd_gi[1]
-
-    bck_gi = run_geodesic([chain[most_strained_node-1], node], nimages=3, align=False)
-    bck_node = bck_gi[1]
-
-    chain_new = chain.copy()
-    engine.compute_energies([bck_node, fwd_node])
-    chain_new.nodes.insert(most_strained_node+1, fwd_node)
-    chain_new.nodes.insert(most_strained_node, bck_node)
-
-    return chain_new
 
 # def upsample_chain(chain, engine, nimages):
 #     coords = chain.energies_kcalmol

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import networkx as nx
 
@@ -102,21 +101,6 @@ class Molecule(nx.Graph):
                 molecule.add_edge(source, target, **attrs)
         return molecule
 
-    def indices_are_identical(self, b: Molecule):
-        res = self.remove_Hs().get_subgraph_isomorphisms_of(b.remove_Hs())
-        if len(res) > 1:
-            # print("Warning! Multiple isomorphisms found.")
-            return True
-        elif len(res) == 0:
-            # print("No isomorphisms found")
-            return False
-
-        for k, v in res[0].reverse_mapping.items():
-            if k != v:
-                # print(f"{k} in predicted is different to {v}")
-                return False
-        return True
-
     def copy(self, reindex=False, start=0) -> Molecule:
         """Overload the nx.Graph.copy() method to bring the non-networkx attributes across
 
@@ -162,20 +146,6 @@ class Molecule(nx.Graph):
             this_iso_remaining_fragments.remove_node(value)
 
         return this_iso_remaining_fragments
-
-    def graph_difference_with_list_and_duplicates(
-        self, mols: list[Molecule]
-    ) -> Molecule:
-        """
-        it is a graph difference between a graph and a list of molecules
-        Every instance of each molecule in the list is removed from the self
-        molecule.
-        """
-        new_mol = self.copy()
-        for mol in mols:
-            while mol.is_subgraph_isomorphic_to(new_mol):
-                new_mol = new_mol.graph_difference(mol)
-        return new_mol
 
     def __add__(self, mol2: Molecule) -> Molecule:
         """when you do: mol1 + mol2
@@ -302,26 +272,6 @@ class Molecule(nx.Graph):
         mol2 = nx.relabel_nodes(self, swaps)
         return mol2
 
-    def change_element_name(self, lab1, lab2):
-        """
-        label1 and label2 -> str
-        this change the 'element' name
-        """
-        mol2 = self.copy()
-        for node in mol2.nodes():
-            label = mol2.nodes[node]["element"]
-            if label == lab1:
-                mol2.nodes[node]["element"] = lab2
-        return mol2
-
-    def get_bond_order(self, first_atom, second_atom):
-        """get the bond orde between two indexes"""
-        return self.edges[first_atom, second_atom]["bond_order"]
-
-    def get_element(self, index_atom):
-        """returns the element at one index"""
-        return self.nodes[index_atom]["element"]
-
     def is_isomorphic_to(self, mol):
         GM = SubGraphMatcher(self)
         return GM.is_isomorphic(mol)
@@ -357,33 +307,12 @@ class Molecule(nx.Graph):
         isoms = GM.get_subgraph_isomorphisms(self.remove_r_groups())
         return [IsomorphismMappings(x) for x in isoms]
 
-    def get_bond_subgraph_isomorphisms_of(
-        self, target, verbosity=0
-    ) -> list[IsomorphismMappings]:
-        """
-        a.get_subgraph_isomorphisms_of(b)
-        gives the isomorphic map of A being a subgraph of B
-        self.get_subgraph_isomorphisms_of(target)
-        tells if the template molecule SELF is a subgraph of TARGET molecule
-        """
-        GM = SubGraphMatcher(target, verbosity=verbosity)
-        isoms = GM.get_bond_subgraph_isomorphisms(self.remove_r_groups())
-        return [IsomorphismMappings(x) for x in isoms]
-
     def create_smiles(self):
         smiles = ".".join(
             sorted([graph_to_smiles(x)
                    for x in self.separate_graph_in_pieces()])
         )
         return smiles
-
-    def which_atoms_are_in(self):
-        """returns a list of unique elements"""
-        return {self.nodes[x]["element"] for x in self.nodes}
-
-    def list_of_elements(self):
-        """returns a list of elements"""
-        return [self.nodes[x]["element"] for x in self.nodes]
 
     def is_empty(self):
         """method to check if the molecule graph is empty or not"""
@@ -423,23 +352,6 @@ class Molecule(nx.Graph):
 
         fixed_mol = mol.add_hydrogens(atoms_to_fix, all_hs_to_add)
         return fixed_mol
-
-    def save_smiles(self, path=None):
-        if path is None:
-            raise ValueError("Must provide a path")
-
-        with open(path, "w") as f:
-            f.write(self.smiles)
-
-    def smiles_from_multiple_molecules(mol):
-        """
-        this method is used to have a unique smile for each graph
-        even when the graph contains multiple molecules.
-        It is used in the pot to have uniqueness.
-        """
-        list_smiles = [x.force_smiles()
-                       for x in mol.separate_graph_in_pieces()]
-        return ".".join(sorted(list_smiles))
 
     def force_smiles(self):
         """

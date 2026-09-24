@@ -125,28 +125,6 @@ class SubGraphMatcher:
             result = False
         return result
 
-    def get_isomorphisms(self, g):
-        """
-        Returns a list of dictionaries of node mappings.
-        The keys of each dictionary are nodes in self.mol, while values are nodes in g.
-        """
-        try:
-            with self._timeout_context():
-                GM = self.GM(
-                    self.mol,
-                    g,
-                    node_match=self._node_matcher,
-                    edge_match=self._edge_matcher,
-                )
-                isos = [a for a in GM.isomorphisms_iter()]
-        except TimeoutIsomorphism:
-            print(
-                "A SubGraphMatcher timeout error occurred in get_isomorphisms "
-                f"{self._safe_smiles_label(self.mol)} -> {self._safe_smiles_label(g)}."
-            )
-            isos = []
-        return isos
-
     def is_subgraph_isomorphic(self, g):
         """
         Returns a boolean if self is subgraph isomorphic of g
@@ -190,28 +168,6 @@ class SubGraphMatcher:
             isos = []
         return isos
 
-    def get_bond_subgraph_isomorphisms(self, g):
-        """
-        Returns a list of dictionaries of node mappings.
-        The keys of each dictionary are nodes in self.mol, while values are nodes in g.
-        """
-        try:
-            with self._timeout_context():
-                GM = self.GM(
-                    self.mol,
-                    g,
-                    node_match=self._node_matcher_no_charge,
-                    edge_match=self._edge_matcher,
-                )
-                isos = [a for a in GM.subgraph_isomorphisms_iter()]
-        except TimeoutIsomorphism:
-            print(
-                "A SubGraphMatcher timeout error occurred in get_subgraph_isomorphisms "
-                f"{self._safe_smiles_label(self.mol)} -> {self._safe_smiles_label(g)}."
-            )
-            isos = []
-        return isos
-
     def largest_common_subgraph(self, g):
         """
         This returns the ISMAGS largest common subgraph.
@@ -222,58 +178,3 @@ class SubGraphMatcher:
         return list(GM.largest_common_subgraph())
 
 
-class SubGraphMatcherApplyPermute(SubGraphMatcher):
-    """
-    This matcher is used for apply_permute
-    NO ismags
-    NO neighbors
-    R are wildcards
-    """
-
-    GM = nx.isomorphism.GraphMatcher
-
-    def _node_matcher(self, n1, n2):
-        nodes_equiv = n1["element"] == n2["element"]
-
-        if n1["element"][0] == "R" or n2["element"][0] == "R":
-            nodes_equiv = True
-
-        return nodes_equiv
-
-
-class SubGraphMatcherRsAreEqualToEachOther(SubGraphMatcher):
-    """
-    This matcher is used for template to template comparison
-    NO ismags
-    NO neighbors
-    R match true only on other Rs
-    """
-
-    GM = nx.isomorphism.GraphMatcher
-
-    def _node_matcher(self, n1, n2):
-        nodes_equiv = n1["element"] == n2["element"]
-
-        if n1["element"][0] == "R" and n2["element"][0] == "R":
-            nodes_equiv = True
-
-        return nodes_equiv
-
-
-class SubGraphMatcherRules(SubGraphMatcher):
-    """
-    This matcher is used by the Rules
-    ISMAGS OFF
-    Neighbors are not used.
-    """
-
-    GM = nx.isomorphism.GraphMatcher
-
-    def _node_matcher(self, n1, n2):
-        if n2["element"] == "A":
-            nodes_equiv = n1["element"] in n2["element_matching"]
-        #             print(f'is {n1["element"]} in {n2["element_matching"]}? {nodes_equiv}')
-        else:
-            nodes_equiv = n1["element"] == n2["element"]
-        #             print(f'is {n1["element"]} equal to {n2["element"]}? {nodes_equiv}')
-        return nodes_equiv

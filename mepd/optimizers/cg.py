@@ -45,9 +45,6 @@ class ConjugateGradient(Optimizer):
         self._nsteps_high_corr = 0
         self._prev_grad_corr = 0.0
 
-    def update_timestep(self, new_timestep: float) -> None:
-        self.timestep = new_timestep
-
     def update_timestep_from_correlation(self, grad_corr: float) -> str | None:
         """Adapt the CG timestep from NEB gradient correlation."""
         if not bool(self.adaptive_dt):

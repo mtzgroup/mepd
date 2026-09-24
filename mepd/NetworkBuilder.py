@@ -6,7 +6,6 @@ import numpy as np
 from scipy.signal import argrelmin
 
 from mepd.chain import Chain
-from mepd.helper_functions import pairwise
 from mepd.inputs import ChainInputs, NetworkInputs
 from mepd.pot import Pot
 from mepd.nodes.node import StructureNode
@@ -289,35 +288,6 @@ class NetworkBuilder:
         pot = self._add_all_edges(pot, structures=structures, edges=edges)
         return pot
 
-    def path_to_keys(self, path_indices):
-        pairs = list(pairwise(path_indices))
-        labels = [f"{a}-{b}" for a, b in pairs]
-        return labels
-
-    def get_best_chain(self, list_of_chains):
-        eAs = [c.get_eA_chain() for c in list_of_chains]
-        return list_of_chains[np.argmin(eAs)]
-
-    def calculate_barrier(self, chain):
-        return (chain.energies.max() - chain[0].energy)*627.5
-
-    def path_to_chain(self, path, leaf_objects):
-        labels = self.path_to_keys(path)
-        node_list = []
-        for label in labels:
-            node_list.extend(self.get_best_chain(leaf_objects[label]).nodes)
-        c = Chain(node_list, ChainInputs())
-        return c
-
-    def path_to_list_of_chains(self, path, leaf_objects):
-        labels = self.path_to_keys(path)
-        c_list = []
-        for label in labels:
-
-            c = self.get_best_chain(leaf_objects[label])
-            c_list.append(c)
-        return c_list
-
     def get_lowest_barrier_chain(self, edge: str):
         edge_data = self.leaf_objects[edge]
         assert len(edge_data) >= 1, f"{edge} was not found in network."
@@ -325,15 +295,3 @@ class NetworkBuilder:
         best_ind = np.argmin(eAs)
         return edge_data[best_ind]
 
-    def get_mechanism_mols(self, chain, elem_step_len=12):
-        out_mols = [chain[0].graph]
-        nsteps = int(len(chain)/elem_step_len)
-        for ind in range(nsteps):
-            r = chain[ind*elem_step_len].graph
-            if r != out_mols[-1]:
-                out_mols.append(r)
-
-        p = chain[-1].graph
-        if p != out_mols[-1]:
-            out_mols.append(p)
-        return out_mols
