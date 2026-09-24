@@ -176,6 +176,12 @@ class NEBInputs:
         minimum; if that fails the rescue escalates to 0.3 and 0.5 bohr
         (elementarystep.RESCUE_ESCALATION_BOHR)
 
+    `stop_on_validated_ts`: at steps ts_validation_first_step, 2x, 4x, ... optimize
+        the current TS guess and follow its IRC; stop as soon as the IRC connects
+        this chain's endpoints, reporting an elementary step (default: True). Band
+        convergence is otherwise the stopping rule, as before. No-op for engines
+        that can't optimize transition states.
+    `ts_validation_first_step`: first NEB step at which to try that (default: 5)
     `recursive_same_pair_split_limit`: during recursive autosplitting, if a branch
         repeats the exact same (start, end) endpoint pair this many times in a row
         with no new chemistry found (a genuinely unproductive loop -- a split that
@@ -217,6 +223,8 @@ class NEBInputs:
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
     recursive_same_pair_split_limit: int = 5
+    stop_on_validated_ts: bool = True
+    ts_validation_first_step: int = 5
 
     max_steps: float = 2000
 
@@ -252,7 +260,9 @@ class ChainInputs:
             see: https://pubs.acs.org/doi/full/10.1021/acs.jctc.1c00462
 
     `node_class`: type of node to use
-    `do_parallel`: whether to compute gradients and energies in parallel
+    `do_parallel`: whether engines that support it (g-xTB) compute a chain's
+        images concurrently; False forces one at a time (the engine's own
+        `n_parallel` sets how many otherwise)
     `use_geodesic_interpolation`: whether to use GI in interpolations
 
     `node_freezing`: whether to freeze nodes in NEB convergence
@@ -704,6 +714,8 @@ class RunInputs:
             raise ValueError(f"Unsupported engine: {self.engine_name}")
 
         setattr(eng, "disable_molecular_graphs", disable_molecular_graphs)
+        if hasattr(eng, "n_parallel") and not getattr(self.chain_inputs, "do_parallel", True):
+            eng.n_parallel = 1
         self.engine = eng
         optimizer_kwds = dict(self.optimizer_kwds)
         optimizer_name = optimizer_kwds.pop("name").lower()

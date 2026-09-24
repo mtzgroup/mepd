@@ -203,3 +203,40 @@ def compute_irc_chain_with_geometric(
         node.graph = None
         irc_nodes.append(node)
     return Chain.model_validate({"nodes": irc_nodes})
+
+
+def optimize_ts_and_irc(engine: Any, ts_guess: StructureNode):
+    """Optimize `ts_guess` to a TS with `engine` and follow its IRC.
+
+    Returns `(ts_node, irc_chain)`; `ts_node` is None if the engine can't
+    optimize transition states or the optimization failed, and `irc_chain`
+    is None if the IRC failed. Never raises."""
+    compute_ts = getattr(engine, "compute_transition_state", None)
+    if not callable(compute_ts):
+        return None, None
+    try:
+        ts_node = compute_ts(node=ts_guess)
+    except Exception:
+        return None, None
+    if not isinstance(ts_node, StructureNode):
+        return None, None
+    try:
+        irc_fn = getattr(engine, "compute_irc_chain", None)
+        irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
+    except Exception:
+        return ts_node, None
+    return ts_node, irc_chain
+
+
+def irc_connects(irc_chain: Chain, start: StructureNode, end: StructureNode) -> bool:
+    """Whether the IRC's two ends are `start` and `end` (same molecules,
+    ignoring conformation), in either direction."""
+    from mepd.nodes.nodehelpers import _connectivity_matches
+
+    a, b, s, e = (
+        StructureNode(structure=node.structure)
+        for node in (irc_chain[0], irc_chain[-1], start, end)
+    )
+    return (_connectivity_matches(a, s) and _connectivity_matches(b, e)) or (
+        _connectivity_matches(a, e) and _connectivity_matches(b, s)
+    )

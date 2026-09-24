@@ -815,6 +815,14 @@ class MSMEP:
             _run_inputs_payload_for_worker(self.inputs) if use_process_workers else None
         )
         set_status = getattr(progress_printer, "set_monitor_status", None)
+        # Branches share the machine: an engine left to size its own image
+        # parallelism (n_parallel = 0) gets an equal slice per branch.
+        branch_inputs = self.inputs
+        if getattr(self.inputs.engine, "n_parallel", None) == 0:
+            branch_inputs = _clone_run_inputs_for_worker(self.inputs)
+            branch_inputs.engine.n_parallel = max(
+                1, int(os.cpu_count() or 1) // bounded_workers
+            )
 
         def _submit(executor: concurrent.futures.Executor, job: SimpleNamespace) -> None:
             job.submitted_at = time.time()
@@ -827,7 +835,7 @@ class MSMEP:
             else:
                 future = executor.submit(
                     _parallel_recursive_step_worker,
-                    self.inputs, job.chain,
+                    branch_inputs, job.chain,
                     job.index, job.depth, resolved_max_depth, job.worker_payload,
                 )
             pending[future] = job

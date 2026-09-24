@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import List, Optional
 
 import typer
-from qcdata import Structure
 
 from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
 from mepd.chain import Chain

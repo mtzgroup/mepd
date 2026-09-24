@@ -888,7 +888,6 @@ def channels(
     if complex_energy_tol < 0:
         raise typer.BadParameter("--complex-energy-tol must be non-negative (0 disables).")
 
-    import json
     import os
     import time
 
@@ -1118,6 +1117,13 @@ def channels(
         parallel_workers = max(1, cpu_count // workers)
     stats["workers"] = workers
     stats["parallel_workers"] = parallel_workers if parallel else None
+    # Engines that can run a chain's images concurrently (n_parallel = 0 is
+    # "auto") get what is left of the machine per branch.
+    if getattr(run_inputs.engine, "n_parallel", None) == 0:
+        run_inputs.engine.n_parallel = max(
+            1, cpu_count // (workers * (parallel_workers if parallel else 1))
+        )
+    stats["engine_parallel"] = getattr(run_inputs.engine, "n_parallel", None)
 
     if conformers_only:
         typer.echo(

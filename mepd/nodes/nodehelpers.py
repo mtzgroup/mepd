@@ -660,3 +660,62 @@ def displace_by_dr(node: Node, displacement: np.array, dr: float = 0.1) -> Node:
     displacement = displacement / np.linalg.norm(displacement)
     new_coords = node.coords + dr*displacement
     return node.update_coords(new_coords)
+
+
+_TWISTED_RING_ALKENE_DEG = 60.0
+
+
+def _n_trans_small_ring_alkenes(node) -> int | None:
+    """How many C=C bonds inside a 3-7 membered ring are trans/twisted (the
+    ring C-C=C-C dihedral above `_TWISTED_RING_ALKENE_DEG`), from the node's
+    own geometry; None if the bonding can't be perceived.
+
+    SMILES can't express E/Z for a double bond in a ring this small, so
+    stereo SMILES calls cis- and trans-cyclohexene the same molecule. They
+    aren't: trans-cyclohexene is ~50 kcal/mol of strain, reached by an
+    antarafacial Diels-Alder TS that `channels` then counted as a channel to
+    ordinary cyclohexene."""
+    from rdkit import Chem
+    from rdkit.Chem import rdDetermineBonds, rdMolTransforms
+
+    try:
+        mol = Chem.MolFromXYZBlock(node.structure.to_xyz())
+        rdDetermineBonds.DetermineBonds(mol, charge=node.structure.charge)
+    except Exception:
+        return None
+    ring_info = mol.GetRingInfo()
+    n = 0
+    for bond in mol.GetBonds():
+        if bond.GetBondType() != Chem.BondType.DOUBLE:
+            continue
+        rings = [r for r in ring_info.BondRings() if bond.GetIdx() in r and len(r) <= 7]
+        if not rings:
+            continue
+        ring_atoms = {mol.GetBondWithIdx(k).GetBeginAtomIdx() for k in rings[0]} | {
+            mol.GetBondWithIdx(k).GetEndAtomIdx() for k in rings[0]
+        }
+        a, c = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        na = [x.GetIdx() for x in mol.GetAtomWithIdx(a).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != c]
+        nc = [x.GetIdx() for x in mol.GetAtomWithIdx(c).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != a]
+        if not na or not nc:
+            continue
+        dihedral = rdMolTransforms.GetDihedralDeg(mol.GetConformer(), na[0], a, c, nc[0])
+        n += abs(dihedral) > _TWISTED_RING_ALKENE_DEG
+    return n
+
+
+def _connectivity_matches(a, b) -> bool:
+    """Same molecule (bond connectivity + stereochemistry), ignoring
+    conformation -- mirrors `NetworkBuilder._graph_equivalent`, used here to
+    compare an IRC-recovered endpoint against the originally requested
+    --start/--end structures without caring which conformer it landed on.
+
+    Stereo SMILES is blind to E/Z of double bonds in small rings, so the
+    count of trans/twisted small-ring alkenes must match as well
+    (`_n_trans_small_ring_alkenes`)."""
+    if getattr(a, "graph", None) is None or getattr(b, "graph", None) is None:
+        return False
+    if not _is_connectivity_identical(a, b, verbose=False, collect_comparison=False):
+        return False
+    na, nb = _n_trans_small_ring_alkenes(a), _n_trans_small_ring_alkenes(b)
+    return na is None or nb is None or na == nb

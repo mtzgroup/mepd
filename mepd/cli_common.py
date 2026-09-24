@@ -10,7 +10,6 @@ so those command modules don't have to import from each other.
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -20,6 +19,7 @@ from qcdata import Structure
 
 from mepd.chain import Chain
 from mepd.inputs import RunInputs
+from mepd.nodes.nodehelpers import _connectivity_matches, _n_trans_small_ring_alkenes  # noqa: F401
 
 
 def _format_run_inputs_value(value) -> str:
@@ -618,52 +618,49 @@ def _optimize_ts_and_irc(
     """
     from mepd.nodes.node import StructureNode
 
-    compute_ts = getattr(run_inputs.engine, "compute_transition_state", None)
-    if not callable(compute_ts):
-        typer.echo(
-            f"Engine {type(run_inputs.engine).__name__} does not support "
-            "transition-state optimization."
-        )
-        return None
+    from mepd.inputs import ChainInputs
+    from mepd.irc import compute_irc_chain_with_geometric
 
-    typer.echo(f"Optimizing transition state ({label})...")
-    try:
-        result = compute_ts(node=ts_guess_node)
-    except Exception as exc:
-        typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
-        return None
+    engine = run_inputs.engine
+    precomputed = getattr(ts_guess_node, "validated_ts_irc", None)
+    if precomputed is not None:
+        # The path search already optimized this guess and followed its IRC.
+        ts_node, irc_chain = precomputed
+        typer.echo(f"Reusing the TS and IRC validated during the path search ({label}).")
+    else:
+        compute_ts = getattr(engine, "compute_transition_state", None)
+        if not callable(compute_ts):
+            typer.echo(f"Engine {type(engine).__name__} does not support transition-state optimization.")
+            return None
+        typer.echo(f"Optimizing transition state ({label})...")
+        try:
+            ts_node = compute_ts(node=ts_guess_node)
+        except Exception as exc:
+            typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
+            return None
+        if not isinstance(ts_node, StructureNode):
+            typer.echo(
+                f"Transition-state optimization did not converge to a usable structure "
+                f"({label}; engine returned {type(ts_node).__name__})."
+            )
+            return None
+        irc_chain = None
 
-    if not isinstance(result, StructureNode):
-        typer.echo(
-            f"Transition-state optimization did not converge to a usable structure "
-            f"({label}; engine returned {type(result).__name__})."
-        )
-        return None
-
-    ts_node = result
     output.mkdir(parents=True, exist_ok=True)
     ts_path = output / f"{label}.xyz"
-    from mepd.inputs import ChainInputs
-
-    Chain.model_validate(
-        {"nodes": [ts_node], "parameters": ChainInputs()}
-    ).write_to_disk(ts_path)
+    Chain.model_validate({"nodes": [ts_node], "parameters": ChainInputs()}).write_to_disk(ts_path)
     typer.echo(f"Wrote optimized TS structure to {ts_path}")
-
     if not run_irc:
         return TsIrcResult(ts_node=ts_node)
 
-    typer.echo(f"Computing IRC ({label})...")
-    irc_fn = getattr(run_inputs.engine, "compute_irc_chain", None)
-    try:
-        if callable(irc_fn):
-            irc_chain = irc_fn(ts_node)
-        else:
-            from mepd.irc import compute_irc_chain_with_geometric
-            irc_chain = compute_irc_chain_with_geometric(run_inputs.engine, ts_node)
-    except Exception as exc:
-        typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
-        return TsIrcResult(ts_node=ts_node)
+    if irc_chain is None:
+        typer.echo(f"Computing IRC ({label})...")
+        try:
+            irc_fn = getattr(engine, "compute_irc_chain", None)
+            irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
+        except Exception as exc:
+            typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
+            return TsIrcResult(ts_node=ts_node)
 
     irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
     irc_chain.write_to_disk(irc_path)
@@ -681,6 +678,8 @@ def _ts_guess_tasks_from_tree(tree, label_prefix: str) -> list[tuple[str, object
         if not leaf.data or not leaf.data.chain_trajectory:
             continue
         guess_node = leaf.data.chain_trajectory[-1].get_ts_node()
+        if getattr(leaf.data, "validated_ts", None) is not None:
+            guess_node.validated_ts_irc = (leaf.data.validated_ts, leaf.data.validated_irc)
         tasks.append((f"{label_prefix}leaf_{leaf.index}", guess_node))
     return tasks
 
@@ -771,62 +770,3 @@ def _collect_ts_guess_tasks(
     return [("ts", StructureNode(structure=guess_structure))]
 
 
-_TWISTED_RING_ALKENE_DEG = 60.0
-
-
-def _n_trans_small_ring_alkenes(node) -> Optional[int]:
-    """How many C=C bonds inside a 3-7 membered ring are trans/twisted (the
-    ring C-C=C-C dihedral above `_TWISTED_RING_ALKENE_DEG`), from the node's
-    own geometry; None if the bonding can't be perceived.
-
-    SMILES can't express E/Z for a double bond in a ring this small, so
-    stereo SMILES calls cis- and trans-cyclohexene the same molecule. They
-    aren't: trans-cyclohexene is ~50 kcal/mol of strain, reached by an
-    antarafacial Diels-Alder TS that `channels` then counted as a channel to
-    ordinary cyclohexene."""
-    from rdkit import Chem
-    from rdkit.Chem import rdDetermineBonds, rdMolTransforms
-
-    try:
-        mol = Chem.MolFromXYZBlock(node.structure.to_xyz())
-        rdDetermineBonds.DetermineBonds(mol, charge=node.structure.charge)
-    except Exception:
-        return None
-    ring_info = mol.GetRingInfo()
-    n = 0
-    for bond in mol.GetBonds():
-        if bond.GetBondType() != Chem.BondType.DOUBLE:
-            continue
-        rings = [r for r in ring_info.BondRings() if bond.GetIdx() in r and len(r) <= 7]
-        if not rings:
-            continue
-        ring_atoms = {mol.GetBondWithIdx(k).GetBeginAtomIdx() for k in rings[0]} | {
-            mol.GetBondWithIdx(k).GetEndAtomIdx() for k in rings[0]
-        }
-        a, c = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        na = [x.GetIdx() for x in mol.GetAtomWithIdx(a).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != c]
-        nc = [x.GetIdx() for x in mol.GetAtomWithIdx(c).GetNeighbors() if x.GetIdx() in ring_atoms and x.GetIdx() != a]
-        if not na or not nc:
-            continue
-        dihedral = rdMolTransforms.GetDihedralDeg(mol.GetConformer(), na[0], a, c, nc[0])
-        n += abs(dihedral) > _TWISTED_RING_ALKENE_DEG
-    return n
-
-
-def _connectivity_matches(a, b) -> bool:
-    """Same molecule (bond connectivity + stereochemistry), ignoring
-    conformation -- mirrors `NetworkBuilder._graph_equivalent`, used here to
-    compare an IRC-recovered endpoint against the originally requested
-    --start/--end structures without caring which conformer it landed on.
-
-    Stereo SMILES is blind to E/Z of double bonds in small rings, so the
-    count of trans/twisted small-ring alkenes must match as well
-    (`_n_trans_small_ring_alkenes`)."""
-    from mepd.nodes.nodehelpers import _is_connectivity_identical
-
-    if getattr(a, "graph", None) is None or getattr(b, "graph", None) is None:
-        return False
-    if not _is_connectivity_identical(a, b, verbose=False, collect_comparison=False):
-        return False
-    na, nb = _n_trans_small_ring_alkenes(a), _n_trans_small_ring_alkenes(b)
-    return na is None or nb is None or na == nb

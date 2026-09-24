@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,6 +120,10 @@ class GXTBCalculator(Engine):
     keep_workdirs: bool = False
     add_gxtb_flag: bool = True
     n_threads: int = 1
+    # Independent calculations (a chain's images, a batch of geometry
+    # optimizations) run as up to this many concurrent g-xTB processes.
+    # 0 = as many as the machine has cores for at n_threads each.
+    n_parallel: int = 0
 
     def __post_init__(self) -> None:
         if self.executable is None:
@@ -155,10 +161,9 @@ class GXTBCalculator(Engine):
         for i in inds_cached:
             results[i] = node_list[i]._cached_result
 
-        for i, node in enumerate(node_list):
-            if i in inds_cached:
-                continue
-            results[i] = self._compute_node(node)
+        todo = [i for i in range(len(node_list)) if i not in inds_cached]
+        for i, res in zip(todo, self._map(self._compute_node, [node_list[i] for i in todo])):
+            results[i] = res
 
         update_node_cache(node_list=node_list, results=results)
         return node_list
@@ -455,19 +460,34 @@ class GXTBCalculator(Engine):
         keywords: dict[str, Any] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[list[StructureNode]]:
-        """Batch geometry optimizations, one g-xTB subprocess per node.
+        """Batch geometry optimizations, one g-xTB subprocess per node, up to
+        `n_parallel` at a time.
 
         `progress_callback`, if given, is called as `progress_callback(completed,
-        total)` after each node finishes -- this "batch" is really a sequential
-        loop under the hood (one local subprocess at a time), so per-candidate
-        progress is available live, unlike a true remote batch backend.
+        total)` after each node finishes, so per-candidate progress is
+        available live, unlike a true remote batch backend.
         """
-        results: list[list[StructureNode]] = []
-        for node in nodes:
-            results.append(self.compute_geometry_optimization(node=node, keywords=keywords))
-            if progress_callback is not None:
-                progress_callback(len(results), len(nodes))
-        return results
+        lock = threading.Lock()
+        done = [0]
+
+        def _optimize(node):
+            traj = self.compute_geometry_optimization(node=node, keywords=keywords)
+            with lock:
+                done[0] += 1
+                if progress_callback is not None:
+                    progress_callback(done[0], len(nodes))
+            return traj
+
+        return self._map(_optimize, list(nodes))
+
+    def _map(self, fn, items: list) -> list:
+        """`[fn(x) for x in items]`, with up to `n_parallel` running at once."""
+        width = int(self.n_parallel) or max(1, (os.cpu_count() or 1) // max(1, int(self.n_threads)))
+        width = min(width, len(items))
+        if width <= 1:
+            return [fn(x) for x in items]
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            return list(pool.map(fn, items))
 
     def _as_ase_engine_for_node(self, node: StructureNode):
         from mepd.engines.ase import ASEEngine
