@@ -14,7 +14,7 @@ from typing import Any, Tuple, List
 
 from mepd.nodes.node import Node, StructureNode
 from mepd.nodes.nodehelpers import _is_connectivity_identical
-from mepd.elementarystep import check_if_elem_step
+from mepd.elementarystep import elem_step_check_kwargs, check_if_elem_step
 
 from mepd.chain import Chain
 import mepd.chainhelpers as ch
@@ -1076,28 +1076,7 @@ class MSMEP:
                     out_chain,
                     engine=self.inputs.engine,
                     verbose=_get_verbose(self.inputs),
-                    validate_minima_with_hessian=bool(
-                        getattr(
-                            self.inputs.path_min_inputs,
-                            "validate_minima_with_hessian",
-                            False,
-                        )
-                    ),
-                    hessian_minimum_frequency_cutoff=float(
-                        getattr(
-                            self.inputs.path_min_inputs,
-                            "hessian_minimum_frequency_cutoff",
-                            0.0,
-                        )
-                    ),
-                    hessian_minima_rescue_displacement=float(
-                        getattr(
-                            self.inputs.path_min_inputs,
-                            "hessian_minima_rescue_displacement",
-                            0.1,
-                        )
-                    ),
-                    disregard_stereochem=_disregard_stereochem(self.inputs),
+                    **elem_step_check_kwargs(self.inputs.path_min_inputs),
                 )
             else:
                 elem_step_results = ElemStepResults(

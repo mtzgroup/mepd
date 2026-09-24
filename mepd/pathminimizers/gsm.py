@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from mepd.chain import Chain
-from mepd.elementarystep import ElemStepResults, check_if_elem_step
+from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 
@@ -506,18 +506,7 @@ class GSM(PathMinimizer):
         elem_step_results = check_if_elem_step(
             final_chain,
             engine=self.engine,
-            validate_minima_with_hessian=bool(
-                getattr(self.parameters, "validate_minima_with_hessian", False)
-            ),
-            hessian_minimum_frequency_cutoff=float(
-                getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
-            ),
-            hessian_minima_rescue_displacement=float(
-                getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
-            ),
-            disregard_stereochem=bool(
-                getattr(self.parameters, "disregard_stereochem", False)
-            ),
+            **elem_step_check_kwargs(self.parameters),
         )
         self.geom_grad_calls_made += elem_step_results.number_grad_calls
         return elem_step_results

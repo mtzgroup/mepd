@@ -947,6 +947,22 @@ def _prepare_nodes_for_comparison(nodes: list[Node], prepare_node) -> list[Node]
     return [_prepare_node_for_comparison(node, prepare_node) for node in nodes]
 
 
+def elem_step_check_kwargs(parameters) -> dict:
+    """`check_if_elem_step`'s Hessian/stereochemistry settings, read off a path
+    minimizer's parameters (an attribute namespace or a dict)."""
+    if isinstance(parameters, dict):
+        get = parameters.get
+    else:
+        def get(key, default):
+            return getattr(parameters, key, default)
+    return {
+        "validate_minima_with_hessian": bool(get("validate_minima_with_hessian", False)),
+        "hessian_minimum_frequency_cutoff": float(get("hessian_minimum_frequency_cutoff", 0.0)),
+        "hessian_minima_rescue_displacement": float(get("hessian_minima_rescue_displacement", 0.1)),
+        "disregard_stereochem": bool(get("disregard_stereochem", False)),
+    }
+
+
 def check_if_elem_step(
     inp_chain: Chain,
     engine: Engine,
@@ -1010,31 +1026,15 @@ def check_if_elem_step(
         {"disregard_stereochem": True} if disregard_stereochem else {}
     )
 
-    try:
-        concavity_results = _chain_is_concave(
-            chain=inp_chain,
-            engine=engine,
-            verbose=verbose,
-            validate_minima_with_hessian=bool(validate_minima_with_hessian),
-            hessian_minimum_frequency_cutoff=float(hessian_minimum_frequency_cutoff),
-            hessian_minima_rescue_displacement=float(
-                hessian_minima_rescue_displacement
-            ),
-            **stereochem_kwargs,
-        )
-    except TypeError as exc:
-        if (
-            "validate_minima_with_hessian" not in str(exc)
-            and "hessian_minimum_frequency_cutoff" not in str(exc)
-            and "hessian_minima_rescue_displacement" not in str(exc)
-        ):
-            raise
-        concavity_results = _chain_is_concave(
-            chain=inp_chain,
-            engine=engine,
-            verbose=verbose,
-            **stereochem_kwargs,
-        )
+    concavity_results = _chain_is_concave(
+        chain=inp_chain,
+        engine=engine,
+        verbose=verbose,
+        validate_minima_with_hessian=bool(validate_minima_with_hessian),
+        hessian_minimum_frequency_cutoff=float(hessian_minimum_frequency_cutoff),
+        hessian_minima_rescue_displacement=float(hessian_minima_rescue_displacement),
+        **stereochem_kwargs,
+    )
     n_geom_opt_grad_calls += concavity_results.number_grad_calls
 
     if concavity_results.is_not_concave:

@@ -13,7 +13,7 @@ from mepd.errors import ExternalProgramError
 
 import mepd.chainhelpers as ch
 from mepd.chain import Chain
-from mepd.elementarystep import ElemStepResults, check_if_elem_step
+from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines import Engine
 from mepd.errors import ElectronicStructureError, NoneConvergedException
 from mepd.inputs import ChainInputs, GIInputs, NEBInputs
@@ -466,18 +466,7 @@ class NEB(PathMinimizer):
             inp_chain=chain,
             engine=self.engine,
             verbose=self.parameters.v,
-            validate_minima_with_hessian=bool(
-                getattr(self.parameters, "validate_minima_with_hessian", False)
-            ),
-            hessian_minimum_frequency_cutoff=float(
-                getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
-            ),
-            hessian_minima_rescue_displacement=float(
-                getattr(self.parameters, "hessian_minima_rescue_displacement", 0.1)
-            ),
-            disregard_stereochem=bool(
-                getattr(self.parameters, "disregard_stereochem", False)
-            ),
+            **elem_step_check_kwargs(self.parameters),
         )
 
         if not elem_step_results.is_elem_step:
@@ -731,22 +720,7 @@ class NEB(PathMinimizer):
                         inp_chain=final_chain,
                         engine=self.engine,
                         verbose=self.parameters.v,
-                        validate_minima_with_hessian=bool(
-                            getattr(self.parameters, "validate_minima_with_hessian", False)
-                        ),
-                        hessian_minimum_frequency_cutoff=float(
-                            getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
-                        ),
-                        hessian_minima_rescue_displacement=float(
-                            getattr(
-                                self.parameters,
-                                "hessian_minima_rescue_displacement",
-                                0.1,
-                            )
-                        ),
-                        disregard_stereochem=bool(
-                            getattr(self.parameters, "disregard_stereochem", False)
-                        ),
+                        **elem_step_check_kwargs(self.parameters),
                     )
                     self.geom_grad_calls_made += elem_step_results.number_grad_calls
                 else:
@@ -789,22 +763,7 @@ class NEB(PathMinimizer):
                     inp_chain=new_chain,
                     engine=self.engine,
                     verbose=self.parameters.v,
-                    validate_minima_with_hessian=bool(
-                        getattr(self.parameters, "validate_minima_with_hessian", False)
-                    ),
-                    hessian_minimum_frequency_cutoff=float(
-                        getattr(self.parameters, "hessian_minimum_frequency_cutoff", 0.0)
-                    ),
-                    hessian_minima_rescue_displacement=float(
-                        getattr(
-                            self.parameters,
-                            "hessian_minima_rescue_displacement",
-                            0.1,
-                        )
-                    ),
-                    disregard_stereochem=bool(
-                        getattr(self.parameters, "disregard_stereochem", False)
-                    ),
+                    **elem_step_check_kwargs(self.parameters),
                 )
                 self.geom_grad_calls_made += elem_step_results.number_grad_calls
                 if elem_step_results.is_elem_step:

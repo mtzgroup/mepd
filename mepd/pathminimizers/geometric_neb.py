@@ -12,7 +12,7 @@ from qcdata import Structure
 
 from mepd.chain import Chain
 from qcconst.constants import ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM
-from mepd.elementarystep import ElemStepResults, check_if_elem_step
+from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
@@ -429,18 +429,7 @@ class GeometricNEB(PathMinimizer):
             elem_step_results = check_if_elem_step(
                 inp_chain=self.optimized,
                 engine=self.engine,
-                validate_minima_with_hessian=bool(
-                    self._params.get("validate_minima_with_hessian", False)
-                ),
-                hessian_minimum_frequency_cutoff=float(
-                    self._params.get("hessian_minimum_frequency_cutoff", 0.0)
-                ),
-                hessian_minima_rescue_displacement=float(
-                    self._params.get("hessian_minima_rescue_displacement", 0.1)
-                ),
-                disregard_stereochem=bool(
-                    self._params.get("disregard_stereochem", False)
-                ),
+                **elem_step_check_kwargs(self._params),
             )
             self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)
             return elem_step_results

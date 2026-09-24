@@ -10,7 +10,7 @@ from qcdata import FileInput, Structure
 
 from mepd.chain import Chain
 from qcconst.constants import ANGSTROM_TO_BOHR
-from mepd.elementarystep import ElemStepResults, check_if_elem_step
+from mepd.elementarystep import elem_step_check_kwargs, ElemStepResults, check_if_elem_step
 from mepd.engines.qccompute import QCComputeEngine
 from mepd.errors import ElectronicStructureError
 from mepd.nodes.node import StructureNode
@@ -704,18 +704,7 @@ class DLFindNEB(PathMinimizer):
                 elem_step_results = check_if_elem_step(
                     inp_chain=loose_chain,
                     engine=self.engine,
-                    validate_minima_with_hessian=bool(
-                        self._params.get("validate_minima_with_hessian", False)
-                    ),
-                    hessian_minimum_frequency_cutoff=float(
-                        self._params.get("hessian_minimum_frequency_cutoff", 0.0)
-                    ),
-                    hessian_minima_rescue_displacement=float(
-                        self._params.get("hessian_minima_rescue_displacement", 0.1)
-                    ),
-                    disregard_stereochem=bool(
-                        self._params.get("disregard_stereochem", False)
-                    ),
+                    **elem_step_check_kwargs(self._params),
                 )
                 self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)
                 if not elem_step_results.is_elem_step:
@@ -752,18 +741,7 @@ class DLFindNEB(PathMinimizer):
             elem_step_results = check_if_elem_step(
                 inp_chain=final_chain,
                 engine=self.engine,
-                validate_minima_with_hessian=bool(
-                    self._params.get("validate_minima_with_hessian", False)
-                ),
-                hessian_minimum_frequency_cutoff=float(
-                    self._params.get("hessian_minimum_frequency_cutoff", 0.0)
-                ),
-                hessian_minima_rescue_displacement=float(
-                    self._params.get("hessian_minima_rescue_displacement", 0.1)
-                ),
-                disregard_stereochem=bool(
-                    self._params.get("disregard_stereochem", False)
-                ),
+                **elem_step_check_kwargs(self._params),
             )
             self.geom_grad_calls_made += int(elem_step_results.number_grad_calls)
             return elem_step_results
