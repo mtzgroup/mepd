@@ -2728,14 +2728,19 @@ def channels(
         "did conformer generation cost?",
     ),
     parallel: bool = typer.Option(
-        False, "--parallel",
+        True, "--parallel/--no-parallel",
         help="Run each pair's recursive autosplitting (MSMEP) with branches "
-        "evaluated in parallel.",
+        "evaluated in parallel, whenever a pair's path actually splits at an "
+        "intermediate. On by default: for a single interactive query this is "
+        "free extra parallelism on top of --workers, which alone leaves most "
+        "cores idle once there are only a handful of pairs left to search.",
     ),
     parallel_workers: Optional[int] = typer.Option(
         None, "--parallel-workers",
-        help="Maximum number of concurrent workers for --parallel. Defaults to "
-        "min(4, cpu count).",
+        help="Concurrent workers for --parallel, per pair. Default: auto -- "
+        "coordinated with --workers so workers x parallel_workers fills the "
+        "machine (cpu_count // workers) rather than MSMEP's own context-free "
+        "min(4, cpu count) default.",
     ),
     pairs_per_mechanism: int = typer.Option(
         3, "--pairs-per-mechanism",
@@ -2746,10 +2751,15 @@ def channels(
         "mostly redundant). See docs/channels_candidates.md.",
     ),
     workers: int = typer.Option(
-        1, "--workers", "-j",
+        0, "--workers", "-j",
         help="Run this many conformer pairs' MSMEP searches at once, and "
         "afterwards this many TS optimizations + IRCs at once, each in its own "
-        "process. Independent of --parallel (branches within one pair).",
+        "process. Stacks with --parallel (branches within one pair): together "
+        "they're what determines whether a single query actually uses more "
+        "than one core. 0 (default) = auto: size to the number of independent "
+        "searches at each stage, capped at the machine's core count, so a "
+        "single interactive query uses the whole machine without needing to "
+        "be told to.",
     ),
     validate_minima_with_hessian: bool = typer.Option(
         True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
@@ -2812,8 +2822,8 @@ def channels(
         raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
     if crest_threads <= 0:
         raise typer.BadParameter("--crest-threads must be a positive integer.")
-    if workers <= 0:
-        raise typer.BadParameter("--workers must be a positive integer.")
+    if workers < 0:
+        raise typer.BadParameter("--workers must be non-negative (0 = auto).")
     if pairs_per_mechanism < 0:
         raise typer.BadParameter("--pairs-per-mechanism must be non-negative (0 = all pairs).")
     if crest_timeout <= 0:
@@ -2824,6 +2834,7 @@ def channels(
         raise typer.BadParameter("--complex-energy-tol must be non-negative (0 disables).")
 
     import json
+    import os
     import time
 
     from mepd.conformers import (
@@ -3017,6 +3028,21 @@ def channels(
         candidates = candidates[:max_pairs]
     stats["n_pairs"] = len(candidates)
 
+    # workers=0 / parallel_workers=None ("auto"): resolved fresh at each
+    # stage from how many genuinely independent things there are to run --
+    # a fixed number picked once up front would be wrong at BOTH ends: too
+    # small for mapping (hundreds of independent (pair, mechanism) scores,
+    # cheap and embarrassingly parallel under --atom-mapping-metric
+    # endpoint-rmsd) and too large for path search (--pairs-per-mechanism
+    # usually leaves only a handful of pairs, so naively handing all of them
+    # `cpu_count` workers wastes the rest of the machine that --parallel
+    # could otherwise be using per pair).
+    cpu_count = os.cpu_count() or 1
+    workers_auto = workers == 0
+    parallel_workers_auto = parallel_workers is None
+    if workers_auto:
+        workers = max(1, min(len(candidates), cpu_count))
+
     # The endpoint-level --atom-mapping check above ran on the two input
     # structures, before any conformer existed; which mechanism a pair can
     # follow, and how its equivalent atoms are best labeled, depend on that
@@ -3030,6 +3056,13 @@ def channels(
     stats.update(mechanism_summary)
     stats["n_path_searches"] = len(candidates)
     _write_stats()
+
+    if workers_auto:
+        workers = max(1, min(len(candidates), cpu_count))
+    if parallel and parallel_workers_auto:
+        parallel_workers = max(1, cpu_count // workers)
+    stats["workers"] = workers
+    stats["parallel_workers"] = parallel_workers if parallel else None
 
     if conformers_only:
         typer.echo(

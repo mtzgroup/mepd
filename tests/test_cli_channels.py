@@ -236,6 +236,80 @@ def test_channels_workers_runs_pairs_in_parallel_processes(tmp_path, monkeypatch
     assert n_pairs > 1 and len(completed) == n_pairs
 
 
+def test_channels_workers_zero_auto_sizes_to_search_count(tmp_path, monkeypatch):
+    """workers=0 (the default) resolves to a real positive worker count sized
+    off how many independent searches actually exist, not left at 0/None,
+    and gets recorded in stats.json so it's visible what was actually used."""
+    import json
+
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    output_dir = tmp_path / "out"
+
+    _call_channels(
+        start="CCCC", end="CC(C)C", inputs=inputs_fp,
+        n_conformers=2, n_embed=30, workers=0, output=output_dir,
+    )
+    stats = json.loads((output_dir / "stats.json").read_text())
+    assert stats["workers"] >= 1
+    assert stats["n_path_searches"] >= 1
+    # never wildly oversized past the actual number of independent searches
+    assert stats["workers"] <= max(stats["n_path_searches"], 1)
+
+
+def test_channels_parallel_workers_auto_coordinates_with_workers(tmp_path, monkeypatch):
+    """parallel_workers=None (the default) is resolved from cpu_count //
+    workers, not MSMEP's own context-free min(4, cpu_count), so the two
+    layers of parallelism don't compete for the same cores blindly."""
+    import json
+    import os
+
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    output_dir = tmp_path / "out"
+
+    _call_channels(
+        start="CCCC", end="CC(C)C", inputs=inputs_fp,
+        n_conformers=2, n_embed=30, workers=0, parallel=True, output=output_dir,
+    )
+    stats = json.loads((output_dir / "stats.json").read_text())
+    cpu_count = os.cpu_count() or 1
+    assert stats["parallel_workers"] == max(1, cpu_count // stats["workers"])
+
+
+def test_channels_parallel_workers_none_when_parallel_off(tmp_path, monkeypatch):
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    output_dir = tmp_path / "out"
+
+    _call_channels(
+        start="CCCC", end="CC(C)C", inputs=inputs_fp,
+        n_conformers=2, n_embed=30, workers=0, parallel=False, output=output_dir,
+    )
+    import json
+    stats = json.loads((output_dir / "stats.json").read_text())
+    assert stats["parallel_workers"] is None
+
+
+def test_channels_explicit_workers_is_not_overridden_by_auto(tmp_path, monkeypatch):
+    import json
+
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    output_dir = tmp_path / "out"
+
+    _call_channels(
+        start="CCCC", end="CC(C)C", inputs=inputs_fp,
+        n_conformers=2, n_embed=30, workers=2, output=output_dir,
+    )
+    stats = json.loads((output_dir / "stats.json").read_text())
+    assert stats["workers"] == 2
+
+
 def test_channels_maps_every_pair_once_per_mechanism(tmp_path, monkeypatch):
     """A Claisen's SLAPMapper mappings tie a [3,3] and a [1,3] shift: every
     conformer pair must become one path search per mechanism, and
@@ -357,9 +431,9 @@ def test_fork_map_matches_serial_map():
     assert _fork_map(lambda x: x * x + offset, list(range(6)), 3) == [x * x + offset for x in range(6)]
 
 
-def test_channels_rejects_nonpositive_workers(tmp_path):
+def test_channels_rejects_negative_workers(tmp_path):
     with pytest.raises(typer.BadParameter):
-        _call_channels(start="CCCC", end="CC(C)C", workers=0, output=tmp_path / "out")
+        _call_channels(start="CCCC", end="CC(C)C", workers=-1, output=tmp_path / "out")
 
 
 def test_channels_caps_at_max_pairs(tmp_path, monkeypatch, capsys):
@@ -370,8 +444,12 @@ def test_channels_caps_at_max_pairs(tmp_path, monkeypatch, capsys):
 
     output_dir = tmp_path / "out"
     _call_channels(
+        # n_conformers=4, not 2: with 2, mirror-image merging (a real,
+        # separate feature) can legitimately collapse both endpoints down to
+        # 1 conformer each, leaving nothing to cap -- 4 leaves enough margin
+        # that pairs > max_pairs=1 regardless.
         start="CCCC", end="CC(C)C", inputs=inputs_fp,
-        n_conformers=2, n_embed=30, max_pairs=1, output=output_dir,
+        n_conformers=4, n_embed=30, max_pairs=1, output=output_dir,
     )
 
     pairs_dir = output_dir / "pairs"
