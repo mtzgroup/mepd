@@ -516,7 +516,7 @@ def _reduce_chain_payload(data: dict, full: bool = False) -> dict:
     plot history and ASCII art). A finished minimization keeps only its
     final frame unless `full` (the page fetches the replay on demand)."""
     geometry = data.get("geometry")
-    if (not full and data.get("kind") == "minimization" and data.get("finished")
+    if (not full and data.get("kind") in ("minimization", "morph") and data.get("finished")
             and geometry and len(geometry.get("frames") or []) > 1):
         geometry = {**geometry, "frames": geometry["frames"][-1:],
                     "frame_steps": (geometry.get("frame_steps") or [])[-1:], "truncated": True}

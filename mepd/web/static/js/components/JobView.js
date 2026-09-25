@@ -19,6 +19,14 @@ function livePaths(progress, now) {
   for (const [name, st] of Object.entries(streams)) {
     const age = st.updated ? now - st.updated : Infinity;
     const state = st.finished ? (st.status === 'failed' ? 'failed' : 'done') : age < 30 ? 'running' : 'idle';
+    if (st.kind === 'morph') {
+      // One proposed reaction of a network expansion (queued until its
+      // product guess starts optimizing).
+      out.push({ id: name, kind: 'morph', label: st.label || name, plot: st.plot || { x: [], y: [] },
+        geometry: st.geometry, caption: st.caption, outcome: st.outcome, updated: st.updated,
+        state: st.finished ? state : st.status === 'queued' ? 'queued' : 'running' });
+      continue;
+    }
     if (st.kind === 'minimization') {
       // One geometry minimization (a Hessian-sampling candidate).
       out.push({ id: name, kind: 'minimization', label: st.label || name, plot: st.plot || { x: [], y: [] },
@@ -36,7 +44,7 @@ function livePaths(progress, now) {
         state, updated: st.updated });
     }
   }
-  const rank = { running: 0, idle: 1, done: 2, failed: 3 };
+  const rank = { running: 0, idle: 1, queued: 2, done: 3, failed: 4 };
   return out.sort((a, b) => rank[a.state] - rank[b.state] || a.label.localeCompare(b.label, undefined, { numeric: true }));
 }
 
@@ -111,6 +119,54 @@ function MinimizationLive({ job, fg }) {
     </div>`;
 }
 
+// One proposed reaction: the source structure turning into the product
+// (a geodesic interpolation), looping -- into the proposed guess while it
+// waits and optimizes, then into the species it optimized to.
+function MorphLive({ job, fg }) {
+  const [full, setFull] = useState(null);
+  const [pick, setPick] = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const truncated = fg.geometry?.truncated;
+  useEffect(() => { setFull(null); setPick(0); setPlaying(true); }, [fg.id]);
+  useEffect(() => {
+    if (!truncated) return undefined;
+    let live = true;
+    api.get(`/api/jobs/${job.id}/live/${encodeURIComponent(fg.id)}`).then((d) => live && setFull(d)).catch(() => {});
+    return () => { live = false; };
+  }, [fg.id, truncated, fg.updated]);
+  const frames = ((truncated && full?.geometry) || fg.geometry || {}).frames || [];
+  const n = frames.length;
+  const shown = Math.min(pick, Math.max(0, n - 1));
+  useEffect(() => {
+    if (!playing || n < 2) return undefined;
+    // Forward through the frames, then hold on the product before looping.
+    const t = setTimeout(() => setPick((i) => (i >= n - 1 ? 0 : i + 1)), shown >= n - 1 ? 1200 : shown === 0 ? 500 : 90);
+    return () => clearTimeout(t);
+  }, [playing, n, shown]);
+  const [e0, e1] = fg.plot?.y || [];
+  const smiles = fg.plot?.reactant_smiles || fg.plot?.product_smiles;
+  const status = fg.outcome || (fg.state === 'queued' ? 'queued' : 'optimizing the product');
+  return html`
+    <div class="card-block live-path">
+      <div class="live-head">
+        <h4><span class="badge accent">${fg.label}</span> ${status}
+          <span class="muted small"> · frame ${n ? shown + 1 : 0} of ${n}${e1 != null && e0 != null ? ` · ΔE ${fmtSigned(e1 - e0)} kcal/mol` : ''}</span>
+          <span class=${`live-state ${fg.outcome ? `outcome-${fg.outcome.replace(/\s+/g, '-')}` : fg.state}`}>${fg.outcome || (fg.state === 'running' ? 'optimizing' : fg.state)}</span></h4>
+        ${n > 1 && html`<button class="btn small" onClick=${() => setPlaying(!playing)}>${playing ? 'Pause' : 'Play'}</button>`}
+      </div>
+      ${n
+        ? html`<${Viewer3D} frames=${frames} frame=${shown} height=${280} />`
+        : html`<p class="small muted">The animation appears once the product guess is built.</p>`}
+      ${n > 1 && html`<div class="frame-bar">
+        <input type="range" min="0" max=${n - 1} value=${shown}
+          onInput=${(ev) => { setPlaying(false); setPick(+ev.target.value); }} />
+      </div>`}
+      ${smiles && html`<p class="small mono morph-smiles">${fg.plot.reactant_smiles || '?'} → ${fg.plot.product_smiles || '?'}</p>`}
+      <p class="small muted">${fg.caption || ''}${fg.outcome ? '' : fg.state === 'running'
+        ? ' · shown into the proposed guess until its optimization finishes' : ' · waiting to be optimized'}</p>
+    </div>`;
+}
+
 function pathBarrier(p) {
   const y = p.plot?.y?.filter((v) => v != null) || [];
   return y.length > 2 ? Math.max(...y.slice(1, -1)) : null;
@@ -133,7 +189,8 @@ function LivePanel({ job }) {
   }, [job.id]);
 
   const paths = livePaths(progress, Date.now() / 1000);
-  const minimizing = paths.length > 0 && paths.every((p) => p.kind === 'minimization');
+  const minimizing = paths.length > 0 && paths.every((p) => p.kind === 'minimization' || p.kind === 'morph');
+  const morphing = paths.length > 0 && paths.every((p) => p.kind === 'morph');
   // First time anything shows up, pin the first path; afterwards stay put.
   useEffect(() => { if (!selected && paths.length) choose(paths[0].id); }, [selected, paths.length]);
   // Sampling runs follow whichever candidate is minimizing now, until you
@@ -153,7 +210,8 @@ function LivePanel({ job }) {
     <div class="live">
       <div class="last-line mono">${progress?.last_line || job.last_line || (job.status === 'queued' ? 'Waiting for a free slot…' : '')}</div>
       ${fg && fg.kind === 'minimization' && html`<${MinimizationLive} job=${job} fg=${fg} />`}
-      ${fg && fg.kind !== 'minimization' && html`
+      ${fg && fg.kind === 'morph' && html`<${MorphLive} job=${job} fg=${fg} />`}
+      ${fg && fg.kind !== 'minimization' && fg.kind !== 'morph' && html`
         <div class="card-block live-path">
           <div class="live-head">
             <h4><span class="badge accent">${fg.label}</span>
@@ -171,8 +229,10 @@ function LivePanel({ job }) {
         </div>`}
       ${paths.length > 1 && html`
         ${minimizing && html`<label class="small check follow-toggle"><input type="checkbox" class="switch" checked=${autoFollow}
-          onChange=${(e) => setAutoFollow(e.target.checked)} /> Follow the candidate being minimized</label>`}
-        <div class="live-list-head small muted">${minimizing
+          onChange=${(e) => setAutoFollow(e.target.checked)} /> ${morphing ? 'Follow the reaction being optimized' : 'Follow the candidate being minimized'}</label>`}
+        <div class="live-list-head small muted">${morphing
+          ? `${paths.length} proposed reactions · ${paths.filter((p) => p.state === 'running').length} optimizing · ${paths.filter((p) => p.state === 'queued').length} queued · ${paths.filter((p) => p.outcome === 'new species').length} new species · click one to watch it`
+          : minimizing
           ? `${paths.length} candidates · ${paths.filter((p) => p.state === 'running').length} minimizing · ${paths.filter((p) => p.outcome === 'new minimum').length} new minima · click one to watch it`
           : `${paths.length} paths · ${paths.filter((p) => p.state === 'running').length} running · click one to bring it to the front`}</div>
         <div class="monitors">
@@ -180,17 +240,23 @@ function LivePanel({ job }) {
               class=${`monitor ${p.state === 'running' ? 'active' : ''} ${p.id === fg?.id ? 'pinned' : ''}`}
               onClick=${() => { setAutoFollow(false); choose(p.id); }} title=${p.caption || p.label}>
             <div class="small monitor-head"><b>${p.label}</b>
-              ${p.kind === 'minimization' && p.outcome
+              ${(p.kind === 'minimization' || p.kind === 'morph') && p.outcome
                 ? html`<span class=${`live-state outcome-${p.outcome.replace(/\s+/g, '-')}`}>${p.outcome}</span>`
                 : html`<span class=${`live-state ${p.state === 'running' && p.kind === 'minimization' ? 'running' : p.state}`}>${p.kind === 'minimization' && p.state === 'running' ? 'minimizing' : p.state}</span>`}
-              ${p.kind === 'minimization'
+              ${p.kind === 'morph'
+                ? p.plot.y?.[1] != null && p.plot.y?.[0] != null && html`<span class="muted mono">${fmtSigned(p.plot.y[1] - p.plot.y[0])}</span>`
+                : p.kind === 'minimization'
                 ? lastEnergy(p) != null && html`<span class="muted mono">${fmtSigned(lastEnergy(p))}</span>`
                 : pathBarrier(p) != null && html`<span class="muted mono">${pathBarrier(p).toFixed(1)}</span>`}</div>
-            <${EnergyPlot} xs=${p.plot.x} ys=${p.plot.y} compact />
+            ${p.kind === 'morph'
+              ? html`<div class="small mono monitor-smiles">${p.plot.product_smiles || ''}</div>`
+              : html`<${EnergyPlot} xs=${p.plot.x} ys=${p.plot.y} compact />`}
           </button>`)}
         </div>`}
       ${stats && html`<${StatsBlock} stats=${stats} />`}
-      ${!paths.length && !stats && job.status === 'running' && html`<p class="muted small">${['hessian-sample', 'hessian-global'].includes(job.op)
+      ${!paths.length && !stats && job.status === 'running' && html`<p class="muted small">${job.op === 'graph-enumeration'
+        ? 'Each proposed reaction appears here, animated from the source structure into its product, as soon as the products are enumerated.'
+        : ['hessian-sample', 'hessian-global'].includes(job.op)
         ? 'Each candidate appears here as it starts minimizing (after the Hessian of the seed).'
         : 'The live paths appear once a path optimization starts.'}</p>`}
     </div>`;

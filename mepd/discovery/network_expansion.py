@@ -302,11 +302,15 @@ class ExpansionResult:
         return pairs
 
 
-def _optimize(engine, nodes: list[StructureNode], maxiter: int, on_event: OnEvent) -> list:
-    """Optimized node (or an exception) per input, isolating failures."""
+def _optimize(engine, nodes: list[StructureNode], maxiter: int, on_event: OnEvent,
+              on_start: Callable[[int], None] = lambda k: None) -> list:
+    """Optimized node (or an exception) per input, isolating failures.
+    `on_start(k)` is called as optimization k (0-based) starts."""
     keywords = {"coordsys": "cart", "maxiter": int(maxiter)}
     batch = getattr(engine, "compute_geometry_optimizations", None)
     if callable(batch) and len(nodes) > 1:
+        for k in range(len(nodes)):
+            on_start(k)
         try:
             trajs = batch(nodes, keywords=keywords)
             if len(trajs) == len(nodes):
@@ -316,6 +320,7 @@ def _optimize(engine, nodes: list[StructureNode], maxiter: int, on_event: OnEven
             pass
     out = []
     for k, node in enumerate(nodes, start=1):
+        on_start(k - 1)
         try:
             try:
                 traj = engine.compute_geometry_optimization(node, keywords=keywords)
@@ -326,6 +331,71 @@ def _optimize(engine, nodes: list[StructureNode], maxiter: int, on_event: OnEven
             out.append(exc)
         _emit(on_event, "candidate_done", index=k, total=len(nodes))
     return out
+
+
+_OUTCOME_LABEL = {"new_species": "new species", "known_species": "known species", "reverted": "back to source",
+                  "not_minimum": "not a minimum", "failed": "failed"}
+
+
+class _LiveReactions:
+    """Live view (web UI): one stream per proposed reaction, animating the
+    source turning into the product by geodesic interpolation -- into the
+    proposed guess while it waits and optimizes, then into what it
+    optimized to. Costs nothing when nobody is watching."""
+
+    def __init__(self, seed_energy: float, nimages: int = 16):
+        from mepd import progress
+
+        self._progress = progress
+        self.enabled = progress._stream_path("probe") is not None
+        self.e0 = seed_energy
+        self.nimages = nimages
+        self._streams: dict[int, str] = {}
+
+    def _frames(self, a: StructureNode, b: StructureNode) -> list[str]:
+        from mepd.chainhelpers import run_geodesic
+
+        try:
+            return [n.structure.to_xyz() for n in run_geodesic([a, b], nimages=self.nimages)]
+        except Exception:
+            return [a.structure.to_xyz(), b.structure.to_xyz()]
+
+    def _write(self, p: Proposal, species, target: StructureNode, *, status: str, outcome=None,
+               product_kcal=None, product_smiles=None, note: str = "") -> None:
+        stream = self._streams.setdefault(id(p), f"rxn{len(self._streams) + 1:04d}")
+        src = species[p.source]
+        sym = list(src.node.symbols)
+        bonds = [f"−{sym[i]}{i}–{sym[j]}{j}" for i, j in p.broken] + [f"+{sym[i]}{i}–{sym[j]}{j}" for i, j in p.formed]
+        self._progress.write_morph(
+            stream, self._frames(src.node, target), label=f"#{int(stream[3:])} from species {p.source}",
+            caption=(" ".join(bonds) or "from the external generator") + note,
+            status=status, finished=status in ("done", "failed"), outcome=outcome,
+            energies_kcal=(src.rel_energy_kcal, product_kcal),
+            reactant_smiles=src.smiles, product_smiles=product_smiles or p.smiles)
+
+    def propose(self, p: Proposal, species, status: str = "queued") -> None:
+        if self.enabled:
+            self._write(p, species, StructureNode(structure=p.structure), status=status)
+
+    def optimizing(self, p: Proposal, species) -> None:
+        self.propose(p, species, status="running")
+
+    def finish(self, edge: ProposedEdge, species, product: Optional[StructureNode] = None) -> None:
+        if not self.enabled:
+            return
+        p = edge.proposal
+        node = product if product is not None else (
+            species[edge.target].node if edge.target is not None else StructureNode(structure=p.structure))
+        try:
+            kcal = (float(node.energy) - self.e0) * HARTREE_TO_KCAL_PER_MOL
+        except Exception:
+            kcal = None
+        note = " · relaxed to a different product than proposed" if edge.intended is False else ""
+        if edge.error:
+            note += f" · {edge.error}"
+        self._write(p, species, node, status="failed" if edge.outcome == "failed" else "done",
+                    outcome=_OUTCOME_LABEL.get(edge.outcome, edge.outcome), product_kcal=kcal,
+                    product_smiles=species[edge.target].smiles if edge.target is not None else None, note=note)
 
 
 def expand_network(
@@ -352,6 +422,25 @@ def expand_network(
     charge, mult = int(seed.structure.charge), int(seed.structure.multiplicity)
     result = ExpansionResult(species=[Species(seed, lewis_smiles(symbols, graph_edges(seed), charge, mult,
                                                                  allow_radicals=True, allow_zwitterions=True) or "", 0)])
+    live = _LiveReactions(e0)
+
+    def _classify(p, guess, opt, record) -> ProposedEdge:
+        intended = _connectivity_matches(opt, guess) if p.broken or p.formed else None
+        match = next((k for k, s in enumerate(result.species) if _connectivity_matches(opt, s.node)), None)
+        if match is not None:
+            if match != p.source and float(opt.energy) < float(result.species[match].node.energy):
+                result.species[match].node = opt.copy()  # keep the lowest conformer found
+                result.species[match].rel_energy_kcal = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
+            return ProposedEdge(p.source, p, "reverted" if match == p.source else "known_species", match, intended)
+        if len(result.species) >= max_species:
+            return ProposedEdge(p.source, p, "failed", error="max_species reached")
+        rel = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
+        smi = lewis_smiles(symbols, graph_edges(opt), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
+        result.species.append(Species(opt.copy(), smi, rnd, rel, record))
+        idx = len(result.species) - 1
+        _emit(on_event, "species_found", index=idx, smiles=smi, rel_energy_kcal=rel, round=rnd)
+        return ProposedEdge(p.source, p, "new_species", idx, intended)
+
     frontier = [0]
     for rnd in range(1, rounds + 1):
         if not frontier:
@@ -381,18 +470,22 @@ def expand_network(
             proposals.extend(props)
         known = {s.smiles: k for k, s in enumerate(result.species) if s.smiles}
         for p in [p for p in proposals if p.smiles in known]:
-            result.edges.append(ProposedEdge(p.source, p, "known_species", known[p.smiles], True))
+            edge = ProposedEdge(p.source, p, "known_species", known[p.smiles], True)
+            result.edges.append(edge)
+            live.finish(edge, result.species)
         proposals = [p for p in proposals if p.smiles not in known]
+        for p in proposals:
+            live.propose(p, result.species)
         _emit(on_event, "proposed", round=rnd, total=len(proposals))
         guesses = [StructureNode(structure=p.structure) for p in proposals]
-        optimized = _optimize(engine, guesses, maxiter, on_event)
+        optimized = _optimize(engine, guesses, maxiter, on_event,
+                              on_start=lambda k: live.optimizing(proposals[k], result.species))
         new_frontier = []
         for p, guess, opt in zip(proposals, guesses, optimized):
+            edge, record = None, None
             if isinstance(opt, Exception):
-                result.edges.append(ProposedEdge(p.source, p, "failed", error=f"{type(opt).__name__}: {opt}"))
-                continue
-            record = None
-            if validate_minima is not None:
+                edge = ProposedEdge(p.source, p, "failed", error=f"{type(opt).__name__}: {opt}")
+            elif validate_minima is not None:
                 from mepd.elementarystep import validate_minimum_with_rescue
 
                 opt, record = validate_minimum_with_rescue(
@@ -400,29 +493,14 @@ def expand_network(
                     rescue_displacement=float(validate_minima.get("rescue_displacement", 0.1)),
                     label=f"proposal {p.label}")
                 if not record["is_minimum"]:
-                    result.edges.append(ProposedEdge(p.source, p, "not_minimum", error=str(record.get("validation"))))
+                    edge = ProposedEdge(p.source, p, "not_minimum", error=str(record.get("validation")))
                     result.rejected.append(opt.copy())
-                    continue
-            intended = _connectivity_matches(opt, guess) if p.broken or p.formed else None
-            match = next((k for k, s in enumerate(result.species) if _connectivity_matches(opt, s.node)), None)
-            if match is not None:
-                outcome = "reverted" if match == p.source else "known_species"
-                if match != p.source and float(opt.energy) < float(result.species[match].node.energy):
-                    result.species[match].node = opt.copy()  # keep the lowest conformer found
-                    result.species[match].rel_energy_kcal = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
-                result.edges.append(ProposedEdge(p.source, p, outcome, match, intended))
-                continue
-            if len(result.species) >= max_species:
-                result.edges.append(ProposedEdge(p.source, p, "failed", error="max_species reached"))
-                continue
-            rel = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
-            smi = lewis_smiles(symbols, graph_edges(opt), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
-            result.species.append(Species(opt.copy(), smi, rnd, rel, record))
-            idx = len(result.species) - 1
-            result.edges.append(ProposedEdge(p.source, p, "new_species", idx, intended))
-            _emit(on_event, "species_found", index=idx, smiles=smi, rel_energy_kcal=rel, round=rnd)
-            if rel <= energy_window_kcal:
-                new_frontier.append(idx)
+            if edge is None:
+                edge = _classify(p, guess, opt, record)
+            result.edges.append(edge)
+            live.finish(edge, result.species, product=None if isinstance(opt, Exception) else opt)
+            if edge.outcome == "new_species" and result.species[edge.target].rel_energy_kcal <= energy_window_kcal:
+                new_frontier.append(edge.target)
         found = [e.target for e in result.edges if e.outcome == "new_species" and result.species[e.target].round == rnd]
         result.rounds.append({"round": rnd, "sources": frontier, "proposed": len(proposals),
                               "new_species": found, "expanded_next": new_frontier, "generator_stats": stats_all})

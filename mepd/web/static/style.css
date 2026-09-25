@@ -493,6 +493,11 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .live-state.outcome-new-minimum { background: var(--ok-soft); color: var(--ok); }
 .live-state.outcome-found-before, .live-state.outcome-back-to-seed { background: var(--panel-2); color: var(--muted); }
 .live-state.outcome-failed { background: var(--danger-soft); color: var(--danger); }
+.live-state.outcome-new-species { background: var(--ok-soft); color: var(--ok); }
+.live-state.outcome-known-species, .live-state.outcome-back-to-source, .live-state.queued { background: var(--panel-2); color: var(--muted); }
+.live-state.outcome-not-a-minimum { background: var(--danger-soft); color: var(--danger); }
+.monitor-smiles { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); padding-top: 2px; }
+.morph-smiles { overflow-wrap: anywhere; margin: 6px 0 0; }
 .follow-toggle { margin: 4px 0 8px; }
 .demo-banner { background: var(--accent-soft); color: var(--heading); padding: 6px 20px; border-bottom: 1px solid var(--border); flex: none; }
 .demo-badge { text-transform: uppercase; letter-spacing: .09em; background: var(--accent-soft); color: var(--label); }

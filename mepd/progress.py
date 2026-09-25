@@ -315,6 +315,30 @@ def set_minimization_outcome(stream: str, outcome: str) -> None:
         _write_minimization(state)
 
 
+def write_morph(stream: str, frames: list, *, label: str = "", caption: str = "", status: str = "queued",
+                finished: bool = False, outcome: str | None = None, energies_kcal: tuple = (None, None),
+                reactant_smiles: str = "", product_smiles: str = "") -> None:
+    """A live stream (kind "morph") animating one proposed reaction: the
+    source structure turning into the product, as xyz frames of a geodesic
+    interpolation. `energies_kcal` = (source, product) relative to the
+    seed. No-op unless a live viewer is attached (MEPD_DRIVE_CHAIN_DIR)."""
+    fp = _stream_path(stream)
+    if fp is None:
+        return
+    payload = {
+        "kind": "morph", "stream": stream, "label": label or stream, "caption": caption,
+        "plot": {"x": [0, 1], "y": list(energies_kcal), "caption": caption,
+                 "reactant_smiles": reactant_smiles, "product_smiles": product_smiles},
+        "geometry": {"frames": list(frames), "ts_index": None},
+        "reference": "seed", "updated": time.time(), "finished": finished, "status": status, "outcome": outcome,
+    }
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(fp, payload)
+    except Exception:
+        return
+
+
 class ProgressPrinter:
     """
     A class to handle progress printing with optional rich formatting.

@@ -162,3 +162,20 @@ def test_web_operation_runs_the_cli_and_reads_its_output(tmp_path, monkeypatch):
     result = collect({"op": "graph-enumeration", "output_dir": str(out), "external": True})
     assert result["headline"].startswith("2 species")
     assert "[C-]#[NH+]" in result["groups"][0]["entries"][1]["note"]
+
+
+def test_live_view_animates_each_reaction_from_source_to_product(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEPD_DRIVE_CHAIN_DIR", str(tmp_path))
+    expand_network(_node("C#N"), _GraphEngine(), rounds=2, allow_zwitterions=True)
+    streams = {fp.stem: json.loads(fp.read_text()) for fp in sorted(tmp_path.glob("rxn*.json"))}
+    assert list(streams) == ["rxn0001", "rxn0002"]
+    forward, back = streams["rxn0001"], streams["rxn0002"]
+    assert forward["kind"] == "morph" and forward["finished"] and forward["outcome"] == "new species"
+    assert back["outcome"] == "known species"  # linked without re-optimizing, still animated
+    frames = forward["geometry"]["frames"]
+    assert len(frames) > 2  # a geodesic interpolation, not just the two ends
+    first, last = (np.array([[float(v) for v in line.split()[1:]] for line in f.strip().splitlines()[2:]])
+                   for f in (frames[0], frames[-1]))
+    h_near = lambda x: np.argmin(np.linalg.norm(x[:2] - x[2], axis=1))  # H next to C (0) or N (1)
+    assert (h_near(first), h_near(last)) == (0, 1)
+    assert forward["plot"]["reactant_smiles"] == "C#N" and forward["plot"]["product_smiles"] == "[C-]#[NH+]"
