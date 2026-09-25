@@ -21,14 +21,12 @@ import warnings
 
 
 def _import_ase_calculator(path: str):
-    """The ASE calculator class named by "package.module:ClassName" (or
-    "package.module.ClassName")."""
-    import importlib
+    """The ASE calculator class or factory named by a short name ("mace-off",
+    "tblite", "emt", ...; see mepd/engines/ase_calculators.py) or by
+    "package.module:ClassName"."""
+    from mepd.engines.ase_calculators import load_calculator
 
-    module_name, _, attr = str(path).replace(":", ".").rpartition(".")
-    if not module_name:
-        raise ValueError(f"ase_engine_kwds.calculator must be 'package.module:ClassName', got {path!r}.")
-    return getattr(importlib.import_module(module_name), attr)
+    return load_calculator(path)
 
 
 def _normalized_path_method(path_min_method: str) -> str:
