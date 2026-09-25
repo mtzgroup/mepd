@@ -68,6 +68,12 @@ gxtb = [
 aam = [
     "slapmapper @ git+https://github.com/shin1koda/slap-mapper",
 ]
+# FAIRChemEngine (engine_name="fairchem"): UMA and other FAIR-Chem MLIPs.
+# The UMA weights are gated on Hugging Face (facebook/UMA): accept the
+# license, then `hf auth login`. Pulls in PyTorch.
+mlip = [
+    "fairchem-core>=2.23.0; python_version >= '3.11'",
+]
 
 [project.scripts]
 mepd = "mepd.cli:app"
@@ -83,6 +89,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mepd"]
+
+[tool.uv]
+# fairchem-core (the `mlip` extra) declares numpy<2.5 as a not-yet-tested
+# cap, not a known incompatibility -- it raises the cap once its CI passes.
+# Keep the numpy the rest of the project runs on instead of downgrading it.
+override-dependencies = ["numpy>=2.2.6,<2.6"]
 
 [tool.hatch.metadata]
 # The `aam` optional-dependency group pins slapmapper via a git URL
