@@ -15,7 +15,7 @@ export async function uploadFiles(files, { charge = null, multiplicity = null } 
     (added) => `Added ${added.length} structure${added.length === 1 ? '' : 's'}`);
 }
 
-function AddBox({ onDone }) {
+export function AddBox({ onDone }) {
   const [text, setText] = useState('');
   const [charge, setCharge] = useState('');
   const [mult, setMult] = useState('');
@@ -65,7 +65,7 @@ export function LevelChip({ rec }) {
   return html`<span class=${`level-chip level-${st.kind}`} title=${st.title}>${st.text}</span>`;
 }
 
-function LevelBar() {
+export function LevelBar() {
   const levelProfile = useStore((s) => s.levelProfile);
   const profiles = useStore((s) => s.profiles);
   const levels = useStore((s) => s.levels);

@@ -6,8 +6,14 @@ import { useEffect, useRef, useState } from './lib.js';
 
 const listeners = new Set();
 
+const _pref = (k, d) => { try { const v = localStorage.getItem('mepd:' + k); return v === null ? d : JSON.parse(v); } catch { return d; } };
+
 export const state = {
   connected: false,
+  // 'classic' (sidebars) or 'playground' (full-screen graph, floating controls; after the UMA playground).
+  layout: _pref('layout', 'classic'),
+  pgBg: _pref('pgBg', 'light'),          // playground background: 'light' | 'dark'
+  pgPanel: null,                         // playground: which sheet is open ('add' | 'settings' | null)
   // The 'How it works' panel, once dismissed, stays away (per browser).
   howToHidden: (() => { try { return localStorage.getItem('mepd:hideHowTo') === 'true'; } catch { return false; } })(),
   loaded: false,

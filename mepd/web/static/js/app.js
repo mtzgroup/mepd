@@ -8,6 +8,7 @@ import { JobsView } from './components/Jobs.js';
 import { Library } from './components/Library.js';
 import { Modals } from './components/Modals.js';
 import { ProfilesView } from './components/Profiles.js';
+import { PlaygroundApp, layoutToggle } from './components/Playground.js';
 
 function TopBar() {
   const view = useStore((s) => s.view);
@@ -41,6 +42,7 @@ function TopBar() {
         <span class="session-label">${root.split('/').pop()}</span><span class="caret">▾</span>
       </button>
       ${demo && html`<span class="badge demo-badge" title="Public demo: private workspace, limited sizes and run times">Demo</span>`}
+      ${layoutToggle()}
       ${auth && html`<a class="topbar-link small" href="/logout" title="Log this device out">Log out</a>`}
       <button class="btn primary" onClick=${() => set({ modal: { kind: 'quick' } })}>New calculation</button>
     </header>`;
@@ -58,13 +60,29 @@ function App() {
   const view = useStore((s) => s.view);
   const loaded = useStore((s) => s.loaded);
   const howToHidden = useStore((s) => s.howToHidden);
+  const layout = useStore((s) => s.layout);
+  const pgBg = useStore((s) => s.pgBg);
   useStore((s) => s.selection);
+  // The layout's palette lives on <html>, so the graph (drawn from CSS
+  // variables) and everything else pick it up.
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.layout = layout;
+    root.dataset.pgbg = pgBg;
+    // The graph draws with the CSS colours: redraw it in the new palette.
+    requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('mepd:graph', { detail: 'restyle' })));
+  }, [layout, pgBg]);
 
   useEffect(() => {
     const onKey = (e) => {
       const tag = e.target.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || state.modal) return;
-      if (e.key === 'Escape') { set({ connectMode: false }); clearSelection(); }
+      if (e.key === 'Escape') {
+        // Playground: Escape also closes a page (Calculations, Profiles, a job) back to the graph.
+        if (state.layout === 'playground' && !state.pgPanel && state.view.tab !== 'graph') { openTab('graph'); return; }
+        set({ connectMode: false, pgPanel: null });
+        clearSelection();
+      }
       if (e.key === 'c' && state.view.tab === 'graph') set({ connectMode: !state.connectMode });
       if ((e.key === 'Delete' || e.key === 'Backspace') && state.view.tab === 'graph') { e.preventDefault(); deleteSelection(); }
     };
@@ -73,6 +91,9 @@ function App() {
   }, []);
 
   if (!loaded) return html`<div class="boot">Connecting to mepd…</div>`;
+  if (layout === 'playground') {
+    return html`<${PlaygroundApp} /><${Modals} /><${Toasts} />`;
+  }
   const demo = state.demo;
   const nothingSelected = !state.selection.structures.length && !state.selection.edges.length;
   const showInspector = (view.tab === 'graph' || view.tab === 'jobs') && !(nothingSelected && howToHidden);

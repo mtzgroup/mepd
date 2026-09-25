@@ -4,7 +4,7 @@ import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, prefs, select, set, state, useStore } from '../store.js';
-import { depictUrl, edgeStatus, edgeStatusKey } from '../util.js';
+import { depictUrl, edgeStatus, edgeStatusKey, playgroundFitMargins } from '../util.js';
 import { uploadFiles } from './Library.js';
 
 function css(name) {
@@ -48,8 +48,19 @@ function fitCapped(c, padding = 70) {
   c.panBy({ x: 0, y: 22 });   // clear of the floating toolbar
 }
 
+// Fit everything into the canvas minus margins (px) kept free for overlays.
+function fitInto(c, m) {
+  const eles = c.elements();
+  if (!eles.length) return;
+  const bb = eles.boundingBox();
+  const aw = Math.max(80, c.width() - m.l - m.r), ah = Math.max(80, c.height() - m.t - m.b);
+  const z = Math.max(c.minZoom(), Math.min(1.1, aw / Math.max(1, bb.w), ah / Math.max(1, bb.h)));
+  c.zoom(z);
+  c.pan({ x: m.l + (aw - bb.w * z) / 2 - bb.x1 * z, y: m.t + (ah - bb.h * z) / 2 - bb.y1 * z });
+}
+
 // Single-structure calculations whose running target "breathes" in the graph.
-const ANIMATED_OPS = new Set(['hessian-sample', 'hessian-global', 'tsopt', 'optimize', 'vri']);
+const ANIMATED_OPS = new Set(['hessian-sample', 'hessian-global', 'nanoreactor', 'graph-enumeration', 'tsopt', 'optimize', 'vri']);
 const NODE_W = 96, NODE_H = 72;
 
 function activeStructureKey(jobs) {
@@ -58,6 +69,32 @@ function activeStructureKey(jobs) {
     if (j.status === 'running' && ANIMATED_OPS.has(j.op)) j.targets.structures.forEach((id) => ids.add(id));
   }
   return [...ids].sort().join(',');
+}
+
+// Where a node found from `parent` (e.g. a species a network expansion just
+// reported) should settle: next to its parent, on the side away from the
+// parent's other neighbours, at the first free spot of a widening fan.
+function spawnSpot(c, parent, taken) {
+  const p = parent.position();
+  const others = parent.neighborhood('node');
+  let ax = 1, ay = 0;
+  if (others.nonempty()) {
+    let sx = 0, sy = 0;
+    others.forEach((n) => { sx += n.position('x') - p.x; sy += n.position('y') - p.y; });
+    const len = Math.hypot(sx, sy);
+    if (len > 1) { ax = -sx / len; ay = -sy / len; }
+  }
+  const base = Math.atan2(ay, ax);
+  const busy = (x, y) => c.nodes().some((n) => Math.abs(n.position('x') - x) < 120 && Math.abs(n.position('y') - y) < 100)
+    || taken.some((q) => Math.abs(q.x - x) < 120 && Math.abs(q.y - y) < 100);
+  for (const r of [190, 300, 420]) {
+    for (let k = 0; k < 12; k += 1) {
+      const a = base + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 6);
+      const x = p.x + r * Math.cos(a), y = p.y + r * Math.sin(a);
+      if (!busy(x, y)) return { x, y };
+    }
+  }
+  return { x: p.x + 190 * Math.cos(base), y: p.y + 190 * Math.sin(base) + 40 * taken.length };
 }
 
 function edgeLabel(e, st) {
@@ -165,6 +202,7 @@ export function Graph() {
     const ids = new Set();
     let placed = 0;
     let unplaced = 0;   // new nodes with no saved position -> the graph re-arranges
+    const spawned = [];  // new nodes found from a node already shown: grow out of it instead
     const extent = c.extent();
     c.batch(() => {
       for (const s of Object.values(structures)) {
@@ -175,6 +213,13 @@ export function Graph() {
         if (el.nonempty()) {
           if (el.data('label') !== data.label || el.data('img') !== data.img) el.data(data);
         } else {
+          const parent = !positions[s.id] && s.origin?.parent ? c.getElementById(s.origin.parent) : null;
+          if (parent && parent.nonempty()) {
+            const to = spawnSpot(c, parent, spawned.map((n) => n.to));
+            spawned.push({ id: s.id, to });
+            c.add({ group: 'nodes', data, position: { ...parent.position() }, style: { opacity: 0 } });
+            continue;
+          }
           if (!positions[s.id]) unplaced += 1;
           const p = positions[s.id] || {
             x: (extent.x1 + extent.x2) / 2 + ((placed % 4) - 1.5) * 130,
@@ -197,6 +242,29 @@ export function Graph() {
       }
       c.elements().forEach((el) => { if (!ids.has(el.id())) el.remove(); });
     });
+    if (spawned.length) {
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      for (const { id, to } of spawned) {
+        const el = c.getElementById(id);
+        el.animate({ position: to, style: { opacity: 1 } }, {
+          duration: reduced ? 0 : 700, easing: 'ease-out-cubic',
+          complete: () => { el.removeStyle('opacity'); savePositions(c); },
+        });
+      }
+      // Keep what just appeared in sight: pan (never zoom in) to include it.
+      const ext = c.extent();
+      const out = spawned.some(({ to }) => to.x - NODE_W < ext.x1 || to.x + NODE_W > ext.x2
+        || to.y - NODE_H < ext.y1 || to.y + NODE_H > ext.y2);
+      if (out && !arranging.current) {
+        const xs = c.nodes().map((n) => n.position('x')).concat(spawned.map((n) => n.to.x));
+        const ys = c.nodes().map((n) => n.position('y')).concat(spawned.map((n) => n.to.y));
+        const w = Math.max(...xs) - Math.min(...xs) + 2 * NODE_W, h = Math.max(...ys) - Math.min(...ys) + 2 * NODE_H;
+        const zoom = Math.min(c.zoom(), c.width() / w, c.height() / h);
+        const cx = (Math.max(...xs) + Math.min(...xs)) / 2, cyy = (Math.max(...ys) + Math.min(...ys)) / 2;
+        c.animate({ zoom, pan: { x: c.width() / 2 - cx * zoom, y: c.height() / 2 - cyy * zoom } },
+          { duration: reduced ? 0 : 500 });
+      }
+    }
     if (unplaced) arrangeRef.current();   // e.g. minima just added from a result
     else if (placed && Object.keys(positions).length === 0) fitCapped(c);
   }, [workspace, statusKey]);
@@ -275,11 +343,32 @@ export function Graph() {
     })
       .on('layoutstop', () => {
         arranging.current = false;
-        fitCapped(c);
+        if (state.layout === 'playground') fitInto(c, playgroundFitMargins()); else fitCapped(c);
         savePositions(c);
       }).run();
   };
   arrangeRef.current = layout;
+
+  // Commands from outside the graph (the playground layout's bottom dock):
+  // 'arrange', 'select-all', or {cmd: 'fit', margins: {l, t, r, b}} to fit
+  // into the part of the canvas that floating controls leave free.
+  useEffect(() => {
+    const on = (e) => {
+      const c = cy.current;
+      if (!c) return;
+      const d = typeof e.detail === 'string' ? { cmd: e.detail } : (e.detail || {});
+      if (d.cmd === 'arrange') arrangeRef.current();
+      else if (d.cmd === 'fit') (d.margins ? fitInto(c, d.margins) : fitCapped(c));
+      else if (d.cmd === 'select-all') select({ structures: Object.keys(state.workspace.structures) });
+      else if (d.cmd === 'restyle') c.style(stylesheet());          // colours come from CSS variables
+      else if (d.cmd === 'center' && d.id) {
+        const el = c.getElementById(d.id);
+        if (el.nonempty()) c.animate({ center: { eles: el }, duration: 250 });
+      }
+    };
+    window.addEventListener('mepd:graph', on);
+    return () => window.removeEventListener('mepd:graph', on);
+  }, []);
   const empty = Object.keys(workspace.structures).length === 0;
 
   return html`

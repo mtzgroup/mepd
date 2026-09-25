@@ -171,6 +171,24 @@ def test_invalid_params_are_reported(client):
     assert r.status_code == 400
 
 
+def test_incomplete_profile_is_refused_before_queueing(client):
+    (s,) = _add(client, "C=CCOC=C")
+    (e,) = _add(client, "C=CCCC=O")
+    # The ASE engine with no calculator can only fail once the job loads it.
+    client.put("/api/profiles/noasecalc",
+               json={"text": 'engine_name = "ase"\nprogram = "terachem"\n[ase_engine_kwds]\ncalculator = ""\n'})
+    r = client.post("/api/jobs", json={"op": "optimize", "structures": [s["id"]], "profile": "noasecalc"})
+    assert r.status_code == 400 and "calculator" in r.json()["detail"]
+    assert client.get("/api/state").json()["jobs"] == []
+    # A path-method problem only blocks path searches, not an optimization.
+    client.put("/api/profiles/dlf", json={"text": 'engine_name = "gxtb"\npath_min_method = "NEB-DLF"\n'})
+    r = client.post("/api/jobs", json={"op": "optimize", "structures": [s["id"]], "profile": "dlf", "dry_run": True})
+    assert r.status_code == 200, r.text
+    r = client.post("/api/jobs", json={"op": "ts", "structures": [s["id"], e["id"]], "profile": "dlf",
+                                       "dry_run": True})
+    assert r.status_code == 400 and "DL-FIND" in r.json()["detail"]
+
+
 @pytest.fixture
 def quick_op(monkeypatch):
     """A registry entry whose command finishes in about a second: exercises
@@ -1007,3 +1025,54 @@ def test_atom_mapping_metric_choices_track_the_metric_registry(client):
     assert r.status_code == 200, r.text
     argv = r.json()[0]["argv"]
     assert argv[argv.index("--atom-mapping-metric") + 1] == "endpoint-rmsd"
+
+
+def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_path):
+    """A running network expansion's live/events.jsonl: each new species
+    becomes a node joined to the one it came from, as it is reported, once."""
+    from mepd.web import chem
+    from mepd.web.jobs import JobManager
+    from mepd.web.workspace import Workspace
+
+    class Bus:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, event, data):
+            self.events.append(event)
+
+    ws = Workspace(tmp_path / "ws")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ, 0, 1)
+    seed = ws.add_structure(water, name="seed", origin={"kind": "smiles"})
+    bus = Bus()
+    jobs = JobManager(ws, bus)
+    job = {"id": "j_live", "op": "graph-enumeration", "targets": {"structures": [seed["id"]], "edges": []},
+           "charge": 0, "multiplicity": 1, "level": None}
+    live = jobs.job_dir("j_live") / "live"
+    live.mkdir(parents=True)
+    bent = WATER_XYZ.replace("0.504", "0.604")
+    events = [
+        {"event": "species", "index": 1, "parent": 0, "xyz": bent, "energy_hartree": -1.0, "caption": "+O0–H1"},
+        {"event": "species", "index": 2, "parent": 1, "xyz": WATER_XYZ, "energy_hartree": -2.0,
+         "validation": {"is_minimum": True}},
+        {"event": "reaction", "source": 0, "target": 2, "caption": ""},
+    ]
+    fp = live / "events.jsonl"
+    fp.write_text(json.dumps(events[0]) + "\n" + json.dumps(events[1])[:20])   # second line half-written
+    jobs._adopt_live_events(job)
+    snap = ws.snapshot()
+    assert len(snap["structures"]) == 2 and len(snap["edges"]) == 1 and bus.events == ["workspace"]
+    (edge,) = snap["edges"].values()
+    assert edge["source"] == seed["id"] and edge["origin"]["proposed"]
+    first = snap["structures"][edge["target"]]
+    assert first["origin"]["parent"] == seed["id"] and first["origin"]["entry"] == "min_1"
+
+    fp.write_text(json.dumps(events[0]) + "\n" + "\n".join(json.dumps(e) for e in events[1:]) + "\n")
+    jobs._adopt_live_events(job)
+    jobs._adopt_live_events(job)          # nothing new: nothing added twice
+    snap = ws.snapshot()
+    assert len(snap["structures"]) == 3
+    pairs = {(e["source"], e["target"]) for e in snap["edges"].values()}
+    second = job["live_nodes"]["2"]
+    assert pairs == {(seed["id"], first["id"]), (first["id"], second), (seed["id"], second)}
+    assert snap["structures"][second]["origin"]["parent"] == first["id"]

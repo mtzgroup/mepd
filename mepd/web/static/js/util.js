@@ -55,8 +55,10 @@ export function edgeStatus(edge, jobs = state.jobs) {
   let status = 'idle';
   if (has('running')) status = 'running';
   else if (has('queued')) status = 'queued';
-  else if (barrier != null || barrierUnverified != null || has('done') || edge.origin?.kind === 'job') status = 'done';
+  else if (barrier != null || barrierUnverified != null || has('done') || (edge.origin?.kind === 'job' && !edge.origin.proposed)) status = 'done';
   else if (has('failed')) status = 'failed';
+  // Proposed by a network expansion, no path search yet.
+  else if (edge.origin?.proposed) status = 'proposed';
   return { status, barrier, barrierUnverified, count: related.length };
 }
 
@@ -79,6 +81,12 @@ export function edgeStatusKey(jobs) {
 // workspace's): {kind: 'ok'|'other'|'none'|'busy'|'failed', text, title}.
 export function isTs(rec) {
   return rec.role === 'ts' || (rec.role == null && /\[TS\]$/.test(rec.name || ''));
+}
+
+// Playground layout: the part of the canvas the floating controls leave free.
+export function playgroundFitMargins() {
+  const phone = window.matchMedia('(max-width: 720px), (max-height: 520px)').matches;
+  return phone ? { l: 16, t: 140, r: 16, b: 70 } : { l: 40, t: 110, r: 330, b: 36 };
 }
 
 export function levelStatus(rec, levelKey = state.levels[state.levelProfile ?? '']?.key) {

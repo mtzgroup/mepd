@@ -21,7 +21,7 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -35,6 +35,7 @@ from mepd.web.sessions import Sessions
 from mepd.web.operations import OPERATIONS
 from mepd.web.results import MINIMA_KINDS, collect_cached, find_entry, summarize
 from mepd.web.workspace import HARTREE_TO_KCAL, Workspace, WorkspaceError, is_ts, validate_profile_text
+from mepd.web.workspace import find_duplicate as _find_duplicate
 
 STATIC = Path(__file__).parent / "static"
 
@@ -85,6 +86,12 @@ class JobIn(BaseModel):
     label: str = ""
     dry_run: bool = False
     source_job: Optional[str] = None  # follow-up operations: the job they build on
+
+
+class ProfileFormIn(BaseModel):
+    text: str
+    path: str
+    value: Any = None
 
 
 class ImportIn(BaseModel):
@@ -598,6 +605,22 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         bus.publish("profiles", W().profile_names(), key=str(W().root))
         return {"ok": True}
 
+    @app.post("/api/profiles/form")
+    def profile_form_view(body: ProfileIn):
+        """The settings form for a profile's TOML (big choices + the
+        Advanced settings those choices use)."""
+        from mepd.web import profile_form
+
+        return profile_form.form(body.text)
+
+    @app.post("/api/profiles/form/apply")
+    def profile_form_apply(body: ProfileFormIn):
+        """Change one form setting; returns the new TOML (not saved) and form."""
+        deny_in_demo("Editing compute profiles")
+        from mepd.web import profile_form
+
+        return profile_form.apply(body.text, body.path, body.value)
+
     @app.post("/api/profiles/validate")
     async def validate_profile(body: ProfileIn):
         deny_in_demo("Validating custom profiles")
@@ -924,26 +947,4 @@ def apply_optimization(ws: Workspace, job: dict) -> None:
         else:
             why = (rec or {}).get("error") or job.get("error") or job["status"]
             ws.set_status([sid], "opt_failed", f"optimization {job['status']}: {str(why).splitlines()[-1][:300]}")
-
-
-def _find_duplicate(ws: Workspace, smiles: Optional[str], energy: Optional[float],
-                    level: Optional[dict], job_id: str) -> Optional[dict]:
-    """Same connectivity, same level of theory and the same energy to within
-    0.05 kcal/mol -> treat as the structure already in the library. Energies
-    from different levels are never compared; when the level is unknown
-    (an imported external output) only structures from that same job count."""
-    if not smiles:
-        return None
-    for rec in ws.snapshot()["structures"].values():
-        if rec.get("smiles") != smiles:
-            continue
-        if level:
-            if (rec.get("level") or {}).get("key") != level.get("key"):
-                continue
-        elif (rec.get("origin") or {}).get("job") != job_id:
-            continue
-        if energy is not None and rec.get("energy") is not None:
-            if abs(rec["energy"] - energy) * HARTREE_TO_KCAL < 0.05:
-                return rec
-    return None
 

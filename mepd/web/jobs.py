@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import signal
@@ -37,6 +38,8 @@ def _bump_rev(job: dict) -> None:
     receives two copies out of order (a live event and a full-state reload
     racing each other) keeps the newer one."""
     job["rev"] = max(time.time_ns(), job.get("rev", 0) + 1)
+
+log = logging.getLogger(__name__)
 
 
 class Broadcaster:
@@ -228,6 +231,18 @@ class JobManager:
             edge_ids = [eid for eid in source["targets"]["edges"] if eid in known["edges"]]
         if profile and profile not in self.ws.profile_names():
             raise WorkspaceError(f"unknown profile {profile!r}")
+        if profile:
+            # Refuse a profile the settings form already knows is incomplete
+            # (e.g. the ASE engine with no calculator), rather than queue a
+            # job that can only fail on loading it.
+            from mepd.web import profile_form
+
+            pf = profile_form.form(self.ws.read_profile(profile))
+            issues = pf["issues"]
+            if op.key in ("optimize", "tsopt"):   # these never read the path method
+                issues = [i for i in issues if i not in pf["path_issues"]]
+            if issues:
+                raise WorkspaceError(f"profile {profile!r} is incomplete: " + " ".join(issues))
         if source is not None:
             target_sets = [(structure_ids, edge_ids)]
         elif dry_run and op.target == "pair" and not edge_ids and len(structure_ids) == 2:
@@ -465,6 +480,10 @@ class JobManager:
         if streams:
             payload["streams"] = streams
             changed = True
+        try:
+            self._adopt_live_events(job)
+        except Exception:   # a bad line must never stop the progress feed
+            log.exception("could not add live results of %s to the graph", job["id"])
 
         for key, fp in (("chain", jdir / "chain.json"), ("stats", out / "stats.json")):
             m = _mtime(fp)
@@ -479,6 +498,77 @@ class JobManager:
                 payload[key] = data
                 changed = True
         return payload if changed else None
+
+    def _adopt_live_events(self, job: dict) -> None:
+        """New species a running job reports (live/events.jsonl, written by
+        e.g. a network expansion) go straight into the Graph: each one a
+        node spawned from the species it came from, joined to it by an edge,
+        ready for a path search. Species 0 is the job's own structure."""
+        fp = self.job_dir(job["id"]) / "live" / "events.jsonl"
+        done = int(job.get("live_offset") or 0)
+        try:
+            if fp.stat().st_size <= done:
+                return
+            with open(fp, "rb") as fh:
+                fh.seek(done)
+                chunk = fh.read()
+        except OSError:
+            return
+        end = chunk.rfind(b"\n") + 1          # only whole lines; the rest next time
+        if not end:
+            return
+        from mepd.web import chem
+        from mepd.web.workspace import find_duplicate
+
+        seeds = job.get("targets", {}).get("structures") or []
+        nodes = dict(job.get("live_nodes") or {})
+        if seeds:
+            nodes.setdefault("0", seeds[0])
+        known = self.ws.snapshot()["structures"]
+        changed = False
+        for raw in chunk[:end].splitlines():
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if ev.get("event") == "species":
+                parent = nodes.get(str(ev.get("parent")))
+                if str(ev["index"]) in nodes or parent not in known:
+                    continue    # already added, or its parent was deleted
+                (s,) = chem.structures_from_xyz_text(ev["xyz"], job.get("charge"), job.get("multiplicity"))
+                smiles = chem.perceive_smiles(s) or ev.get("smiles") or None
+                rec = find_duplicate(self.ws, smiles, ev.get("energy_hartree"), job.get("level"), job["id"])
+                if rec is None:
+                    validation = ev.get("validation")
+                    rec = self.ws.add_structure(
+                        s, name=smiles or chem.formula(s), energy=ev.get("energy_hartree"), smiles=smiles,
+                        optimized=(validation or {}).get("is_minimum", True), level=job.get("level"),
+                        validation=validation,
+                        origin={"kind": "job", "job": job["id"], "entry": f"min_{ev['index']}",
+                                "label": f"Minimum {ev['index']}", "frame": 0, "parent": parent, "live": True})
+                    known = self.ws.snapshot()["structures"]
+                nodes[str(ev["index"])] = rec["id"]
+                a, b = parent, rec["id"]
+            elif ev.get("event") == "reaction":
+                a, b = nodes.get(str(ev.get("source"))), nodes.get(str(ev.get("target")))
+                if a not in known or b not in known:
+                    continue
+            else:
+                continue
+            if a != b and self.ws.find_edge(a, b) is None:
+                try:
+                    self.ws.add_edge(a, b, origin={
+                        "kind": "job", "job": job["id"], "live": True, "proposed": True,
+                        "headline": "proposed reaction" + (f" ({ev['caption']})" if ev.get("caption") else "")
+                        + ": run a path search to connect it"})
+                except WorkspaceError:
+                    pass
+            changed = True
+        job["live_offset"] = done + end
+        job["live_nodes"] = nodes
+        self._write(job)
+        if changed:
+            self.bus.publish("workspace", self.ws.snapshot())
 
     def progress_snapshot(self, jid: str) -> dict:
         """Current progress state in full, for a client that opens a job's

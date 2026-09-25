@@ -27,7 +27,9 @@ export function JobControls({ job, compact = false }) {
     ${['failed', 'cancelled', 'interrupted'].includes(job.status) && !job.external && html`<button class="btn small" onClick=${stop(retry)} title="Rerun into the same output folder; finished pieces are skipped">Resume</button>`}
     ${job.status === 'done' && !job.external && !compact && html`<button class="btn small" onClick=${stop(retry)} title="Rerun into the same output folder">Rerun</button>`}
     ${!compact && job.status !== 'queued' && html`<a class="btn small" href=${`/api/jobs/${job.id}/archive`} title="Output folder, inputs and logs as a zip">Download .zip</a>`}
-    ${!['queued', 'running'].includes(job.status) && html`<button class="btn small ghost" onClick=${stop(del)} title="Delete">✕</button>`}
+    ${!['queued', 'running'].includes(job.status) && (compact
+      ? html`<button class="btn small ghost" onClick=${stop(del)} title="Delete this calculation">✕</button>`
+      : html`<button class="btn small danger-outline" onClick=${stop(del)} title="Delete this calculation">Delete</button>`)}
   </span>`;
 }
 

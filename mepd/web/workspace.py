@@ -490,5 +490,27 @@ def validate_profile_text(text: str, timeout: float = 120.0) -> dict:
     return {"ok": False, "message": "\n".join(tail)}
 
 
+def find_duplicate(ws: Workspace, smiles: Optional[str], energy: Optional[float],
+                    level: Optional[dict], job_id: str) -> Optional[dict]:
+    """Same connectivity, same level of theory and the same energy to within
+    0.05 kcal/mol -> treat as the structure already in the library. Energies
+    from different levels are never compared; when the level is unknown
+    (an imported external output) only structures from that same job count."""
+    if not smiles:
+        return None
+    for rec in ws.snapshot()["structures"].values():
+        if rec.get("smiles") != smiles:
+            continue
+        if level:
+            if (rec.get("level") or {}).get("key") != level.get("key"):
+                continue
+        elif (rec.get("origin") or {}).get("job") != job_id:
+            continue
+        if energy is not None and rec.get("energy") is not None:
+            if abs(rec["energy"] - energy) * HARTREE_TO_KCAL < 0.05:
+                return rec
+    return None
+
+
 def remove_tree(fp: Path) -> None:
     shutil.rmtree(fp, ignore_errors=True)
