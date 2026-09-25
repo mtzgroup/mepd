@@ -39,6 +39,8 @@ def detect_operation(path: Path) -> Optional[str]:
             return "optimize"
         if (path / "mep_output.xyz").exists():
             return "ts"
+        if (path / "species.xyz").exists():
+            return "graph-enumeration"
         if (path / "unique.xyz").exists():
             return "hessian-sample"
         if (path / "accepted_minima.xyz").exists():
@@ -682,6 +684,26 @@ def collect_hessian_global(out: Path, charge: int, multiplicity: int) -> dict:
     ], extra_headline=f" · {s['rounds_run']} rounds" if s.get("rounds_run") else "")
 
 
+def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict:
+    s = _read_json(out / "summary.json") or {}
+    species = s.get("species") or []
+    outcomes = s.get("outcomes") or {}
+    result = _minima_result(out, "species.xyz", charge, multiplicity, "Species", s.get("seed_energy"), [
+        {"label": "Proposed reactions", "value": sum(outcomes.values()) or None},
+        {"label": "Outcomes", "value": _counts(outcomes)},
+        {"label": "Rounds", "value": len(s.get("rounds") or []) or None},
+        {"label": "Reactions to connect", "value": len(s.get("connections") or []) or None},
+        {"label": "Hessian validation", "value": "on" if (s.get("settings") or {}).get("hessian_validation") else "off"},
+        {"label": "Energies relative to", "value": "seed structure (species 0)"},
+    ], validation=[sp.get("validation") for sp in species]
+        if (s.get("settings") or {}).get("hessian_validation") else None)
+    if (out / "pairs").is_dir() or (out / "network.json").exists():
+        paths = collect_network_splits(out, charge, multiplicity)
+        result["groups"] += paths["groups"]
+        result["headline"] += " · " + paths["headline"]
+    return result
+
+
 def collect_network_splits(out: Path, charge: int, multiplicity: int) -> dict:
     net = _network_group(out / "network.json", None)
     pairs = []
@@ -846,6 +868,7 @@ COLLECTORS = {
     "tsopt": collect_tsopt,
     "hessian-sample": collect_hessian_sample,
     "hessian-global": collect_hessian_global,
+    "graph-enumeration": collect_graph_enumeration,
     "network-splits": collect_network_splits,
     "vri": collect_vri,
     # Follow-ups add to the VRI folder: they show the same, updated, result.
@@ -896,7 +919,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 9
+RESULT_VERSION = 10
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

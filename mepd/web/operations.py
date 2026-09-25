@@ -290,6 +290,28 @@ class NetworkSplitsParams(Params):
                                    advanced=True, group="Recursive splitting", ge=0)
 
 
+class ExpandParams(Params):
+    rounds: int = P(1, "Rounds", "Round 2 proposes products of round 1's new species, and so on.", cli="--rounds", ge=1)
+    n_break: int = P(2, "Bonds broken (max)", cli="--n-break", ge=0)
+    n_form: int = P(2, "Bonds formed (max)", cli="--n-form", ge=0)
+    max_products: int = P(50, "Proposals per species", "Fewest bond changes first.", cli="--max-products", ge=1)
+    energy_window: float = P(60.0, "Expand species within (kcal/mol)", "Only species this close to the seed "
+                             "are expanded in the next round.", cli="--energy-window")
+    form_distance: float = P(4.0, "Form bonds within (Å)", cli="--form-distance", gt=0, advanced=True, group="Rules")
+    allow_radicals: bool = P(False, "Allow radicals and carbenes", cli="--allow-radicals", kind="toggle",
+                             advanced=True, group="Rules")
+    allow_zwitterions: bool = P(False, "Allow charge-separated products", "Needed for e.g. isocyanides and CO.",
+                                cli="--allow-zwitterions", kind="switch", advanced=True, group="Rules")
+    validate_minima_with_hessian: bool = P(
+        True, "Validate species with Hessian", "Every new species must have no imaginary frequency; one that "
+        "stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped if that fails.",
+        cli="--validate-minima-with-hessian", kind="toggle")
+    connect: bool = P(False, "Connect by path search", "Run a recursive path search for every proposed reaction "
+                      "that reached a new species, and build the network from the paths.", cli="--connect", kind="toggle")
+    max_pairs: int = P(50, "Max path searches", cli="--max-pairs", ge=1, requires="connect")
+    maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
+
+
 # --------------------------------------------------------------- context
 
 @dataclass
@@ -666,9 +688,12 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         unavailable_reason="The engine can generate nanoreactor candidates "
         "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
     Operation(
-        "graph-enumeration", "Graph enumeration", "Enumerate products by bond-breaking/forming rules.",
-        "structure", EXPLORE, available=False,
-        unavailable_reason="Not implemented in mepd yet."),
+        "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming bonds "
+        "(valence and Lewis-structure rules, no Hessians), optimize them, and repeat from the new species; "
+        "optionally connect each reaction by a path search. (`mepd discovery expand`)",
+        "structure", EXPLORE, ExpandParams, _build_discovery("expand"),
+        produces=["product species", "proposed reactions", "network edges (with path search)"],
+        cli_path=("discovery", "expand"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),
     Operation(
         "network-splits", "All-pairs network", "Run recursive path searches between every pair of the "
         "selected minima and assemble a reaction network. (`mepd network-splits`)",
