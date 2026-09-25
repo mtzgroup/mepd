@@ -9,9 +9,11 @@ settled up front: `"gi-energy"` (an actual QM energy evaluation along the
 geodesic path) is the most direct proxy but the most expensive per
 candidate; `"geodesic-distance"` and `"path-rmsd"` are effectively free
 byproducts of the same interpolation, but unvalidated as mapping-quality
-signals. All three are kept pluggable, and `score_candidate_all_metrics`
-lets a caller (see `cli.py`'s `--debug-dump` handling) record all three for
-every candidate so real runs double as comparative data.
+signals; `"endpoint-rmsd"` skips the interpolation altogether, so it is
+cheaper again and weaker again (see `score_candidate`). All four are kept
+pluggable, and `score_candidate_all_metrics` lets a caller (see `cli.py`'s
+`--debug-dump` handling) record every one of them for every candidate so
+real runs double as comparative data.
 """
 from __future__ import annotations
 
@@ -22,9 +24,8 @@ from typing import Optional
 from qcdata.models.structure import Structure
 
 from mepd.atom_mapping import AtomMapping, realign_end_to_start
+from mepd.atom_mapping_metrics import METRICS  # noqa: F401  (re-exported)
 from mepd.chain import Chain
-
-METRICS = ("gi-energy", "geodesic-distance", "path-rmsd", "endpoint-rmsd")
 
 
 @dataclass

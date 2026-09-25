@@ -984,3 +984,26 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
                 assert not unknown, f"{op['key']}: mepd {' '.join(job['argv'][:2])} has no {unknown}"
                 checked += 1
     assert checked >= 10
+
+
+def test_atom_mapping_metric_choices_track_the_metric_registry(client):
+    """The UI spells no metric out by hand any more: the list it offered was
+    duplicated per form and had already drifted a metric behind the registry,
+    leaving `endpoint-rmsd` unreachable from the browser for a while."""
+    from mepd.atom_mapping_metrics import METRICS
+    from mepd.web.operations import ChannelsParams, TsParams
+
+    for model in (ChannelsParams, TsParams):
+        choices = model.model_json_schema()["properties"]["atom_mapping_metric"]["enum"]
+        assert tuple(choices) == METRICS, f"{model.__name__} drifted from METRICS"
+
+    # ...and the odd one out survives the trip to a command line.
+    (s,) = _add(client, "C=CCOC=C")
+    (e,) = _add(client, "C=CCCC=O")
+    r = client.post("/api/jobs", json={
+        "op": "channels", "structures": [s["id"], e["id"]], "edges": [],
+        "params": {"atom_mapping_metric": "endpoint-rmsd"},
+        "profile": "default", "dry_run": True})
+    assert r.status_code == 200, r.text
+    argv = r.json()[0]["argv"]
+    assert argv[argv.index("--atom-mapping-metric") + 1] == "endpoint-rmsd"

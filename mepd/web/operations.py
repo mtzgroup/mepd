@@ -26,9 +26,15 @@ from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mepd.atom_mapping_metrics import METRICS as _ATOM_MAPPING_METRICS
 from mepd.web.workspace import Workspace, WorkspaceError, is_ts
 
 Target = Literal["structure", "pair", "set", "job"]  # "job": a follow-up on another job's output
+# Subscripting with a tuple lists its items, so this stays in step with
+# mepd's metric registry instead of drifting behind it (it did: the UI
+# offered three of the four for a while). `Literal[*METRICS]` would be
+# tidier but needs 3.11, and this package still supports 3.10.
+AtomMappingMetric = Literal[_ATOM_MAPPING_METRICS]
 
 
 def P(default, title: str, help: str = "", *, cli: Optional[str] = None, kind: str = "value",
@@ -85,6 +91,12 @@ _ENDPOINTS_HELP = (
     "structure has been minimized (so the path starts from those minima), and the SMILES "
     "only for two raw SMILES embeddings (mepd then builds an atom-mapped pair itself)."
 )
+_MAPPING_METRIC_HELP = (
+    "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
+    "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
+    "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
+    "experimental in mepd)."
+)
 
 
 class TsParams(Params):
@@ -106,11 +118,8 @@ class TsParams(Params):
                                 group="Endpoints", advanced=True)
     atom_mapping_candidates: int = P(200, "Mapping candidates", cli="--atom-mapping-candidates",
                                      group="Atom mapping", advanced=True, ge=1, requires="atom_mapping")
-    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy", "endpoint-rmsd"] = P(
-        "geodesic-distance", "Mapping metric", "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
-        "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
-        "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
-        "experimental in mepd).",
+    atom_mapping_metric: AtomMappingMetric = P(
+        "geodesic-distance", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
         requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
@@ -174,11 +183,8 @@ class ChannelsParams(Params):
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
-    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy", "endpoint-rmsd"] = P(
-        "geodesic-distance", "Mapping metric", "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
-        "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
-        "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
-        "experimental in mepd).",
+    atom_mapping_metric: AtomMappingMetric = P(
+        "geodesic-distance", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Pairs", advanced=True,
         requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
