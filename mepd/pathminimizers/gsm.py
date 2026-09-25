@@ -543,7 +543,7 @@ class GSM(PathMinimizer):
         self.grad_calls_made += n_before
         self._log(
             f"Seeding molecularGSM with the already-computed {len(interpolated_nodes)}-node "
-            "geodesic-interpolated path (RESTART mode)."
+            f"initial path ({getattr(chain.parameters, 'interpolation', 'geodesic')} interpolation; RESTART mode)."
         )
         return interpolated_nodes
 

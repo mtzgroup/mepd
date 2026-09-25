@@ -63,7 +63,10 @@ app = typer.Typer(
 
 
 def _normalized_path_method(method: str) -> str:
-    return str(method or "").strip().upper().replace("_", "-")
+    # The same names and aliases RunInputs accepts (e.g. DLFIND, GEOMETRIC, FSM).
+    from mepd.inputs import _normalized_path_method as _normalized
+
+    return _normalized(method)
 
 
 def _build_path_minimizer(initial_chain: Chain, run_inputs: RunInputs):
@@ -438,17 +441,10 @@ def run(
         "parameters": copy.deepcopy(run_inputs.chain_inputs),
     })
 
-    typer.echo("Building initial path via geodesic interpolation...")
-    initial_chain = ch.run_geodesic(
-        chain=seed_chain,
-        chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
-        nimages=run_inputs.gi_inputs.nimages,
-        friction=run_inputs.gi_inputs.friction,
-        nudge=run_inputs.gi_inputs.nudge,
-        random_seed=run_inputs.gi_inputs.random_seed,
-        align=run_inputs.gi_inputs.align,
-        **(run_inputs.gi_inputs.extra_kwds or {}),
-    )
+    from mepd.interpolation import initial_chain as _initial_chain, interpolation_method
+
+    typer.echo(f"Building initial path via {interpolation_method(run_inputs.chain_inputs)} interpolation...")
+    initial_chain = _initial_chain(seed_chain, run_inputs.chain_inputs, run_inputs.gi_inputs)
 
     output.mkdir(parents=True, exist_ok=True)
 

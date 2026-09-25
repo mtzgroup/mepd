@@ -141,7 +141,11 @@ class NEB(PathMinimizer):
     def _build_inserted_node(self, left_node: Node, right_node: Node, chain: Chain) -> Node:
         import mepd.chainhelpers as ch
 
-        use_gi = bool(getattr(chain.parameters, "use_geodesic_interpolation", False))
+        from mepd.interpolation import interpolation_method
+
+        # New images follow the chain's interpolation: geodesic midpoints for
+        # "geodesic", straight-line midpoints otherwise.
+        use_gi = interpolation_method(chain.parameters) == "geodesic"
         if use_gi and hasattr(left_node, "symbols") and hasattr(right_node, "symbols"):
             try:
                 gi = ch.run_geodesic([left_node, right_node], nimages=3, align=False)

@@ -57,7 +57,7 @@ def _make_chain(coords):
     return Chain.model_validate(
         {
             "nodes": [XYNode(structure=np.array(c, dtype=float)) for c in coords],
-            "parameters": ChainInputs(use_geodesic_interpolation=False),
+            "parameters": ChainInputs(interpolation="linear"),
         }
     )
 

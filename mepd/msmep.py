@@ -72,6 +72,7 @@ def _normalize_path_method(path_min_method: str) -> str:
         "DL-FIND": "NEB-DLF",
         "GEOMETRIC": "GEOMETRIC-NEB",
         "GEOMETRICNEB": "GEOMETRIC-NEB",
+        "FSM": "FNEB",  # freezing string method
     }
     return aliases.get(method, method)
 
@@ -965,7 +966,15 @@ class MSMEP:
         logger.propagate = False
 
 
-        if self.inputs.chain_inputs.use_geodesic_interpolation:
+        from mepd.interpolation import initial_chain as _initial_chain, interpolation_method
+
+        method = interpolation_method(self.inputs.chain_inputs)
+        if method != "geodesic":
+            # linear / LST / IDPP. A sub-path's ends are minima already found:
+            # never re-align (move) them.
+            interpolation = _initial_chain(chain, self.inputs.chain_inputs, self.inputs.gi_inputs, align=False)
+            interpolation._zero_velocity()
+        else:
             if chain.parameters.frozen_atom_indices:
                 inds_frozen = chain.parameters.frozen_atom_indices
                 if _get_verbose(self.inputs):
@@ -990,20 +999,6 @@ class MSMEP:
             )
 
             interpolation._zero_velocity()
-
-        else:  # do a linear interpolation using numpy
-            start_point = chain[0].coords
-            end_point = chain[-1].coords
-            coords = np.linspace(
-                start=start_point, stop=end_point, num=self.inputs.gi_inputs.nimages
-            )
-            nodes = [
-                node.update_coords(c)
-                for node, c in zip([chain.nodes[0]] * len(coords), coords)
-            ]
-            interpolation = Chain.model_validate({
-                "nodes": nodes, "parameters": copy.deepcopy(self.inputs.chain_inputs)})
-
 
         return interpolation
 

@@ -653,16 +653,9 @@ def _run_msmep_pairs(
                 "nodes": [structures[i], structures[j]],
                 "parameters": copy.deepcopy(run_inputs.chain_inputs),
             })
-            pair_chain = ch.run_geodesic(
-                chain=seed_chain,
-                chain_inputs=copy.deepcopy(run_inputs.chain_inputs),
-                nimages=run_inputs.gi_inputs.nimages,
-                friction=run_inputs.gi_inputs.friction,
-                nudge=run_inputs.gi_inputs.nudge,
-                random_seed=run_inputs.gi_inputs.random_seed,
-                align=run_inputs.gi_inputs.align,
-                **(run_inputs.gi_inputs.extra_kwds or {}),
-            )
+            from mepd.interpolation import initial_chain as _initial_chain
+
+            pair_chain = _initial_chain(seed_chain, run_inputs.chain_inputs, run_inputs.gi_inputs)
             msmep = MSMEP(inputs=run_inputs)
             if parallel:
                 pair_history = msmep.run_parallel_recursive_minimize(

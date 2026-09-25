@@ -26,7 +26,7 @@ def test_linear_interpolation_preserves_endpoint_geometries_and_clears_cache():
     inputs = SimpleNamespace(
         engine=SimpleNamespace(__class__=SimpleNamespace(__name__="FakeEngine")),
         path_min_method="NEB",
-        chain_inputs=ChainInputs(use_geodesic_interpolation=False),
+        chain_inputs=ChainInputs(interpolation="linear"),
         gi_inputs=SimpleNamespace(nimages=5),
     )
     m = MSMEP(inputs=inputs)
@@ -58,7 +58,7 @@ def test_linear_interpolation_preserves_endpoint_geometries_and_clears_cache():
 
 
 def test_geodesic_interpolation_uses_configured_run_geodesic(monkeypatch):
-    chain_inputs = ChainInputs(use_geodesic_interpolation=True)
+    chain_inputs = ChainInputs(interpolation="geodesic")
     gi_inputs = SimpleNamespace(
         nimages=5,
         friction=0.01,
@@ -190,7 +190,7 @@ def test_recursive_minimize_runs_real_toy_potential_end_to_end():
     chain_inputs = ChainInputs(
         k=10,
         delta_k=9,
-        use_geodesic_interpolation=False,
+        interpolation="linear",
         node_ene_thre=10,
     )
     neb_inputs = NEBInputs(
@@ -223,7 +223,7 @@ def test_recursive_minimize_runs_real_toy_potential_end_to_end():
 def _flower_split_msmep():
     coords = np.linspace([-2.59807434, -1.499999], [2.5980755, 1.49999912], 15)
     coords[1:-1] += [-1, 1]
-    chain_inputs = ChainInputs(k=10, delta_k=9, use_geodesic_interpolation=False, node_ene_thre=10)
+    chain_inputs = ChainInputs(k=10, delta_k=9, interpolation="linear", node_ene_thre=10)
     neb_inputs = NEBInputs(
         barrier_thre=5, v=False, max_steps=200, climb=False,
         do_elem_step_checks=True, early_stop_force_thre=0.1,

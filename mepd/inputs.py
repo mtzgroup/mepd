@@ -40,6 +40,7 @@ def _normalized_path_method(path_min_method: str) -> str:
         "DL-FIND": "NEB-DLF",
         "GEOMETRIC": "GEOMETRIC-NEB",
         "GEOMETRICNEB": "GEOMETRIC-NEB",
+        "FSM": "FNEB",  # freezing string method
     }
     return aliases.get(method, method)
 
@@ -272,7 +273,9 @@ class ChainInputs:
     `do_parallel`: whether engines that support it (g-xTB) compute a chain's
         images concurrently; False forces one at a time (the engine's own
         `n_parallel` sets how many otherwise)
-    `use_geodesic_interpolation`: whether to use GI in interpolations
+    `interpolation`: how initial paths (and recursive sub-paths) are built:
+        "geodesic" (default), "linear", "lst" (linear synchronous transit) or
+        "idpp" (image-dependent pair potential); see mepd/interpolation.py
 
     `node_freezing`: whether to freeze nodes in NEB convergence
     `fraction_freeze`: multiplier applied to convergence thresholds when deciding
@@ -289,7 +292,7 @@ class ChainInputs:
     delta_k: float = 0.09
 
     do_parallel: bool = True
-    use_geodesic_interpolation: bool = True
+    interpolation: str = "geodesic"
 
     node_freezing: bool = True
     fraction_freeze: float = 0.1
@@ -302,6 +305,13 @@ class ChainInputs:
         if isinstance(self.frozen_atom_indices, str) and len(self.frozen_atom_indices) > 0:
             self.frozen_atom_indices = [
                 int(x) for x in self.frozen_atom_indices.split()]
+        # Checked (and normalized) here so a typo fails when the profile is
+        # read, not after the endpoints have been minimized.
+        method = str(self.interpolation if self.interpolation is not None else "geodesic").strip().lower() or "geodesic"
+        if method not in ("geodesic", "linear", "lst", "idpp"):
+            raise ValueError(
+                f"chain_inputs.interpolation must be geodesic, linear, lst or idpp, got {self.interpolation!r}.")
+        self.interpolation = method
         for name in ("k", "delta_k"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -663,7 +673,18 @@ class RunInputs:
                     "chain_inputs.friction_optimal_gi has been removed. "
                     "Set gi_inputs.friction directly instead."
                 )
-            self.chain_inputs = ChainInputs(**self.chain_inputs)
+            chain_kwds = dict(self.chain_inputs)
+            # Replaced by `interpolation`. Every older profile carries `= true`
+            # (the default, i.e. geodesic): ignore that. A false one, in a
+            # profile that doesn't set `interpolation` itself, would now
+            # silently mean geodesic: say what to write instead.
+            legacy = chain_kwds.pop("use_geodesic_interpolation", True)
+            if "interpolation" not in chain_kwds and str(legacy).strip().lower() in ("false", "0", "no", "off"):
+                raise ValueError(
+                    "chain_inputs.use_geodesic_interpolation has been removed. "
+                    'Set chain_inputs.interpolation = "linear" (or "geodesic", "idpp", "lst") instead.'
+                )
+            self.chain_inputs = ChainInputs(**chain_kwds)
 
         if self.optimizer_kwds is None:
             self.optimizer_kwds = {"name": "cg"}
