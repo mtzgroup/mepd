@@ -108,6 +108,10 @@ packages = ["mepd"]
 # cap, not a known incompatibility -- it raises the cap once its CI passes.
 # Keep the numpy the rest of the project runs on instead of downgrading it.
 override-dependencies = ["numpy>=2.2.6,<2.6"]
+conflicts = [
+    [{ extra = "mlip" }, { extra = "orb" }],
+    [{ extra = "mlip" }, { extra = "mace" }],
+]
 
 [tool.hatch.metadata]
 # The `aam` optional-dependency group pins slapmapper via a git URL
