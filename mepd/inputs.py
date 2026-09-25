@@ -18,7 +18,17 @@ import tomli_w
 from pathlib import Path
 import warnings
 
-_ASE_OMOL25_DEFAULT_MODEL_PATH = "/home/diptarka/fairchem/esen_sm_conserving_all.pt"
+
+
+def _import_ase_calculator(path: str):
+    """The ASE calculator class named by "package.module:ClassName" (or
+    "package.module.ClassName")."""
+    import importlib
+
+    module_name, _, attr = str(path).replace(":", ".").rpartition(".")
+    if not module_name:
+        raise ValueError(f"ase_engine_kwds.calculator must be 'package.module:ClassName', got {path!r}.")
+    return getattr(importlib.import_module(module_name), attr)
 
 
 def _normalized_path_method(path_min_method: str) -> str:
@@ -63,7 +73,7 @@ def _resolve_ase_omol25_model_settings(
                 device = model_payload.get("device")
 
     return (
-        str(model_path or _ASE_OMOL25_DEFAULT_MODEL_PATH),
+        str(model_path or ""),
         str(device or "cuda"),
     )
 
@@ -404,6 +414,16 @@ class NetworkInputs:
 
 @dataclass
 class RunInputs:
+    """
+    `engine_name`: the level of theory --
+        "gxtb" (local g-xTB), "qccompute" / "chemcloud" (`program` +
+        `program_kwds`), "fairchem" (a FAIR-Chem MLIP such as UMA, configured by
+        `fairchem_engine_kwds`: model, task, device, checkpoint,
+        inference_settings, batch_size), or "ase" (any ASE calculator:
+        `ase_engine_kwds.calculator = "package.module:ClassName"` with its
+        keyword arguments in `ase_engine_kwds.calculator_kwds`).
+    """
+
     engine_name: str = "gxtb"
     program: str = "xtb"
     chemcloud_queue: str = None
@@ -421,6 +441,7 @@ class RunInputs:
     program_kwds: ProgramArgs = None
     ase_engine_kwds: dict = None
     gxtb_engine_kwds: dict = None
+    fairchem_engine_kwds: dict = None
     geometry_optimizer_kwds: dict = None
     optimizer_kwds: dict = None
 
@@ -577,7 +598,7 @@ class RunInputs:
             self.program_kwds = None
 
         if self.program_kwds is None:
-            if self.engine_name in {"gxtb", "ase"}:
+            if self.engine_name in {"gxtb", "ase", "fairchem"}:
                 # Neither engine uses the qccompute/chemcloud ProgramArgs/qcdata
                 # input construct -- gxtb shells out directly, and ASEEngine
                 # takes an already-constructed ase.Calculator.
@@ -622,6 +643,8 @@ class RunInputs:
         else:
             self.gxtb_engine_kwds = dict(self.gxtb_engine_kwds)
 
+        self.fairchem_engine_kwds = dict(self.fairchem_engine_kwds or {})
+
         if self.geometry_optimizer_kwds is None:
             self.geometry_optimizer_kwds = {}
         else:
@@ -654,6 +677,10 @@ class RunInputs:
                              geometry_optimizer_kwds=self.geometry_optimizer_kwds,
                              frozen_atom_indices=self.chain_inputs.frozen_atom_indices,
                              )
+        elif self.engine_name == 'fairchem':
+            from mepd.engines.fairchem import FAIRChemEngine
+
+            eng = FAIRChemEngine(**self.fairchem_engine_kwds)
         elif self.engine_name == 'ase':
             try:
                 from mepd.engines.ase import ASEEngine
@@ -662,44 +689,28 @@ class RunInputs:
                     "engine_name='ase' requires the 'ase' extra "
                     "(pip install mepd[ase])."
                 ) from exc
-            ase_progs = ['omol25']
-            assert self.program in ase_progs, f"{self.program} not yet supported with ASEEngine. Use one of {ase_progs} instead."
-            if self.program == 'omol25':
-                try:
-                    from fairchem.core import pretrained_mlip, FAIRChemCalculator
-                except ModuleNotFoundError as exc:
-                    raise ModuleNotFoundError(
-                        "ASE program 'omol25' requires 'fairchem-core'. "
-                        "Install a compatible fairchem-core build (currently unavailable on Python 3.14) "
-                        "or use a different engine/program."
-                    ) from exc
-                model_path, model_device = _resolve_ase_omol25_model_settings(
-                    self.path_min_inputs,
-                    self.program_kwds,
-                )
-                try:
-                    predictor = pretrained_mlip.load_predict_unit(
-                        model_path,
-                        device=model_device,
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        "Failed to load OMol25 model for ASE engine "
-                        f"(model_path='{model_path}', device='{model_device}')."
-                    ) from exc
-                calc = FAIRChemCalculator(predictor, task_name="omol")
-            else:
-                raise ValueError(f"Unsupported program: {self.program}")
             ase_kwds = dict(self.ase_engine_kwds or {})
-            if "geometry_optimizer" in ase_kwds:
-                ase_kwds["geometry_optimizer"] = str(
-                    ase_kwds["geometry_optimizer"]
+            for key in ("geometry_optimizer", "transition_state_optimizer"):
+                if key in ase_kwds:
+                    ase_kwds[key] = str(ase_kwds[key])
+            calculator_path = ase_kwds.pop("calculator", None)
+            calculator_kwds = dict(ase_kwds.pop("calculator_kwds", None) or {})
+            if calculator_path:
+                eng = ASEEngine(calculator=_import_ase_calculator(calculator_path)(**calculator_kwds), **ase_kwds)
+            elif self.program == 'omol25':
+                from mepd.engines.fairchem import FAIRChemEngine
+
+                model_path, model_device = _resolve_ase_omol25_model_settings(
+                    self.path_min_inputs, self.program_kwds,
                 )
-            if "transition_state_optimizer" in ase_kwds:
-                ase_kwds["transition_state_optimizer"] = str(
-                    ase_kwds["transition_state_optimizer"]
+                eng = FAIRChemEngine(
+                    checkpoint=model_path or None, device=model_device, task="omol", **ase_kwds,
                 )
-            eng = ASEEngine(calculator=calc, **ase_kwds)
+            else:
+                raise ValueError(
+                    "engine_name='ase' needs ase_engine_kwds.calculator "
+                    "(\"package.module:ClassName\") or program='omol25'."
+                )
         elif self.engine_name == 'gxtb':
             try:
                 from mepd.engines.gxtb import GXTBCalculator

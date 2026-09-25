@@ -524,7 +524,14 @@ def _unsafe_to_fork() -> Optional[str]:
     interpreter to prevent the known case; the probe then *verifies* the
     result rather than inferring it from which modules happen to be imported,
     since the handlers are registered in C and are not all enumerable from
-    Python. One fork and one `/usr/bin/true`, a few times per run."""
+    Python. One fork and one `/usr/bin/true`, a few times per run.
+
+    On any platform, a process that has initialised CUDA (a GPU model such as
+    a FAIR-Chem MLIP is loaded) cannot fork: the children inherit a CUDA
+    context they cannot use."""
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        return "CUDA is initialised in this process (a GPU model is loaded) and does not survive fork"
     if sys.platform != "darwin":
         return None
     if sys.modules.get("_tkinter") is not None:
