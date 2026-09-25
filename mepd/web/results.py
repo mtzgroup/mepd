@@ -284,8 +284,13 @@ def collect_ts(out: Path, charge: int, multiplicity: int) -> dict:
     ]
     result = _result(headline, groups, summary, barrier, warnings)
     result["barrier_verified"] = verified
+    if verified:
+        # The TS that sets the edge's barrier (a VRI search on the edge starts here).
+        top = [i for i in route["items"] if i["on_route"] and i["barrier"] is not None
+               and abs(i["barrier"] - route["barrier"]) < 1e-6]
+        if top:
+            result["route_ts"] = _route_ts(top[0]["label"], top[0]["ts"], top[0]["barrier"])
     return result
-    return _result(headline, groups, summary, barrier, warnings)
 
 
 def _connectivity_classes(nodes: list) -> list[int]:
@@ -301,6 +306,12 @@ def _connectivity_classes(nodes: list) -> list[int]:
             reps.append(n)
             ids.append(len(reps) - 1)
     return ids
+
+
+def _route_ts(label: str, ts_node, barrier: Optional[float]) -> dict:
+    """The TS a result's edge barrier comes from (kept as geometry so a VRI
+    search on that edge can start from it without re-reading the result)."""
+    return {"label": label, "barrier_kcal": _clean(barrier), "xyz": ts_node.structure.to_xyz()}
 
 
 def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
@@ -600,7 +611,11 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
         {"label": "Wall time", "value": f"{stats['total_seconds']:.0f} s" if stats.get("total_seconds") else None},
         {"label": "Barrier reference", "value": "lowest reactant conformer / reactant-side IRC end"},
     ]
-    return _result(headline, groups, summary, best, warnings)
+    result = _result(headline, groups, summary, best, warnings)
+    lowest = [i for i in channels if i.get("barrier") is not None and best is not None and abs(i["barrier"] - best) < 1e-6]
+    if lowest:
+        result["route_ts"] = _route_ts(lowest[0]["title"], lowest[0]["ts"], lowest[0]["barrier"])
+    return result
 
 
 def _validation_note(v: Optional[dict]) -> str:
@@ -706,6 +721,124 @@ def collect_optimize(out: Path, charge: int, multiplicity: int) -> dict:
                    [{"label": "Failed", "value": "; ".join(failed) or None}], warnings=failed)
 
 
+_VRI_VERDICT = {
+    "bifurcation": "post-TS bifurcation: the path splits into P1 and P2",
+    "second_product_untested": "second product found; not yet checked (run 'Check the bifurcation')",
+    "second_product_no_split": "second product found, but sideways pushes all drain into P1",
+    "vrt_no_second_product": "valley-ridge transition, but no second product",
+    "transient_softening": "a transient soft mode only (no valley-ridge transition)",
+    "no_vrt": "no valley-ridge transition",
+}
+
+
+def _kcal(x: Optional[float], digits: int = 1) -> Optional[str]:
+    return None if x is None else f"{x:+.{digits}f} kcal/mol"
+
+
+def _counts(counts: Optional[dict]) -> Optional[str]:
+    if not counts:
+        return None
+    return " · ".join(f"{k} {v}" for k, v in counts.items() if v)
+
+
+def collect_vri(out: Path, charge: int, multiplicity: int) -> dict:
+    """A `mepd discovery vri` folder (also after `vri-check` / `vri-surface`
+    have added to it): verdict per IRC branch, TS1/TS2, P1/P2, the IRC and
+    the VRT/VRI points, energies relative to TS1."""
+    top = _read_json(out / "summary.json")
+    if not top:
+        return _result("VRI search running (no summary yet)", [], [])
+    candidates = top.get("ts1_candidates") or [{"label": "input", "dir": str(out)}]
+    many = len([c for c in candidates if (Path(c.get("dir") or out) / "summary.json").exists()]) > 1
+    ts_e, prod_e, path_e, point_e, summary, headline_bits = [], [], [], [], [], []
+    has_checks = has_surface = False
+    for cand in candidates:
+        d = Path(cand.get("dir") or out)
+        s = _read_json(d / "summary.json")
+        if not s:
+            continue
+        tag = f"{cand.get('label', 'input')} · " if many else ""
+        pre = f"{cand.get('label', 'input')}_" if many else ""
+        e_ts1 = s.get("ts1_energy")
+        scan = _read_json(d / "projected_freqs.json") or {}
+        irc = _load_chain(d / "irc.xyz", charge, multiplicity)
+        if irc is not None:
+            ts_index = scan.get("ts_index")
+            ts_index = int(ts_index) if ts_index is not None and 0 <= int(ts_index) < len(irc) else None
+            path_e.append(_entry(f"{pre}irc", f"{tag}IRC through TS1", irc.nodes, e_ts1, ts_index=ts_index,
+                                 note=_irc_note(irc)))
+            if ts_index is not None:
+                ts_e.append(_entry(f"{pre}ts1", f"{tag}TS1", [irc.nodes[ts_index]], e_ts1,
+                                   note=f"{s.get('ts1_n_imaginary', '?')} imaginary frequency"))
+        for name, b in (s.get("branches") or {}).items():
+            verdict = b.get("verdict") or "no_vrt"
+            label = f"{tag}{name}"
+            summary.append({"label": label.capitalize(), "value": _VRI_VERDICT.get(verdict, verdict)})
+            if verdict in ("bifurcation", "second_product_untested", "second_product_no_split"):
+                headline_bits.append(name)
+            vrt = b.get("vrt") or {}
+            if vrt:
+                summary.append({"label": f"VRT ({label})", "value": f"s = {vrt.get('s', 0):.2f}, "
+                                f"{_kcal(vrt.get('rel_ts1_kcal_mol'))} vs TS1"})
+            pr = b.get("products") or {}
+            p1, p2, ts2 = pr.get("p1_rel_ts1_kcal_mol"), pr.get("p2_rel_ts1_kcal_mol"), pr.get("ts2_rel_ts1_kcal_mol")
+            if p1 is not None or p2 is not None:
+                summary.append({"label": f"P1 / P2 ({label})",
+                                "value": f"{_kcal(p1) or '–'} / {_kcal(p2) or '–'} vs TS1"})
+            if ts2 is not None:
+                summary.append({"label": f"TS2 ({label})", "value": f"{_kcal(ts2)} vs TS1"
+                                + (" (verified)" if pr.get("ts2_verified") else " (not verified)")})
+            checks = _read_json(d / f"checks_{name}.json")
+            if checks:
+                has_checks = True
+                vri = checks.get("vri") or {}
+                if vri:
+                    summary.append({"label": f"Exact VRI ({label})", "value": (
+                        f"converged in {vri.get('iterations')} steps" if vri.get("converged") else "did not converge")})
+                basin = _counts((checks.get("basin") or {}).get("counts"))
+                if basin:
+                    summary.append({"label": f"Basin test ({label})", "value": basin})
+                traj = checks.get("trajectories") or {}
+                if traj.get("counts"):
+                    summary.append({"label": f"Trajectories ({label})",
+                                    "value": f"{_counts(traj['counts'])} (of {traj.get('n')})"})
+            if (d / f"surface_{name}.json").exists():
+                has_surface = True
+            for key, title, bucket, kind_note in (
+                (f"p1_{name}", "P1", prod_e, "product the IRC reaches"),
+                (f"p2_{name}", "P2", prod_e, "second product (the other side of the ridge)"),
+                (f"ts2_{name}", "TS2", ts_e, "saddle between P1 and P2"),
+                (f"vrt_{name}", "VRT", point_e, "where the path's sideways curvature turns negative"),
+                (f"vri_{name}", "VRI", point_e, "exact valley-ridge inflection point"),
+            ):
+                chain = _load_chain(d / f"{key}.xyz", charge, multiplicity)
+                if chain is None:
+                    continue
+                note = kind_note + (f" · {_smiles(chain[0])}" if bucket is prod_e else "")
+                bucket.append(_entry(f"{pre}{key}", f"{tag}{title} ({name})", [chain[0]], e_ts1, note=note))
+            ts2_irc = _load_chain(d / f"ts2_{name}_irc.xyz", charge, multiplicity)
+            if ts2_irc is not None:
+                path_e.append(_entry(f"{pre}ts2_{name}_irc", f"{tag}TS2 IRC ({name})", ts2_irc.nodes, e_ts1,
+                                     note=_irc_note(ts2_irc)))
+    overall = top.get("verdict") or "no_vrt"
+    headline = _VRI_VERDICT.get(overall, overall)
+    headline = headline[0].upper() + headline[1:]
+    if headline_bits:
+        headline += f" ({', '.join(headline_bits)} branch{'es' if len(headline_bits) > 1 else ''})"
+    result = _result(headline, [
+        _group("Transition states", "ts", ts_e),
+        _group("Products", "minima", prod_e),
+        _group("Ridge points", "points", point_e),
+        _group("Paths", "irc", path_e),
+    ], summary)
+    import importlib.util
+
+    result["vri"] = {"verdict": overall, "checked": has_checks, "surface": has_surface,
+                     # The interactive explorer (mepd.viz_vri) ships with newer mepd.
+                     "explorer": importlib.util.find_spec("mepd.viz_vri") is not None}
+    return result
+
+
 COLLECTORS = {
     "optimize": collect_optimize,
     "ts": collect_ts,
@@ -714,11 +847,20 @@ COLLECTORS = {
     "hessian-sample": collect_hessian_sample,
     "hessian-global": collect_hessian_global,
     "network-splits": collect_network_splits,
+    "vri": collect_vri,
+    # Follow-ups add to the VRI folder: they show the same, updated, result.
+    "vri-check": collect_vri,
+    "vri-surface": collect_vri,
 }
 
 
-def collect(job: dict) -> dict:
+def collect(job: dict, job_dir: Optional[Path] = None) -> dict:
     out = Path(job["output_dir"])
+    if not out.exists() and job_dir is not None and (Path(job_dir) / "output").exists() and not job.get("external"):
+        # The session folder was moved or copied (e.g. out of the demo's
+        # container): the recorded absolute path is stale, the output is here.
+        out = Path(job_dir) / "output"
+        job = {**job, "output_dir": str(out)}
     if not out.exists():
         return _result("No output yet", [], [])
     fn = COLLECTORS.get(job["op"])
@@ -754,7 +896,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 6
+RESULT_VERSION = 9
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:
@@ -769,7 +911,11 @@ def collect_cached(job: dict, job_dir: Path) -> dict:
                 return cached
         except Exception:
             pass
-    result = collect(job)
+    result = collect(job, job_dir)
+    route_ts = result.get("route_ts")
+    if route_ts and terminal:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "route_ts.xyz").write_text(route_ts["xyz"])
     if terminal:
         result["_finished"] = job.get("finished")
         result["_version"] = RESULT_VERSION
@@ -784,7 +930,9 @@ def summarize(result: dict) -> dict:
     return {"headline": result.get("headline"), "barrier_kcal": result.get("barrier_kcal"),
             # False: the barrier is not backed by IRCs connecting the job's
             # two ends (edges then show it as unconfirmed).
-            "barrier_verified": result.get("barrier_verified", True), "counts": counts}
+            "barrier_verified": result.get("barrier_verified", True), "counts": counts,
+            # Which TS sets that barrier (no geometry: that is in route_ts.xyz).
+            "route_ts": {k: v for k, v in result["route_ts"].items() if k != "xyz"} if result.get("route_ts") else None}
 
 
 def find_entry(result: dict, entry_id: str) -> tuple[dict, dict]:

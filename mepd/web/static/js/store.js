@@ -8,6 +8,8 @@ const listeners = new Set();
 
 export const state = {
   connected: false,
+  // The 'How it works' panel, once dismissed, stays away (per browser).
+  howToHidden: (() => { try { return localStorage.getItem('mepd:hideHowTo') === 'true'; } catch { return false; } })(),
   loaded: false,
   workspace: { structures: {}, edges: {}, positions: {}, root: '' },
   jobs: {},

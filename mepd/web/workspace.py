@@ -328,12 +328,21 @@ class Workspace:
             structure = structure.model_copy(update={"charge": rec["charge"], "multiplicity": rec["multiplicity"]})
             structure.save(str(self.structures_dir / f"{sid}.xyz"))
             new_smiles = chem.perceive_smiles(structure)
-            if new_smiles and rec.get("smiles") and chem.canonical_key(new_smiles) != chem.canonical_key(rec["smiles"]):
-                # The optimization changed connectivity (e.g. a proton moved):
-                # keep the result but say so rather than hiding it.
-                rec["status_error"] = f"connectivity changed on optimization: {rec['smiles']} -> {new_smiles}"
+            old_smiles = rec.get("smiles")
+            if new_smiles and old_smiles and chem.canonical_key(new_smiles) != chem.canonical_key(old_smiles):
+                # The minimization changed connectivity (a proton moved, or the
+                # input reacted downhill, e.g. OH- + CH3Br -> CH3OH + Br-): keep
+                # the result, rename a structure still carrying its automatic
+                # name so the graph shows what it now is, and flag it.
+                rec["status_error"] = (f"reacted while being minimized: {old_smiles} -> {new_smiles}. "
+                                       "This is now a different species.")
+                rec["reacted"] = {"from": old_smiles, "to": new_smiles}
+                origin_input = (rec.get("origin") or {}).get("input")
+                if rec.get("name") in (old_smiles, origin_input):
+                    rec["name"] = new_smiles
             else:
                 rec["status_error"] = None
+                rec.pop("reacted", None)
             rec.update(smiles=new_smiles or rec.get("smiles"), energy=energy, optimized=True,
                        level=level, status="ready", validation=validation)
             if validation and validation.get("is_minimum") is False:

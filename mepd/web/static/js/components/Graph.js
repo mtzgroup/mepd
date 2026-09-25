@@ -3,7 +3,7 @@
 import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
-import { clearSelection, select, set, state, useStore } from '../store.js';
+import { clearSelection, prefs, select, set, state, useStore } from '../store.js';
 import { depictUrl, edgeStatus, edgeStatusKey } from '../util.js';
 import { uploadFiles } from './Library.js';
 
@@ -15,10 +15,10 @@ function stylesheet() {
   return [
     { selector: 'node', style: {
       shape: 'round-rectangle', width: 96, height: 72,
-      'background-color': css('--node-bg'), 'border-width': 1.5, 'border-color': css('--border-strong'),
+      'background-color': css('--node-bg'), 'border-width': 1, 'border-color': css('--border-strong'), 'corner-radius': 4,
       'background-image': 'data(img)', 'background-fit': 'contain', 'background-clip': 'node',
       'background-image-containment': 'inside', 'background-width': '90%', 'background-height': '90%',
-      label: 'data(label)', 'font-size': 11, 'font-family': css('--font-ui'), color: css('--text'),
+      label: 'data(label)', 'font-size': 12, 'font-family': css('--font-ui'), color: css('--heading'),
       'text-valign': 'bottom', 'text-margin-y': 6, 'text-wrap': 'ellipsis', 'text-max-width': 140,
       'text-background-color': css('--bg'), 'text-background-opacity': 0.85, 'text-background-padding': 2,
     } },
@@ -26,7 +26,7 @@ function stylesheet() {
     { selector: 'node:selected', style: { 'border-width': 3, 'border-color': css('--accent') } },
     { selector: 'node.connect-source', style: { 'border-width': 3, 'border-style': 'dashed', 'border-color': css('--accent') } },
     { selector: 'edge', style: {
-      width: 2.5, 'curve-style': 'bezier', 'line-color': css('--edge-idle'), 'target-arrow-shape': 'triangle',
+      width: 2, 'curve-style': 'bezier', 'line-color': css('--edge-idle'), 'target-arrow-shape': 'triangle',
       'target-arrow-color': css('--edge-idle'), 'arrow-scale': 1.1, 'line-style': 'dashed', 'line-dash-pattern': [6, 4],
       label: 'data(label)', 'font-size': 11, 'font-family': css('--font-mono'), color: css('--text'),
       'text-background-color': css('--bg'), 'text-background-opacity': 0.9, 'text-background-padding': 3,
@@ -41,14 +41,15 @@ function stylesheet() {
 }
 
 // Fit everything in view, but never blow a two-node graph up to poster size.
-function fitCapped(c, padding = 60) {
+function fitCapped(c, padding = 70) {
   if (!c.nodes().length) return;
   c.fit(undefined, padding);
   if (c.zoom() > 1.1) { c.zoom(1.1); c.center(); }
+  c.panBy({ x: 0, y: 22 });   // clear of the floating toolbar
 }
 
 // Single-structure calculations whose running target "breathes" in the graph.
-const ANIMATED_OPS = new Set(['hessian-sample', 'hessian-global', 'tsopt', 'optimize']);
+const ANIMATED_OPS = new Set(['hessian-sample', 'hessian-global', 'tsopt', 'optimize', 'vri']);
 const NODE_W = 96, NODE_H = 72;
 
 function activeStructureKey(jobs) {
@@ -78,18 +79,18 @@ export function Graph() {
   const workspace = useStore((s) => s.workspace);
   const statusKey = useStore((s) => edgeStatusKey(s.jobs));
   const activeKey = useStore((s) => activeStructureKey(s.jobs));
-  const animBase = useRef(new Map());   // node id -> resting position while it trembles
-  const arranging = useRef(false);      // a layout is animating: no tremble meanwhile
+  const glowing = useRef(new Set());    // nodes currently wearing the 'calculation running' glow
+  const arranging = useRef(false);      // a layout is animating
   const pendingArrange = useRef(false); // new nodes arrived while the graph was hidden
   const arrangeRef = useRef(() => {});
   const selection = useStore((s) => s.selection);
   const connectMode = useStore((s) => s.connectMode);
+  const howToHidden = useStore((s) => s.howToHidden);
   const [drag, setDrag] = useState(false);
 
-  // Save resting positions, never the few pixels of animation jitter.
   const savePositions = (c) => {
     const pos = {};
-    c.nodes().forEach((n) => { pos[n.id()] = animBase.current.get(n.id()) || n.position(); });
+    c.nodes().forEach((n) => { pos[n.id()] = n.position(); });
     api.put('/api/positions', pos).catch(() => {});
   };
   const nSelected = selection.structures.length + selection.edges.length;
@@ -101,6 +102,8 @@ export function Graph() {
       boxSelectionEnabled: true, selectionType: 'additive',
     });
     cy.current = c;
+    // Labels are drawn on a canvas: redraw once the web fonts have arrived.
+    document.fonts?.ready.then(() => { if (cy.current === c) c.style(stylesheet()); });
 
     c.on('tap', (evt) => {
       const additive = evt.originalEvent && (evt.originalEvent.shiftKey || evt.originalEvent.metaKey || evt.originalEvent.ctrlKey);
@@ -136,7 +139,6 @@ export function Graph() {
       }, 0);
     });
     c.on('dragfree', 'node', (evt) => {
-      if (animBase.current.has(evt.target.id())) animBase.current.set(evt.target.id(), { ...evt.target.position() });
       clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
         savePositions(c);
@@ -200,25 +202,23 @@ export function Graph() {
   }, [workspace, statusKey]);
 
   // --- "breathing" nodes: a structure with a calculation running on it
-  // slowly swells and shrinks with a soft glow, and trembles slightly.
+  // glows softly, the halo slowly swelling and fading (no shaking).
   useEffect(() => {
     const c = cy.current;
     if (!c) return undefined;
     const ids = activeKey ? activeKey.split(',') : [];
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const base = animBase.current;
+    const base = glowing.current;
     const settle = (id) => {
       const el = c.getElementById(id);
-      if (el.nonempty()) {
-        el.removeStyle('width height underlay-color underlay-opacity underlay-padding');
-        if (base.has(id) && !el.grabbed()) el.position({ ...base.get(id) });
-      }
+      if (el.nonempty()) el.removeStyle('width height underlay-color underlay-opacity underlay-padding underlay-shape');
       base.delete(id);
     };
     for (const id of [...base.keys()]) if (!ids.includes(id)) settle(id);
     if (!ids.length) return undefined;
     const accent = css('--accent');
-    const phase = Object.fromEntries(ids.map((id, i) => [id, i * 1.7]));   // don't breathe in lockstep
+    const phase = Object.fromEntries(ids.map((id, i) => [id, i * 1.3]));   // don't breathe in lockstep
+    const PERIOD = 3.6;                                                    // seconds per slow breath
     let frame;
     const tick = (now) => {
       const t = now / 1000;
@@ -226,24 +226,20 @@ export function Graph() {
         for (const id of ids) {
           const el = c.getElementById(id);
           if (el.empty()) continue;
-          if (!base.has(id)) base.set(id, { ...el.position() });
-          const p = phase[id];
-          const breath = Math.sin((2 * Math.PI * t) / 1.8 + p);                 // ~1.8 s in and out
+          base.add(id);
+          // 0..1, eased at both ends so it lingers at rest and at full glow.
+          const u = (1 - Math.cos((2 * Math.PI * t) / PERIOD + phase[id])) / 2;
+          const breath = u * u * (3 - 2 * u);
           el.style({
             'underlay-color': accent,
-            'underlay-opacity': 0.18 + 0.14 * breath,
-            'underlay-padding': 6 + 4 * breath,
-            ...(reduced ? {} : { width: NODE_W * (1 + 0.07 * breath), height: NODE_H * (1 + 0.07 * breath) }),
+            'underlay-shape': 'round-rectangle',
+            'underlay-opacity': reduced ? 0.16 : 0.08 + 0.14 * breath,
+            'underlay-padding': reduced ? 6 : 3 + 7 * breath,
+            ...(reduced ? {} : { width: NODE_W * (1 + 0.015 * breath), height: NODE_H * (1 + 0.015 * breath) }),
           });
-          if (!reduced && !el.grabbed() && !arranging.current) {
-            const b = base.get(id);
-            const dx = 1.3 * Math.sin(2 * Math.PI * 6.1 * t + p) + 0.6 * Math.sin(2 * Math.PI * 9.3 * t + 2 * p);
-            const dy = 1.3 * Math.sin(2 * Math.PI * 5.3 * t + 3 * p) + 0.6 * Math.sin(2 * Math.PI * 8.7 * t + p);
-            el.position({ x: b.x + dx, y: b.y + dy });
-          }
         }
       });
-      frame = requestAnimationFrame(tick);
+      if (!reduced) frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
@@ -278,11 +274,6 @@ export function Graph() {
       idealEdgeLength: () => 180, componentSpacing: 120, padding: 40,
     })
       .on('layoutstop', () => {
-        // Breathing nodes rest at their new place, not where they were.
-        for (const id of animBase.current.keys()) {
-          const el = c.getElementById(id);
-          if (el.nonempty()) animBase.current.set(id, { ...el.position() });
-        }
         arranging.current = false;
         fitCapped(c);
         savePositions(c);
@@ -296,32 +287,31 @@ export function Graph() {
       onDragOver=${(e) => { e.preventDefault(); setDrag(true); }}
       onDragLeave=${() => setDrag(false)}
       onDrop=${(e) => { e.preventDefault(); setDrag(false); if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]); }}>
-      <div class="graph-toolbar">
-        <button class=${`btn ${connectMode ? 'primary' : ''}`} onClick=${() => set({ connectMode: !state.connectMode })}
-          title="Click a start structure, then an end structure, to draw an edge (C)">
-          ${connectMode ? 'Connecting… (Esc)' : '＋ Connect'}</button>
-        <button class="btn" onClick=${layout} title="Auto-arrange">Arrange</button>
-        <button class="btn" onClick=${() => fitCapped(cy.current)} title="Fit to view">Fit</button>
-        <button class="btn" onClick=${() => select({ structures: Object.keys(state.workspace.structures) })}
-          title="Select every structure (then Delete, download, or batch-run)">Select all</button>
-        <button class="btn danger-outline" disabled=${!nSelected} onClick=${deleteSelection}
-          title="Delete the selected structures and edges (Delete key)">Delete${nSelected ? ` (${nSelected})` : ''}</button>
-        <span class="legend">
-          <span><i class="lg idle"></i>not computed</span>
-          <span><i class="lg queued"></i>queued</span>
-          <span><i class="lg running"></i>running</span>
-          <span><i class="lg done"></i>ΔE‡ kcal/mol (≈x? = not IRC-verified)</span>
-          <span><i class="lg failed"></i>failed</span>
-        </span>
-      </div>
       <div class="graph" ref=${host}></div>
+      <div class="graph-toolbar">
+        <button class=${`btn small ${connectMode ? 'primary' : 'ghost'}`} onClick=${() => set({ connectMode: !state.connectMode })}
+          title="Click a start structure, then an end structure, to draw an edge (C)">
+          ${connectMode ? 'Connecting… Esc to stop' : '＋ Connect'}</button>
+        <button class="btn small ghost" onClick=${layout} title="Auto-arrange the graph">Arrange</button>
+        <button class="btn small ghost" onClick=${() => fitCapped(cy.current)} title="Fit everything in view">Fit</button>
+        <button class="btn small ghost" onClick=${() => select({ structures: Object.keys(state.workspace.structures) })}
+          title="Select every structure (then delete, download, or run one calculation on all)">Select all</button>
+        ${howToHidden && html`<button class="btn small ghost" title="Show 'How it works'" aria-label="How it works"
+          onClick=${() => { prefs.set('hideHowTo', false); set({ howToHidden: false }); }}>?</button>`}
+        ${nSelected > 0 && html`<button class="btn small ghost danger-text" onClick=${deleteSelection}
+          title="Delete the selected structures and edges (Delete key)">Delete ${nSelected}</button>`}
+      </div>
+      ${!empty && html`<div class="legend" title="Edge colours. Labels are the lowest barrier ΔE‡ in kcal/mol; ≈x? means the path maximum, not yet confirmed by TS + IRC.">
+        <span><i class="lg idle"></i>not computed</span>
+        <span><i class="lg running"></i>running</span>
+        <span><i class="lg done"></i>ΔE‡, kcal/mol</span>
+        <span><i class="lg failed"></i>failed</span>
+      </div>`}
       ${connectMode && html`<div class="graph-hint">Click the <b>start</b> structure, then the <b>end</b> structure.</div>`}
       ${empty && html`<div class="graph-empty">
-        <h3>An empty reaction graph</h3>
-        <p>Add structures on the left (or drop files here). They appear as nodes.</p>
-        <p>Draw edges with <b>＋ Connect</b>, or select two structures and run a calculation between them.
-          Results can be pulled back in as new nodes and edges.</p>
-        <button class="btn primary" onClick=${() => set({ modal: { kind: 'quick' } })}>Quick start: TS between two structures</button>
+        <h3>Your reaction graph</h3>
+        <p>Structures you add appear here as nodes. Select two and run a calculation to connect them, or start with a transition-state search right away.</p>
+        <button class="btn primary" onClick=${() => set({ modal: { kind: 'quick' } })}>Find a transition state</button>
       </div>`}
     </div>`;
 }

@@ -34,6 +34,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 COOKIE = "mepd_session"
 COOKIE_MAX_AGE = 30 * 24 * 3600
 _OPEN_PATHS = {"/login", "/favicon.ico"}
+_OPEN_PREFIXES = ("/static/vendor/fonts/",)  # the login page's fonts; public OFL files
+
+
+def _open_path(path: str) -> bool:
+    return path in _OPEN_PATHS or path.startswith(_OPEN_PREFIXES)
 
 
 def token_path() -> Path:
@@ -116,7 +121,7 @@ class Auth:
 
     async def middleware(self, request: Request, call_next):
         path = request.url.path
-        if path in _OPEN_PATHS or self.authenticated(request):
+        if _open_path(path) or self.authenticated(request):
             return await call_next(request)
         return _unauthenticated(path)
 
@@ -192,7 +197,7 @@ class VisitorAuth:
         if vid:
             request.state.visitor = vid
             return await call_next(request)
-        if path in _OPEN_PATHS:
+        if _open_path(path):
             return await call_next(request)
         return _unauthenticated(path, demo=True)
 
@@ -215,19 +220,24 @@ def login_page(error: str = "", status: int = 200, demo: bool = False) -> HTMLRe
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mepd · log in</title>
 <style>
-  :root {{ color-scheme: light dark; --bg:#f6f7f9; --panel:#fff; --text:#1b2230; --muted:#5d6778; --accent:#2f6fdf; --border:#c5ccd7; --err:#c93a3a; }}
-  @media (prefers-color-scheme: dark) {{ :root {{ --bg:#11151c; --panel:#171c25; --text:#e3e8f0; --muted:#97a1b3; --accent:#6d9eff; --border:#3b4456; --err:#f07171; }} }}
+  @font-face {{ font-family:"Source Sans 3 Variable"; font-weight:200 900; font-display:swap; src:url(/static/vendor/fonts/source-sans-3-latin-wght-normal.woff2) format("woff2-variations"); }}
+  @font-face {{ font-family:"Source Serif 4 Variable"; font-weight:200 900; font-display:swap; src:url(/static/vendor/fonts/source-serif-4-latin-wght-normal.woff2) format("woff2-variations"); }}
+  :root {{ color-scheme: light dark; --bg:#f8f7f3; --panel:#fcfcfa; --text:#202a33; --heading:#17324a; --muted:#5e6d78; --accent:#3868b8; --accent-strong:#17324a; --border:#c9d1d8; --err:#b23b3b; }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0f1d2a; --panel:#132434; --text:#e9edf1; --heading:#fcfcfa; --muted:#a9bacb; --accent:#7fa6df; --accent-strong:#b1cbef; --border:#3a536b; --err:#ee8a84; }} }}
   body {{ margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text);
-         font:16px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; padding:16px; box-sizing:border-box; }}
-  form {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:22px; width:min(380px,100%); box-sizing:border-box; }}
-  h1 {{ font-size:20px; margin:0 0 6px; }} p {{ color:var(--muted); margin:0 0 14px; font-size:14px; }}
-  input {{ width:100%; box-sizing:border-box; font:inherit; padding:12px; border-radius:8px; border:1px solid var(--border);
+         font:16px/1.5 "Source Sans 3 Variable", "Segoe UI", system-ui, sans-serif; padding:16px; box-sizing:border-box; }}
+  form {{ background:var(--panel); border:1px solid var(--border); border-radius:4px; padding:28px; width:min(380px,100%); box-sizing:border-box; }}
+  h1 {{ font:450 30px/1.1 "Source Serif 4 Variable", Georgia, serif; letter-spacing:-.035em; color:var(--heading); margin:0 0 10px; }}
+  p {{ color:var(--muted); margin:0 0 16px; font-size:15px; }}
+  input {{ width:100%; box-sizing:border-box; font:inherit; padding:11px 12px; border-radius:3px; border:1px solid var(--border);
           background:transparent; color:var(--text); margin-bottom:12px; }}
-  button {{ width:100%; font:inherit; font-weight:600; padding:12px; border:0; border-radius:8px; background:var(--accent); color:#fff; }}
+  input:focus {{ outline:none; border-color:var(--accent); }}
+  button {{ width:100%; font:inherit; font-weight:600; padding:11px; border:1px solid var(--accent); border-radius:3px; background:var(--accent); color:#fff; cursor:pointer; }}
+  button:hover {{ background:var(--accent-strong); border-color:var(--accent-strong); }}
   .err {{ color:var(--err); font-weight:600; }}
 </style></head><body>
 <form method="post" action="/login">
-  <h1>⌬ mepd</h1>
+  <h1>mepd</h1>
   <p>{"Enter the demo password you were given. You get your own private workspace." if demo else "Enter the access token printed by <code>mepd web --auth</code>."}</p>
   {msg}
   <input name="{"password" if demo else "token"}" type="password" autocomplete="current-password" autofocus placeholder="{"password" if demo else "access token"}" required>

@@ -744,3 +744,243 @@ def test_gsm_early_stop_is_off_by_default_and_flagged_when_on():
     assert "early stop off" in path_summary('path_min_method = "GSM"\n')["text"]
     on = path_summary('path_min_method = "GSM"\n[path_min_inputs]\nearly_stop_on_minima = true\n')
     assert "early stop on" in on["text"] and any("early_stop_on_minima" in w for w in on["warnings"])
+
+
+def test_ts_uses_minimized_geometries_not_the_typed_smiles(client):
+    (s,) = _add(client, "C=CCOC=C")
+    (e,) = _add(client, "C=CCCC=O")
+    ws = client.app.state.sessions.current.ws
+    # Once an endpoint holds a minimized geometry, re-embedding its SMILES
+    # would throw that minimum away.
+    ws._data["structures"][s["id"]]["level"] = {"profile": "default", "key": "k", "label": "test"}
+    (ts,) = client.post("/api/jobs", json={"op": "ts", "structures": [s["id"], e["id"]], "params": {},
+                                           "profile": "default", "dry_run": True}).json()
+    argv = ts["argv"]
+    assert argv[2].endswith("start.xyz") and argv[4].endswith("end.xyz")
+
+
+def test_structure_that_reacts_on_minimization_is_renamed_and_flagged(client):
+    (s,) = _add(client, "[OH-].CBr")
+    assert s["name"] == "[OH-].CBr"
+    ws = client.app.state.sessions.current.ws
+    # Minimized to methanol + bromide (the gas-phase SN2 product).
+    product = client.post("/api/structures", json={"text": "CO.[Br-]", "optimize": False}).json()[0]
+    xyz = (ws.structures_dir / f"{product['id']}.xyz").read_text()
+    from mepd.web import chem
+
+    (geom,) = chem.structures_from_xyz_text(xyz)
+    rec = ws.replace_geometry(s["id"], geom, energy=-1.0, level={"profile": "default", "key": "k", "label": "test"})
+    assert chem.canonical_key(rec["smiles"]) == chem.canonical_key("CO.[Br-]")
+    assert rec["name"] == rec["smiles"]  # the automatic name follows the new species
+    assert rec["reacted"]["from"] == "[OH-].CBr"
+    assert "reacted" in rec["status_error"]
+    # A name the user chose is kept.
+    ws._data["structures"][product["id"]]["name"] = "my product"
+    (geom2,) = chem.structures_from_xyz_text((ws.structures_dir / f"{s['id']}.xyz").read_text())
+    rec2 = ws.replace_geometry(product["id"], geom2, energy=-1.0, level={"profile": "default", "key": "k", "label": "test"})
+    assert rec2["name"] == "my product" and "reacted" not in rec2
+
+
+def test_job_revisions_only_increase(client, quick_op):
+    # The browser keeps whichever copy of a job has the larger rev, so a
+    # full-state reload racing a live 'done' event can't roll it back.
+    (s,) = _add(client, WATER_XYZ)
+    (job,) = client.post("/api/jobs", json={"op": "quick", "structures": [s["id"]], "profile": None}).json()
+    done = _wait(client, job["id"])
+    assert done["status"] == "done"
+    assert done["rev"] > job["rev"] > 0
+
+
+def _vri_folder(root: Path) -> Path:
+    """A small, synthetic `mepd discovery vri` output: one bifurcating branch."""
+    d = root / "vri_out"
+    d.mkdir()
+    branch = {"verdict": "bifurcation",
+              "vrt": {"s": 1.2, "rel_ts1_kcal_mol": -8.0},
+              "products": {"p1_rel_ts1_kcal_mol": -30.0, "p2_rel_ts1_kcal_mol": -31.5,
+                           "ts2_rel_ts1_kcal_mol": -20.0, "ts2_verified": True}}
+    (d / "summary.json").write_text(json.dumps({
+        "verdict": "bifurcation", "ts1_energy": -76.0, "ts1_n_imaginary": 1,
+        "branches": {"forward": branch, "reverse": {"verdict": "no_vrt"}},
+        "ts1_candidates": [{"label": "input", "dir": str(d)}]}))
+    (d / "projected_freqs.json").write_text(json.dumps({"ts_index": 1, "branches": {}}))
+    (d / "irc.xyz").write_text(WATER_BENT_XYZ + WATER_XYZ + WATER_BENT_XYZ)
+    for name in ("p1_forward", "p2_forward", "ts2_forward", "vrt_forward"):
+        (d / f"{name}.xyz").write_text(WATER_XYZ)
+    (d / "checks_forward.json").write_text(json.dumps({
+        "branch": "forward", "vri": {"converged": True, "iterations": 5},
+        "basin": {"counts": {"P1": 7, "P2": 5}}, "trajectories": {"counts": {"P1": 30, "P2": 20}, "n": 50}}))
+    return d
+
+
+def _skip_unless_available(client, *keys):
+    """VRI operations switch on only with an mepd whose VRI CLI has every flag they use."""
+    ops = {o["key"]: o for o in client.get("/api/state").json()["operations"]}
+    for key in keys:
+        if not ops[key]["available"]:
+            pytest.skip(f"{key}: {ops[key]['unavailable_reason']}")
+
+
+def test_operations_whose_cli_is_missing_are_shown_unavailable(monkeypatch):
+    from mepd.web import operations as ops
+
+    monkeypatch.setattr(ops, "_cli_options", lambda path: frozenset({"--charge"}))
+    problem = ops.OPERATIONS["vri"].cli_problem()
+    assert problem and "lacks" in problem and "--stride" in problem
+    assert not ops.OPERATIONS["vri"].describe()["available"]
+    monkeypatch.setattr(ops, "_cli_options", lambda path: None)
+    assert "no `mepd discovery vri-check` command" in ops.OPERATIONS["vri-check"].cli_problem()
+    with pytest.raises(ops.WorkspaceError):
+        ops.get_operation("vri-check")
+    assert ops.OPERATIONS["ts"].cli_problem() is None   # operations without a declared command are unaffected
+
+
+def _fake_ts_job(client, sids, eids=(), barrier=12.3):
+    """A finished TS search on this pair whose IRC-verified TS is recorded
+    (what results.collect_ts writes: summary.route_ts + route_ts.xyz)."""
+    jobs = client.app.state.sessions.current.jobs
+    jid = "j_fakets" + str(len(jobs.jobs))
+    (jobs.job_dir(jid)).mkdir(parents=True)
+    (jobs.job_dir(jid) / "route_ts.xyz").write_text(WATER_BENT_XYZ)
+    jobs.jobs[jid] = {"id": jid, "op": "ts", "status": "done", "title": "TS", "created": 0, "finished": 1,
+                      "targets": {"structures": list(sids), "edges": list(eids)}, "output_dir": "/nonexistent",
+                      "summary": {"headline": "", "barrier_kcal": barrier, "barrier_verified": True, "counts": {},
+                                  "route_ts": {"label": "ts_leaf_0", "barrier_kcal": barrier}}}
+    return jid
+
+
+def test_vri_runs_on_an_edge_from_its_verified_ts(client):
+    (a,) = _add(client, WATER_XYZ)
+    (b,) = _add(client, WATER_BENT_XYZ)
+    edge = client.post("/api/edges", json={"source": a["id"], "target": b["id"]}).json()
+    body = {"op": "vri", "edges": [edge["id"]], "params": {"find_ts2": False}, "dry_run": True}
+    _skip_unless_available(client, "vri")
+    r = client.post("/api/jobs", json=body)
+    assert r.status_code == 400 and "no transition state connects" in r.json()["detail"]
+
+    _fake_ts_job(client, [a["id"], b["id"]], [edge["id"]], barrier=20.0)
+    _fake_ts_job(client, [b["id"], a["id"]], [], barrier=9.5)     # same pair, other direction
+    (job,) = client.post("/api/jobs", json=body).json()
+    argv = job["argv"]
+    assert argv[:2] == ["discovery", "vri"] and argv[2].endswith("inputs/ts1.xyz")
+    assert "--skip-ts2" in argv and argv[argv.index("--stride") + 1] == "2" and argv[-2] == "--output"
+    ops = {o["key"]: o for o in client.get("/api/state").json()["operations"]}
+    assert ops["vri"]["target"] == "pair" and ops["vri"]["needs_route_ts"]
+    assert ops["vri-check"]["target"] == "job" and ops["vri-check"]["source_ops"] == ["vri"]
+
+
+def test_ts_result_records_the_route_ts(tmp_path):
+    from mepd.web import results
+
+    job = {"id": "j_x", "op": "ts", "status": "done", "finished": 1.0, "output_dir": str(tmp_path / "out")}
+    fake = {"headline": "h", "groups": [], "summary": [], "warnings": [], "barrier_kcal": 5.0,
+            "route_ts": {"label": "ts_leaf_0", "barrier_kcal": 5.0, "xyz": WATER_XYZ}}
+    orig = results.collect
+    results.collect = lambda j, job_dir=None: dict(fake)
+    try:
+        out = results.collect_cached(job, tmp_path / "jobdir")
+    finally:
+        results.collect = orig
+    assert (tmp_path / "jobdir" / "route_ts.xyz").read_text() == WATER_XYZ
+    assert results.summarize(out)["route_ts"] == {"label": "ts_leaf_0", "barrier_kcal": 5.0}
+
+
+def test_vri_follow_ups_work_in_the_source_folder(client, tmp_path):
+    _skip_unless_available(client, "vri-check", "vri-surface")
+    d = _vri_folder(tmp_path)
+    src = client.post("/api/jobs/import", json={"path": str(d), "op": "vri"}).json()
+    (chk,) = client.post("/api/jobs", json={"op": "vri-check", "params": {"trajectories": 20},
+                                            "source_job": src["id"], "dry_run": True}).json()
+    assert chk["argv"][:3] == ["discovery", "vri-check", str(d)]
+    assert chk["argv"][chk["argv"].index("--trajectories") + 1] == "20"
+    assert chk["output_dir"] == str(d) and chk["source_job"] == src["id"]
+    (srf,) = client.post("/api/jobs", json={"op": "vri-surface", "source_job": src["id"], "dry_run": True}).json()
+    assert srf["argv"][:3] == ["discovery", "vri-surface", str(d)]
+
+    # A follow-up needs a finished job of the right kind.
+    (s,) = _add(client, WATER_XYZ)
+    r = client.post("/api/jobs", json={"op": "vri-check", "source_job": "j_nope", "dry_run": True})
+    assert r.status_code == 400
+    other = client.post("/api/jobs/import", json={"path": str(d), "op": "tsopt"}).json()
+    r = client.post("/api/jobs", json={"op": "vri-check", "source_job": other["id"], "dry_run": True})
+    assert r.status_code == 400 and "follows up on vri" in r.json()["detail"]
+
+
+def test_vri_result_reads_verdicts_products_and_checks(tmp_path):
+    from mepd.web.results import collect_vri
+
+    r = collect_vri(_vri_folder(tmp_path), 0, 1)
+    assert r["headline"].startswith("Post-TS bifurcation") and "forward branch" in r["headline"]
+    assert {k: r["vri"][k] for k in ("verdict", "checked", "surface")} == {
+        "verdict": "bifurcation", "checked": True, "surface": False}
+    kinds = {g["kind"]: [e["label"] for e in g["entries"]] for g in r["groups"]}
+    assert kinds["ts"] == ["TS1", "TS2 (forward)"]
+    assert kinds["minima"] == ["P1 (forward)", "P2 (forward)"]
+    assert kinds["points"] == ["VRT (forward)"]
+    assert kinds["irc"] == ["IRC through TS1"]
+    summary = {s["label"]: s["value"] for s in r["summary"]}
+    assert summary["Basin test (forward)"] == "P1 7 · P2 5"
+    assert summary["Reverse"] == "no valley-ridge transition"
+
+
+def _cli_options(argv: list[str]) -> set[str]:
+    """Every option the mepd CLI command that `argv` runs accepts."""
+    import click
+    import typer
+
+    from mepd.cli import app
+
+    cmd = typer.main.get_command(app)
+    words = list(argv)
+    while hasattr(cmd, "get_command") and words and not words[0].startswith("-"):
+        sub = cmd.get_command(click.Context(cmd), words[0])
+        if sub is None:
+            break
+        cmd, words = sub, words[1:]
+    opts = set()
+    for prm in cmd.params:
+        opts.update(getattr(prm, "opts", []))
+        opts.update(getattr(prm, "secondary_opts", []))
+    return opts
+
+
+def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
+    # The web UI drives mepd through its CLI; a renamed or removed flag
+    # would otherwise only show up as a failed job (it happened: VRI's
+    # --enumerate-products). Build every operation's command with default
+    # parameters and with every on/off option flipped, and check each flag.
+    from qcdata import Structure
+
+    ws = client.app.state.sessions.current.ws
+    (a,) = _add(client, "C=CCOC=C")
+    (b,) = _add(client, "C=CCCC=O")
+    ts = ws.add_structure(Structure.from_xyz(WATER_BENT_XYZ), name="TS1", origin={"kind": "xyz"}, role="ts")
+    _fake_ts_job(client, [a["id"], b["id"]])      # so edge operations that need a TS (VRI) can build
+    src = client.post("/api/jobs/import", json={"path": str(_vri_folder(tmp_path)), "op": "vri"}).json()
+    ops = client.get("/api/state").json()["operations"]
+    checked = 0
+    for op in ops:
+        if not op["available"]:
+            continue
+        body = {"op": op["key"], "dry_run": True, "profile": "default"}
+        if op["target"] == "pair":
+            body["structures"] = [a["id"], b["id"]]
+        elif op["target"] == "set":
+            body["structures"] = [a["id"], b["id"]]
+        elif op["target"] == "job":
+            body["source_job"] = src["id"]
+        else:
+            body["structures"] = [ts["id"] if op.get("structure_role") == "ts" else a["id"]]
+        props = (op["schema"] or {}).get("properties", {})
+        flipped = {k: not v.get("default") for k, v in props.items() if v.get("type") == "boolean"}
+        for params in ({}, flipped):
+            r = client.post("/api/jobs", json={**body, "params": params})
+            if r.status_code == 400 and params:
+                continue  # an invalid combination (e.g. IRC without TS optimization)
+            assert r.status_code == 200, (op["key"], r.text)
+            for job in r.json():
+                known = _cli_options(job["argv"])
+                unknown = [w for w in job["argv"] if w.startswith("--") and w not in known]
+                assert not unknown, f"{op['key']}: mepd {' '.join(job['argv'][:2])} has no {unknown}"
+                checked += 1
+    assert checked >= 10

@@ -1,7 +1,7 @@
 // Right panel: what is selected, what we know about it, what can be run on it.
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
-import { clearSelection, openJob, select, set, useStore } from '../store.js';
+import { clearSelection, openJob, prefs, select, set, useStore } from '../store.js';
 import { PHONE_QUERY, STATUS_LABEL, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus } from '../util.js';
 import { ActionPanel } from './Actions.js';
 import { Viewer3D } from './Viewer3D.js';
@@ -56,7 +56,7 @@ function StructureDetail({ rec }) {
   return html`
     <section>
       <${Editable} className="title-input" value=${rec.name} onSave=${(name) => patch({ name })} />
-      <div class="smiles" title="Connectivity perceived from the geometry">${rec.smiles || '—'}</div>
+      ${rec.smiles && rec.smiles !== rec.name && html`<div class="smiles" title="Connectivity perceived from the geometry">${rec.smiles}</div>`}
       <${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />
       <div class="viewer-tools">
         <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
@@ -171,17 +171,16 @@ export function Inspector() {
   let head, body = null;
   if (!nS && !nE) {
     return html`<aside class="inspector empty">
-      <div class="pane-head"><h2>Selection</h2></div>
+      <div class="pane-head"><h2>How it works</h2>
+        <button class="btn-icon" title="Hide this panel (bring it back with ? on the graph)" aria-label="Hide"
+          onClick=${() => { prefs.set('hideHowTo', true); set({ howToHidden: true }); }}>✕</button></div>
       <div class="empty-hint">
-        <p><strong>Nothing selected.</strong></p>
-        <ul class="hint-list">
-          <li><b>One structure</b>: explore around it (Hessian sampling, basin hopping, TS optimization).</li>
-          <li><b>Two structures or an edge</b>: find the TS / MEP or sample reaction channels.</li>
-          <li><b>Several edges</b>: run the same calculation on each.</li>
-          <li><b>Several structures</b>: all-pairs network, or batch exploration.</li>
-        </ul>
-        <p class="small muted">Shift/⌘-click to multi-select. Shift-drag on the graph to box-select. The first structure you pick is the start.</p>
-        <button class="btn" onClick=${() => set({ modal: { kind: 'quick' } })}>Quick start…</button>
+        <ol class="steps">
+          <li><b>Add structures</b><span>SMILES or XYZ, in the panel on the left. Each becomes a node.</span></li>
+          <li><b>Select</b><span>One structure to explore around it; two, or an edge, to connect them.</span></li>
+          <li><b>Run a calculation</b><span>The options for your selection appear here. Results can be added back to the graph.</span></li>
+        </ol>
+        <p class="small muted">Shift-click to select several. Shift-drag on the graph to box-select.</p>
       </div>
     </aside>`;
   }

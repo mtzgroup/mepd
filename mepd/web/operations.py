@@ -17,6 +17,8 @@ in `mepd.web.results`).
 
 from __future__ import annotations
 
+import functools
+import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mepd.web.workspace import Workspace, WorkspaceError, is_ts
 
-Target = Literal["structure", "pair", "set"]
+Target = Literal["structure", "pair", "set", "job"]  # "job": a follow-up on another job's output
 
 
 def P(default, title: str, help: str = "", *, cli: Optional[str] = None, kind: str = "value",
@@ -79,9 +81,9 @@ def generic_flags(params: Params) -> list[str]:
 
 EndpointMode = Literal["auto", "smiles", "xyz"]
 _ENDPOINTS_HELP = (
-    "How endpoints are handed to mepd. 'auto' passes SMILES when both structures were "
-    "entered as SMILES (mepd then builds an atom-mapped pair itself) and the stored "
-    "geometries otherwise."
+    "How endpoints are handed to mepd. 'auto' passes the stored geometries once either "
+    "structure has been minimized (so the path starts from those minima), and the SMILES "
+    "only for two raw SMILES embeddings (mepd then builds an atom-mapped pair itself)."
 )
 
 
@@ -104,8 +106,12 @@ class TsParams(Params):
                                 group="Endpoints", advanced=True)
     atom_mapping_candidates: int = P(200, "Mapping candidates", cli="--atom-mapping-candidates",
                                      group="Atom mapping", advanced=True, ge=1, requires="atom_mapping")
-    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy"] = P(
-        "geodesic-distance", "Mapping metric", cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
+    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy", "endpoint-rmsd"] = P(
+        "geodesic-distance", "Mapping metric", "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
+        "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
+        "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
+        "experimental in mepd).",
+        cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
         requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
@@ -168,8 +174,12 @@ class ChannelsParams(Params):
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
-    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy"] = P(
-        "geodesic-distance", "Mapping metric", cli="--atom-mapping-metric", group="Pairs", advanced=True,
+    atom_mapping_metric: Literal["geodesic-distance", "path-rmsd", "gi-energy", "endpoint-rmsd"] = P(
+        "geodesic-distance", "Mapping metric", "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
+        "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
+        "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
+        "experimental in mepd).",
+        cli="--atom-mapping-metric", group="Pairs", advanced=True,
         requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
@@ -283,6 +293,9 @@ class JobContext:
     output_dir: Path
     structures: list[dict]  # resolved structure records, in target order
     profile: Optional[str]
+    source: Optional[dict] = None  # follow-up operations: the job whose output they work on
+    edge_ids: list = field(default_factory=list)   # the edge(s) a pair job runs on
+    jobs: dict = field(default_factory=dict)       # the session's jobs (to find an edge's TS)
 
     def snapshot_structure(self, rec: dict, name: str) -> Path:
         """Copy a library geometry into the job folder, so the job stays
@@ -293,7 +306,11 @@ class JobContext:
         return dst
 
     def common_flags(self) -> list[str]:
-        first = self.structures[0]
+        # A follow-up whose structure has since left the graph (or an
+        # imported folder, which never had one) uses its source job's.
+        first = self.structures[0] if self.structures else {
+            "charge": (self.source or {}).get("charge") or 0,
+            "multiplicity": (self.source or {}).get("multiplicity") or 1}
         argv = ["--charge", str(first["charge"]), "--multiplicity", str(first["multiplicity"])]
         if self.profile:
             prof = self.job_dir / "inputs" / "profile.toml"
@@ -317,7 +334,12 @@ class JobContext:
             if a[key] != b[key]:
                 raise WorkspaceError(f"endpoints disagree on {key}: {a['name']}={a[key]}, {b['name']}={b[key]}")
         smiles = [rec.get("origin", {}).get("kind") == "smiles" and rec["origin"].get("input") for rec in (a, b)]
-        use_smiles = mode == "smiles" or (mode == "auto" and all(smiles))
+        # Once a structure has a minimized geometry, that geometry *is* the
+        # structure: re-embedding its SMILES would throw the minimum away (and
+        # the input SMILES may not even describe it any more, if it reacted
+        # while being minimized).
+        minimized = any(rec.get("level") for rec in (a, b))
+        use_smiles = mode == "smiles" or (mode == "auto" and all(smiles) and not minimized)
         if use_smiles:
             if not all(smiles):
                 raise WorkspaceError("endpoint source 'smiles' needs both structures to have been entered as SMILES")
@@ -342,6 +364,40 @@ class Operation:
     min_structures: int = 1
     # What a finished job contributes to the graph (used by the UI's import hints).
     produces: list[str] = field(default_factory=list)
+    # "ts": offered only when every selected structure is a transition state.
+    structure_role: Optional[str] = None
+    # target "job": the operations whose finished output this follows up on.
+    source_ops: tuple = ()
+    # target "pair": runs from the edge's IRC-verified TS (so needs one).
+    needs_route_ts: bool = False
+    # The mepd command this runs (e.g. ("discovery", "vri")) and flags its
+    # builder adds beyond the params' own: checked against the installed CLI,
+    # so an operation whose command or flags this mepd lacks is shown as
+    # unavailable instead of failing when run.
+    cli_path: tuple = ()
+    cli_extra_flags: tuple = ()
+
+    def cli_problem(self) -> Optional[str]:
+        if not self.cli_path:
+            return None
+        opts = _cli_options(self.cli_path)
+        if opts is None:
+            return f"this mepd has no `mepd {' '.join(self.cli_path)}` command yet"
+        wanted = set(self.cli_extra_flags)
+        for finfo in (self.params_model.model_fields.values() if self.params_model else []):
+            extra = finfo.json_schema_extra or {}
+            if extra.get("cli") and extra.get("cli_kind") != "custom":
+                wanted.add(extra["cli"])
+                if extra.get("cli_kind") == "toggle":
+                    wanted.add("--no-" + extra["cli"].removeprefix("--"))
+        missing = sorted(wanted - opts)
+        if missing:
+            return f"this mepd's `mepd {' '.join(self.cli_path)}` lacks {', '.join(missing)} (update mepd)"
+        return None
+
+    @property
+    def usable(self) -> bool:
+        return self.available and self.cli_problem() is None
 
     def describe(self) -> dict:
         return {
@@ -350,10 +406,13 @@ class Operation:
             "summary": self.summary,
             "target": self.target,
             "category": self.category,
-            "available": self.available,
-            "unavailable_reason": self.unavailable_reason,
+            "available": self.usable,
+            "unavailable_reason": self.unavailable_reason or self.cli_problem() or "",
             "min_structures": self.min_structures,
             "produces": self.produces,
+            "structure_role": self.structure_role,
+            "source_ops": list(self.source_ops),
+            "needs_route_ts": self.needs_route_ts,
             "schema": self.params_model.model_json_schema() if self.params_model else None,
         }
 
@@ -404,6 +463,140 @@ def _build_discovery(command: str):
     return build
 
 
+class VriParams(Params):
+    branches: Literal["both", "forward", "reverse"] = P(
+        "both", "IRC branches", "Which side(s) of TS1 to scan for a valley-ridge transition.", cli="--branches")
+    stride: int = P(2, "Hessian every Nth IRC point", "1 resolves the scan best; 2 halves the cost (the "
+                    "VRT is still bracketed and then bisected).", cli="--stride", ge=1)
+    workers: int = P(4, "Parallel Hessians", "Hessians/optimizations at once; each engine call stays "
+                     "single-threaded.", cli="--workers", ge=1)
+    find_ts2: bool = P(True, "Find TS2", "Search for the second saddle (TS2) between P1 and P2.", kind="custom")
+    symmetric_ts: bool = P(True, "Try symmetrized TS1", "Also start from TS1 candidates made by symmetrizing "
+                           "TS1 under near-symmetries of its bond graph (finds ridge saddles).",
+                           cli="--symmetric-ts", kind="toggle")
+    exact_vri: bool = P(True, "Converge the exact VRI", "From the VRT to the exact valley-ridge inflection "
+                        "point, on every branch with a second product (a few seconds per branch).",
+                        cli="--exact-vri", kind="toggle")
+    trajectories: int = P(0, "Trajectories from TS1", "Quasiclassical trajectories into each confirmed "
+                          "bifurcation, for the P1:P2 ratio (100 resolves shares above a few percent; 0 = none).",
+                          cli="--trajectories", ge=0, group="Advanced", advanced=True)
+    hessian: Literal["auto", "gradients", "engine"] = P(
+        "auto", "Hessian source", "gradients: central differences of engine gradients; engine: the "
+        "engine's own Hessian.", cli="--hessian", group="Advanced", advanced=True)
+    irc_step: float = P(0.05, "IRC step (Å·amu½)", cli="--irc-step", gt=0, group="Advanced", advanced=True)
+    irc_fmax: float = P(0.01, "IRC stopping force (eV/Å)", cli="--irc-fmax", gt=0, group="Advanced", advanced=True)
+    n_bisect: int = P(4, "Bisection steps", cli="--n-bisect", ge=0, group="Advanced", advanced=True)
+    vrt_threshold: float = P(50.0, "Imaginary threshold (cm⁻¹)", cli="--vrt-threshold", gt=0,
+                             group="Advanced", advanced=True)
+    persist: int = P(2, "Consecutive imaginary points", cli="--persist", ge=1, group="Advanced", advanced=True)
+    push_amplitude: float = P(0.3, "Ridge push (bohr)", cli="--push-amplitude", gt=0,
+                              group="Advanced", advanced=True)
+    max_vrt_depth: float = P(30.0, "Max VRT depth below TS1 (kcal/mol)", cli="--max-vrt-depth", gt=0,
+                             group="Advanced", advanced=True)
+    ts2_method: Literal["auto", "geodesic", "neb"] = P("auto", "TS2 search", cli="--ts2-method",
+                                                       group="Advanced", advanced=True, requires="find_ts2")
+    save_hessians: bool = P(True, "Save Hessians", cli="--save-hessians", kind="toggle",
+                            group="Advanced", advanced=True)
+
+
+class VriCheckParams(Params):
+    trajectories: int = P(150, "Trajectories from TS1", "Quasiclassical trajectories per branch, to count "
+                          "P1 vs P2 (0 = skip).", cli="--trajectories", ge=0)
+    refine: bool = P(True, "Converge the exact VRI", cli="--refine", kind="toggle")
+    basin: bool = P(True, "Basin test", "Steepest descent from sideways pushes off the IRC: a real "
+                    "bifurcation drains into both P1 and P2.", cli="--basin", kind="toggle")
+    workers: int = P(4, "Parallel engine calls", cli="--workers", ge=1)
+    traj_fs: float = P(400.0, "Trajectory length (fs)", cli="--traj-fs", gt=0, group="Advanced", advanced=True)
+
+
+class VriSurfaceParams(Params):
+    grid: int = P(13, "Grid nodes per axis", "Each node is one restrained optimization.", cli="--grid", ge=3)
+    workers: int = P(4, "Parallel gradient calls", cli="--workers", ge=1)
+
+
+# Result groups whose entries are IRCs (or carry one): their TS connects the
+# two ends of an edge added from them ("Add ends + edge to Graph").
+IRC_GROUP_KINDS = ("irc", "channel", "alternate", "offtarget")
+
+
+def _origin_ts(ws, edge: dict) -> Optional[tuple]:
+    """(barrier, xyz) of the TS of the IRC an edge was added from, if any."""
+    origin = edge.get("origin") or {}
+    if origin.get("kind") != "job" or not origin.get("entry"):
+        return None
+    fp = ws.jobs_dir / origin["job"] / "result.json"
+    try:
+        result = json.loads(fp.read_text())
+    except (OSError, ValueError):
+        return None
+    for group in result.get("groups", []):
+        for entry in group.get("entries", []):
+            if entry.get("id") != origin["entry"]:
+                continue
+            is_irc = group.get("kind") in IRC_GROUP_KINDS or str(entry["id"]).endswith("_irc")
+            k = entry.get("ts_index")
+            if not is_irc or k is None or not (0 <= k < len(entry.get("frames") or [])):
+                return None
+            barrier = origin.get("barrier_kcal", entry.get("barrier_kcal"))
+            return (barrier if barrier is not None else float("inf"), entry["frames"][k]["xyz"])
+    return None
+
+
+def edge_route_ts(ws, jobs: dict, structure_ids: list, edge_ids: list) -> Optional[tuple]:
+    """(barrier, label, xyz) of the lowest IRC-verified TS known between these
+    two structures: from a finished TS / channels job on them, or from the
+    IRC an edge was added from."""
+    pair = set(structure_ids)
+    best = None
+    for job in jobs.values():
+        if job["status"] != "done" or job["op"] not in ("ts", "channels"):
+            continue
+        targets = job.get("targets") or {}
+        if not (set(targets.get("edges") or []) & set(edge_ids) or set(targets.get("structures") or []) == pair):
+            continue
+        info = (job.get("summary") or {}).get("route_ts")
+        fp = ws.jobs_dir / job["id"] / "route_ts.xyz"
+        if not info or not fp.exists():
+            continue
+        barrier = info.get("barrier_kcal")
+        key = barrier if barrier is not None else float("inf")
+        if best is None or key < best[0]:
+            best = (key, f"{info.get('label')} of {job['title']}", fp.read_text())
+    for eid in edge_ids:
+        try:
+            found = _origin_ts(ws, ws.edge(eid))
+        except WorkspaceError:
+            found = None
+        if found is not None and (best is None or found[0] < best[0]):
+            best = (found[0], "the TS of the IRC this edge was added from", found[1])
+    return best
+
+
+def _build_vri(ctx: JobContext, p: VriParams) -> list[str]:
+    a, b = ctx.structures
+    found = edge_route_ts(ctx.ws, ctx.jobs, [a["id"], b["id"]], ctx.edge_ids)
+    if found is None:
+        raise WorkspaceError(f"no transition state connects {a['name']} and {b['name']} yet: run 'Transition "
+                             "state' or 'Reaction channels' on this edge first (the VRI search starts from the "
+                             "IRC-verified TS that sets the edge's barrier)")
+    _, _label, xyz = found
+    ts = ctx.job_dir / "inputs" / "ts1.xyz"
+    ts.parent.mkdir(parents=True, exist_ok=True)
+    ts.write_text(xyz)
+    argv = ["discovery", "vri", str(ts), *ctx.common_flags(), *generic_flags(p)]
+    if not p.find_ts2:
+        argv.append("--skip-ts2")
+    return argv + ["--output", str(ctx.output_dir)]
+
+
+def _build_vri_followup(command: str):
+    def build(ctx: JobContext, p: Params) -> list[str]:
+        if ctx.source is None:
+            raise WorkspaceError(f"{command} follows up on a finished VRI search")
+        return ["discovery", command, ctx.source["output_dir"], *ctx.common_flags(), *generic_flags(p)]
+    return build
+
+
 def _build_optimize(ctx: JobContext, p: OptimizeParams) -> list[str]:
     ts = [r["name"] for r in ctx.structures if is_ts(r)]
     if ts:
@@ -428,6 +621,7 @@ def _build_network_splits(ctx: JobContext, p: NetworkSplitsParams) -> list[str]:
 PAIR = "Connect two structures"
 EXPLORE = "Explore around a structure"
 SET = "Across a set of structures"
+FROM_TS = "Past the transition state"
 
 OPERATIONS: dict[str, Operation] = {op.key: op for op in [
     Operation(
@@ -474,6 +668,23 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "selected minima and assemble a reaction network. (`mepd network-splits`)",
         "set", SET, NetworkSplitsParams, _build_network_splits, min_structures=2,
         produces=["network edges", "intermediates"]),
+    Operation(
+        "vri", "Valley-ridge inflection", "Scan the IRC from this edge's transition state for a valley-ridge "
+        "transition, where the path can split after the TS (a post-TS bifurcation into two products, P1 and P2). "
+        "(`mepd discovery vri`)",
+        "pair", FROM_TS, VriParams, _build_vri, min_structures=2, needs_route_ts=True,
+        produces=["products P1 and P2", "TS2 between them"],
+        cli_path=("discovery", "vri"), cli_extra_flags=("--skip-ts2", "--charge", "--multiplicity", "--inputs", "--output")),
+    Operation(
+        "vri-check", "Check the bifurcation", "Converge the exact VRI, test that sideways pushes off the IRC "
+        "drain into both P1 and P2, and count trajectories into each. (`mepd discovery vri-check`)",
+        "job", FROM_TS, VriCheckParams, _build_vri_followup("vri-check"), source_ops=("vri",),
+        cli_path=("discovery", "vri-check")),
+    Operation(
+        "vri-surface", "Map the 2D surface", "Reconstruct the energy surface around each bifurcation "
+        "(TS1, VRI, TS2, P1, P2 on one map). (`mepd discovery vri-surface`)",
+        "job", FROM_TS, VriSurfaceParams, _build_vri_followup("vri-surface"), source_ops=("vri",),
+        cli_path=("discovery", "vri-surface")),
 ]}
 
 
@@ -482,6 +693,28 @@ def get_operation(key: str) -> Operation:
         op = OPERATIONS[key]
     except KeyError:
         raise WorkspaceError(f"unknown operation {key!r}") from None
-    if not op.available:
-        raise WorkspaceError(f"{op.title} is not available: {op.unavailable_reason}")
+    if not op.usable:
+        raise WorkspaceError(f"{op.title} is not available: {op.unavailable_reason or op.cli_problem()}")
     return op
+
+
+@functools.lru_cache(maxsize=None)
+def _cli_options(path: tuple) -> Optional[frozenset]:
+    """Every option of the installed `mepd <path...>` command, or None if
+    there is no such command."""
+    import click
+    import typer
+
+    from mepd.cli import app
+
+    cmd = typer.main.get_command(app)
+    for word in path:
+        sub = cmd.get_command(click.Context(cmd), word) if hasattr(cmd, "get_command") else None
+        if sub is None:
+            return None
+        cmd = sub
+    opts = set()
+    for prm in cmd.params:
+        opts.update(getattr(prm, "opts", []))
+        opts.update(getattr(prm, "secondary_opts", []))
+    return frozenset(opts)

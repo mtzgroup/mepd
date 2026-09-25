@@ -18,7 +18,26 @@ async function request(method, url, body, { raw = false } = {}) {
   }
   if (raw) return res;
   const ct = res.headers.get('content-type') || '';
-  return ct.includes('application/json') ? res.json() : res.text();
+  const out = ct.includes('application/json') ? await res.json() : await res.text();
+  // A job the server just created or re-queued is ours right away: don't
+  // wait for its live update (which can lag behind, e.g. through a tunnel)
+  // before a view that opens it can find it.
+  if (method === 'POST' && url.startsWith('/api/jobs') && !(body && body.dry_run)) rememberJobs(out);
+  return out;
+}
+
+function isJob(x) {
+  return x && typeof x === 'object' && typeof x.id === 'string' && x.id.startsWith('j_') && 'status' in x && 'op' in x;
+}
+
+function rememberJobs(out) {
+  const jobs = (Array.isArray(out) ? out : [out]).filter(isJob);
+  if (!jobs.length) return;
+  update((s) => {
+    const next = { ...s.jobs };
+    for (const j of jobs) next[j.id] = newer(next[j.id], j);
+    s.jobs = next;
+  });
 }
 
 export const api = {
@@ -58,10 +77,23 @@ export async function deleteSelection() {
   }
 }
 
+function newer(a, b) {
+  if (!a) return b;
+  return (a.rev ?? 0) > (b.rev ?? 0) ? a : b;
+}
+
 function applyState(data) {
   update((s) => {
     s.workspace = data.workspace;
-    s.jobs = Object.fromEntries(data.jobs.map((j) => [j.id, j]));
+    // A reload that was already in flight when a live update arrived must not
+    // roll that job back (e.g. 'done' -> 'running'): keep the newer copy.
+    const fresh = Object.fromEntries(data.jobs.map((j) => [j.id, newer(s.jobs[j.id], j)]));
+    // Jobs this page learned about after the server took this snapshot
+    // (queued while the reload was in flight) are missing from it: keep them.
+    if (data.now_ns != null) {
+      for (const [id, j] of Object.entries(s.jobs)) if (!(id in fresh) && (j.rev ?? 0) > data.now_ns) fresh[id] = j;
+    }
+    s.jobs = fresh;
     s.operations = data.operations;
     s.profiles = data.profiles;
     s.levelProfile = data.level_profile;
@@ -103,6 +135,7 @@ const handlers = {
   },
   job: (job) => {
     const prev = state.jobs[job.id];
+    if (prev && newer(prev, job) === prev) return;   // stale copy, arrived late
     update((s) => { s.jobs = { ...s.jobs, [job.id]: job }; });
     if (prev && prev.status !== job.status && ['done', 'failed'].includes(job.status)) {
       toast(`${job.status === 'done' ? 'Finished' : 'Failed'}: ${job.title}`, job.status === 'done' ? 'ok' : 'error');
@@ -174,7 +207,11 @@ export function connect() {
     if (Object.values(state.jobs).some((j) => j.status === 'running' || j.status === 'queued')) {
       refreshState().catch(() => {});
     }
-  }, 45000);
+  }, 15000);
+  // Phones freeze background tabs (and their connections): catch up on return.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshState().catch(() => {});
+  });
   const es = new EventSource('/api/events');
   let sawHello = false;
   const fallback = setTimeout(() => {

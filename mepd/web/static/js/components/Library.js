@@ -15,7 +15,7 @@ export async function uploadFiles(files, { charge = null, multiplicity = null } 
     (added) => `Added ${added.length} structure${added.length === 1 ? '' : 's'}`);
 }
 
-function AddBox() {
+function AddBox({ onDone }) {
   const [text, setText] = useState('');
   const [charge, setCharge] = useState('');
   const [mult, setMult] = useState('');
@@ -36,24 +36,25 @@ function AddBox() {
     if (added) {
       setText('');
       select({ structures: added.map((a) => a.id) });
+      onDone?.();
     }
   };
   return html`
     <div class="add-box">
       <textarea rows="3" value=${text} spellcheck="false"
-        placeholder=${'SMILES (one per line, optional name after a space)\nor paste XYZ — or drop .xyz/.smi files here'}
+        placeholder=${'SMILES, one per line (a name may follow a space),\nor pasted XYZ. You can also drop .xyz / .smi files.'}
         onInput=${(e) => setText(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) add(); }} />
       <div class="add-row">
-        <input type="number" class="tiny" placeholder="charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} title="Charge (default: from SMILES / xyz)" />
-        <input type="number" class="tiny" placeholder="mult." min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} title="Spin multiplicity" />
+        <input type="number" class="tiny" placeholder="Charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} title="Charge (default: from SMILES / xyz)" />
+        <input type="number" class="tiny" placeholder="Mult." min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} title="Spin multiplicity (default: from SMILES / xyz)" />
         <button class="btn primary" disabled=${busy || !text.trim()} onClick=${add}>
           ${busy ? 'Embedding…' : isXyz ? 'Add XYZ' : n > 1 ? `Add ${n}` : 'Add'}
         </button>
       </div>
       <label class="small opt-toggle" title="Minimize at the workspace level of theory so every structure in the graph lives on the same potential energy surface">
         <input type="checkbox" checked=${optimize} onChange=${(e) => { setOptimize(e.target.checked); prefs.set('optimizeOnAdd', e.target.checked); }} />
-        <span>Optimize at <b>${level?.label ?? 'workspace level'}</b> on add${validate ? ' + Hessian check' : ''}</span>
+        <span>Minimize at the level of theory first${validate ? ', then check with a Hessian' : ''}</span>
       </label>
     </div>`;
 }
@@ -78,23 +79,25 @@ function LevelBar() {
     (js) => `Re-optimizing ${off.length} structure${off.length > 1 ? 's' : ''} (${js.length} job${js.length > 1 ? 's' : ''})`);
   return html`
     <div class="level-bar">
-      <label class="small" title="The level of theory every structure in this workspace is minimized at. Change the profile's engine/method under Profiles.">
-        Level of theory
+      <label class="level-field" title="Every structure in this session is minimized at this level of theory, so all energies are comparable. Edit a profile's engine and method under Profiles.">
+        <span class="field-label">Level of theory</span>
         <select value=${levelProfile ?? ''} onChange=${(e) => setLevel(e.target.value)}>
-          ${profiles.map((p) => html`<option value=${p}>${p} · ${levels[p]?.label ?? ''}</option>`)}
-          <option value="">mepd defaults · ${levels['']?.label ?? ''}</option>
+          ${profiles.map((p) => html`<option value=${p}>${levels[p]?.label ?? p} · ${p}</option>`)}
+          <option value="">${levels['']?.label ?? ''} · mepd defaults</option>
         </select>
       </label>
-      <label class="small hess-toggle" title="After optimizing a structure, compute its Hessian and require no imaginary frequency. A structure stuck on a saddle point is pushed along its unstable mode and re-optimized; if that fails it is flagged 'not a minimum'.">
-        <input type="checkbox" checked=${validate}
+      <label class="check small" title="After a structure is minimized, compute its Hessian and require no imaginary frequency. A structure stuck on a saddle point is pushed along its unstable mode and re-minimized; if that fails it is flagged 'not a minimum'.">
+        <input type="checkbox" class="switch" checked=${validate}
           onChange=${(e) => attempt(() => api.put('/api/level', { validate_minima: e.target.checked }))
             .then((r) => r && refreshState())} />
-        Verify minima (Hessian)
+        Confirm minima with a Hessian
       </label>
-      ${busy > 0 && html`<span class="small muted">${busy} optimizing…</span>`}
-      ${off.length > 0 && html`<button class="btn small warn-outline" onClick=${reopt}
-        title="Minimize every structure that is not a minimum at this level (force-field embeddings, other levels, failed optimizations)">
-        Re-optimize ${off.length} off-level</button>`}
+      ${(busy > 0 || off.length > 0) && html`<div class="level-status small">
+        ${busy > 0 && html`<span class="muted">${busy} minimizing…</span>`}
+        ${off.length > 0 && html`<button class="btn-link small warn-text" onClick=${reopt}
+          title="Minimize every structure that is not yet a minimum at this level (force-field embeddings, other levels, failed optimizations)">
+          ${off.length} not at this level · re-optimize</button>`}
+      </div>`}
     </div>`;
 }
 
@@ -115,8 +118,8 @@ function Card({ rec, selected, order }) {
           <span>${rec.formula}</span>
           ${(rec.charge !== 0 || rec.multiplicity !== 1) && html`<span class="badge">${rec.charge >= 0 ? '+' : ''}${rec.charge} / ${rec.multiplicity}</span>`}
           <span class=${`origin origin-${origin}`} title=${origin === 'job' ? `From ${rec.origin.label}` : `Entered as ${origin}`}>
-            ${origin === 'job' ? 'result' : origin}</span>
-          <${LevelChip} rec=${rec} />
+            ${origin === 'job' ? 'from a calculation' : origin === 'smiles' ? 'SMILES' : 'XYZ'}</span>
+          ${levelStatus(rec).kind !== 'ok' && html`<${LevelChip} rec=${rec} />`}
         </div>
       </div>
     </li>`;
@@ -127,6 +130,7 @@ export function Library() {
   const selected = useStore((s) => s.selection.structures);
   const [q, setQ] = useState('');
   const [drag, setDrag] = useState(false);
+  const [adding, setAdding] = useState(false);
   const list = Object.values(structures)
     .filter((r) => !q || `${r.name} ${r.smiles} ${r.formula}`.toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => b.created - a.created);
@@ -136,27 +140,28 @@ export function Library() {
     setDrag(false);
     if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
   };
+  const empty = Object.keys(structures).length === 0;
+  const showAdd = adding || empty;
   return html`
     <aside class=${cls('library', drag && 'drag')}
       onDragOver=${(e) => { e.preventDefault(); setDrag(true); }}
       onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
       onDrop=${onDrop}>
       <div class="pane-head">
-        <h2>Structures <span class="count">${Object.keys(structures).length}</span></h2>
+        <h2>Structures${!empty && html` <span class="count">${Object.keys(structures).length}</span>`}</h2>
+        ${!empty && html`<button class=${cls('btn small', !adding && 'primary')} onClick=${() => setAdding(!adding)}
+          title="Add structures from SMILES or XYZ">${adding ? 'Close' : '＋ Add'}</button>`}
       </div>
       <${LevelBar} />
-      <${AddBox} />
+      ${showAdd && html`<${AddBox} onDone=${() => setAdding(false)} />`}
       ${Object.keys(structures).length > 6 && html`
-        <input class="search" type="search" placeholder="Filter by name, SMILES, formula" value=${q} onInput=${(e) => setQ(e.target.value)} />`}
-      ${list.length === 0 && !q
-        ? html`<div class="empty-hint">
-            <p><strong>Start here.</strong> Add reactants, products or any structure you want to explore.</p>
-            <p class="small muted">Select one structure to explore around it, two (or an edge) to connect them, or several to batch.</p>
-          </div>`
+        <input class="search" type="search" placeholder="Filter by name, SMILES or formula" value=${q} onInput=${(e) => setQ(e.target.value)} />`}
+      ${empty
+        ? html`<p class="empty-hint small muted">Add the reactants, products or any structure you want to explore. Each becomes a node in the graph.</p>`
         : html`<ul class="cards">
             ${list.map((r) => html`<${Card} key=${r.id} rec=${r} selected=${selected.includes(r.id)}
               order=${selected.length > 1 ? selected.indexOf(r.id) + 1 : 0} />`)}
           </ul>`}
-      <div class="drop-overlay">Drop .xyz / .smi files to add</div>
+      <div class="drop-overlay">Drop .xyz / .smi files to add them</div>
     </aside>`;
 }

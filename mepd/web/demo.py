@@ -35,6 +35,9 @@ class DemoPolicy:
     max_upload_bytes: int = 1_000_000
     max_smiles_length: int = 300
     job_timeout_s: float = 30 * 60
+    # A VRI search computes a Hessian at many IRC points: typically 10-25
+    # minutes with 3 workers, up to ~40 with the demo's 2.
+    op_timeout_s: dict = field(default_factory=lambda: {"vri": 75 * 60, "vri-check": 45 * 60})
     global_concurrency: int = 4        # running jobs across all visitors
     # op -> field -> max allowed value (inclusive). Booleans listed here are
     # forced off (False is the only allowed value).
@@ -45,10 +48,13 @@ class DemoPolicy:
         "hessian-sample": {"max_candidates": 60, "maxiter": 500},
         "hessian-global": {"max_rounds": 5, "max_candidates": 40, "maxiter": 500},
         "network-splits": {"max_pairs": 10},
+        "vri": {"workers": 2, "trajectories": 50},
+        "vri-check": {"workers": 2, "trajectories": 50},
+        "vri-surface": {"workers": 2, "grid": 13},
     })
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
-                          "network-splits")
+                          "network-splits", "vri", "vri-check", "vri-surface")
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""

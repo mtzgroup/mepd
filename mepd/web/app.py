@@ -12,7 +12,9 @@ import asyncio
 import json
 import multiprocessing
 import os
+import re
 import secrets
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -23,12 +25,12 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from mepd.web import chem
-from mepd.web.jobs import Broadcaster, JobManager
+from mepd.web.jobs import Broadcaster, JobManager, _reduce_chain_payload
 from mepd.web.sessions import Sessions
 from mepd.web.operations import OPERATIONS
 from mepd.web.results import MINIMA_KINDS, collect_cached, find_entry, summarize
@@ -82,6 +84,7 @@ class JobIn(BaseModel):
     profile: Optional[str] = None
     label: str = ""
     dry_run: bool = False
+    source_job: Optional[str] = None  # follow-up operations: the job they build on
 
 
 class ImportIn(BaseModel):
@@ -117,6 +120,24 @@ class SessionIn(BaseModel):
     name: Optional[str] = None
 
 
+def _die_with_parent(parent_pid: int) -> None:
+    """Pool-worker initializer: exit when the server does. A server killed
+    outright (SIGKILL, `fuser -k`) never shuts its pool down, and spawned
+    workers would otherwise linger, idle, holding memory."""
+    import signal
+
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            PR_SET_PDEATHSIG = 1
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        except Exception:
+            pass
+    if os.getppid() != parent_pid:  # the server died before we got here
+        os._exit(0)
+
+
 class ResultParser:
     """Parses job outputs in worker processes, not the server's threads.
 
@@ -131,7 +152,8 @@ class ResultParser:
 
     def _get(self) -> ProcessPoolExecutor:
         if self._pool is None:
-            self._pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("spawn"))
+            self._pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("spawn"),
+                                             initializer=_die_with_parent, initargs=(os.getpid(),))
         return self._pool
 
     async def __call__(self, job: dict, job_dir: Path) -> dict:
@@ -182,6 +204,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 job["summary"] = {"headline": f"result not readable: {type(exc).__name__}: {exc}",
                                   "barrier_kcal": None, "counts": {}}
             manager._update(job)
+            source = manager.jobs.get(job.get("source_job") or "")
+            if source is not None:
+                # A follow-up (e.g. vri-check) changed the source job's result:
+                # re-read it, and let every open view of it refresh.
+                (manager.job_dir(source["id"]) / "result.json").unlink(missing_ok=True)
+                try:
+                    source["summary"] = summarize(await parse_result(source, manager.job_dir(source["id"])))
+                except Exception:
+                    pass
+                source["result_rev"] = int(source.get("result_rev") or 0) + 1
+                manager._update(source)
         asyncio.get_running_loop().create_task(attach())
 
     def refresh_stale_summaries(manager: JobManager) -> None:
@@ -189,7 +222,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         summary (e.g. a barrier from before IRC-route verification): redo
         those from the files on disk, in the background."""
         stale = [j for j in manager.jobs.values()
-                 if j["status"] == "done" and j.get("summary") and "barrier_verified" not in j["summary"]]
+                 if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
+                     # ...or from before the edge's TS was recorded (route_ts, for VRI on edges)
+                     or (j["op"] in ("ts", "channels") and "route_ts" not in j["summary"]))]
         if stale:
             async def redo() -> None:
                 for job in stale:
@@ -311,6 +346,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     @app.get("/api/state")
     def state():
         return {
+            # Snapshot time (same clock as job 'rev'): the page keeps jobs it
+            # heard about after this, which the snapshot cannot contain yet.
+            "now_ns": time.time_ns(),
             # Demo visitors see their session's name, never server paths.
             "workspace": {**W().snapshot(), "root": W().root.name if demo is not None else str(W().root)},
             "jobs": J().list(),
@@ -576,11 +614,39 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         # It only snapshots files and builds argv, so it is quick.
         created = J().submit(body.op, structure_ids=body.structures, edge_ids=body.edges,
                              params=body.params, profile=body.profile, label=body.label,
-                             dry_run=body.dry_run)
+                             dry_run=body.dry_run, source_job_id=body.source_job)
         if body.op == "optimize" and not body.dry_run:
             W().set_status(body.structures, "optimizing")
             publish_ws()
         return created
+
+    @app.get("/api/jobs/{jid}/vri-viewer", response_class=HTMLResponse)
+    def vri_viewer(jid: str):
+        """The interactive VRI explorer (`mepd visualize` of a VRI folder),
+        with the app's own 3Dmol instead of the CDN copy. Rebuilt only when
+        the folder's results change (a follow-up adds checks or a surface)."""
+        from mepd.viz import _3DMOL_CDN_SCRIPT
+
+        try:
+            from mepd.viz_vri import is_vri_output, load_vri_result, render_vri_html
+        except ImportError:
+            raise HTTPException(404, "this mepd has no VRI explorer (mepd.viz_vri) yet")
+
+        job = J().get(jid)
+        out = Path(job["output_dir"])
+        if not is_vri_output(out):
+            raise HTTPException(404, "no VRI result in this job (yet)")
+        stamp = max((p.stat().st_mtime for p in out.glob("*.json")), default=0.0)
+        cache = J().job_dir(jid) / "vri_viewer.html"
+        if cache.exists() and cache.stat().st_mtime >= stamp:
+            return HTMLResponse(cache.read_text())
+        page = render_vri_html(load_vri_result(out), title=job["title"])
+        page = page.replace(_3DMOL_CDN_SCRIPT, '<script src="/static/vendor/3Dmol-min.js"></script>')
+        try:
+            cache.write_text(page)
+        except OSError:
+            pass
+        return HTMLResponse(page)
 
     @app.post("/api/jobs/import")
     async def import_job(body: ImportIn):
@@ -591,6 +657,18 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     @app.get("/api/jobs/{jid}")
     def get_job(jid: str):
         return {"job": J().get(jid), "progress": J().progress_snapshot(jid)}
+
+    @app.get("/api/jobs/{jid}/live/{stream}")
+    def get_live_stream(jid: str, stream: str):
+        """One live stream in full (a finished minimization's whole replay,
+        which the progress updates leave out to stay small)."""
+        J().get(jid)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", stream):
+            raise HTTPException(404)
+        fp = J().job_dir(jid) / "live" / f"{stream}.json"
+        if not fp.is_file():
+            raise HTTPException(404)
+        return _reduce_chain_payload(json.loads(fp.read_text()), full=True)
 
     @app.get("/api/jobs/{jid}/log", response_class=PlainTextResponse)
     def job_log(jid: str, which: Literal["stdout", "progress"] = "stdout", offset: int = 0):
@@ -675,7 +753,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if len(set(ids)) == 2:
                 edge = W().add_edge(ids[0], ids[1], label=entry["label"], origin={
                     "kind": "job", "job": jid, "entry": entry["id"], "barrier_kcal": entry.get("barrier_kcal"),
-                    "headline": entry.get("note", "")})
+                    "headline": entry.get("note", ""),
+                    # IRC-derived edges know their TS (a VRI search can start from it).
+                    "group": group.get("kind"), "has_ts": entry.get("ts_index") is not None})
         return {"added": added, "reused": reused, "edge": edge}
 
     @app.post("/api/jobs/{jid}/import-entry")

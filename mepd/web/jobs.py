@@ -32,6 +32,13 @@ from mepd.web.workspace import Workspace, WorkspaceError, _atomic_write, new_id,
 TERMINAL = {"done", "failed", "cancelled", "interrupted"}
 
 
+def _bump_rev(job: dict) -> None:
+    """Every change to a job record gets a larger `rev`, so a browser that
+    receives two copies out of order (a live event and a full-state reload
+    racing each other) keeps the newer one."""
+    job["rev"] = max(time.time_ns(), job.get("rev", 0) + 1)
+
+
 class Broadcaster:
     """Fan-out of server events to every connected SSE client."""
 
@@ -102,10 +109,10 @@ class JobManager:
                  on_finished: Optional[Callable[[dict], Any]] = None,
                  global_slot_free: Optional[Callable[[], bool]] = None,
                  on_slot_freed: Optional[Callable[[], Any]] = None,
-                 max_runtime: Optional[float] = None):
+                 max_runtime: Optional[float] = None, op_runtime: Optional[dict] = None):
         """`global_slot_free`/`on_slot_freed`: a concurrency limit shared by
         several managers (one per demo visitor); `max_runtime`: seconds after
-        which a running job is killed."""
+        which a running job is killed (`op_runtime`: per-operation overrides)."""
         self.ws = ws
         self.bus = broadcaster
         self.max_concurrent = max_concurrent
@@ -113,6 +120,7 @@ class JobManager:
         self.global_slot_free = global_slot_free or (lambda: True)
         self.on_slot_freed = on_slot_freed
         self.max_runtime = max_runtime
+        self.op_runtime = dict(op_runtime or {})
         self.jobs: dict[str, dict] = {}
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._cancel_requested: set[str] = set()
@@ -160,6 +168,7 @@ class JobManager:
 
     def _update(self, job: dict, **fields: Any) -> None:
         job.update(fields)
+        _bump_rev(job)
         self._write(job)
         self.bus.publish("job", job)
 
@@ -199,14 +208,29 @@ class JobManager:
 
     def submit(self, op_key: str, *, structure_ids: list[str], edge_ids: list[str],
                params: Optional[dict], profile: Optional[str], label: str = "",
-               dry_run: bool = False) -> list[dict]:
+               dry_run: bool = False, source_job_id: Optional[str] = None) -> list[dict]:
         """Create one job per target set. `dry_run` validates and returns
-        the would-be records (with their `command`) without keeping anything."""
+        the would-be records (with their `command`) without keeping anything.
+        A follow-up operation (target "job") works on `source_job_id`'s
+        finished output, in that job's output folder, at its level of theory."""
         op = get_operation(op_key)
         parsed = op.parse_params(params)
+        source = None
+        if op.target == "job":
+            source = self.get(source_job_id or "")
+            if source["op"] not in op.source_ops:
+                raise WorkspaceError(f"{op.title} follows up on {', '.join(op.source_ops)} results, not {source['op']}")
+            if source["status"] != "done":
+                raise WorkspaceError(f"{op.title} needs the {source['title']} job to have finished")
+            profile = source.get("profile")
+            known = self.ws.snapshot()
+            structure_ids = [sid for sid in source["targets"]["structures"] if sid in known["structures"]]
+            edge_ids = [eid for eid in source["targets"]["edges"] if eid in known["edges"]]
         if profile and profile not in self.ws.profile_names():
             raise WorkspaceError(f"unknown profile {profile!r}")
-        if dry_run and op.target == "pair" and not edge_ids and len(structure_ids) == 2:
+        if source is not None:
+            target_sets = [(structure_ids, edge_ids)]
+        elif dry_run and op.target == "pair" and not edge_ids and len(structure_ids) == 2:
             target_sets = [(list(structure_ids), [])]  # don't create an edge just to preview
         else:
             target_sets = self._resolve_targets(op, structure_ids, edge_ids)
@@ -224,18 +248,23 @@ class JobManager:
                     busy = [r["name"] for r in recs if r.get("status") == "optimizing"]
                     if busy:
                         raise WorkspaceError(f"{', '.join(busy)} is still being optimized; run this once it is done")
-                ctx = JobContext(self.ws, jdir, jdir / "output", recs, profile)
+                ctx = JobContext(self.ws, jdir, jdir / "output", recs, profile, source=source,
+                                 edge_ids=list(eids), jobs=self.jobs)
                 argv = op.build(ctx, parsed)  # raises on invalid combinations
                 names = " → ".join(r["name"] for r in recs) if op.target == "pair" else ", ".join(r["name"] for r in recs)
+                if source is not None:
+                    names = source["title"]
                 created.append({
                     "id": jid, "op": op.key, "title": label or f"{op.title}: {names}",
                     "status": "queued", "created": time.time(), "started": None, "finished": None,
                     "returncode": None, "argv": argv,
                     "command": "mepd " + " ".join(shlex.quote(a) for a in argv),
                     "targets": {"structures": sids, "edges": eids},
-                    "charge": recs[0]["charge"], "multiplicity": recs[0]["multiplicity"],
+                    "charge": recs[0]["charge"] if recs else (source or {}).get("charge", 0),
+                    "multiplicity": recs[0]["multiplicity"] if recs else (source or {}).get("multiplicity", 1),
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
-                    "output_dir": str(jdir / "output"), "external": False,
+                    "output_dir": source["output_dir"] if source is not None else str(jdir / "output"),
+                    "external": False, "source_job": source["id"] if source is not None else None,
                     "error": None, "last_line": "", "summary": None,
                 })
         except Exception:
@@ -247,6 +276,7 @@ class JobManager:
                 remove_tree(d)
             return created
         for job in created:
+            _bump_rev(job)
             self.jobs[job["id"]] = job
             self._write(job)
             self.bus.publish("job", job)
@@ -272,6 +302,7 @@ class JobManager:
             "charge": charge, "multiplicity": multiplicity, "params": {}, "profile": None, "batch": None,
             "output_dir": str(path), "external": True, "error": None, "last_line": "", "summary": None,
         }
+        _bump_rev(job)
         self.jobs[jid] = job
         self._write(job)
         self.bus.publish("job", job)
@@ -367,7 +398,7 @@ class JobManager:
         if jid in self._timed_out:
             self._timed_out.discard(jid)
             self._cancel_requested.discard(jid)
-            status, error = "failed", f"stopped: exceeded the {self.max_runtime / 60:.0f}-minute run-time limit"
+            status, error = "failed", f"stopped: exceeded the {self._runtime_limit(job) / 60:.0f}-minute run-time limit"
         elif jid in self._cancel_requested:
             self._cancel_requested.discard(jid)
             status, error = "cancelled", "cancelled by user; resume to continue where it left off"
@@ -456,14 +487,20 @@ class JobManager:
         self._watch.pop(jid, None)
         return self._collect_progress(job, force=True) or {"id": jid}
 
+    def _runtime_limit(self, job: dict) -> Optional[float]:
+        if not self.max_runtime:
+            return None
+        return self.op_runtime.get(job.get("op"), self.max_runtime)
+
     async def _monitor(self) -> None:
         while True:
             await asyncio.sleep(1.0)
             for jid in list(self._procs):
                 job = self.jobs.get(jid)
                 if job is not None:
-                    if (self.max_runtime and job.get("started") and jid not in self._timed_out
-                            and time.time() - job["started"] > self.max_runtime):
+                    limit = self._runtime_limit(job)
+                    if (limit and job.get("started") and jid not in self._timed_out
+                            and time.time() - job["started"] > limit):
                         self._timed_out.add(jid)
                         self._cancel_requested.add(jid)
                         self._kill(jid, signal.SIGTERM)
@@ -474,19 +511,30 @@ class JobManager:
                         pass
 
 
-def _reduce_chain_payload(data: dict) -> dict:
+def _reduce_chain_payload(data: dict, full: bool = False) -> dict:
     """What the live view needs from a progress file (drops the 120-step
-    plot history and ASCII art)."""
+    plot history and ASCII art). A finished minimization keeps only its
+    final frame unless `full` (the page fetches the replay on demand)."""
+    geometry = data.get("geometry")
+    if (not full and data.get("kind") == "minimization" and data.get("finished")
+            and geometry and len(geometry.get("frames") or []) > 1):
+        geometry = {**geometry, "frames": geometry["frames"][-1:],
+                    "frame_steps": (geometry.get("frame_steps") or [])[-1:], "truncated": True}
     return {
         "plot": data.get("plot"),
         "caption": data.get("caption"),
         # Current path geometry + TS-guess index (live viewer).
-        "geometry": data.get("geometry"),
+        "geometry": geometry,
         "monitor_id": data.get("monitor_id"),
         "stream": data.get("stream"),
         "updated": data.get("updated"),
         "finished": data.get("finished", False),
         "status": data.get("status"),
+        # Geometry minimizations (Hessian sampling candidates) vs path searches.
+        "kind": data.get("kind", "path"),
+        "label": data.get("label"),
+        "outcome": data.get("outcome"),
+        "reference": data.get("reference"),
         "monitors": {
             mid: {"plot": mon.get("plot"), "caption": mon.get("caption"),
                   "status": mon.get("status_message"), "active": mon.get("active"),

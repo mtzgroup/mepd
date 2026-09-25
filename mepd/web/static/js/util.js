@@ -87,6 +87,7 @@ export function levelStatus(rec, levelKey = state.levels[state.levelProfile ?? '
     return { kind: 'ts', text: rec.level ? `TS · ${rec.level.label}` : 'TS', title: `Saddle point${at}; never minimized` };
   }
   if (rec.status === 'optimizing') return { kind: 'busy', text: 'optimizing…', title: 'Being minimized at the workspace level of theory' };
+  if (rec.reacted && rec.status === 'ready') return { kind: 'changed', text: 'reacted on minimization', title: rec.status_error || `Reacted while being minimized: ${rec.reacted.from} → ${rec.reacted.to}` };
   if (rec.status === 'not_minimum') return { kind: 'failed', text: 'not a minimum', title: rec.status_error || 'Hessian has an imaginary frequency' };
   if (rec.status === 'opt_failed') return { kind: 'failed', text: 'opt failed', title: rec.status_error || 'Optimization failed' };
   if (!rec.level) {
@@ -94,7 +95,7 @@ export function levelStatus(rec, levelKey = state.levels[state.levelProfile ?? '
     return { kind: 'none', text: 'not optimized', title: `Not at any QM level: ${why}` };
   }
   if (rec.level.key !== levelKey) {
-    return { kind: 'other', text: rec.level.label || 'other level', title: `Optimized at ${rec.level.profile ?? 'built-in defaults'} (${rec.level.label}), not the workspace level` };
+    return { kind: 'other', text: rec.level.label ? `${rec.level.label} · other level` : 'other level', title: `Optimized at ${rec.level.profile ?? 'built-in defaults'} (${rec.level.label}), not the workspace level` };
   }
   return { kind: 'ok', text: rec.level.label || 'optimized', title: `Minimum at the workspace level (${rec.level.profile ?? 'built-in defaults'}: ${rec.level.label})` };
 }

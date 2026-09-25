@@ -5,6 +5,7 @@ import { api, attempt } from '../api.js';
 import { openJob, prefs, set, state, useStore } from '../store.js';
 import { fmtAgo, readFileText } from '../util.js';
 import { clampToSchema, defaultsFor } from './ParamForm.js';
+import { defaultProfile } from './Actions.js';
 
 function Modal({ title, children, onClose }) {
   useEffect(() => {
@@ -59,20 +60,32 @@ function QuickStart({ onClose }) {
       const [sa] = await api.post('/api/structures', { text: a, ...opts, optimize: true });
       const ids = [sa.id];
       if (m.pair) { const [sb] = await api.post('/api/structures', { text: b, ...opts, optimize: true }); ids.push(sb.id); }
-      else {
-        // Exploring around a structure needs it to be a minimum first:
-        // wait for its optimization at the workspace level to finish.
-        setPhase('Optimizing at the workspace level…');
+      // Every calculation starts from minima at the workspace level: wait for
+      // the minimizations, and stop with an explanation if one of them turned
+      // the input into something else.
+      setPhase('Minimizing at the workspace level of theory…');
+      const recs = [];
+      for (const id of ids) {
         const t0 = Date.now();
-        while (state.workspace.structures[sa.id]?.status === 'optimizing' || !(sa.id in state.workspace.structures)) {
-          if (Date.now() - t0 > 30 * 60 * 1000) throw new Error('optimization is taking too long; run the exploration from the graph once it is done');
+        while (state.workspace.structures[id]?.status === 'optimizing' || !(id in state.workspace.structures)) {
+          if (Date.now() - t0 > 30 * 60 * 1000) throw new Error('minimization is taking too long; run the calculation from the graph once it is done');
           await new Promise((r) => setTimeout(r, 500));
         }
-        const rec = state.workspace.structures[sa.id];
-        if (rec.status === 'opt_failed') throw new Error(`optimization failed: ${rec.status_error || 'see its job'}`);
+        const rec = state.workspace.structures[id];
+        if (rec.status === 'opt_failed') throw new Error(`minimizing ${rec.name} failed: ${rec.status_error || 'see its job'}`);
+        recs.push(rec);
+      }
+      const reacted = recs.filter((r) => r.reacted);
+      if (reacted.length) {
+        const r = reacted[0];
+        throw new Error(`${r.reacted.from} is not a stable minimum at this level of theory: it relaxed without a barrier to ${r.reacted.to}. `
+          + 'Both structures are in the graph; nothing was run. Try a different level of theory, or start from a pre-reactive complex.');
+      }
+      if (m.pair && recs[0].smiles && recs[0].smiles === recs[1].smiles) {
+        throw new Error(`After minimization both ends are ${recs[0].smiles}, so there is no reaction between them to search. Both structures are in the graph; nothing was run.`);
       }
       const params = clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) });
-      const profile = prefs.get('profile', state.profiles.includes('default') ? 'default' : null);
+      const profile = defaultProfile();
       return api.post('/api/jobs', { op: op.key, structures: ids, params, profile });
     });
     setBusy(false);
@@ -92,7 +105,7 @@ function QuickStart({ onClose }) {
       <div class="add-row">
         <input type="number" class="tiny" placeholder="charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} />
         <input type="number" class="tiny" placeholder="mult." min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} />
-        <span class="small muted">Structures are minimized at the workspace level of theory; the calculation uses your last settings and default profile.</span>
+        <span class="small muted">Structures are minimized at the workspace level of theory; the calculation then runs at that same level, with your last settings.</span>
       </div>
       <div class="modal-foot">
         <button class="btn" onClick=${onClose}>Cancel</button>

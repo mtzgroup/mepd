@@ -228,6 +228,7 @@ class Sessions:
                 ws, _SessionBus(self.bus, key), max_concurrent=self.max_concurrent,
                 global_slot_free=self._global_slot_free, on_slot_freed=self._wake_all,
                 max_runtime=self.demo.job_timeout_s if self.demo else None,
+                op_runtime=self.demo.op_timeout_s if self.demo else None,
             )
             jobs.on_finished = lambda job, _jobs=jobs: self._on_finished(_jobs, job)
             if visitor is None:

@@ -19,28 +19,29 @@ function TopBar() {
   });
   const lastJob = useStore((s) => s.view.jobId);
   const tabs = [['graph', 'Graph'], ['jobs', 'Calculations'], ['profiles', 'Profiles']];
+  const demo = useStore((s) => s.demo);
+  const auth = useStore((s) => s.auth);
+  const active = counts.running + counts.queued;
   return html`
     <header class="topbar">
-      <div class="brand"><span class="logo">⌬</span> mepd</div>
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><polygon points="16,3 27,9.5 27,22.5 16,29 5,22.5 5,9.5" fill="none" stroke="currentColor" stroke-width="2.6"/><circle cx="16" cy="16" r="3.2" fill="currentColor"/></svg>
+        mepd
+      </div>
       <nav class="main-tabs">
         ${tabs.map(([k, l]) => html`<button class=${view.tab === k || (k === 'jobs' && view.tab === 'job') ? 'on' : ''}
           onClick=${() => (k === 'jobs' && view.tab === 'jobs' && lastJob ? set({ view: { tab: 'job', jobId: lastJob } }) : openTab(k))}>
-          ${l}${k === 'jobs' && counts.running + counts.queued > 0 ? html` <span class="badge accent">${counts.running}${counts.queued ? `+${counts.queued}` : ''}</span>` : ''}
+          ${l}${k === 'jobs' && active > 0 && html` <span class="tab-count" title=${`${counts.running} running, ${counts.queued} queued`}>${active}</span>`}
         </button>`)}
       </nav>
       <span class="spacer"></span>
-      <div class="session-buttons">
-        <button class="btn ghost session-name" title=${`Session workspace: ${root}\nClick to switch sessions`}
-          onClick=${() => set({ modal: { kind: 'sessions' } })}>
-          <span class="muted small">Session</span> <strong>${root.split('/').pop()}</strong> ▾
-        </button>
-        <button class="btn" title="Start over in a new, empty session (the current one is kept)"
-          onClick=${() => set({ modal: { kind: 'sessions', startWith: 'new' } })}>New session</button>
-        <button class="btn" title="Open an existing session" onClick=${() => set({ modal: { kind: 'sessions' } })}>Open…</button>
-      </div>
-      ${useStore((s) => s.demo) && html`<span class="badge accent demo-badge" title="Public demo: private workspace, limited sizes and run times">demo</span>`}
-      <span class=${`conn ${connected ? 'on' : 'off'}`} title=${connected ? 'Live' : 'Reconnecting…'}></span>
-      ${useStore((s) => s.auth) && html`<a class="btn ghost small" href="/logout" title="Log this device out">Log out</a>`}
+      <button class="session-name" title=${`Session folder: ${root}\nSwitch, open or start a new session`}
+        onClick=${() => set({ modal: { kind: 'sessions' } })}>
+        <span class=${`conn ${connected ? 'on' : 'off'}`} title=${connected ? 'Connected' : 'Reconnecting…'}></span>
+        <span class="session-label">${root.split('/').pop()}</span><span class="caret">▾</span>
+      </button>
+      ${demo && html`<span class="badge demo-badge" title="Public demo: private workspace, limited sizes and run times">Demo</span>`}
+      ${auth && html`<a class="topbar-link small" href="/logout" title="Log this device out">Log out</a>`}
       <button class="btn primary" onClick=${() => set({ modal: { kind: 'quick' } })}>New calculation</button>
     </header>`;
 }
@@ -56,6 +57,8 @@ function Toasts() {
 function App() {
   const view = useStore((s) => s.view);
   const loaded = useStore((s) => s.loaded);
+  const howToHidden = useStore((s) => s.howToHidden);
+  useStore((s) => s.selection);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -71,10 +74,11 @@ function App() {
 
   if (!loaded) return html`<div class="boot">Connecting to mepd…</div>`;
   const demo = state.demo;
-  const showInspector = view.tab === 'graph' || view.tab === 'jobs';
+  const nothingSelected = !state.selection.structures.length && !state.selection.edges.length;
+  const showInspector = (view.tab === 'graph' || view.tab === 'jobs') && !(nothingSelected && howToHidden);
   return html`
     <${TopBar} />
-    ${demo && html`<div class="demo-banner small">${`Demo: this is your private workspace. Limits: ${demo.max_atoms} atoms per structure, ${demo.max_active_jobs} calculations at a time, ${Math.round(demo.job_timeout_s / 60)} min per calculation. Compute profiles are fixed.`}</div>`}
+    ${demo && html`<div class="demo-banner small">${`Demo: this is your private workspace. Limits: ${demo.max_atoms} atoms per structure, ${demo.max_active_jobs} calculations at a time, ${Math.round(demo.job_timeout_s / 60)} min per calculation${demo.op_timeout_s?.vri ? ` (VRI searches ${Math.round(demo.op_timeout_s.vri / 60)} min)` : ''}. Compute profiles are fixed.`}</div>`}
     <main class=${`layout tab-${view.tab} ${showInspector ? '' : 'no-inspector'}`}>
       <${Library} />
       <section class="center">

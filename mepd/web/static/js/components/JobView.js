@@ -1,10 +1,11 @@
 // One job: live progress while it runs, an explorable result when it has
 // output (partial results work too), the raw log, and its files.
 import { Component, html, useEffect, useMemo, useRef, useState } from '../lib.js';
-import { api, attempt } from '../api.js';
-import { select, set, state, toast, update, useStore } from '../store.js';
+import { api, attempt, refreshState } from '../api.js';
+import { openJob, prefs, select, set, state, toast, update, useStore } from '../store.js';
 import { STATUS_LABEL, copy, downloadText, entryToXyz, fmtDuration, fmtKcal, jobElapsed, safeName, structureName, tsFrameIndex } from '../util.js';
 import { EnergyPlot } from './EnergyPlot.js';
+import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
 import { JobControls, useTick } from './Jobs.js';
 import { Viewer3D } from './Viewer3D.js';
 
@@ -18,6 +19,12 @@ function livePaths(progress, now) {
   for (const [name, st] of Object.entries(streams)) {
     const age = st.updated ? now - st.updated : Infinity;
     const state = st.finished ? (st.status === 'failed' ? 'failed' : 'done') : age < 30 ? 'running' : 'idle';
+    if (st.kind === 'minimization') {
+      // One geometry minimization (a Hessian-sampling candidate).
+      out.push({ id: name, kind: 'minimization', label: st.label || name, plot: st.plot || { x: [], y: [] },
+        geometry: st.geometry, caption: st.caption, state, outcome: st.outcome, reference: st.reference, updated: st.updated });
+      continue;
+    }
     const branches = Object.entries(st.monitors || {}).filter(([, m]) => m.geometry?.frames?.length && m.plot?.y?.length > 1);
     if (branches.length > 1) {
       for (const [mid, m] of branches) {
@@ -33,6 +40,77 @@ function livePaths(progress, now) {
   return out.sort((a, b) => rank[a.state] - rank[b.state] || a.label.localeCompare(b.label, undefined, { numeric: true }));
 }
 
+function lastEnergy(p) {
+  const y = p.plot?.y || [];
+  for (let i = y.length - 1; i >= 0; i -= 1) if (y[i] != null) return y[i];
+  return null;
+}
+
+function fmtSigned(v) {
+  return `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(1)}`;
+}
+
+// One minimization, live: the newest optimizer step while it runs; once it
+// is done, its whole trajectory to scrub or replay.
+function MinimizationLive({ job, fg }) {
+  const [full, setFull] = useState(null);     // finished: the replay, fetched on demand
+  const [pick, setPick] = useState(null);     // chosen frame (null = newest)
+  const [playing, setPlaying] = useState(false);
+  const truncated = fg.geometry?.truncated;
+  useEffect(() => { setFull(null); setPick(null); setPlaying(false); }, [fg.id]);
+  useEffect(() => {
+    if (!truncated) return undefined;
+    let live = true;
+    api.get(`/api/jobs/${job.id}/live/${encodeURIComponent(fg.id)}`).then((d) => live && setFull(d)).catch(() => {});
+    return () => { live = false; };
+  }, [fg.id, truncated]);
+  const geometry = (truncated && full?.geometry) || fg.geometry || {};
+  const frames = geometry.frames || [];
+  const steps = geometry.frame_steps || [];
+  const shown = pick == null ? frames.length - 1 : Math.min(pick, frames.length - 1);
+  useEffect(() => {
+    if (!playing || frames.length < 2) return undefined;
+    const t = setInterval(() => setPick((i) => {
+      const next = (i == null || i >= frames.length - 1) ? 0 : i + 1;
+      if (next === frames.length - 1) setPlaying(false);
+      return next;
+    }), 120);
+    return () => clearInterval(t);
+  }, [playing, frames.length]);
+  const y = fg.plot.y || [];
+  const step = steps[shown] ?? (y.length ? y.length - 1 : 0);
+  const e = y[step];
+  const running = fg.state === 'running';
+  const toStep = (k) => {                      // nearest stored frame to optimizer step k
+    if (!steps.length) return;
+    let best = 0;
+    steps.forEach((st, i) => { if (Math.abs(st - k) < Math.abs(steps[best] - k)) best = i; });
+    setPlaying(false);
+    setPick(best);
+  };
+  return html`
+    <div class="card-block live-path">
+      <div class="live-head">
+        <h4><span class="badge accent">${fg.label}</span>
+          ${running ? ' Minimizing' : ` ${fg.outcome || fg.state}`}
+          <span class="muted small"> · step ${y.length ? step + 1 : 0}${y.length ? ` of ${y.length}` : ''}${e != null ? ` · ${fmtSigned(e)} kcal/mol vs ${fg.reference === 'seed' ? 'the seed' : 'the start'}` : ''}</span>
+          <span class=${`live-state ${fg.state}`}>${running ? 'minimizing' : fg.state}</span></h4>
+        ${!running && frames.length > 1 && html`<button class="btn small" onClick=${() => { if (!playing && shown >= frames.length - 1) setPick(0); setPlaying(!playing); }}>
+          ${playing ? 'Pause' : 'Replay'}</button>`}
+      </div>
+      ${frames.length
+        ? html`<${Viewer3D} frames=${frames} frame=${Math.max(0, shown)} height=${280} />`
+        : html`<p class="small muted">The geometry appears with the first optimizer step.</p>`}
+      ${!running && frames.length > 1 && html`<div class="frame-bar">
+        <input type="range" min="0" max=${frames.length - 1} value=${Math.max(0, shown)}
+          onInput=${(ev) => { setPlaying(false); setPick(+ev.target.value); }} />
+      </div>`}
+      <${EnergyPlot} xs=${fg.plot.x} ys=${y} height=${150} current=${y.length ? step : null}
+        onPick=${!running && steps.length > 1 ? toStep : null} />
+      <p class="small muted">${fg.caption || ''}${running ? ' · the newest step is shown as it arrives' : ''}</p>
+    </div>`;
+}
+
 function pathBarrier(p) {
   const y = p.plot?.y?.filter((v) => v != null) || [];
   return y.length > 2 ? Math.max(...y.slice(1, -1)) : null;
@@ -45,7 +123,7 @@ function LivePanel({ job }) {
   const selected = useStore((s) => s.liveSelection?.[job.id] ?? null);
   const choose = (id) => update((s) => { s.liveSelection = { ...(s.liveSelection || {}), [job.id]: id }; });
   const [follow, setFollow] = useState(true);   // keep the viewer on the current TS guess
-  const [frame, setFrame] = useState(0);
+  const [frame, setFrame] = useState(null);     // null = the newest image
   useTick(5000, job.status === 'running');       // refresh running/idle badges
   useEffect(() => {
     // Seed with a full snapshot (SSE only sends deltas).
@@ -55,20 +133,27 @@ function LivePanel({ job }) {
   }, [job.id]);
 
   const paths = livePaths(progress, Date.now() / 1000);
+  const minimizing = paths.length > 0 && paths.every((p) => p.kind === 'minimization');
   // First time anything shows up, pin the first path; afterwards stay put.
   useEffect(() => { if (!selected && paths.length) choose(paths[0].id); }, [selected, paths.length]);
-  const fg = paths.find((p) => p.id === selected) || null;
+  // Sampling runs follow whichever candidate is minimizing now, until you
+  // click one (then it stays in front).
+  const [autoFollow, setAutoFollow] = useState(true);
+  const runningNow = minimizing && autoFollow ? paths.find((p) => p.state === 'running') : null;
+  const fg = runningNow || paths.find((p) => p.id === selected) || null;
   const stats = progress?.stats;
 
   const frames = useMemo(() => fg?.geometry?.frames, [fg?.geometry]);
   const tsIndex = fg?.geometry?.ts_index ?? null;
-  const shown = follow && tsIndex != null ? tsIndex : Math.min(frame, (frames?.length || 1) - 1);
+  const last = (frames?.length || 1) - 1;
+  const shown = follow && tsIndex != null ? tsIndex : frame == null ? last : Math.min(frame, last);
   const energy = fg?.plot?.y?.[shown];
 
   return html`
     <div class="live">
       <div class="last-line mono">${progress?.last_line || job.last_line || (job.status === 'queued' ? 'Waiting for a free slot…' : '')}</div>
-      ${fg && html`
+      ${fg && fg.kind === 'minimization' && html`<${MinimizationLive} job=${job} fg=${fg} />`}
+      ${fg && fg.kind !== 'minimization' && html`
         <div class="card-block live-path">
           <div class="live-head">
             <h4><span class="badge accent">${fg.label}</span>
@@ -85,19 +170,29 @@ function LivePanel({ job }) {
           <p class="small muted">${fg.caption || ''}${fg.plot.reactant_smiles ? html` · <span class="mono">${fg.plot.reactant_smiles} → ${fg.plot.product_smiles}</span>` : ''}</p>
         </div>`}
       ${paths.length > 1 && html`
-        <div class="live-list-head small muted">${paths.length} paths · ${paths.filter((p) => p.state === 'running').length} running · click one to bring it to the front</div>
+        ${minimizing && html`<label class="small check follow-toggle"><input type="checkbox" class="switch" checked=${autoFollow}
+          onChange=${(e) => setAutoFollow(e.target.checked)} /> Follow the candidate being minimized</label>`}
+        <div class="live-list-head small muted">${minimizing
+          ? `${paths.length} candidates · ${paths.filter((p) => p.state === 'running').length} minimizing · ${paths.filter((p) => p.outcome === 'new minimum').length} new minima · click one to watch it`
+          : `${paths.length} paths · ${paths.filter((p) => p.state === 'running').length} running · click one to bring it to the front`}</div>
         <div class="monitors">
           ${paths.map((p) => html`<button type="button" key=${p.id}
-              class=${`monitor ${p.state === 'running' ? 'active' : ''} ${p.id === selected ? 'pinned' : ''}`}
-              onClick=${() => choose(p.id)} title=${p.caption || p.label}>
+              class=${`monitor ${p.state === 'running' ? 'active' : ''} ${p.id === fg?.id ? 'pinned' : ''}`}
+              onClick=${() => { setAutoFollow(false); choose(p.id); }} title=${p.caption || p.label}>
             <div class="small monitor-head"><b>${p.label}</b>
-              <span class=${`live-state ${p.state}`}>${p.state}</span>
-              ${pathBarrier(p) != null && html`<span class="muted mono">${pathBarrier(p).toFixed(1)}</span>`}</div>
+              ${p.kind === 'minimization' && p.outcome
+                ? html`<span class=${`live-state outcome-${p.outcome.replace(/\s+/g, '-')}`}>${p.outcome}</span>`
+                : html`<span class=${`live-state ${p.state === 'running' && p.kind === 'minimization' ? 'running' : p.state}`}>${p.kind === 'minimization' && p.state === 'running' ? 'minimizing' : p.state}</span>`}
+              ${p.kind === 'minimization'
+                ? lastEnergy(p) != null && html`<span class="muted mono">${fmtSigned(lastEnergy(p))}</span>`
+                : pathBarrier(p) != null && html`<span class="muted mono">${pathBarrier(p).toFixed(1)}</span>`}</div>
             <${EnergyPlot} xs=${p.plot.x} ys=${p.plot.y} compact />
           </button>`)}
         </div>`}
       ${stats && html`<${StatsBlock} stats=${stats} />`}
-      ${!paths.length && !stats && job.status === 'running' && html`<p class="muted small">The live paths appear once a path optimization starts.</p>`}
+      ${!paths.length && !stats && job.status === 'running' && html`<p class="muted small">${['hessian-sample', 'hessian-global'].includes(job.op)
+        ? 'Each candidate appears here as it starts minimizing (after the Hessian of the seed).'
+        : 'The live paths appear once a path optimization starts.'}</p>`}
     </div>`;
 }
 
@@ -216,20 +311,22 @@ function BulkBar({ group, picked, inGraph, onSet, onAdd, busy }) {
   const n = picked.size;
   return html`
     <div class="bulk-bar">
-      <div class="bulk-select small">
-        ${group && html`<span class="muted">Select in <b>${group.title}</b>:</span>
-          <button class="btn small ghost" onClick=${() => onSet(free.map((e) => e.id))}>all</button>
-          ${minE != null && html`
-            <span class="bulk-field">within <input type="number" class="tiny" min="0" step="0.5" value=${within}
-              onInput=${(e) => setWithin(+e.target.value)} /> kcal/mol of lowest
-              <button class="btn small ghost" onClick=${() => onSet(withE.filter((e) => entryEnergy(e) - minE <= within + 1e-9).map((e) => e.id))}>select</button></span>
-            <span class="bulk-field">lowest <input type="number" class="tiny" min="1" step="1" value=${lowest}
-              onInput=${(e) => setLowest(Math.max(1, +e.target.value | 0))} />
-              <button class="btn small ghost" onClick=${() => onSet(byEnergy.slice(0, lowest).map((e) => e.id))}>select</button></span>`}
-          <button class="btn small ghost" onClick=${() => onSet([])}>none</button>`}
-      </div>
+      ${group && html`<div class="bulk-select small">
+        <div class="bulk-row"><span class="bulk-what" title=${group.title}>Pick from <b>${group.title}</b></span>
+          <span class="bulk-quick"><button class="btn-link small" onClick=${() => onSet(free.map((e) => e.id))}>All</button>
+          <button class="btn-link small" onClick=${() => onSet([])}>None</button></span></div>
+        ${minE != null && html`
+          <div class="bulk-row">
+            <span class="bulk-field">Within <input type="number" class="tiny" min="0" step="0.5" value=${within}
+              onInput=${(e) => setWithin(+e.target.value)} /> kcal/mol of lowest</span>
+            <button class="btn-link small" onClick=${() => onSet(withE.filter((e) => entryEnergy(e) - minE <= within + 1e-9).map((e) => e.id))}>Pick</button></div>
+          <div class="bulk-row">
+            <span class="bulk-field">The <input type="number" class="tiny" min="1" step="1" value=${lowest}
+              onInput=${(e) => setLowest(Math.max(1, +e.target.value | 0))} /> lowest in energy</span>
+            <button class="btn-link small" onClick=${() => onSet(byEnergy.slice(0, lowest).map((e) => e.id))}>Pick</button></div>`}
+      </div>`}
       <button class="btn primary" disabled=${!n || busy} onClick=${onAdd}>
-        ${busy ? 'Adding…' : n ? `Add ${n} to Graph` : 'Tick structures to add them to the Graph'}</button>
+        ${busy ? 'Adding…' : n ? `Add ${n} to Graph` : 'Tick structures to add'}</button>
     </div>`;
 }
 
@@ -254,7 +351,8 @@ function ResultPanel({ job }) {
     } catch (e) { setError(e.message); }
     setLoading(false);
   };
-  useEffect(() => { load(); }, [job.id, job.status, job.finished]);
+  // result_rev: a follow-up (e.g. 'Check the bifurcation') added to this job's output.
+  useEffect(() => { load(); }, [job.id, job.status, job.finished, job.result_rev]);
 
   const entry = useMemo(() => result?.groups.flatMap((g) => g.entries).find((e) => e.id === entryId), [result, entryId]);
   const frameXyz = useMemo(() => entry?.frames.map((x) => x.xyz), [entry]);
@@ -340,6 +438,7 @@ function ResultPanel({ job }) {
           <summary>${result.warnings.length} warning${result.warnings.length > 1 ? 's' : ''} reported by mepd — check before trusting every number</summary>
           <ul>${result.warnings.map((w) => html`<li class="mono">${w}</li>`)}</ul>
         </details>`}
+      ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       <div class="result-body">
         <div class="entries-col">
           ${pickGroup && html`<${BulkBar} group=${pickGroup} picked=${picked} inGraph=${inGraph} busy=${adding}
@@ -385,7 +484,82 @@ function ResultPanel({ job }) {
             </div>
           </div>`}
       </div>
+      ${result.vri?.explorer && html`<${VriExplorer} job=${job} />`}
     </div>`;
+}
+
+// ------------------------------------------------------------ VRI
+const VRI_NEXT = {
+  second_product_untested: 'A second product was found. Check the bifurcation to see whether paths from TS1 really split between P1 and P2.',
+  bifurcation: 'Checked: sideways pushes off the IRC drain into both products. Map the surface to see TS1, the VRI, TS2, P1 and P2 on one picture.',
+  second_product_no_split: 'Sideways pushes all end in P1, so the second product is probably not reached from TS1 (trajectories can still be run).',
+};
+
+function FollowUpCard({ op, job, runs, done }) {
+  const [open, setOpen] = useState(false);
+  const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) }));
+  const [busy, setBusy] = useState(false);
+  const last = runs[0];
+  const active = last && ['queued', 'running'].includes(last.status);
+  const run = async () => {
+    setBusy(true);
+    prefs.set(`params:${op.key}`, values);
+    const out = await attempt(() => api.post('/api/jobs', { op: op.key, params: values, source_job: job.id }),
+      (js) => `Queued: ${js[0].title}`);
+    setBusy(false);
+    if (out) setOpen(false);
+  };
+  return html`
+    <div class=${`op-card ${open ? 'open' : ''}`}>
+      <button type="button" class="op-head" onClick=${() => setOpen(!open)} aria-expanded=${open}>
+        <span class="op-text">
+          <span class="op-title">${op.title}
+            ${last ? html` <span class=${`pill ${last.status}`}>${STATUS_LABEL[last.status]}</span>`
+              : done && html` <span class="pill done">Done</span>`}</span>
+          <span class="op-summary">${op.summary.replace(/\s*\(`[^`]*`\)\s*$/, '')}</span>
+        </span>
+        <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
+      </button>
+      ${open && html`<div class="op-body">
+        <${ParamForm} schema=${op.schema} values=${values} onChange=${setValues} />
+        <div class="op-run">
+          <button class="btn primary" disabled=${busy || active} onClick=${run}>
+            ${active ? 'Running…' : busy ? 'Queuing…' : (last || done) ? 'Run again' : 'Run'}</button>
+          ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id); }}>its log</a>`}
+          <span class="small muted">Runs at this job's level of theory; results appear on this page.</span>
+        </div>
+      </div>`}
+    </div>`;
+}
+
+function VriFollowUps({ job, vri }) {
+  const operations = useStore((s) => s.operations);
+  const runsKey = useStore((s) => Object.values(s.jobs).filter((j) => j.source_job === job.id)
+    .map((j) => `${j.id}:${j.status}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.source_job === job.id)
+    .sort((a, b) => b.created - a.created), [runsKey]);
+  const ops = operations.filter((o) => o.target === 'job' && o.available && (o.source_ops || []).includes(job.op));
+  if (job.status !== 'done' || !ops.length || job.source_job) return null;
+  const done = { 'vri-check': vri.checked, 'vri-surface': vri.surface };
+  return html`
+    <section class="followups">
+      <h3 class="section-title">Next steps</h3>
+      ${VRI_NEXT[vri.verdict] && html`<p class="small muted">${VRI_NEXT[vri.verdict]}</p>`}
+      ${ops.map((op) => html`<${FollowUpCard} key=${op.key} op=${op} job=${job} done=${done[op.key]}
+        runs=${runs.filter((r) => r.op === op.key)} />`)}
+    </section>`;
+}
+
+function VriExplorer({ job }) {
+  const src = `/api/jobs/${job.id}/vri-viewer?rev=${job.result_rev || 0}`;
+  return html`
+    <section class="vri-explorer">
+      <div class="live-head">
+        <h3 class="section-title">VRI explorer</h3>
+        <a class="small" href=${src} target="_blank" rel="noopener">Open in a new tab</a>
+      </div>
+      <iframe class="vri-frame" src=${src} title="VRI explorer" loading="lazy"></iframe>
+    </section>`;
 }
 
 // ------------------------------------------------------------ log
@@ -445,7 +619,17 @@ export function JobView({ jobId }) {
   const [tab, setTab] = useState(null);
   useTick(1000, job?.status === 'running');
   useEffect(() => { setTab(null); }, [jobId]);
-  if (!job) return html`<div class="empty-hint"><p>This job no longer exists.</p></div>`;
+  // Opened before this page heard about the job (just queued): look it up
+  // once before calling it gone.
+  const [lookedUp, setLookedUp] = useState(false);
+  useEffect(() => {
+    setLookedUp(false);
+    if (job) return;
+    refreshState().catch(() => {}).finally(() => setLookedUp(true));
+  }, [jobId]);
+  if (!job) {
+    return html`<div class="empty-hint"><p>${lookedUp ? 'This calculation no longer exists.' : 'Loading this calculation…'}</p></div>`;
+  }
   const hasOutput = job.status !== 'queued';
   const current = tab || (['done'].includes(job.status) || job.external ? 'result' : job.status === 'failed' ? 'log' : 'live');
   const targets = job.targets.structures.map((id) => ({ id, label: structureName(id) }));
@@ -465,10 +649,13 @@ export function JobView({ jobId }) {
         </div>
         <${JobControls} job=${job} />
       </div>
-      <div class="cmd-line" title="Exactly what ran; paste into a shell to reproduce">
-        <code>${job.command}</code>
-        <button class="btn-icon" onClick=${() => copy(job.command)} title="Copy">⧉</button>
-      </div>
+      <details class="cmd-line">
+        <summary>Command</summary>
+        <div class="cmd-body" title="Exactly what ran; paste into a shell to reproduce">
+          <code>${job.command}</code>
+          <button class="btn-icon" onClick=${() => copy(job.command)} title="Copy">⧉</button>
+        </div>
+      </details>
       ${job.status === 'failed' && job.error && html`<pre class="error-box">${job.error}</pre>`}
       ${['cancelled', 'interrupted'].includes(job.status) && html`<p class="warn-box small">${job.error} ${!job.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${job.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
