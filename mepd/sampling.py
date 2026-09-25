@@ -33,6 +33,18 @@ def generate_seed_pairs(
 
         stats = stats if stats is not None else {}
         stats["start"], stats["end"] = {}, {}
+        backend = ((conformer_inputs.backend if conformer_inputs else None) or "rdkit").lower()
+        if backend == "crest":
+            # Each CREST run is a single-threaded subprocess in its own temp
+            # directory: run both endpoints' searches at once, so this stage
+            # takes as long as the slower one rather than their sum.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="crest") as pool:
+                start_future = pool.submit(generate_conformers, start_node, conformer_inputs, stats["start"])
+                end_future = pool.submit(generate_conformers, end_node, conformer_inputs, stats["end"])
+                return start_future.result(), end_future.result()
+        # RDKit embedding can already use several threads per call: keep it serial.
         return (
             generate_conformers(start_node, conformer_inputs, stats["start"]),
             generate_conformers(end_node, conformer_inputs, stats["end"]),

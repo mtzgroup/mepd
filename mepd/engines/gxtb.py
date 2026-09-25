@@ -65,6 +65,37 @@ def _check_gxtb_optimization_converged(stdout: str, *, maxiter: int | None) -> N
     )
 
 
+
+_XTBOPT_ENERGY_RE = re.compile(r"energy:\s*(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)")
+
+
+def _read_xtbopt_progress(fp: Path, natoms: int) -> tuple[list[float], list[str]]:
+    """Energies and xyz frames of every step xtb has written to its
+    optimization log so far -- cheap enough to call while the optimizer runs
+    (the file is appended to; a half-written last frame is skipped)."""
+    try:
+        lines = fp.read_text().splitlines()
+    except OSError:
+        return [], []
+    energies: list[float] = []
+    frames: list[str] = []
+    i = 0
+    while i + natoms + 1 < len(lines):
+        head = lines[i].strip()
+        if head != str(natoms):
+            i += 1
+            continue
+        block = lines[i + 2 : i + 2 + natoms]
+        if len(block) < natoms or any(len(row.split()) < 4 for row in block):
+            break
+        match = _XTBOPT_ENERGY_RE.search(lines[i + 1])
+        if match:
+            energies.append(float(match.group(1)))
+            frames.append("\n".join([str(natoms), lines[i + 1].strip(), *block]) + "\n")
+        i += natoms + 2
+    return energies, frames
+
+
 class _GXTBASEResultsCalculator(Calculator):
     implemented_properties = ["energy", "forces"]
 
@@ -221,6 +252,7 @@ class GXTBCalculator(Engine):
         multiplicity: int,
         cwd: Path,
         optimize: bool,
+        watch: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         cmd = [
             self.executable,
@@ -241,14 +273,32 @@ class GXTBCalculator(Engine):
         env["OMP_NUM_THREADS"] = str(int(self.n_threads))
         env.update(self.env)
         try:
-            completed = subprocess.run(
-                cmd,
-                cwd=cwd,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            if watch is None:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            else:
+                # Same run, but call `watch()` about twice a second while it
+                # goes (a live viewer reading the optimizer's step log).
+                proc = subprocess.Popen(
+                    cmd, cwd=cwd, env=env, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                while True:
+                    try:
+                        stdout, stderr = proc.communicate(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        try:
+                            watch()
+                        except Exception:
+                            pass
+                completed = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
         except FileNotFoundError as exc:
             raise ElectronicStructureError(
                 msg=(
@@ -417,13 +467,28 @@ class GXTBCalculator(Engine):
                 workdir = Path(tmp)
                 xyz_path = workdir / "structure.xyz"
                 xyz_path.write_text(node.structure.to_xyz())
+                from mepd import progress as _progress
+
+                sink = _progress.minimization_sink()
+                watch = None
+                if sink is not None:
+                    natoms = len(node.symbols)
+
+                    def watch(final: bool = False) -> None:
+                        energies, frames = _read_xtbopt_progress(workdir / "xtbopt.log", natoms)
+                        if energies:
+                            sink(energies, frames, final=final)
+
                 completed = self._run_gxtb(
                     xyz_path=xyz_path,
                     charge=int(node.structure.charge),
                     multiplicity=int(node.structure.multiplicity),
                     cwd=workdir,
                     optimize=True,
+                    watch=watch,
                 )
+                if watch is not None:
+                    watch(final=True)  # the steps written after the last poll
                 _check_gxtb_optimization_converged(completed.stdout, maxiter=maxiter)
                 try:
                     opt_nodes = self._parse_optimization_trajectory(

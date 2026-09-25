@@ -164,6 +164,157 @@ def _write_progress_chain_payload(payload: dict | None) -> None:
         return
 
 
+# ------------------------------------------------------------------
+# Live geometry minimizations (e.g. every Hessian-sampling candidate).
+#
+# Each minimization is its own stream file next to the path streams, with
+# kind "minimization": the latest geometry (every frame of a subsampled
+# trajectory once it is finished), and the energy at every step relative
+# to a reference (the sampling seed). Engines that can see their optimizer
+# steps while it runs (g-xTB reads xtb's xtbopt.log) report them through
+# `minimization_sink()`; for every other engine the viewer shows the start
+# geometry and then the finished trajectory.
+
+_HARTREE_TO_KCAL = 627.5094740631
+_MAX_REPLAY_FRAMES = 60
+_minimizations: dict[str, dict] = {}   # stream -> state, for this process
+_active_minimization: str | None = None
+
+
+def _stream_path(stream: str) -> Path | None:
+    directory = os.environ.get("MEPD_DRIVE_CHAIN_DIR", "").strip()
+    if not directory:
+        return None
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in stream) or "main"
+    return Path(directory) / f"{safe}.json"
+
+
+def _relative_kcal(energies: list, reference: float | None) -> list:
+    known = [e for e in energies if e is not None]
+    if reference is None:
+        reference = known[0] if known else None
+    return [None if (e is None or reference is None) else (e - reference) * _HARTREE_TO_KCAL for e in energies]
+
+
+def _write_minimization(state: dict) -> None:
+    fp = _stream_path(state["stream"])
+    if fp is None:
+        return
+    y = _relative_kcal(state["energies"], state["reference"])
+    payload = {
+        "kind": "minimization",
+        "stream": state["stream"],
+        "label": state["label"] or state["stream"],
+        "caption": state["caption"],
+        "plot": {"x": list(range(len(y))), "y": y, "caption": state["caption"]},
+        # frame_steps[i] = the optimizer step geometry.frames[i] shows.
+        "geometry": {"frames": state["frames"], "ts_index": None, "frame_steps": state["frame_steps"]},
+        "reference": "seed" if state["reference"] is not None else "first step",
+        "updated": time.time(),
+        "finished": state["finished"],
+        "status": state["status"],
+        "outcome": state["outcome"],
+    }
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(fp, payload)
+    except Exception:
+        return
+
+
+def begin_minimization(stream: str, *, label: str = "", caption: str = "", reference_energy: float | None = None,
+                       start_xyz: str | None = None, start_energy: float | None = None) -> None:
+    """Start reporting one geometry minimization as its own live stream.
+    No-op unless a live viewer is attached (MEPD_DRIVE_CHAIN_DIR)."""
+    global _active_minimization
+    if _stream_path(stream) is None:
+        _active_minimization = None
+        return
+    state = {"stream": stream, "label": label, "caption": caption, "reference": reference_energy,
+             "energies": [start_energy] if start_energy is not None else [],
+             "frames": [start_xyz] if start_xyz else [], "frame_steps": [0] if start_xyz else [],
+             "finished": False, "status": None, "outcome": None, "last_write": 0.0}
+    _minimizations[stream] = state
+    _active_minimization = stream
+    _write_minimization(state)
+
+
+def minimization_sink():
+    """For engines: a callable `sink(energies_hartree, frames, final=False)`
+    reporting the running minimization's steps so far (`frames`: the xyz of
+    every step, or just the latest one), or None when nobody watches. Only
+    the newest frame is published while it runs; all of them are kept so the
+    replay exists as soon as the minimization ends."""
+    state = _minimizations.get(_active_minimization or "")
+    if state is None or state["finished"]:
+        return None
+
+    def sink(energies, frames, final: bool = False) -> None:
+        now = time.time()
+        if state["finished"] or (not final and now - state["last_write"] < 0.3):
+            return
+        state["last_write"] = now
+        state["energies"] = [float(e) for e in energies]
+        frames = [frames] if isinstance(frames, str) else list(frames or [])
+        if frames:
+            if len(frames) == len(energies):
+                state["all_frames"] = frames
+            state["frames"], state["frame_steps"] = frames[-1:], [max(0, len(energies) - 1)]
+        _write_minimization(state)
+
+    return sink
+
+
+def end_minimization(stream: str | None = None, *, trajectory=None, status: str = "done",
+                     error: str | None = None) -> None:
+    """Finish a minimization stream (default: the active one). A
+    `trajectory` (nodes with energies) becomes a subsampled replay."""
+    global _active_minimization
+    stream = stream or _active_minimization
+    state = _minimizations.get(stream or "")
+    if state is None:
+        return
+    if trajectory:
+        energies = []
+        for node in trajectory:
+            try:
+                energies.append(float(node.energy))
+            except Exception:
+                energies.append(None)
+        n = len(trajectory)
+        m = min(n, _MAX_REPLAY_FRAMES)
+        keep = sorted({round(i * (n - 1) / max(1, m - 1)) for i in range(m)})
+        try:
+            state["frames"] = [trajectory[i].structure.to_xyz() for i in keep]
+            state["frame_steps"] = keep
+            state["energies"] = energies
+        except Exception:
+            pass
+    elif len(state.get("all_frames") or []) > 1:
+        # No trajectory handed over (e.g. inside an engine's batch call):
+        # replay the steps the engine reported live.
+        frames = state["all_frames"]
+        n = len(frames)
+        m = min(n, _MAX_REPLAY_FRAMES)
+        keep = sorted({round(i * (n - 1) / max(1, m - 1)) for i in range(m)})
+        state["frames"], state["frame_steps"] = [frames[i] for i in keep], keep
+    if error:
+        state["caption"] = f"{state['caption']} · {error}".strip(" ·")
+    state.update(finished=True, status=status)
+    state.pop("all_frames", None)
+    _write_minimization(state)
+    if _active_minimization == stream:
+        _active_minimization = None
+
+
+def set_minimization_outcome(stream: str, outcome: str) -> None:
+    """Tag a finished minimization with what it found (e.g. 'new minimum')."""
+    state = _minimizations.get(stream)
+    if state is not None:
+        state["outcome"] = outcome
+        _write_minimization(state)
+
+
 class ProgressPrinter:
     """
     A class to handle progress printing with optional rich formatting.

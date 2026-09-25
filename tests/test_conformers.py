@@ -492,3 +492,39 @@ def test_generate_conformers_default_caps_at_50_via_diverse_selection():
     confs = generate_conformers(node, None, stats)  # default ConformerInputs()
     assert len(confs) <= 50
     assert confs[0].structure.geometry.tolist() == node.structure.geometry.tolist()
+
+
+def test_crest_endpoint_searches_run_concurrently(monkeypatch):
+    # Each endpoint's CREST search is its own single-threaded subprocess:
+    # `mepd channels` runs both at once instead of back to back.
+    import threading
+    import time as _time
+
+    import mepd.conformers as conformers_mod
+    from mepd.conformers import ConformerInputs
+    from mepd.sampling import generate_seed_pairs
+
+    spans = {}
+    lock = threading.Lock()
+
+    def fake_generate(node, inputs, stats):
+        t0 = _time.perf_counter()
+        _time.sleep(0.3)
+        with lock:
+            spans[node] = (t0, _time.perf_counter())
+        stats["seconds"] = 0.3
+        return [node]
+
+    monkeypatch.setattr(conformers_mod, "generate_conformers", fake_generate)
+    stats = {}
+    start, end = generate_seed_pairs("conformers", "A", "B",
+                                     conformer_inputs=ConformerInputs(backend="crest"), stats=stats)
+    assert (start, end) == (["A"], ["B"])            # order kept
+    assert stats["start"]["seconds"] == stats["end"]["seconds"] == 0.3
+    (a0, a1), (b0, b1) = spans["A"], spans["B"]
+    assert a0 < b1 and b0 < a1                        # the two searches overlapped
+
+    spans.clear()
+    generate_seed_pairs("conformers", "A", "B", conformer_inputs=ConformerInputs(backend="rdkit"), stats={})
+    (a0, a1), (b0, b1) = spans["A"], spans["B"]
+    assert a1 <= b0                                   # RDKit stays serial

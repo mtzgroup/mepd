@@ -241,8 +241,8 @@ def _same_ts(a, b, rmsd_cutoff: float, kcal_mol_cutoff: float) -> bool:
     it can't, fall back to the sorted interatomic-distance list, which is
     itself invariant to permutation, rotation and reflection."""
     import numpy as np
-    import qcinf
 
+    from mepd._qcinf_compat import snap_rmsd
     from mepd.conformers import mirror_image
 
     try:
@@ -252,8 +252,8 @@ def _same_ts(a, b, rmsd_cutoff: float, kcal_mol_cutoff: float) -> bool:
         pass
     try:
         return min(
-            qcinf.snap_rmsd(a.structure, b.structure),
-            qcinf.snap_rmsd(a.structure, mirror_image(b.structure)),
+            snap_rmsd(a.structure, b.structure),
+            snap_rmsd(a.structure, mirror_image(b.structure)),
         ) < rmsd_cutoff
     except Exception:
         pass

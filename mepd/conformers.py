@@ -26,6 +26,7 @@ import qcinf
 from qcconst.constants import ANGSTROM_TO_BOHR
 from qcdata.models.structure import Structure
 
+from mepd._qcinf_compat import snap_rmsd
 from mepd.nodes.node import StructureNode
 from mepd.rigid_alignment import kabsch_align
 
@@ -482,9 +483,9 @@ def same_up_to_mirror(a: Structure, b: Structure, rmsd_cutoff: float) -> bool:
     superimposes by rotation and never sees it. For a molecule with
     stereocentres, a conformer can't match another's mirror image unless it
     is the enantiomer, which doesn't belong in the pool either."""
-    if qcinf.snap_rmsd(a, b) < rmsd_cutoff:
+    if snap_rmsd(a, b) < rmsd_cutoff:
         return True
-    return qcinf.snap_rmsd(mirror_image(a), b) < rmsd_cutoff
+    return snap_rmsd(mirror_image(a), b) < rmsd_cutoff
 
 
 def merge_mirror_images(
@@ -567,7 +568,7 @@ def merge_degenerate_complex_conformers(
                 continue
             try:
                 duplicate = all(
-                    qcinf.snap_rmsd(
+                    snap_rmsd(
                         _fragment_structure(node.structure, idx),
                         _fragment_structure(other.structure, idx),
                     ) < rmsd_cutoff
@@ -601,7 +602,7 @@ def _diverse_subset(conformers: list[StructureNode], n_max: int) -> list[Structu
     min_dist = []
     for cand in remaining:
         try:
-            min_dist.append(qcinf.snap_rmsd(cand.structure, selected[0].structure))
+            min_dist.append(snap_rmsd(cand.structure, selected[0].structure))
         except ValueError:
             min_dist.append(-1.0)
 
@@ -614,7 +615,7 @@ def _diverse_subset(conformers: list[StructureNode], n_max: int) -> list[Structu
         selected.append(picked)
         for i, cand in enumerate(remaining):
             try:
-                d = qcinf.snap_rmsd(cand.structure, picked.structure)
+                d = snap_rmsd(cand.structure, picked.structure)
             except ValueError:
                 continue
             if d < min_dist[i]:
@@ -651,7 +652,7 @@ def _subselect_conformers(
     for candidate in conformers[1:]:
         try:
             distinct_from_all_kept = all(
-                qcinf.snap_rmsd(candidate.structure, kept.structure) >= rmsd_cutoff
+                snap_rmsd(candidate.structure, kept.structure) >= rmsd_cutoff
                 for kept in selected
             )
         except ValueError:

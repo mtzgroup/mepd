@@ -309,6 +309,39 @@ def _generate_mode_displacements(
     return nodes, metadata, clipped
 
 
+_OUTCOME_LABEL = {
+    "new_minimum": "new minimum",
+    "known_minimum": "found before",
+    "returned_to_seed_basin": "back to seed",
+    "opt_failed": "failed",
+}
+
+
+def _live_stream(prefix: str, index: int) -> str:
+    return f"{prefix}c{index:03d}"
+
+
+def _live_begin(prefix: str, index: int, total: int, node: Node, meta: HessianSampleCandidate,
+                seed_energy: Optional[float], label_prefix: str = "") -> None:
+    """Live view (web UI): announce candidate `index` (1-based) starting."""
+    from mepd import progress as _progress
+
+    stream = _live_stream(prefix, index)
+    if _progress._stream_path(stream) is None:
+        return  # nobody is watching: cost nothing
+    try:
+        start_xyz = node.structure.to_xyz()
+    except Exception:
+        start_xyz = None
+    amp = f", {meta.effective_dr:.2f} bohr" if meta.effective_dr is not None else ""
+    _progress.begin_minimization(
+        stream,
+        label=f"{label_prefix}#{index} · mode {meta.mode_index}{meta.direction}",
+        caption=f"Candidate {index}/{total}: mode {meta.mode_index} displaced {meta.direction}{amp}",
+        reference_energy=seed_energy, start_xyz=start_xyz,
+    )
+
+
 def _optimize_candidates_serially(
     engine: Engine,
     candidates: List[Node],
@@ -316,6 +349,9 @@ def _optimize_candidates_serially(
     keywords: dict,
     *,
     on_event: OnEvent = None,
+    live_prefix: str = "",
+    live_label: str = "",
+    seed_energy: Optional[float] = None,
 ) -> tuple[List[Node], List[HessianSampleCandidate], List[dict]]:
     """Optimize each candidate one at a time, isolating failures per
     candidate rather than letting one blow up the rest -- used both when the
@@ -325,7 +361,10 @@ def _optimize_candidates_serially(
     optimized_metadata: List[HessianSampleCandidate] = []
     failed_candidates: List[dict] = []
     total = len(candidates)
+    from mepd import progress as _progress
+
     for index, (candidate, meta) in enumerate(zip(candidates, metadata), start=1):
+        _live_begin(live_prefix, index, total, candidate, meta, seed_energy, live_label)
         try:
             try:
                 trajectory = engine.compute_geometry_optimization(candidate, keywords=keywords)
@@ -335,8 +374,11 @@ def _optimize_candidates_serially(
                 raise ValueError("optimization returned an empty trajectory")
             optimized_nodes.append(trajectory[-1])
             optimized_metadata.append(meta)
+            _progress.end_minimization(_live_stream(live_prefix, index), trajectory=trajectory)
         except Exception as exc:
             failed_candidates.append({"meta": meta, "error": f"{type(exc).__name__}: {exc}"})
+            _progress.end_minimization(_live_stream(live_prefix, index), status="failed",
+                                       error=type(exc).__name__)
         _emit(on_event, "candidate_done", index=index, total=total)
     return optimized_nodes, optimized_metadata, failed_candidates
 
@@ -358,6 +400,8 @@ def run_hessian_sample(
     validate_minima_with_hessian: bool = False,
     hessian_minimum_frequency_cutoff: float = 0.0,
     hessian_minima_rescue_displacement: float = 0.1,
+    live_prefix: str = "",
+    live_label: str = "",
 ) -> HessianSampleResult:
     """Explore minima near `seed_node` by displacing along Hessian normal modes.
 
@@ -485,6 +529,8 @@ def run_hessian_sample(
         candidates_clipped=clipped,
     )
 
+    from mepd import progress as _progress
+
     keywords = {"coordsys": "cart", "maxiter": int(maxiter)}
     batch_optimizer = getattr(engine, "compute_geometry_optimizations", None)
     optimized_nodes: List[Node] = []
@@ -500,8 +546,19 @@ def run_hessian_sample(
         # progress during that one blocking call; engines that don't support
         # it (a TypeError on the attempt) fall back silently -- their
         # progress just shows up in one shot when the whole call returns.
+        # Live view: a sequential "batch" reports each candidate finishing,
+        # so the next one's stream starts right then (a real remote batch
+        # never calls back: its streams appear when the whole call returns).
         def _batch_progress_cb(completed: int, total: int = total_candidates) -> None:
+            _progress.end_minimization(_live_stream(live_prefix, completed))
+            if completed < total:
+                _live_begin(live_prefix, completed + 1, total, displaced_nodes[completed],
+                            displaced_metadata[completed], seed_energy, live_label)
             _emit(on_event, "candidate_done", index=completed, total=total)
+
+        if displaced_nodes:
+            _live_begin(live_prefix, 1, total_candidates, displaced_nodes[0], displaced_metadata[0],
+                        seed_energy, live_label)
 
         try:
             try:
@@ -529,6 +586,7 @@ def run_hessian_sample(
             result.optimization_submission_mode = "batch_fallback_serial"
             optimized_nodes, optimized_metadata, failed_candidates = _optimize_candidates_serially(
                 engine, displaced_nodes, displaced_metadata, keywords, on_event=on_event,
+                live_prefix=live_prefix, live_label=live_label, seed_energy=seed_energy,
             )
         else:
             result.optimization_submission_mode = "batch"
@@ -537,19 +595,27 @@ def run_hessian_sample(
                     "Batch geometry optimization returned a trajectory count "
                     "different from the submitted candidate count."
                 )
-            for index, (meta, trajectory) in enumerate(zip(displaced_metadata, trajectories), start=1):
+            for index, (node, meta, trajectory) in enumerate(
+                zip(displaced_nodes, displaced_metadata, trajectories), start=1
+            ):
+                stream = _live_stream(live_prefix, index)
+                if stream not in _progress._minimizations:
+                    _live_begin(live_prefix, index, total_candidates, node, meta, seed_energy, live_label)
                 if trajectory:
                     optimized_nodes.append(trajectory[-1])
                     optimized_metadata.append(meta)
+                    _progress.end_minimization(stream, trajectory=trajectory)
                 else:
                     failed_candidates.append(
                         {"meta": meta, "error": "optimization returned an empty trajectory"}
                     )
+                    _progress.end_minimization(stream, status="failed", error="no trajectory")
                 _emit(on_event, "candidate_done", index=index, total=total_candidates)
     else:
         result.optimization_submission_mode = "serial"
         optimized_nodes, optimized_metadata, failed_candidates = _optimize_candidates_serially(
             engine, displaced_nodes, displaced_metadata, keywords, on_event=on_event,
+            live_prefix=live_prefix, live_label=live_label, seed_energy=seed_energy,
         )
 
     for failed in failed_candidates:
@@ -560,6 +626,10 @@ def run_hessian_sample(
     for node, meta, outcome in zip(optimized_nodes, optimized_metadata, outcomes):
         meta.outcome = outcome
         meta.final_energy_kcal_rel_seed = (float(node.energy) - seed_energy) * hartree_to_kcal
+    stream_of = {id(meta): _live_stream(live_prefix, i) for i, meta in enumerate(displaced_metadata, start=1)}
+    for meta in displaced_metadata:
+        if meta.outcome in _OUTCOME_LABEL:
+            _progress.set_minimization_outcome(stream_of[id(meta)], _OUTCOME_LABEL[meta.outcome])
 
     result.optimized_nodes = optimized_nodes
     result.optimized_metadata = optimized_metadata
@@ -779,6 +849,10 @@ def run_hessian_global_optimization(
                     validate_minima_with_hessian=validate_minima_with_hessian,
                     hessian_minimum_frequency_cutoff=hessian_minimum_frequency_cutoff,
                     hessian_minima_rescue_displacement=hessian_minima_rescue_displacement,
+                    # Live view: one stream per candidate of every round/source.
+                    live_prefix=f"r{round_index + 1:02d}s{source_index + 1:02d}",
+                    live_label=(f"round {round_index + 1} · " if len(current_queue) == 1
+                                else f"round {round_index + 1} · source {source_index + 1} · "),
                 )
             except Exception as exc:
                 # A source failing outright (e.g. its Hessian computation
