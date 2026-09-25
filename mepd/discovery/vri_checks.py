@@ -215,8 +215,9 @@ class ProductRegistry:
     appearance (one entry per species, atom-indexed heavy-atom bonds +
     H counts, see `same_species`). Keeps one structure per product."""
 
-    def __init__(self, p1, p2, reactants: Sequence = ()):
-        self.entries = [("P1", p1), ("P2", p2)]
+    def __init__(self, p1, p2=None, reactants: Sequence = ()):
+        # Without a known P2, the first further product found becomes P2.
+        self.entries = [("P1", p1)] + ([("P2", p2)] if p2 is not None else [])
         self.reactants = list(reactants)
         self.counts: dict = {}
 
@@ -397,8 +398,11 @@ def check_branch(
     opt_keywords: Optional[dict] = None,
     log=print,
 ) -> Optional[dict]:
-    """Exact VRI, basin test and trajectories for one branch with a P1 and
-    P2. Writes vri_<branch>.xyz (the refined VRI) and returns the results."""
+    """Exact VRI, basin test and trajectories for one branch with a P1.
+    P2 is the second product the VRI search found, if any; otherwise the
+    first product the basin test reaches that is neither P1 nor the reactant
+    becomes P2 (written to p2_<branch>.xyz, `out["p2_source"] = "basin"`).
+    Writes vri_<branch>.xyz (the refined VRI) and returns the results."""
     import json
     from pathlib import Path
 
@@ -408,10 +412,11 @@ def check_branch(
     d = Path(cand_dir)
     summary = json.loads((d / "summary.json").read_text())
     scan = json.loads((d / "projected_freqs.json").read_text())
-    if not ((d / f"p1_{branch}.xyz").exists() and (d / f"p2_{branch}.xyz").exists()):
+    if not (d / f"p1_{branch}.xyz").exists():
         return None
     p1 = _load_nodes(d / f"p1_{branch}.xyz", charge, multiplicity)[-1]
-    p2 = _load_nodes(d / f"p2_{branch}.xyz", charge, multiplicity)[-1]
+    p2_fp = d / f"p2_{branch}.xyz"
+    p2 = _load_nodes(p2_fp, charge, multiplicity)[-1] if p2_fp.exists() else None
     irc = _load_nodes(d / "irc.xyz", charge, multiplicity)
     ts_index = int(scan["ts_index"])
     nodes = vri.split_irc_branches(irc, ts_index)[branch]
@@ -419,7 +424,7 @@ def check_branch(
     ts1 = nodes[0]
     e_ts1 = float(summary["ts1_energy"])
     masses = node_masses(ts1)
-    out: dict = {"branch": branch}
+    out: dict = {"branch": branch, "p2_source": "search" if p2 is not None else None}
 
     def soft_mode(node):
         vri._ensure_energy_gradient([node], engine)
@@ -487,6 +492,16 @@ def check_branch(
                            reference=[reactant], registry=registry)
         out["basin"] = res_b.to_dict()
         out["basin"]["points_with_two_imaginary_modes"] = n_double
+        if p2 is None:
+            found = dict(registry.entries).get("P2")
+            if found is not None:
+                p2 = found
+                out["p2_source"] = "basin"
+                vri._ensure_energy_gradient([p2], engine)
+                from mepd.chain import Chain
+
+                Chain.model_validate({"nodes": [p2], "parameters": ChainInputs()}).write_to_disk(p2_fp)
+                log(f"    second product found by the basin test: {vri._stereo_smiles(p2)}")
         save_paths(d / f"paths_{branch}.npz", "basin", res_b.paths,
                    [st["outcome"] for st in res_b.starts], res_b.starts)
         log(f"    outcomes: {res_b.counts}" + (f" (second soft mode pushed at {n_double} point(s))" if n_double else ""))
@@ -497,7 +512,8 @@ def check_branch(
         ts_modes = vri.stationary_point_modes(ts1, engine)
         direction = vri._mass_weighted(nodes[1]) - vri._mass_weighted(nodes[0])
         other_end = vri.split_irc_branches(irc, ts_index)["reverse" if branch == "forward" else "forward"][-1]
-        classify = qct.pattern_classifier(list(ts1.symbols), {"P1": p1, "P2": p2, "R": other_end}, ts1.coords)
+        refs = {"P1": p1, "R": other_end, **({"P2": p2} if p2 is not None else {})}
+        classify = qct.pattern_classifier(list(ts1.symbols), refs, ts1.coords)
         result = qct.run_qct(ts1, ts_modes, engine, direction, n_trajectories=n_traj, max_fs=traj_fs,
                              workers=workers, seed=0, opt_keywords=opt_keywords, commit_to=classify)
         counts = {"P1": 0, "P2": 0, "recrossed": 0, "failed": 0}

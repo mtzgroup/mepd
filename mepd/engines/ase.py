@@ -1,3 +1,7 @@
+import copy
+import threading
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, List, Union
 
@@ -50,6 +54,23 @@ AVAIL_OPTS = {
 }
 
 
+# Per-thread calculator copies (see `ASEEngine._calculator_in_use`), keyed by
+# id(engine) with a weak reference to guard against id reuse.
+_THREAD_CALCULATORS = threading.local()
+_ENGINE_LOCKS: dict = {}  # id(engine) -> (weakref to engine, RLock); engines are unhashable dataclasses
+_ENGINE_LOCKS_GUARD = threading.Lock()
+
+
+def _engine_lock(engine) -> threading.RLock:
+    with _ENGINE_LOCKS_GUARD:
+        entry = _ENGINE_LOCKS.get(id(engine))
+        if entry is None or entry[0]() is not engine:
+            for key in [k for k, (ref, _) in _ENGINE_LOCKS.items() if ref() is None]:
+                del _ENGINE_LOCKS[key]
+            entry = _ENGINE_LOCKS[id(engine)] = (weakref.ref(engine), threading.RLock())
+        return entry[1]
+
+
 @dataclass
 class ASEEngine(Engine):
     """
@@ -75,6 +96,38 @@ class ASEEngine(Engine):
              available optimizer: {AVAIL_OPTS.keys()}"
 
             self.ase_optimizer = AVAIL_OPTS[self.geometry_optimizer]
+
+    @contextmanager
+    def _calculator_in_use(self):
+        """The calculator for this thread. An ASE calculator keeps the last
+        structure and its results, so two threads using one at once can read
+        each other's energies/forces. Worker threads (mepd runs engine calls
+        in thread pools) each get their own deep copy; the main thread uses
+        the original. A calculator that cannot be copied is shared under a
+        lock instead (correct, but serialized). Subclasses whose `calculator`
+        is a property building a fresh calculator per access (FAIRChemEngine)
+        are used as is."""
+        if isinstance(getattr(type(self), "calculator", None), property):
+            yield self.calculator
+            return
+        base = self.calculator
+        calc = base
+        if threading.current_thread() is not threading.main_thread():
+            cache = _THREAD_CALCULATORS.__dict__.setdefault("by_engine", {})
+            entry = cache.get(id(self))
+            if entry is None or entry[0]() is not self or entry[1] is not base:
+                try:
+                    own = copy.deepcopy(base)
+                    if hasattr(own, "reset"):
+                        own.reset()
+                except Exception:
+                    own = None
+                entry = cache[id(self)] = (weakref.ref(self), base, own)
+            if entry[2] is not None:
+                yield entry[2]
+                return
+        with _engine_lock(self):
+            yield calc
 
     def _extract_optimizer_run_kwargs(
         self,
@@ -103,19 +156,37 @@ class ASEEngine(Engine):
         run_kwds, optimizer_kwds = self._extract_optimizer_run_kwargs(keywords)
 
         atoms = structure_to_ase_atoms(node.structure)
-        atoms.calc = self.calculator
         tmp = tempfile.NamedTemporaryFile(suffix=".traj", mode="w+", delete=False)
+        with self._calculator_in_use() as calc:
+            atoms.calc = calc
+            optimizer = optimizer_cls(
+                atoms=atoms,
+                logfile=None,
+                trajectory=tmp.name,
+                **optimizer_kwds,
+            )  # ASE does geometry updates in-place.
+            from mepd import progress as _progress
 
-        optimizer = optimizer_cls(
-            atoms=atoms,
-            logfile=None,
-            trajectory=tmp.name,
-            **optimizer_kwds,
-        )  # ASE does geometry updates in-place.
-        try:
-            optimizer.run(**run_kwds)
-        except Exception as exc:
-            raise ElectronicStructureError(msg="Electronic structure failed.", obj=exc)
+            sink = _progress.minimization_sink()
+            if sink is not None:
+                live_energies: list[float] = []
+                live_frames: list[str] = []
+
+                def _report_step() -> None:
+                    try:
+                        live_energies.append(atoms.get_potential_energy() / Hartree)
+                        live_frames.append(ase_atoms_to_structure(
+                            atoms=atoms, charge=node.structure.charge,
+                            multiplicity=node.structure.multiplicity).to_xyz())
+                        sink(live_energies, live_frames)
+                    except Exception:
+                        pass  # the live view must never break the optimization
+
+                optimizer.attach(_report_step, interval=1)
+            try:
+                optimizer.run(**run_kwds)
+            except Exception as exc:
+                raise ElectronicStructureError(msg="Electronic structure failed.", obj=exc)
 
         charge = node.structure.charge
         multiplicity = node.structure.multiplicity
@@ -205,13 +276,11 @@ class ASEEngine(Engine):
 
     def compute_func(self, atoms: Atoms):
         try:
-            ene_ev = self.calculator.get_potential_energy(atoms=atoms)  # eV
+            with self._calculator_in_use() as calc:
+                ene_ev = calc.get_potential_energy(atoms=atoms)  # eV
+                # ASE outputs the negative gradient
+                grad_ev_ang = calc.get_forces(atoms=atoms) * (-1)  # eV / Angstroms
             ene = ene_ev / Hartree  # Hartree
-
-            # ASE outputs the negative gradient
-            grad_ev_ang = self.calculator.get_forces(atoms=atoms) * (
-                -1
-            )  # eV / Angstroms
             grad = (grad_ev_ang / ANGSTROM_TO_BOHR) / Hartree  # Hartree / Bohr
             res = FakeQCIOResults.model_validate(
                 {"energy": ene, "gradient": grad})
@@ -224,7 +293,8 @@ class ASEEngine(Engine):
 
     def _compute_gradient_from_atoms(self, atoms: Atoms) -> NDArray:
         """Return dE/dx in Hartree/Bohr for an ASE Atoms object."""
-        grad_ev_ang = self.calculator.get_forces(atoms=atoms) * (-1.0)
+        with self._calculator_in_use() as calc:
+            grad_ev_ang = calc.get_forces(atoms=atoms) * (-1.0)
         return (grad_ev_ang / ANGSTROM_TO_BOHR) / Hartree
 
     def compute_hessian(
@@ -354,18 +424,19 @@ class ASEEngine(Engine):
 
         def _run_direction(direction: str) -> list[StructureNode]:
             atoms = structure_to_ase_atoms(ts_node.structure)
-            atoms.calc = self.calculator
             tmp = tempfile.NamedTemporaryFile(suffix=".traj", mode="w+", delete=False)
-            optimizer = SellaIRC(
-                atoms=atoms,
-                logfile=None,
-                trajectory=tmp.name,
-                **optimizer_kwds,
-            )
-            try:
-                optimizer.run(fmax=fmax, steps=steps, direction=direction)
-            except Exception as exc:
-                raise ElectronicStructureError(msg="ASE IRC computation failed.", obj=exc)
+            with self._calculator_in_use() as calc:
+                atoms.calc = calc
+                optimizer = SellaIRC(
+                    atoms=atoms,
+                    logfile=None,
+                    trajectory=tmp.name,
+                    **optimizer_kwds,
+                )
+                try:
+                    optimizer.run(fmax=fmax, steps=steps, direction=direction)
+                except Exception as exc:
+                    raise ElectronicStructureError(msg="ASE IRC computation failed.", obj=exc)
 
             charge = ts_node.structure.charge
             multiplicity = ts_node.structure.multiplicity

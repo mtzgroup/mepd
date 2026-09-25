@@ -212,6 +212,18 @@ def test_verify_ts2_checks_connectivity_energy_and_curvature():
 # --------------------------------------------------------------------------
 
 
+def test_detect_vrt_depth_window_limits_the_onset_not_the_run():
+    # rxn_072: the ridge begins inside the window and keeps going past it
+    freqs = [30, 12, -56, -198, -280, -300]
+    ok = [True, True, True, False, False, False]
+    first, transients, _ = vri._detect_vrt(freqs, threshold=50, persist=2, may_start=ok)
+    assert first == 2 and transients == []
+    # a dip that only begins past the window is not a VRT
+    first, _, _ = vri._detect_vrt([30, 20, 10, -80, -90], threshold=50, persist=2,
+                                  may_start=[True, True, True, False, False])
+    assert first is None
+
+
 def test_detect_vrt_rejects_single_point_noise_and_flags_reformed_valley():
     freqs = [100, 80, -30, 60, 40, 10, -25, -60, -90, -40, 30]
     first, transients, reforms = vri._detect_vrt(freqs, threshold=20, persist=2)

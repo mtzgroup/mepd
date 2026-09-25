@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from mepd.helper_functions import pairwise
-from typing import Any, Tuple, List
+from typing import Any, List, Sequence, Tuple
 
 from mepd.nodes.node import Node, StructureNode
 from mepd.nodes.nodehelpers import _is_connectivity_identical
@@ -1337,16 +1337,23 @@ class MSMEP:
             chains = self._do_maxima_based_split(chain, minimization_results)
 
         if getattr(getattr(self.inputs, "atom_mapping_inputs", None), "recheck_on_split", False):
-            chains = [self._maybe_realign_chain_endpoints(c) for c in chains]
+            parent_ends = [chain[0], chain[-1]] if len(chain) >= 2 else []
+            chains = [self._maybe_realign_chain_endpoints(c, forbidden=parent_ends) for c in chains]
 
         return chains
 
-    def _maybe_realign_chain_endpoints(self, chain: Chain) -> Chain:
+    def _maybe_realign_chain_endpoints(self, chain: Chain, forbidden: Sequence[Node] = ()) -> Chain:
         """`--atom-mapping-recheck-splits`: re-run the same best-of-N
         atom-mapping selection `--atom-mapping` runs once on the original
         --start/--end pair, but on THIS split's (reactant, product) pair.
         A no-op for splits whose pair has no SLAPMapper-detectable
-        alternative mapping -- see `maybe_realign_pair`."""
+        alternative mapping -- see `maybe_realign_pair`.
+
+        `forbidden`: the parent chain's endpoints. A renumbering that makes
+        the product side bond-for-bond (atom-indexed) identical to one of
+        them is refused: when the intermediate C found on A -> B is the same
+        molecule as B, renumbering it to B's numbering would recreate the
+        parent pair A -> B, which splits at C again, forever."""
         from mepd.atom_mapping_selection import maybe_realign_pair
         from mepd.nodes.node import StructureNode
 
@@ -1356,6 +1363,27 @@ class MSMEP:
             )
         except Exception:
             return chain
+        if changed and forbidden:
+            from mepd.discovery.qct import bond_pattern
+
+            def bonds(structure):
+                return bond_pattern(list(structure.symbols), structure.geometry)
+
+            try:
+                new_bonds = bonds(realigned_structure)
+                clash = any(
+                    new_bonds == bonds(node.structure) != bonds(chain[-1].structure)
+                    for node in forbidden
+                    if getattr(node, "structure", None) is not None
+                    and list(node.structure.symbols) == list(realigned_structure.symbols)
+                )
+            except Exception:
+                clash = False
+            if clash:
+                if _get_verbose(self.inputs):
+                    print("--atom-mapping-recheck-splits: kept a split's numbering "
+                          "(the remap would recreate the parent's endpoint).")
+                return chain
         if changed:
             if _get_verbose(self.inputs):
                 print("--atom-mapping-recheck-splits: reindexed a split's product-side atoms.")

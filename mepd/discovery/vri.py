@@ -507,7 +507,8 @@ def _arc_length(nodes: Sequence[Node]) -> np.ndarray:
     return np.concatenate([[0.0], np.cumsum(steps)])
 
 
-def _detect_vrt(freqs: Sequence[float], threshold: float, persist: int):
+def _detect_vrt(freqs: Sequence[float], threshold: float, persist: int,
+                may_start: Optional[Sequence[bool]] = None):
     """Scan a TS-outward sequence of lowest projected frequencies.
 
     Returns (first_index, transient_indices, reforms):
@@ -517,6 +518,11 @@ def _detect_vrt(freqs: Sequence[float], threshold: float, persist: int):
     - transient_indices: starts of dips below -threshold that did not
       persist (numerical noise).
     - reforms: the frequency rose back above +threshold after the VRT.
+
+    `may_start` (per point) restricts where a dip may begin (the depth
+    window); a dip that begins inside it counts all its points toward
+    `persist`, including those past the window. Dips beginning outside it
+    are skipped.
     """
     freqs = list(freqs)
     n = len(freqs)
@@ -528,6 +534,9 @@ def _detect_vrt(freqs: Sequence[float], threshold: float, persist: int):
             run_end = i
             while run_end + 1 < n and freqs[run_end + 1] < -threshold:
                 run_end += 1
+            if may_start is not None and not may_start[i]:
+                i = run_end + 1
+                continue
             run_len = run_end - i + 1
             if run_len >= persist or run_end == n - 1:
                 reforms = any(f > threshold for f in freqs[run_end + 1:])
@@ -668,22 +677,31 @@ def scan_irc_for_vrt(
             ))
 
         freqs = [p.lowest_freq for p in branch.points]
+        may_start = None
         if max_vrt_depth is not None:
             from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
 
             e_ts = float(ts_node._cached_energy)
-            too_deep = [
-                (e_ts - p.energy) * float(HARTREE_TO_KCAL_PER_MOL) > float(max_vrt_depth)
+            may_start = [
+                (e_ts - p.energy) * float(HARTREE_TO_KCAL_PER_MOL) <= float(max_vrt_depth)
                 for p in branch.points
             ]
+        first, transients, reforms = _detect_vrt(freqs, vrt_threshold, persist, may_start)
+        if may_start is not None:
+            # imaginary points past the window that are not part of the VRT's run
+            in_vrt = set()
+            if first is not None:
+                k = first
+                while k < len(freqs) and freqs[k] < -vrt_threshold:
+                    in_vrt.add(k)
+                    k += 1
             branch.late_dips = [
-                p.s for p, deep, f in zip(branch.points, too_deep, freqs) if deep and f < -vrt_threshold
+                p.s for k, (p, ok, f) in enumerate(zip(branch.points, may_start, freqs))
+                if not ok and f < -vrt_threshold and k not in in_vrt
             ]
-            freqs = [np.inf if deep else f for f, deep in zip(freqs, too_deep)]
-        first, transients, reforms = _detect_vrt(freqs, vrt_threshold, persist)
         branch.double_ridge = [
-            p.s for p, f in zip(branch.points, freqs)
-            if np.isfinite(f) and len(p.lowest_freqs) > 1 and p.lowest_freqs[1] < -vrt_threshold
+            p.s for k, (p, f) in enumerate(zip(branch.points, freqs))
+            if (may_start is None or may_start[k]) and len(p.lowest_freqs) > 1 and p.lowest_freqs[1] < -vrt_threshold
         ]
         branch.transient_dips = [branch.points[i].s for i in transients]
         branch.valley_reforms = reforms
@@ -1179,17 +1197,30 @@ def basin_split(checks: Optional[dict]) -> bool:
 
 
 def branch_verdict(branch: BranchScan, products: Optional[BranchProducts]) -> str:
-    """The basin test decides: a branch with a second product is a
-    bifurcation only if steepest descent from sideways pushes off the IRC
-    ends in at least two different products. (TS2 checks alone over-predict: a low saddle
-    between P1 and P2 does not mean trajectories from TS1 reach P2.)"""
+    """The basin test decides: a branch is a bifurcation only if steepest
+    descent from sideways pushes off the IRC ends in at least two different
+    products. (TS2 checks alone over-predict: a low saddle between P1 and P2
+    does not mean trajectories from TS1 reach P2. And the few pushes of the
+    P2 search under-predict: the basin test also runs on VRT branches where
+    they found nothing.)"""
+    checks = products.checks if products is not None else None
     if products is not None and products.p2 is not None:
-        if not (products.checks or {}).get("basin"):
+        if not (checks or {}).get("basin"):
             return "second_product_untested"
-        return "bifurcation" if basin_split(products.checks) else "second_product_no_split"
+        return "bifurcation" if basin_split(checks) else "second_product_no_split"
     if branch.vrt is None:
         return "transient_softening" if branch.transient_dips else "no_vrt"
-    return "vrt_no_second_product"
+    return verdict_after_checks("vrt_no_second_product", False, checks)
+
+
+def verdict_after_checks(verdict: str, had_p2: bool, checks: Optional[dict]) -> str:
+    """A branch's verdict updated with its checks (see `branch_verdict`):
+    `had_p2` = the VRI search itself found the second product."""
+    if not (checks or {}).get("basin"):
+        return "second_product_untested" if had_p2 else verdict
+    if basin_split(checks):
+        return "bifurcation"
+    return "second_product_no_split" if had_p2 else verdict
 
 
 def overall_verdict(verdicts: Sequence[str]) -> str:

@@ -331,3 +331,39 @@ def test_make_sequence_of_chains_recheck_on_split_missing_atom_mapping_inputs_is
     result = m.make_sequence_of_chains(chain=chain, split_method="minima", minimization_results=[])
 
     assert result == [chain]
+
+
+def _h3(bonded: tuple[int, int] | None) -> Structure:
+    """Three H atoms; `bonded` pair 1.0 bohr apart, everything else >= 4 bohr."""
+    X = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    if bonded is not None:
+        i, j = bonded
+        X[j] = X[i] + [0.0, 0.0, 1.0]
+    return Structure(geometry=X, symbols=["H", "H", "H"], charge=0, multiplicity=1)
+
+
+def test_recheck_on_split_refuses_a_remap_that_recreates_the_parent_endpoint(monkeypatch):
+    """A -> B splits at C, the same molecule as B with other atoms bonded.
+    Renumbering C to B's numbering would turn the child A -> C back into
+    A -> B, which splits at C again forever; that remap must be refused,
+    while a remap onto anything else still goes through."""
+    import mepd.atom_mapping_selection as selection_module
+
+    m = _msmep_for_split_test(recheck_on_split=True)
+    a, b, c = (StructureNode(structure=_h3(p)) for p in ((0, 1), (1, 2), (0, 2)))
+    parent = Chain.model_validate({"nodes": [a, b], "parameters": ChainInputs()})
+    child = Chain.model_validate({"nodes": [a, c], "parameters": ChainInputs()})
+    monkeypatch.setattr(m, "_do_minima_based_split", lambda chain, minimization_results: [child])
+
+    remap_to = {}
+    monkeypatch.setattr(selection_module, "maybe_realign_pair",
+                        lambda start, end, run_inputs: (remap_to["s"], True))
+
+    for target in ((1, 2), (0, 1)):  # B's bonds, A's bonds: refused
+        remap_to["s"] = _h3(target)
+        result = m.make_sequence_of_chains(chain=parent, split_method="minima", minimization_results=[])
+        assert result[0][-1] is c
+
+    remap_to["s"] = _h3(None)  # a numbering matching neither parent endpoint: accepted
+    result = m.make_sequence_of_chains(chain=parent, split_method="minima", minimization_results=[])
+    assert np.allclose(result[0][-1].structure.geometry, remap_to["s"].geometry)

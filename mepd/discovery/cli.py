@@ -1022,15 +1022,18 @@ def _vri_single(ts_node, ts_modes, ts_n_imag, irc_path, output: Path, S: _VRISet
     }
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    # Checks on every branch with a second product: the basin test always (a
-    # branch is a bifurcation only if sideways pushes off the IRC drain into
-    # both P1 and P2), the exact VRI unless disabled, trajectories if asked.
+    # Checks on every branch with a second product or a VRT: the basin test
+    # always (a branch is a bifurcation only if sideways pushes off the IRC
+    # drain into two products; on a VRT branch where the P2 search found
+    # nothing, the basin test's second product is P2), the exact VRI unless
+    # disabled, trajectories if asked.
     from mepd.discovery.vri_checks import check_branch
 
     verdicts: List[str] = []
     for name in S.branch_names:
         products = branch_products.get(name)
-        if products is not None and products.p2 is not None:
+        has_p2 = products is not None and products.p2 is not None
+        if products is not None and (has_p2 or scan.branches[name].vrt is not None):
             typer.echo(f"[{label}] Checking the {name} branch (basin test"
                        + (", exact VRI" if S.exact_vri else "") + (f", {S.n_traj} trajectories" if S.n_traj else "") + ")...")
             try:
@@ -1043,6 +1046,8 @@ def _vri_single(ts_node, ts_modes, ts_n_imag, irc_path, output: Path, S: _VRISet
                 checks = {"error": f"{type(exc).__name__}: {exc}"}
                 typer.echo(f"  checks failed: {checks['error']}")
             products.checks = checks
+            if not has_p2 and (checks or {}).get("p2_source") == "basin":
+                _record_basin_p2(output, name, branch_results[name], output_files)
             if S.n_traj > 0 and checks and vri.basin_split(checks):
                 try:
                     more = check_branch(
@@ -1064,6 +1069,23 @@ def _vri_single(ts_node, ts_modes, ts_n_imag, irc_path, output: Path, S: _VRISet
     summary["output_files"] = {k: v for k, v in output_files.items() if v}
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
+
+
+def _record_basin_p2(d: Path, branch: str, result: dict, output_files: Optional[dict] = None) -> None:
+    """Note in a branch's summary entry the P2 the basin test found."""
+    fp = d / f"p2_{branch}.xyz"
+    pr = result.setdefault("products", {}) or {}
+    result["products"] = pr
+    energies = fp.with_suffix(".energies")
+    try:
+        import numpy as np
+
+        pr["p2_energy"] = float(np.atleast_1d(np.loadtxt(energies))[-1]) if energies.exists() else None
+    except Exception:
+        pr["p2_energy"] = None
+    pr["evidence"] = "basin"
+    if output_files is not None:
+        output_files[f"p2_{branch}"] = str(fp)
 
 
 def _opt(value, kind, default):
@@ -1403,8 +1425,11 @@ def vri_check(
     for cand in summary.get("ts1_candidates") or [{"label": "input", "dir": str(vri_output)}]:
         d = candidate_dir(vri_output, cand)
         cs = json.loads((d / "summary.json").read_text())
+        changed = False
         for branch, b in (cs.get("branches") or {}).items():
-            if not (b.get("products") or {}).get("p2_energy"):
+            pr = b.get("products") or {}
+            had_p2 = pr.get("p2_energy") is not None and pr.get("evidence") != "basin"
+            if not (had_p2 or b.get("vrt")):
                 continue
             typer.echo(f"[{cand['label']}] {branch} branch ({b['verdict']})")
             res = check_branch(d, branch, engine, charge=charge, multiplicity=multiplicity, workers=workers,
@@ -1414,6 +1439,31 @@ def vri_check(
                                opt_keywords=opt_keywords, log=typer.echo)
             if res is not None:
                 (d / f"checks_{branch}.json").write_text(json.dumps(res, indent=2))
+                if res.get("p2_source") == "basin":
+                    _record_basin_p2(d, branch, b)
+                if b.get("products") is not None:
+                    b["products"]["checks"] = res
+                if not b.get("verdict"):  # a run stopped before its verdicts were written
+                    b["verdict"] = "vrt_no_second_product" if b.get("vrt") else "no_vrt"
+                new = vri.verdict_after_checks(b["verdict"], had_p2, res)
+                if new != b["verdict"]:
+                    typer.echo(f"  verdict: {b['verdict']} -> {new}")
+                    b["verdict"] = new
+                changed = True
                 done += 1
+        if changed:
+            cs["verdict"] = vri.overall_verdict([b["verdict"] for b in cs["branches"].values()])
+            (d / "summary.json").write_text(json.dumps(cs, indent=2))
+    if done and summary.get("ts1_candidates"):
+        # Re-read: for the input TS the top-level summary is also its own.
+        top = json.loads((vri_output / "summary.json").read_text())
+        for c in top["ts1_candidates"]:
+            fp = candidate_dir(vri_output, c) / "summary.json"
+            if fp.exists():
+                c["verdict"] = json.loads(fp.read_text()).get("verdict")
+        top["input_verdict"] = next((c["verdict"] for c in top["ts1_candidates"] if c["label"] == "input"),
+                                    top.get("input_verdict"))
+        top["verdict"] = vri.overall_verdict([c["verdict"] for c in top["ts1_candidates"] if c.get("verdict")])
+        (vri_output / "summary.json").write_text(json.dumps(top, indent=2))
     if not done:
-        typer.echo("No branch with a second product (P2) to check.")
+        typer.echo("No branch with a VRT or second product to check.")

@@ -88,3 +88,21 @@ def test_basin_paths_are_recorded_and_saved_with_the_other_kind_kept(tmp_path):
     assert list(z["trajectory_labels"]) == ["P2"]
     assert z["basin_offsets"][-1] == len(z["basin_coords"]) == sum(len(p) for p in res.paths)
     assert sorted(z["basin_labels"]) == ["P1", "P2"]
+
+
+def test_basin_test_finds_the_second_product_without_a_known_p2():
+    surface = _Surface("sym", eps=0.02)
+    engine = _AnalyticEngine(surface)
+    ts = _find_ts(surface, [-1.0, 0.0])
+    nodes = _irc(surface, ts)
+    scan = vri.scan_irc_for_vrt(nodes, engine, vrt_threshold=0.05, persist=2)
+    pts = [p for p in scan.branches["forward"].points if 0.3 < p.s < 2.2][::8]
+    p1 = _xy(surface, [1.2808, -1.1317])
+    res = vri_checks.basin_test([p.node for p in pts], [p.s for p in pts], [np.array([0.0, 1.0])] * len(pts),
+                                p1, None, engine, displacements=(0.05, 0.1, 0.2))
+    assert res.counts.get("P1", 0) > 0 and res.counts.get("P2", 0) > 0, res.counts
+    checks = {"basin": res.to_dict()}
+    assert vri.verdict_after_checks("vrt_no_second_product", False, checks) == "bifurcation"
+    one_sided = {"basin": {"counts": {"P1": 12}}}
+    assert vri.verdict_after_checks("vrt_no_second_product", False, one_sided) == "vrt_no_second_product"
+    assert vri.verdict_after_checks("bifurcation", True, one_sided) == "second_product_no_split"
