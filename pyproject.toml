@@ -68,11 +68,23 @@ gxtb = [
 aam = [
     "slapmapper @ git+https://github.com/shin1koda/slap-mapper",
 ]
-# FAIRChemEngine (engine_name="fairchem"): UMA and other FAIR-Chem MLIPs.
-# The UMA weights are gated on Hugging Face (facebook/UMA): accept the
-# license, then `hf auth login`. Pulls in PyTorch.
+# Machine-learned potentials (engine_name="mlip"; `mepd models` lists them).
+# AIMNet2, ANI, Orb and MACE weights download without any account; the
+# FAIR-Chem models (UMA, eSEN) are gated on Hugging Face: request access on
+# the model page, then `hf auth login`. All pull in PyTorch.
 mlip = [
     "fairchem-core>=2.23.0; python_version >= '3.11'",
+    "aimnet[ase]>=0.2.0; python_version >= '3.11'",
+    "torchani>=2.9.0",
+]
+# Orb and MACE cannot share an environment with fairchem-core (orb-models
+# pins nvalchemi-toolkit-ops<0.4, fairchem needs >=0.4.1; mace-torch pins
+# e3nn 0.4, fairchem needs 0.6): install one of these instead of `mlip`.
+orb = [
+    "orb-models>=0.7.0; python_version >= '3.12'",
+]
+mace = [
+    "mace-torch>=0.3.16",
 ]
 
 [project.scripts]

@@ -1345,6 +1345,44 @@ def optimize(
 _DEFAULT_INPUTS_PATH_METHODS = ("NEB", "FNEB", "NEB-DLF", "GEOMETRIC-NEB", "GSM")
 
 
+@app.command("models")
+def models() -> None:
+    """List the machine-learned potentials usable as `engine_name = "mlip"`:
+    whether each is open or needs Hugging Face access, whether its package is
+    installed here, and what it covers."""
+    import importlib.util
+
+    from rich.console import Console
+    from rich.markup import escape
+    from rich.table import Table
+
+    from mepd.engines.mlip import MODELS
+
+    packages = {"aimnet2": "aimnet", "orb": "orb_models", "ani": "torchani", "mace": "mace", "fairchem": "fairchem"}
+    table = Table(title="MLIP models (mlip_engine_kwds.model)", show_lines=False)
+    for col in ("model", "access", "installed", "charge / spin", "elements", "install"):
+        table.add_column(col, overflow="fold")
+    for name, spec in MODELS.items():
+        installed = importlib.util.find_spec(packages[spec.family]) is not None
+        table.add_row(
+            name,
+            "[yellow]gated: request access at huggingface.co/" + spec.options.get("repo", "") + "[/yellow]"
+            if spec.gated else "[green]open[/green]",
+            "yes" if installed else "no",
+            escape(spec.charge_and_spin),
+            escape(spec.elements),
+            escape(spec.install),
+        )
+    console = Console()
+    console.print(table)
+    console.print(escape(
+        'Use one with engine_name = "mlip" and [mlip_engine_kwds] model = "<name>". '
+        'A local file: add family = "aimnet2" | "orb" | "fairchem" | "mace" and checkpoint = "/path". '
+        'Any other ASE calculator: calculator = "package.module:ClassOrFactory" (+ calculator_kwds). '
+        'Install: `uv sync --inexact --extra mlip` (fairchem, AIMNet2, ANI), or `--extra orb` / `--extra mace` in a separate environment.'
+    ))
+
+
 @app.command("init")
 def make_default_inputs(
     output: Path = typer.Option(

@@ -417,9 +417,11 @@ class RunInputs:
     """
     `engine_name`: the level of theory --
         "gxtb" (local g-xTB), "qccompute" / "chemcloud" (`program` +
-        `program_kwds`), "fairchem" (a FAIR-Chem MLIP such as UMA, configured by
-        `fairchem_engine_kwds`: model, task, device, checkpoint,
-        inference_settings, batch_size), or "ase" (any ASE calculator:
+        `program_kwds`), "mlip" (a machine-learned potential chosen by name in
+        `mlip_engine_kwds.model`, e.g. "aimnet2-rxn", "orb-v3-conservative-omol",
+        "uma-s-1p2p1"; a local file via `family` + `checkpoint`; `mepd models`
+        lists them -- see mepd/engines/mlip.py), "fairchem" (FAIR-Chem models
+        with their own `fairchem_engine_kwds`), or "ase" (any ASE calculator:
         `ase_engine_kwds.calculator = "package.module:ClassName"` with its
         keyword arguments in `ase_engine_kwds.calculator_kwds`).
     """
@@ -442,6 +444,7 @@ class RunInputs:
     ase_engine_kwds: dict = None
     gxtb_engine_kwds: dict = None
     fairchem_engine_kwds: dict = None
+    mlip_engine_kwds: dict = None
     geometry_optimizer_kwds: dict = None
     optimizer_kwds: dict = None
 
@@ -598,7 +601,7 @@ class RunInputs:
             self.program_kwds = None
 
         if self.program_kwds is None:
-            if self.engine_name in {"gxtb", "ase", "fairchem"}:
+            if self.engine_name in {"gxtb", "ase", "fairchem", "mlip"}:
                 # Neither engine uses the qccompute/chemcloud ProgramArgs/qcdata
                 # input construct -- gxtb shells out directly, and ASEEngine
                 # takes an already-constructed ase.Calculator.
@@ -644,6 +647,7 @@ class RunInputs:
             self.gxtb_engine_kwds = dict(self.gxtb_engine_kwds)
 
         self.fairchem_engine_kwds = dict(self.fairchem_engine_kwds or {})
+        self.mlip_engine_kwds = dict(self.mlip_engine_kwds or {})
 
         if self.geometry_optimizer_kwds is None:
             self.geometry_optimizer_kwds = {}
@@ -677,6 +681,10 @@ class RunInputs:
                              geometry_optimizer_kwds=self.geometry_optimizer_kwds,
                              frozen_atom_indices=self.chain_inputs.frozen_atom_indices,
                              )
+        elif self.engine_name == 'mlip':
+            from mepd.engines.mlip import build_mlip_engine
+
+            eng = build_mlip_engine(self.mlip_engine_kwds)
         elif self.engine_name == 'fairchem':
             from mepd.engines.fairchem import FAIRChemEngine
 

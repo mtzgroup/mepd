@@ -101,9 +101,21 @@ class FAIRChemEngine(ASEEngine):
             return pretrained_mlip.load_predict_unit(
                 self.checkpoint, inference_settings=self.inference_settings, device=device
             )
-        return pretrained_mlip.get_predict_unit(
-            self.model, inference_settings=self.inference_settings, device=device
-        )
+        try:
+            return pretrained_mlip.get_predict_unit(
+                self.model, inference_settings=self.inference_settings, device=device
+            )
+        except Exception as exc:
+            text = f"{type(exc).__name__}: {exc}"
+            if "Gated" in type(exc).__name__ or any(code in text for code in ("401", "403", "restricted")):
+                from mepd.engines.mlip import MODELS, UMA_ACCESS_HELP
+
+                spec = MODELS.get(self.model)
+                repo = spec.options.get("repo", "facebook/UMA") if spec else "facebook/UMA"
+                raise PermissionError(
+                    f"Can't download {self.model!r}: {text.splitlines()[0]}\n" + UMA_ACCESS_HELP.format(repo=repo)
+                ) from exc
+            raise
 
     @property
     def calculator(self):
