@@ -296,6 +296,7 @@ class GXTBCalculator(Engine):
         cwd: Path,
         optimize: bool,
         watch: Callable[[], None] | None = None,
+        extra_args: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         cmd = [
             self.executable,
@@ -310,7 +311,7 @@ class GXTBCalculator(Engine):
             cmd.extend(["--uhf", str(uhf)])
         if self.add_gxtb_flag and Path(self.executable).name != "gxtb":
             cmd.append("--gxtb")
-        cmd.extend(self.extra_args)
+        cmd.extend(self.extra_args if extra_args is None else extra_args)
 
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(int(self.n_threads))
@@ -512,63 +513,58 @@ class GXTBCalculator(Engine):
         if maxiter is not None:
             extra_args.extend(["--cycles", str(int(maxiter))])
 
-        original_extra_args = self.extra_args
-        self.extra_args = extra_args
-        try:
-            with tempfile.TemporaryDirectory(prefix="gxtb-opt-") as tmp:
-                workdir = Path(tmp)
-                xyz_path = workdir / "structure.xyz"
-                xyz_path.write_text(node.structure.to_xyz())
-                from mepd import progress as _progress
+        with tempfile.TemporaryDirectory(prefix="gxtb-opt-") as tmp:
+            workdir = Path(tmp)
+            xyz_path = workdir / "structure.xyz"
+            xyz_path.write_text(node.structure.to_xyz())
+            from mepd import progress as _progress
 
-                sink = _progress.minimization_sink()
-                watch = None
-                if sink is not None:
-                    natoms = len(node.symbols)
+            sink = _progress.minimization_sink()
+            watch = None
+            if sink is not None:
+                natoms = len(node.symbols)
 
-                    def watch(final: bool = False) -> None:
-                        energies, frames = _read_xtbopt_progress(workdir / "xtbopt.log", natoms)
-                        if energies:
-                            sink(energies, frames, final=final)
+                def watch(final: bool = False) -> None:
+                    energies, frames = _read_xtbopt_progress(workdir / "xtbopt.log", natoms)
+                    if energies:
+                        sink(energies, frames, final=final)
 
-                completed = self._run_gxtb(
-                    xyz_path=xyz_path,
-                    charge=int(node.structure.charge),
-                    multiplicity=int(node.structure.multiplicity),
-                    cwd=workdir,
-                    optimize=True,
-                    watch=watch,
+            completed = self._run_gxtb(
+                xyz_path=xyz_path,
+                charge=int(node.structure.charge),
+                multiplicity=int(node.structure.multiplicity),
+                cwd=workdir,
+                optimize=True,
+                watch=watch,
+                extra_args=extra_args,
+            )
+            if watch is not None:
+                watch(final=True)  # the steps written after the last poll
+            _check_gxtb_optimization_converged(completed.stdout, maxiter=maxiter)
+            try:
+                opt_nodes = self._parse_optimization_trajectory(
+                    node=node,
+                    fp=workdir / "xtbopt.log",
                 )
-                if watch is not None:
-                    watch(final=True)  # the steps written after the last poll
-                _check_gxtb_optimization_converged(completed.stdout, maxiter=maxiter)
-                try:
-                    opt_nodes = self._parse_optimization_trajectory(
-                        node=node,
-                        fp=workdir / "xtbopt.log",
-                    )
-                    if not opt_nodes:
-                        opt_nodes = [
-                            self._parse_optimized_node(node=node, fp=workdir / "xtbopt.xyz")
-                        ]
-                except Exception as exc:
-                    raise ElectronicStructureError(
-                        msg="Failed to parse g-xTB optimization output.",
-                        obj=completed.stdout + completed.stderr,
-                    ) from exc
+                if not opt_nodes:
+                    opt_nodes = [
+                        self._parse_optimized_node(node=node, fp=workdir / "xtbopt.xyz")
+                    ]
+            except Exception as exc:
+                raise ElectronicStructureError(
+                    msg="Failed to parse g-xTB optimization output.",
+                    obj=completed.stdout + completed.stderr,
+                ) from exc
 
-                final_result = self._compute_node(opt_nodes[-1])
-                opt_nodes[-1]._cached_result = final_result
-                opt_nodes[-1]._cached_energy = final_result.results.energy
-                opt_nodes[-1]._cached_gradient = final_result.results.gradient
+            final_result = self._compute_node(opt_nodes[-1])
+            opt_nodes[-1]._cached_result = final_result
+            opt_nodes[-1]._cached_energy = final_result.results.energy
+            opt_nodes[-1]._cached_gradient = final_result.results.gradient
 
-                if self.keep_workdirs:
-                    persistent = Path.cwd() / "gxtb-workdirs"
-                    persistent.mkdir(exist_ok=True)
-                    shutil.copytree(workdir, persistent / workdir.name, dirs_exist_ok=True)
-        finally:
-            self.extra_args = original_extra_args
-
+            if self.keep_workdirs:
+                persistent = Path.cwd() / "gxtb-workdirs"
+                persistent.mkdir(exist_ok=True)
+                shutil.copytree(workdir, persistent / workdir.name, dirs_exist_ok=True)
         return opt_nodes
 
     def compute_geometry_optimizations(
