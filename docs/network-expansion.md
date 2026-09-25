@@ -50,6 +50,19 @@ Species within `--energy-window` (60 kcal/mol) of the seed are expanded in
 the next round. If a later proposal matches a species already found, it is
 recorded as an edge to that species without being optimized again.
 
+## Methods and references
+
+| stage | method | reference |
+|---|---|---|
+| Enumeration | break ≤ n and form ≤ m bonds on the molecular graph, filtered by coordination | ZStruct: P. M. Zimmerman, *J. Comput. Chem.* **34**, 1385–1392 (2013), [doi:10.1002/jcc.23271](https://doi.org/10.1002/jcc.23271); the "b2f2" enumeration of YARP: Q. Zhao, B. M. Savoie, *Nat. Comput. Sci.* **1**, 479–490 (2021), [doi:10.1038/s43588-021-00101-3](https://doi.org/10.1038/s43588-021-00101-3) |
+| Lewis-structure filter | bond orders and formal charges from connectivity (RDKit `DetermineBondOrders`) | xyz2mol: Y. Kim, W. Y. Kim, *Bull. Korean Chem. Soc.* **36**, 1769–1777 (2015), [doi:10.1002/bkcs.10334](https://doi.org/10.1002/bkcs.10334) |
+| Product guess geometry | restrained relaxation of the source geometry onto the product bonds | mepd's own heuristic, not a published method |
+| Live-view animation | geodesic interpolation from source to product | X. Zhu, K. C. Thompson, T. J. Martínez, *J. Chem. Phys.* **150**, 164103 (2019), [doi:10.1063/1.5090303](https://doi.org/10.1063/1.5090303) |
+
+The same list is written to `summary.json` (`methods`) and shown with the
+results in the web UI. mepd reimplements the enumeration; it does not call
+ZStruct or YARP.
+
 ## Other generators
 
 These options plug in in place of the built-in generator:
@@ -72,7 +85,7 @@ These options plug in in place of the built-in generator:
 | `species/species_<k>.xyz` | one file per species, e.g. to pass to `mepd network-splits` or `channels` |
 | `proposals.xyz` | every product guess, before optimization |
 | `rejected.xyz` | species that failed the Hessian check |
-| `summary.json` | the species (SMILES, round, energy relative to the seed, Hessian record); one record per proposed reaction (source, target, bonds broken and formed, outcome, whether it landed on the proposed connectivity); rounds; `connections` |
+| `summary.json` | the methods and references used; the species (SMILES, round, energy relative to the seed, Hessian record); one record per proposed reaction (source, target, bonds broken and formed, outcome, whether it landed on the proposed connectivity); rounds; `connections` |
 | `pairs/`, `network.json` | with `--connect`: one MSMEP tree per reaction, and the network built from them (as in `mepd network-splits`) |
 
 ## Limits

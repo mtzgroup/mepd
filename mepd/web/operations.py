@@ -310,6 +310,8 @@ class ExpandParams(Params):
                       "that reached a new species, and build the network from the paths.", cli="--connect", kind="toggle")
     max_pairs: int = P(50, "Max path searches", cli="--max-pairs", ge=1, requires="connect")
     maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
+    workers: int = P(4, "Parallel workers", "Processes building product guesses and their animations.",
+                     cli="--workers", ge=1, advanced=True, group="Advanced")
 
 
 # --------------------------------------------------------------- context
@@ -688,9 +690,11 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         unavailable_reason="The engine can generate nanoreactor candidates "
         "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
     Operation(
-        "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming bonds "
-        "(valence and Lewis-structure rules, no Hessians), optimize them, and repeat from the new species; "
-        "optionally connect each reaction by a path search. (`mepd discovery expand`)",
+        "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming up to two "
+        "bonds on the molecular graph (the ZStruct/YARP enumeration: Zimmerman, J. Comput. Chem. 2013; Zhao & "
+        "Savoie, Nat. Comput. Sci. 2021), keep those with a valid Lewis structure (xyz2mol: Kim & Kim, Bull. Korean "
+        "Chem. Soc. 2015), optimize them, and repeat from the new species; optionally connect each reaction by a "
+        "path search. (`mepd discovery expand`)",
         "structure", EXPLORE, ExpandParams, _build_discovery("expand"),
         produces=["product species", "proposed reactions", "network edges (with path search)"],
         cli_path=("discovery", "expand"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),

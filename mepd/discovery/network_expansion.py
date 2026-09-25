@@ -11,6 +11,18 @@ DetermineBondOrders), and builds each product's 3D guess from the reactant
 geometry by a restrained relaxation onto the new bonds -- so every product
 keeps the reactant's atom order and can go straight into a path search.
 
+Methods (see REFERENCES):
+  * the break/form enumeration over the bond graph is the ZStruct scheme
+    (Zimmerman 2013), in the n-break/n-form form YARP uses (Zhao & Savoie
+    2021);
+  * the Lewis-structure filter is RDKit's DetermineBondOrders, an
+    implementation of xyz2mol (Kim & Kim 2015);
+  * the restrained relaxation that builds each product guess is mepd's own
+    heuristic (springs on the product bonds, repulsion elsewhere, a weak
+    tether to the source geometry), not a published method;
+  * the live view's animations are geodesic interpolations (Zhu, Thompson &
+    Martinez 2019).
+
 Any other generator plugs in by import path: a callable
 `generate(structure, **options)` returning product Structures in the same
 atom order (or xyz paths); `products_file` imports products an external
@@ -31,6 +43,28 @@ from mepd.nodes.node import StructureNode
 from mepd.nodes.nodehelpers import _connectivity_matches
 
 OnEvent = Optional[Callable[[str, dict], None]]
+
+# What each stage is, and where it comes from (written into summary.json and
+# shown by the CLI and the web UI).
+REFERENCES = {
+    "enumeration": {
+        "method": "break up to n bonds and form up to m bonds on the molecular graph (ZStruct; the b2f2 enumeration of YARP)",
+        "cite": ["P. M. Zimmerman, J. Comput. Chem. 34, 1385-1392 (2013), doi:10.1002/jcc.23271",
+                 "Q. Zhao, B. M. Savoie, Nat. Comput. Sci. 1, 479-490 (2021), doi:10.1038/s43588-021-00101-3"],
+    },
+    "lewis_filter": {
+        "method": "bond orders and formal charges from connectivity: RDKit DetermineBondOrders (xyz2mol)",
+        "cite": ["Y. Kim, W. Y. Kim, Bull. Korean Chem. Soc. 36, 1769-1777 (2015), doi:10.1002/bkcs.10334"],
+    },
+    "guess_geometry": {
+        "method": "mepd heuristic: restrained relaxation of the source geometry onto the product bonds (not a published method)",
+        "cite": [],
+    },
+    "animation": {
+        "method": "geodesic interpolation between source and product (live view only)",
+        "cite": ["X. Zhu, K. C. Thompson, T. J. Martinez, J. Chem. Phys. 150, 164103 (2019), doi:10.1063/1.5090303"],
+    },
+}
 Edge = tuple[int, int]
 
 # (min, max) number of bonded neighbours an atom may have in a proposed
@@ -62,6 +96,7 @@ class Proposal:
     formed: tuple[Edge, ...]
     smiles: str
     structure: object = None  # guess geometry (qcdata Structure), reactant atom order
+    frames: Optional[list] = field(default=None, repr=False)  # live view: source-to-guess animation
 
     @property
     def label(self) -> str:
@@ -337,45 +372,132 @@ _OUTCOME_LABEL = {"new_species": "new species", "known_species": "known species"
                   "not_minimum": "not a minimum", "failed": "failed"}
 
 
+def _morph_frames(job) -> list[str]:
+    """xyz frames of a geodesic interpolation (Zhu, Thompson & Martinez,
+    J. Chem. Phys. 150, 164103 (2019)) from structure a to b, moved as one
+    rigid body so the first frame sits on `reference` (Bohr). A plain
+    function of plain data, so it runs in a worker process."""
+    from qcdata import Structure
+
+    from mepd.chainhelpers import run_geodesic
+
+    symbols, charge, mult, xa, xb, reference, nimages = job
+    a, b = (StructureNode(structure=Structure(symbols=list(symbols), geometry=np.asarray(x), charge=charge,
+                                              multiplicity=mult)) for x in (xa, xb))
+    try:
+        nodes = list(run_geodesic([a, b], nimages=nimages))
+    except Exception:
+        nodes = [a, b]
+    coords = [np.asarray(n.coords, dtype=float) for n in nodes]
+    shift = coords[0].mean(axis=0)
+    u, _, vt = np.linalg.svd((coords[0] - shift).T @ reference)
+    rot = u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
+    return [n.structure.model_copy(update={"geometry": (c - shift) @ rot}).to_xyz() for n, c in zip(nodes, coords)]
+
+
 class _LiveReactions:
     """Live view (web UI): one stream per proposed reaction, animating the
     source turning into the product by geodesic interpolation -- into the
     proposed guess while it waits and optimizes, then into what it
     optimized to. Costs nothing when nobody is watching."""
 
-    def __init__(self, seed_energy: float, nimages: int = 16):
+    def __init__(self, seed: StructureNode, seed_energy: float, nimages: int = 16, workers: int = 1):
         from mepd import progress
 
         self._progress = progress
         self.enabled = progress._stream_path("probe") is not None
         self.e0 = seed_energy
         self.nimages = nimages
+        self.workers = max(1, int(workers))
         self._streams: dict[int, str] = {}
+        self._frames_of: dict[int, list] = {}   # proposal -> seed-to-guess frames
+        self._pool = None
+        self._pending: list = []
+        # Every animation starts from the seed in one fixed pose (centred,
+        # principal axes along x, y, z), so they all begin in the same place.
+        x = np.asarray(seed.coords, dtype=float)
+        x = x - x.mean(axis=0)
+        _, _, vt = np.linalg.svd(x, full_matrices=False)
+        if np.linalg.det(vt) < 0:
+            vt[-1] *= -1
+        self.reference = x @ vt.T
 
-    def _frames(self, a: StructureNode, b: StructureNode) -> list[str]:
-        from mepd.chainhelpers import run_geodesic
+    def job(self, a: StructureNode, b: StructureNode):
+        st = a.structure
+        return (list(st.symbols), int(st.charge), int(st.multiplicity), np.asarray(a.coords, dtype=float),
+                np.asarray(b.coords, dtype=float), self.reference, self.nimages)
 
-        try:
-            return [n.structure.to_xyz() for n in run_geodesic([a, b], nimages=self.nimages)]
-        except Exception:
-            return [a.structure.to_xyz(), b.structure.to_xyz()]
+    def _submit(self, job, done: Callable[[list], None]) -> None:
+        """Compute frames off the main loop (forked workers when that is safe,
+        else threads) and hand them to `done` when ready."""
+        if self._pool is None:
+            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-    def _write(self, p: Proposal, species, target: StructureNode, *, status: str, outcome=None,
+            from mepd.cli_common import _unsafe_to_fork
+
+            if self.workers > 1 and _unsafe_to_fork() is None:
+                import multiprocessing
+
+                self._pool = ProcessPoolExecutor(self.workers, mp_context=multiprocessing.get_context("fork"))
+            else:
+                self._pool = ThreadPoolExecutor(1)
+        fut = self._pool.submit(_morph_frames, job)
+        fut.add_done_callback(lambda f: done(f.result() if f.exception() is None else []))
+        self._pending.append(fut)
+
+    def close(self) -> None:
+        """Wait for the last animations, so every stream ends finished."""
+        if self._pool is not None:
+            for fut in self._pending:
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+            self._pool.shutdown(wait=True)
+            self._pool = None
+
+    def _write(self, p: Proposal, species, frames: list, *, status: str, outcome=None,
                product_kcal=None, product_smiles=None, note: str = "") -> None:
         stream = self._streams.setdefault(id(p), f"rxn{len(self._streams) + 1:04d}")
         src = species[p.source]
         sym = list(src.node.symbols)
         bonds = [f"−{sym[i]}{i}–{sym[j]}{j}" for i, j in p.broken] + [f"+{sym[i]}{i}–{sym[j]}{j}" for i, j in p.formed]
         self._progress.write_morph(
-            stream, self._frames(src.node, target), label=f"#{int(stream[3:])} from species {p.source}",
+            stream, frames, label=f"#{int(stream[3:])} from species {p.source}",
             caption=(" ".join(bonds) or "from the external generator") + note,
             status=status, finished=status in ("done", "failed"), outcome=outcome,
             energies_kcal=(src.rel_energy_kcal, product_kcal),
-            reactant_smiles=src.smiles, product_smiles=product_smiles or p.smiles)
+            reactant_smiles=src.smiles, product_smiles=product_smiles or p.smiles,
+            extra={"source": p.source, "bonds": " ".join(bonds)})
 
-    def propose(self, p: Proposal, species, status: str = "queued") -> None:
-        if self.enabled:
-            self._write(p, species, StructureNode(structure=p.structure), status=status)
+    def _event(self, edge: ProposedEdge, species) -> None:
+        """A new species (or a new link between two known ones) as soon as
+        it is accepted, so a viewer can add it to its network right away."""
+        src = species[edge.source]
+        sym = list(src.node.symbols)
+        p = edge.proposal
+        caption = " ".join([f"−{sym[i]}{i}–{sym[j]}{j}" for i, j in p.broken]
+                           + [f"+{sym[i]}{i}–{sym[j]}{j}" for i, j in p.formed])
+        if edge.outcome == "new_species":
+            s = species[edge.target]
+            self._progress.append_live_event({
+                "event": "species", "index": edge.target, "parent": edge.source, "smiles": s.smiles,
+                "energy_hartree": float(s.node.energy), "rel_energy_kcal": s.rel_energy_kcal, "round": s.round,
+                "validation": s.validation, "xyz": s.node.structure.to_xyz(), "caption": caption})
+        elif edge.outcome == "known_species" and edge.target is not None and edge.target != edge.source:
+            self._progress.append_live_event({
+                "event": "reaction", "source": edge.source, "target": edge.target, "caption": caption})
+
+    def propose(self, p: Proposal, species, frames: Optional[list] = None, status: str = "queued") -> None:
+        if not self.enabled:
+            return
+        if frames is not None:
+            self._frames_of[id(p)] = frames
+        frames = self._frames_of.get(id(p))
+        if frames is None:  # not built with the guess (external generator): make it now
+            frames = _morph_frames(self.job(species[p.source].node, StructureNode(structure=p.structure)))
+            self._frames_of[id(p)] = frames
+        self._write(p, species, frames, status=status)
 
     def optimizing(self, p: Proposal, species) -> None:
         self.propose(p, species, status="running")
@@ -383,6 +505,7 @@ class _LiveReactions:
     def finish(self, edge: ProposedEdge, species, product: Optional[StructureNode] = None) -> None:
         if not self.enabled:
             return
+        self._event(edge, species)
         p = edge.proposal
         node = product if product is not None else (
             species[edge.target].node if edge.target is not None else StructureNode(structure=p.structure))
@@ -393,9 +516,33 @@ class _LiveReactions:
         note = " · relaxed to a different product than proposed" if edge.intended is False else ""
         if edge.error:
             note += f" · {edge.error}"
-        self._write(p, species, node, status="failed" if edge.outcome == "failed" else "done",
-                    outcome=_OUTCOME_LABEL.get(edge.outcome, edge.outcome), product_kcal=kcal,
-                    product_smiles=species[edge.target].smiles if edge.target is not None else None, note=note)
+        write = lambda frames: self._write(  # noqa: E731
+            p, species, frames or self._frames_of.get(id(p)) or [], status="failed" if edge.outcome == "failed" else "done",
+            outcome=_OUTCOME_LABEL.get(edge.outcome, edge.outcome), product_kcal=kcal,
+            product_smiles=species[edge.target].smiles if edge.target is not None else None, note=note)
+        self._submit(self.job(species[p.source].node, node), write)
+
+
+def _build_guesses(props: list[Proposal], node: StructureNode, coords: np.ndarray, live, workers: int) -> None:
+    """Each proposal's 3D guess (and, for a watching live view, its
+    seed-to-guess animation), across `workers` forked processes."""
+    from mepd.cli_common import _fork_map
+
+    symbols = list(node.symbols)
+    edges = graph_edges(node)
+
+    def build(k):
+        p = props[k]
+        guess = embed_product(symbols, coords, (edges - set(p.broken)) | set(p.formed))
+        frames = None
+        if live.enabled:
+            structure = _structure_with(node.structure, guess)
+            frames = _morph_frames(live.job(node, StructureNode(structure=structure)))
+        return guess, frames
+
+    for p, (guess, frames) in zip(props, _fork_map(build, list(range(len(props))), workers)):
+        p.structure = _structure_with(node.structure, guess)
+        p.frames = frames
 
 
 def expand_network(
@@ -404,7 +551,7 @@ def expand_network(
     products_file: Optional[str] = None, maxiter: int = 500, n_break: int = 2, n_form: int = 2,
     form_distance: float = 4.0, max_products: int = 50, allow_radicals: bool = False,
     allow_zwitterions: bool = False, max_species: int = 200, validate_minima: Optional[dict] = None,
-    on_event: OnEvent = None,
+    workers: int = 1, on_event: OnEvent = None,
 ) -> ExpansionResult:
     """Breadth-first network expansion from `seed`. Each round proposes
     products of every species found in the previous round (within
@@ -422,7 +569,7 @@ def expand_network(
     charge, mult = int(seed.structure.charge), int(seed.structure.multiplicity)
     result = ExpansionResult(species=[Species(seed, lewis_smiles(symbols, graph_edges(seed), charge, mult,
                                                                  allow_radicals=True, allow_zwitterions=True) or "", 0)])
-    live = _LiveReactions(e0)
+    live = _LiveReactions(seed, e0, workers=workers)
 
     def _classify(p, guess, opt, record) -> ProposedEdge:
         intended = _connectivity_matches(opt, guess) if p.broken or p.formed else None
@@ -463,9 +610,7 @@ def expand_network(
                     n_break=n_break, n_form=n_form, form_distance=form_distance, max_products=max_products,
                     allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions, source=src,
                 )
-                for p in props:
-                    product = (graph_edges(node) - set(p.broken)) | set(p.formed)
-                    p.structure = _structure_with(node.structure, embed_product(symbols, coords, product))
+                _build_guesses(props, node, coords, live, workers)
             stats_all.append({"source": src, **stats})
             proposals.extend(props)
         known = {s.smiles: k for k, s in enumerate(result.species) if s.smiles}
@@ -475,7 +620,7 @@ def expand_network(
             live.finish(edge, result.species)
         proposals = [p for p in proposals if p.smiles not in known]
         for p in proposals:
-            live.propose(p, result.species)
+            live.propose(p, result.species, frames=p.frames)
         _emit(on_event, "proposed", round=rnd, total=len(proposals))
         guesses = [StructureNode(structure=p.structure) for p in proposals]
         optimized = _optimize(engine, guesses, maxiter, on_event,
@@ -505,4 +650,5 @@ def expand_network(
         result.rounds.append({"round": rnd, "sources": frontier, "proposed": len(proposals),
                               "new_species": found, "expanded_next": new_frontier, "generator_stats": stats_all})
         frontier = new_frontier
+    live.close()
     return result

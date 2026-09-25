@@ -317,7 +317,7 @@ def set_minimization_outcome(stream: str, outcome: str) -> None:
 
 def write_morph(stream: str, frames: list, *, label: str = "", caption: str = "", status: str = "queued",
                 finished: bool = False, outcome: str | None = None, energies_kcal: tuple = (None, None),
-                reactant_smiles: str = "", product_smiles: str = "") -> None:
+                reactant_smiles: str = "", product_smiles: str = "", extra: dict | None = None) -> None:
     """A live stream (kind "morph") animating one proposed reaction: the
     source structure turning into the product, as xyz frames of a geodesic
     interpolation. `energies_kcal` = (source, product) relative to the
@@ -328,13 +328,34 @@ def write_morph(stream: str, frames: list, *, label: str = "", caption: str = ""
     payload = {
         "kind": "morph", "stream": stream, "label": label or stream, "caption": caption,
         "plot": {"x": [0, 1], "y": list(energies_kcal), "caption": caption,
-                 "reactant_smiles": reactant_smiles, "product_smiles": product_smiles},
+                 "reactant_smiles": reactant_smiles, "product_smiles": product_smiles, **(extra or {})},
         "geometry": {"frames": list(frames), "ts_index": None},
         "reference": "seed", "updated": time.time(), "finished": finished, "status": status, "outcome": outcome,
     }
     try:
         fp.parent.mkdir(parents=True, exist_ok=True)
         _atomic_json_write(fp, payload)
+    except Exception:
+        return
+
+
+def append_live_event(event: dict) -> None:
+    """Append one JSON line to live/events.jsonl, for things a live viewer
+    should act on as they happen (e.g. a new species found, which the web UI
+    adds to its graph at once). No-op unless a live viewer is attached."""
+    fp = _stream_path("events")
+    if fp is None:
+        return
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(event, default=str) + "\n"
+        # One write on an O_APPEND file: a reader never sees half a line
+        # from us, only possibly a line still being written (no newline yet).
+        fd = os.open(fp.with_suffix(".jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
     except Exception:
         return
 

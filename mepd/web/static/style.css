@@ -496,8 +496,6 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .live-state.outcome-new-species { background: var(--ok-soft); color: var(--ok); }
 .live-state.outcome-known-species, .live-state.outcome-back-to-source, .live-state.queued { background: var(--panel-2); color: var(--muted); }
 .live-state.outcome-not-a-minimum { background: var(--danger-soft); color: var(--danger); }
-.monitor-smiles { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); padding-top: 2px; }
-.morph-smiles { overflow-wrap: anywhere; margin: 6px 0 0; }
 .follow-toggle { margin: 4px 0 8px; }
 .demo-banner { background: var(--accent-soft); color: var(--heading); padding: 6px 20px; border-bottom: 1px solid var(--border); flex: none; }
 .demo-badge { text-transform: uppercase; letter-spacing: .09em; background: var(--accent-soft); color: var(--label); }
@@ -528,3 +526,30 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .followups .section-title { margin-top: 6px; }
 .vri-explorer { margin-top: 22px; }
 .vri-frame { width: 100%; height: min(820px, 110vh); border: 1px solid var(--border); border-radius: var(--radius); background: #fff; }
+
+/* Network expansion live view: stage + growing grid of found structures. */
+.netlive { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 1000px) { .netlive { grid-template-columns: 1fr; } }
+.nl-stage { position: relative; padding: 0; overflow: hidden; }
+.nl-stage .viewer { border: 0; border-radius: 0; }
+.nl-empty { height: 420px; display: flex; align-items: center; justify-content: center; text-align: center; padding: 0 40px; }
+.nl-caption { padding: 10px 14px 12px; border-top: 1px solid var(--border); min-height: 58px; }
+.nl-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.nl-title .mono { overflow-wrap: anywhere; }
+.nl-controls { position: absolute; top: 10px; right: 10px; display: flex; gap: 6px; }
+.nl-list { max-height: 520px; display: flex; flex-direction: column; }
+.nl-list-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.nl-list-head h4 { margin: 0; }
+.nl-counts { margin: 6px 0 10px; }
+.nl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 8px; overflow-y: auto; padding: 2px; }
+.nl-tile { display: flex; flex-direction: column; gap: 4px; padding: 6px; text-align: left; font: inherit; color: inherit; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 4px; animation: nl-pop .35s ease-out; }
+.nl-tile:hover { border-color: var(--border-strong); }
+.nl-tile.pinned { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.nl-tile.arriving { visibility: hidden; animation: none; }
+.nl-tile.dim { opacity: .62; }
+.nl-depict { width: 100%; aspect-ratio: 3 / 2; object-fit: contain; display: block; }
+.nl-tile-foot { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
+.nl-ghost { position: fixed; z-index: 60; pointer-events: none; object-fit: contain;
+  background: var(--panel); border-radius: 4px; box-shadow: 0 6px 24px rgba(23, 50, 74, .18); }
+@keyframes nl-pop { from { transform: scale(.9); opacity: .4; } to { transform: none; opacity: 1; } }

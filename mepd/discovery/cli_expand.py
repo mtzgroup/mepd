@@ -3,6 +3,7 @@ graph rules (see mepd.discovery.network_expansion)."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -60,6 +61,10 @@ def expand(
         "atom-mapped to the seed (same atoms, same order). Replaces the generator for the seed."),
     maxiter: int = typer.Option(500, "--maxiter", help="Maximum geometry-optimization steps per proposal."),
     max_species: int = typer.Option(200, "--max-species", help="Stop adding species beyond this many."),
+    workers: int = typer.Option(
+        min(4, max(1, (os.cpu_count() or 1) // 2)), "--workers",
+        help="Processes building product guesses (and the web live view's animations) in parallel. "
+        "Optimizations use the engine's own parallelism (e.g. g-xTB runs one process per core)."),
     validate_minima_with_hessian: bool = typer.Option(
         False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
         help="Hessian-check every new species (rescue push along an unstable mode; dropped if still not a minimum)."),
@@ -81,6 +86,12 @@ def expand(
     the new species; optionally connect each proposed reaction by a path
     search.
 
+    Methods: break/form enumeration on the bond graph as in ZStruct
+    (Zimmerman, J. Comput. Chem. 2013) and YARP (Zhao & Savoie, Nat. Comput.
+    Sci. 2021); Lewis-structure filter by RDKit DetermineBondOrders, i.e.
+    xyz2mol (Kim & Kim, Bull. Korean Chem. Soc. 2015); product guesses by a
+    restrained relaxation of mepd's own. Full references in summary.json.
+
     Writes species.xyz (the seed first, then every species found),
     species/species_<k>.xyz, proposals.xyz (every product guess, before
     optimization), rejected.xyz (if Hessian-checked) and summary.json (the
@@ -91,7 +102,7 @@ def expand(
         _completed_tree_dirs, _echo_run_inputs_summary, _load_structure_from_smiles_or_xyz, _open_run_inputs,
         _run_msmep_pairs,
     )
-    from mepd.discovery.network_expansion import expand_network
+    from mepd.discovery.network_expansion import REFERENCES, expand_network
     from mepd.nodes.node import StructureNode
 
     for name, value in (("--rounds", rounds), ("--max-products", max_products), ("--maxiter", maxiter),
@@ -131,7 +142,7 @@ def expand(
                 generator_options=_parse_options(generator_option), products_file=str(products) if products else None,
                 maxiter=maxiter, n_break=n_break, n_form=n_form, form_distance=form_distance,
                 max_products=max_products, allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions,
-                max_species=max_species, on_event=on_event,
+                max_species=max_species, workers=workers, on_event=on_event,
                 validate_minima={"frequency_cutoff": validation["hessian_minimum_frequency_cutoff"],
                                  "rescue_displacement": validation["hessian_minima_rescue_displacement"]}
                 if validation else None,
@@ -175,6 +186,8 @@ def expand(
         "reactions": [{"source": e.source, "target": e.target, "outcome": e.outcome, "proposed_smiles": e.proposal.smiles,
                        "broken": [list(b) for b in e.proposal.broken], "formed": [list(f) for f in e.proposal.formed],
                        "landed_as_proposed": e.intended, "error": e.error or None} for e in result.edges],
+        "methods": REFERENCES if products is None and generator == "bond-rules"
+        else {k: v for k, v in REFERENCES.items() if k == "animation"},
         "rounds": result.rounds,
         "connections": [list(p) for p in pairs],
         "output_files": files,

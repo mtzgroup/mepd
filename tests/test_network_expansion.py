@@ -179,3 +179,34 @@ def test_live_view_animates_each_reaction_from_source_to_product(tmp_path, monke
     h_near = lambda x: np.argmin(np.linalg.norm(x[:2] - x[2], axis=1))  # H next to C (0) or N (1)
     assert (h_near(first), h_near(last)) == (0, 1)
     assert forward["plot"]["reactant_smiles"] == "C#N" and forward["plot"]["product_smiles"] == "[C-]#[NH+]"
+
+
+def test_parallel_guesses_match_serial_and_live_animations_start_at_the_seed(tmp_path, monkeypatch):
+    seed = _node("CCO")
+    serial = expand_network(seed, _GraphEngine(), max_products=6, workers=1)
+    monkeypatch.setenv("MEPD_DRIVE_CHAIN_DIR", str(tmp_path))
+    parallel = expand_network(seed, _GraphEngine(), max_products=6, workers=3)
+    assert [s.smiles for s in parallel.species] == [s.smiles for s in serial.species]
+    for a, b in zip(serial.species, parallel.species):
+        assert np.allclose(a.node.coords, b.node.coords)
+    firsts = []
+    for fp in sorted(tmp_path.glob("rxn*.json")):
+        data = json.loads(fp.read_text())
+        assert data["finished"] and len(data["geometry"]["frames"]) > 2
+        firsts.append(data["geometry"]["frames"][0])
+    assert len(firsts) == 6 and len(set(firsts)) == 1  # every animation begins from the same seed pose
+
+
+def test_summary_names_the_methods_and_references(tmp_path, monkeypatch):
+    def run_inputs(_path):
+        ri = RunInputs()
+        ri.engine = _GraphEngine()
+        return ri
+
+    monkeypatch.setattr(cli_common, "_open_run_inputs", run_inputs)
+    out = tmp_path / "out"
+    CliRunner().invoke(app, ["discovery", "expand", "CCO", "--max-products", "2", "--workers", "1", "-o", str(out)])
+    methods = json.loads((out / "summary.json").read_text())["methods"]
+    assert "doi:10.1002/jcc.23271" in " ".join(methods["enumeration"]["cite"])       # ZStruct
+    assert "doi:10.1002/bkcs.10334" in " ".join(methods["lewis_filter"]["cite"])     # xyz2mol
+    assert "not a published method" in methods["guess_geometry"]["method"]
