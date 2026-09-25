@@ -10,6 +10,7 @@ so those command modules don't have to import from each other.
 from __future__ import annotations
 
 import copy
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -480,15 +481,85 @@ def _fork_call(item):
     return _FORK_JOB["fn"](item)
 
 
+def _fork_probe_child() -> None:
+    """Runs in a throwaway forked child: does the one thing every real worker
+    does first -- launch a subprocess -- so a parent with broken `atfork`
+    handlers kills us here, in milliseconds, instead of mid-run.
+
+    `cwd` is set deliberately: CPython only takes its `posix_spawn` shortcut
+    when `cwd is None`, and it is the `fork()` path that runs the handlers, so
+    a probe without a `cwd` would not exercise what the engines exercise."""
+    import subprocess
+
+    subprocess.run(["/usr/bin/true"], capture_output=True, cwd="/")
+
+
+def _fork_probe_ok() -> bool:
+    """Whether a forked child survives long enough to start a subprocess."""
+    import multiprocessing
+
+    try:
+        child = multiprocessing.get_context("fork").Process(target=_fork_probe_child)
+        child.start()
+    except OSError:
+        return False
+    child.join(60)
+    if child.is_alive():  # wedged on an inherited lock rather than killed
+        child.kill()
+        child.join()
+        return False
+    return child.exitcode == 0
+
+
+def _unsafe_to_fork() -> Optional[str]:
+    """Why forking children that will launch subprocesses is unsafe here, or
+    None when it is fine.
+
+    On macOS a `pthread_atfork` handler that grabs a lock -- Tcl's notifier is
+    the one mepd hit, via `import tkinter`; CoreFoundation and the ObjC runtime
+    have the same shape -- hands every forked child a lock owned by a thread
+    that does not exist there. The child is then SIGKILLed the instant it forks
+    again to run the engine, with no Python traceback and nothing but a
+    `BrokenProcessPool` to show for it. `mepd/__init__.py` keeps Tk out of the
+    interpreter to prevent the known case; the probe then *verifies* the
+    result rather than inferring it from which modules happen to be imported,
+    since the handlers are registered in C and are not all enumerable from
+    Python. One fork and one `/usr/bin/true`, a few times per run."""
+    if sys.platform != "darwin":
+        return None
+    if sys.modules.get("_tkinter") is not None:
+        return "tkinter/Tcl is loaded, and its atfork handlers kill forked children on macOS"
+    if not _fork_probe_ok():
+        return "a probe child was killed as soon as it launched a subprocess (macOS atfork handlers)"
+    return None
+
+
 def _fork_map(fn, items: list, workers: int) -> list:
     """`[fn(x) for x in items]`, across `workers` forked processes when
     workers > 1. `fn` (and everything it closes over -- structures, the
     engine, RunInputs) reaches the children through fork rather than
-    pickling; only each item and its return value are pickled."""
+    pickling; only each item and its return value are pickled.
+
+    Falls back to running `items` serially -- rather than losing the run --
+    both when forking is known to be unsafe up front and when a child dies
+    without raising (SIGKILL, a segfaulting engine, the OOM killer), which
+    `ProcessPoolExecutor` can only report as `BrokenProcessPool` for the whole
+    pool. Every caller's `fn` writes its own files or returns its own value,
+    so re-running is wasted time, never a wrong answer."""
     if workers <= 1 or len(items) <= 1:
         return [fn(x) for x in items]
+
+    unsafe = _unsafe_to_fork()
+    if unsafe:
+        typer.echo(
+            f"Running {len(items)} item(s) serially instead of across "
+            f"{min(workers, len(items))} worker process(es): {unsafe}."
+        )
+        return [fn(x) for x in items]
+
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
 
     _FORK_JOB["fn"] = fn
     try:
@@ -497,6 +568,13 @@ def _fork_map(fn, items: list, workers: int) -> list:
             mp_context=multiprocessing.get_context("fork"),
         ) as pool:
             return list(pool.map(_fork_call, items))
+    except BrokenProcessPool:
+        typer.echo(
+            "A worker process died without reporting an error (killed by the "
+            "OS, or a crash inside the engine); retrying the remaining work "
+            "serially. Re-run with --workers 1 to skip the failed attempt."
+        )
+        return [fn(x) for x in items]
     finally:
         _FORK_JOB.pop("fn", None)
 
@@ -539,6 +617,12 @@ def _run_msmep_pairs(
         i, j = pair
         pair_dir = pairs_dir / f"pair_{i}_{j}"
         tree_dir = pair_dir / "tree"
+        # `todo` was filtered against the disk before the first attempt, but
+        # `_fork_map` may re-run this list serially after a worker died; pairs
+        # that did finish in the meantime are on disk and stay there.
+        if (tree_dir / "adj_matrix.txt").exists():
+            typer.echo(f"Skipping pair ({i}, {j}): already completed.")
+            return
         pair_dir.mkdir(parents=True, exist_ok=True)
         typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")
         # MSMEP's "endpoints already attempted elsewhere" dedup (meant to stop

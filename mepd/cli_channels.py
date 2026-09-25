@@ -506,7 +506,12 @@ def _discover_channels(
 
         def _opt(task):
             label, node = task
-            result = _optimize_ts_and_irc(node, run_inputs, ts_dir, run_irc=True, label=label)
+            # As in `_run_msmep_pairs`: `pending` was filtered against the disk
+            # before the first attempt, and `_fork_map` may re-run it serially
+            # after a worker died.
+            result = _load_ts_and_irc_from_disk(ts_dir, label, tree_charge, tree_multiplicity)
+            if result is None:
+                result = _optimize_ts_and_irc(node, run_inputs, ts_dir, run_irc=True, label=label)
             ok = result is not None and result.irc_chain is not None and len(result.irc_chain) >= 2
             return label, ok
 

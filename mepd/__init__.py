@@ -1,3 +1,41 @@
+"""mepd -- reaction path discovery.
+
+Note the Tcl/Tk guard below: it has to run before any `mepd.*` submodule
+(and so before `openbabel.pybel`) is imported, which is why it sits at the
+very top of the package's `__init__`.
+"""
+
+import os
+import sys
+
+# macOS fork safety. `mepd.cli_common._fork_map` runs pairs/TS-opts/mechanism
+# searches in *forked* children (fork, not spawn, so the closure's structures,
+# engine and RunInputs reach each child for free instead of being pickled).
+#
+# Importing `tkinter` registers Tcl's macOS notifier `pthread_atfork` handlers.
+# After a fork-without-exec, the child's copy of Tcl's `notifierInitLock` is
+# recorded as owned by a thread that does not exist there, so the next time
+# that child forks -- which is the first thing it does, to launch the engine's
+# subprocess -- `AtForkPrepare` tries to take the lock and the kernel SIGKILLs
+# the child ("BUG IN CLIENT OF LIBPLATFORM: os_unfair_lock is corrupt"). No
+# Python-level exception is raised, so the whole run dies with an opaque
+# `BrokenProcessPool` a few milliseconds into the first parallel stage.
+#
+# Nothing in mepd draws with Tk: the import arrives transitively through
+# `openbabel.pybel`, which wants it only for `Molecule.draw()` and already
+# falls back to `tk = None` when the import fails. Blocking it keeps Tcl's
+# atfork handlers unregistered and the children alive. `None` in `sys.modules`
+# is the documented way to make an import fail; set MEPD_ALLOW_TKINTER=1 to
+# keep Tk (and run the parallel stages with `--workers 1`).
+if (
+    sys.platform == "darwin"
+    and "_tkinter" not in sys.modules
+    and not os.environ.get("MEPD_ALLOW_TKINTER")
+):
+    for _tk_module in ("_tkinter", "tkinter"):
+        sys.modules.setdefault(_tk_module, None)
+    del _tk_module
+
 import importlib
 from typing import TYPE_CHECKING
 
