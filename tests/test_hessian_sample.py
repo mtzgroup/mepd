@@ -536,3 +536,40 @@ def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
         verbose=False, label="t")
     assert tried == [0.1, -0.1, 0.3, -0.3, 0.5, -0.5] and rescued is None and not check.is_minimum
     assert es._rescue_schedule(0.3) == [0.3, 0.5] and es._rescue_schedule(0.7) == [0.7]
+
+
+def test_restore_rigid_body_hessian_recovers_a_projected_hessian_off_equilibrium():
+    """A rotation-invariant pair potential away from its minimum: projecting
+    rigid motion out of the exact Hessian (what g-xTB does) and restoring it
+    from the gradient must give back the exact Hessian."""
+    import numpy as np
+
+    from mepd.engines.gxtb import restore_rigid_body_hessian
+
+    rng = np.random.default_rng(3)
+    X = rng.normal(size=(5, 3)) * 1.5
+
+    def energy(x):
+        x = x.reshape(-1, 3)
+        e = 0.0
+        for i in range(len(x)):
+            for j in range(i + 1, len(x)):
+                r = np.linalg.norm(x[i] - x[j])
+                e += (1 - np.exp(-(r - 2.0))) ** 2
+        return e
+
+    def grad(x, h=1e-5):
+        return np.array([(energy(x + h * e) - energy(x - h * e)) / (2 * h) for e in np.eye(x.size)])
+
+    x0 = X.reshape(-1)
+    H = np.array([(grad(x0 + 1e-4 * e) - grad(x0 - 1e-4 * e)) / 2e-4 for e in np.eye(x0.size)])
+    H = 0.5 * (H + H.T)
+    g = grad(x0)
+    # project rigid motion out (Cartesian), as a QC program would
+    r = X - X.mean(0)
+    V = [np.tile(a, (5, 1)).reshape(-1) for a in np.eye(3)] + [np.cross(a, r).reshape(-1) for a in np.eye(3)]
+    Q, _ = np.linalg.qr(np.array(V).T)
+    P = np.eye(15) - Q @ Q.T
+    projected = P @ H @ P
+    assert np.abs(projected - H).max() > 1e-3  # the projection really changes it here (g != 0)
+    np.testing.assert_allclose(restore_rigid_body_hessian(projected, X, g), H, atol=1e-5)

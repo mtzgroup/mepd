@@ -82,6 +82,10 @@ def fake_pipeline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(vri, "scan_irc_for_vrt", fake_scan)
     monkeypatch.setattr(vri, "find_bifurcation_products", fake_products)
+    import mepd.discovery.vri_checks as vri_checks
+
+    monkeypatch.setattr(vri_checks, "check_branch",
+                        lambda *a, **k: {"branch": a[1], "basin": {"counts": {"P1": 4, "P2": 2}, "starts": []}})
     return ts_fp, tmp_path, state
 
 
@@ -116,3 +120,25 @@ def test_vri_command_rejects_bad_branch_option(fake_pipeline):
     ts_fp, tmp_path, _ = fake_pipeline
     with pytest.raises(typer.BadParameter):
         _call_vri(ts=str(ts_fp), output=tmp_path / "out", branches="sideways")
+
+
+def test_visualize_renders_a_vri_output_directory(fake_pipeline):
+    from mepd.cli import _load_visualization_object
+    from mepd.viz_vri import VriResult, render_vri_html
+
+    ts_fp, tmp_path, _ = fake_pipeline
+    out = tmp_path / "out"
+    _call_vri(ts=str(ts_fp), output=out)
+
+    obj = _load_visualization_object(out, 0, 1)
+    assert isinstance(obj, VriResult)
+    cand = obj.candidates[0].payload
+    assert len(cand["irc"]["frames"]) == 9 and cand["irc"]["ts_frame"] == 4
+    forward = cand["branches"]["forward"]
+    assert forward["verdict"] == "bifurcation" and forward["vrt"]["s"] == 0.4
+    assert forward["p1"] and forward["p2"] and forward["ts2"] and forward["ridge_mode"]
+    assert cand["branches"]["reverse"]["vrt"] is None
+
+    page = render_vri_html(obj, title="demo")
+    assert '"verdict": "bifurcation"' in page and 'id="viewer"' in page and 'id="map"' in page
+    assert "</script>" not in page.split("const DATA = ")[1].split(";\nconst SHOW_IDX")[0]

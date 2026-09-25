@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -223,6 +224,58 @@ def projected_frequencies(
     )
 
 
+class GradientHessianEngine:
+    """Wraps an engine so `compute_hessian` is central differences of the
+    engine's own gradients (6N gradient calls); everything else delegates.
+
+    Why: g-xTB's `--hess` matrix is not consistent with its own gradients
+    (differences up to ~0.02 Eh/bohr^2, even at stationary points), and at
+    non-stationary IRC points that flips the sign of soft projected
+    frequencies. A Hessian built from the gradients agrees with energy
+    finite differences to ~1e-5, i.e. it describes the surface the IRC and
+    the optimizations actually run on.
+
+    At most `max_concurrent` gradient calls run at once across all threads
+    (a shared semaphore), so parallel Hessians never oversubscribe cores.
+    """
+
+    def __init__(self, engine, *, step: float = 0.005, max_concurrent: int = 1):
+        import threading
+
+        self.engine = engine
+        self.step = float(step)
+        self._slots = threading.Semaphore(max(1, int(max_concurrent)))
+        self._max = max(1, int(max_concurrent))
+
+    def __getattr__(self, name):
+        return getattr(self.engine, name)
+
+    def _gradient(self, node) -> np.ndarray:
+        with self._slots:
+            return np.asarray(self.engine.compute_gradients([node])[0], dtype=float).reshape(-1)
+
+    def compute_hessian(self, node, step_size=None) -> np.ndarray:
+        h = float(step_size or self.step)
+        base = node.copy()
+        if type(base).__name__ == "StructureNode":
+            # skip OpenBabel perception on each of the 6N displaced copies
+            base.has_molecular_graph = False
+            base.graph = None
+        x = np.asarray(base.coords, dtype=float)
+        shape, flat = x.shape, x.reshape(-1)
+
+        def column(i):
+            e = np.zeros_like(flat)
+            e[i] = h
+            gp = self._gradient(base.update_coords((flat + e).reshape(shape)))
+            gm = self._gradient(base.update_coords((flat - e).reshape(shape)))
+            return (gp - gm) / (2.0 * h)
+
+        with ThreadPoolExecutor(max_workers=self._max) as pool:
+            H = np.array(list(pool.map(column, range(flat.size))))
+        return 0.5 * (H + H.T)
+
+
 _warned_fd_engines: set = set()
 
 
@@ -249,6 +302,40 @@ def compute_cartesian_hessian(node: Node, engine: Engine) -> np.ndarray:
     hessian = np.asarray(compute(node), dtype=float)
     ndof = np.asarray(node.coords).size
     return hessian.reshape(ndof, ndof)
+
+
+def compute_hessians(
+    nodes: Sequence[Node],
+    engine: Engine,
+    workers: int = 1,
+    on_done: Optional[Callable[[int], None]] = None,
+) -> List[np.ndarray]:
+    """Cartesian Hessians for `nodes`, in order, `workers` at a time.
+
+    Threads suffice: engines like g-xTB run each Hessian as its own
+    subprocess in its own temp directory. Keep each engine call
+    single-threaded and parallelize across points instead -- for g-xTB that
+    is ~10x faster than one multi-threaded call at a time."""
+    nodes = list(nodes)
+    if int(workers) <= 1 or len(nodes) <= 1:
+        out = []
+        for i, node in enumerate(nodes, start=1):
+            out.append(compute_cartesian_hessian(node, engine))
+            if on_done is not None:
+                on_done(i)
+        return out
+    out: List[Optional[np.ndarray]] = [None] * len(nodes)
+    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+        futures = {pool.submit(compute_cartesian_hessian, node, engine): i for i, node in enumerate(nodes)}
+        done = 0
+        from concurrent.futures import as_completed
+
+        for future in as_completed(futures):
+            out[futures[future]] = future.result()
+            done += 1
+            if on_done is not None:
+                on_done(done)
+    return out
 
 
 def _ensure_energy_gradient(nodes: Sequence[Node], engine: Engine) -> None:
@@ -306,6 +393,7 @@ class ProjectedPoint:
     chain_index: Optional[int]    # index within the branch; None for a bisection point
     soft_mode_cart: Optional[np.ndarray] = field(default=None, repr=False)
     node: Optional[Node] = field(default=None, repr=False)
+    second_mode_cart: Optional[np.ndarray] = field(default=None, repr=False)  # next-softest perpendicular mode
 
     @property
     def lowest_freq(self) -> float:
@@ -353,6 +441,14 @@ class BranchScan:
     vrt: Optional[VRT] = None
     transient_dips: List[float] = field(default_factory=list)  # s of noise-level dips
     valley_reforms: bool = False    # soft mode turned real again after the VRT
+    late_dips: List[float] = field(default_factory=list)  # s of dips deeper than max_vrt_depth below TS1
+    # s of points where the two softest perpendicular modes are both imaginary:
+    # a possible higher-order VRI (the ridge may open into more than two valleys)
+    double_ridge: List[float] = field(default_factory=list)
+    # Raw Cartesian Hessians (Eh/bohr^2) per scanned point / bisection point,
+    # parallel to `points` / `bisection_points`; see `save_hessians`.
+    hessians: List[np.ndarray] = field(default_factory=list, repr=False)
+    bisection_hessians: List[np.ndarray] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -364,6 +460,8 @@ class BranchScan:
             "vrt": self.vrt.to_dict() if self.vrt else None,
             "transient_dips_s": self.transient_dips,
             "valley_reforms": self.valley_reforms,
+            "late_dips_s": self.late_dips,
+            "double_ridge_s": self.double_ridge,
         }
 
 
@@ -466,6 +564,8 @@ def scan_irc_for_vrt(
     vrt_threshold: float = 20.0,
     persist: int = 2,
     grad_floor: float = 1e-4,
+    max_vrt_depth: Optional[float] = None,
+    workers: int = 1,
     on_event: OnEvent = None,
 ) -> VRTScan:
     """Projected-frequency scan along each IRC branch; locate the VRT.
@@ -475,8 +575,19 @@ def scan_irc_for_vrt(
     `vrt_threshold` is in the frequency units of `ProjectedModes` (cm^-1
     for molecules). The branch endpoint is not scanned (the projection is
     meaningless at a minimum); it is handled by `find_bifurcation_products`.
+
+    `max_vrt_depth` (kcal/mol): imaginary dips more than this far below
+    TS1 are recorded as `late_dips`, not as a VRT. Deep in a product valley
+    a soft torsion going slightly imaginary is not a bifurcation of the
+    TS1 reaction (the VRI of a PTSB lies above TS2, which is below TS1 but
+    typically not far below). None disables the window.
+
+    `workers` Hessians run concurrently. Bisection then becomes a k-section:
+    each of the `n_bisect` rounds evaluates `workers` interior points at once
+    (plain bisection for workers=1).
     """
     irc_nodes = list(irc_nodes)
+    workers = max(1, int(workers))
     if len(irc_nodes) < 3:
         raise ValueError("The IRC needs at least 3 points to scan.")
     stride = max(1, int(stride))
@@ -515,8 +626,17 @@ def scan_irc_for_vrt(
         _ensure_energy_gradient([nodes[k] for k in indices], engine)
         _emit(on_event, "branch_start", branch=name, total=len(indices))
 
+        todo = [k for k in indices if k != 0]
+        n_total = len(indices)
+        offset = n_total - len(todo)
+        hessians = dict(zip(todo, compute_hessians(
+            [nodes[k] for k in todo], engine, workers,
+            on_done=lambda i: _emit(on_event, "point_done", branch=name, index=i + offset, total=n_total),
+        )))
+        n_hessians += len(todo)
+
         prev_mode = None
-        for done, k in enumerate(indices, start=1):
+        for k in indices:
             node = nodes[k]
             if k == 0:
                 hessian = ts_hessian
@@ -524,8 +644,7 @@ def scan_irc_for_vrt(
                     hessian, node.coords, masses, gradient=None, tangent_mw=ts_tangent,
                 )
             else:
-                hessian = compute_cartesian_hessian(node, engine)
-                n_hessians += 1
+                hessian = hessians[k]
                 modes = projected_frequencies(
                     hessian, node.coords, masses, gradient=node._cached_gradient,
                     tangent_mw=_chain_tangent_mw(nodes, k), grad_floor=grad_floor,
@@ -533,6 +652,7 @@ def scan_irc_for_vrt(
             soft = modes.modes_mw[:, 0]
             overlap = None if prev_mode is None else float(abs(soft @ prev_mode))
             prev_mode = soft
+            branch.hessians.append(np.asarray(hessian, dtype=np.float32))
             branch.points.append(ProjectedPoint(
                 s=float(branch.s[k]),
                 energy=float(node._cached_energy),
@@ -544,11 +664,27 @@ def scan_irc_for_vrt(
                 chain_index=k,
                 soft_mode_cart=modes.lowest_mode_cart,
                 node=node,
+                second_mode_cart=modes.modes_cart[1] if len(modes.modes_cart) > 1 else None,
             ))
-            _emit(on_event, "point_done", branch=name, index=done, total=len(indices))
 
         freqs = [p.lowest_freq for p in branch.points]
+        if max_vrt_depth is not None:
+            from qcconst.constants import HARTREE_TO_KCAL_PER_MOL
+
+            e_ts = float(ts_node._cached_energy)
+            too_deep = [
+                (e_ts - p.energy) * float(HARTREE_TO_KCAL_PER_MOL) > float(max_vrt_depth)
+                for p in branch.points
+            ]
+            branch.late_dips = [
+                p.s for p, deep, f in zip(branch.points, too_deep, freqs) if deep and f < -vrt_threshold
+            ]
+            freqs = [np.inf if deep else f for f, deep in zip(freqs, too_deep)]
         first, transients, reforms = _detect_vrt(freqs, vrt_threshold, persist)
+        branch.double_ridge = [
+            p.s for p, f in zip(branch.points, freqs)
+            if np.isfinite(f) and len(p.lowest_freqs) > 1 and p.lowest_freqs[1] < -vrt_threshold
+        ]
         branch.transient_dips = [branch.points[i].s for i in transients]
         branch.valley_reforms = reforms
         if first is None:
@@ -563,33 +699,38 @@ def scan_irc_for_vrt(
         hi = lo + 1
         a, b = branch.points[lo], branch.points[hi]
         _emit(on_event, "bisecting", branch=name, total=n_bisect)
+        n_interior = min(workers, 7)
         for it in range(int(n_bisect)):
-            mid_node = _interpolate_node(a.node, b.node, 0.5)
-            _ensure_energy_gradient([mid_node], engine)
-            hessian = compute_cartesian_hessian(mid_node, engine)
-            n_hessians += 1
+            taus = [(j + 1) / (n_interior + 1) for j in range(n_interior)]
+            probe_nodes = [_interpolate_node(a.node, b.node, t) for t in taus]
+            _ensure_energy_gradient(probe_nodes, engine)
+            probe_hessians = compute_hessians(probe_nodes, engine, workers)
+            n_hessians += len(probe_nodes)
             tangent = _mass_weighted(b.node) - _mass_weighted(a.node)
-            modes = projected_frequencies(
-                hessian, mid_node.coords, masses, gradient=mid_node._cached_gradient,
-                tangent_mw=tangent, grad_floor=grad_floor,
-            )
-            mid = ProjectedPoint(
-                s=0.5 * (a.s + b.s),
-                energy=float(mid_node._cached_energy),
-                grad_norm=modes.grad_norm,
-                lowest_freqs=[float(f) for f in modes.freqs[:5]],
-                lowest_eigval=float(modes.eigvals[0]),
-                soft_overlap=float(abs(modes.modes_mw[:, 0] @ _to_mw(b.soft_mode_cart, masses))),
-                tangent_source=modes.tangent_source,
-                chain_index=None,
-                soft_mode_cart=modes.lowest_mode_cart,
-                node=mid_node,
-            )
-            branch.bisection_points.append(mid)
-            if mid.lowest_eigval >= 0:
-                a = mid
-            else:
-                b = mid
+            probes = []
+            for t, probe_node, hessian in zip(taus, probe_nodes, probe_hessians):
+                modes = projected_frequencies(
+                    hessian, probe_node.coords, masses, gradient=probe_node._cached_gradient,
+                    tangent_mw=tangent, grad_floor=grad_floor,
+                )
+                probes.append(ProjectedPoint(
+                    s=(1 - t) * a.s + t * b.s,
+                    energy=float(probe_node._cached_energy),
+                    grad_norm=modes.grad_norm,
+                    lowest_freqs=[float(f) for f in modes.freqs[:5]],
+                    lowest_eigval=float(modes.eigvals[0]),
+                    soft_overlap=float(abs(modes.modes_mw[:, 0] @ _to_mw(b.soft_mode_cart, masses))),
+                    tangent_source=modes.tangent_source,
+                    chain_index=None,
+                    soft_mode_cart=modes.lowest_mode_cart,
+                    node=probe_node,
+                ))
+            branch.bisection_points.extend(probes)
+            branch.bisection_hessians.extend(np.asarray(h, dtype=np.float32) for h in probe_hessians)
+            # New bracket: last real probe before the first imaginary one.
+            sequence = [a] + probes + [b]
+            j = next(i for i, p_ in enumerate(sequence) if p_.lowest_eigval < 0)
+            a, b = sequence[j - 1], sequence[j]
             _emit(on_event, "bisect_done", branch=name, index=it + 1, total=n_bisect)
 
         # Linear root of the eigenvalue (smooth through zero, unlike the
@@ -637,14 +778,30 @@ def labeled_bond_set(node: Node) -> Optional[frozenset]:
     return frozenset(tuple(sorted((int(i), int(j)))) for i, j in graph.edges())
 
 
+def _heavy_signature(node: Node, bonds: frozenset) -> tuple:
+    """Atom-indexed heavy-atom bonds plus the number of H on each heavy
+    atom: hydrogens are interchangeable (which of two CH2 hydrogens moved
+    does not make a different product), heavy atoms are not (the two
+    atom-distinct adducts of a degenerate bifurcation stay distinct)."""
+    symbols = list(node.symbols)
+    heavy = frozenset(b for b in bonds if symbols[b[0]] != "H" and symbols[b[1]] != "H")
+    h_count: dict = {}
+    for i, j in bonds:
+        if symbols[i] == "H" and symbols[j] != "H":
+            h_count[j] = h_count.get(j, 0) + 1
+        elif symbols[j] == "H" and symbols[i] != "H":
+            h_count[i] = h_count.get(i, 0) + 1
+    return heavy, tuple(sorted(h_count.items()))
+
+
 def same_species(a: Node, b: Node, *, xy_tol: float = 0.05) -> bool:
-    """Same atom-indexed connectivity (molecules), or within `xy_tol` of
-    each other (toy potentials)."""
+    """Same atom-indexed heavy-atom connectivity and H count per heavy atom
+    (molecules), or within `xy_tol` of each other (toy potentials)."""
     bonds_a, bonds_b = labeled_bond_set(a), labeled_bond_set(b)
     if bonds_a is None or bonds_b is None:
         diff = np.asarray(a.coords, dtype=float) - np.asarray(b.coords, dtype=float)
         return float(np.linalg.norm(diff)) < xy_tol
-    return bonds_a == bonds_b
+    return _heavy_signature(a, bonds_a) == _heavy_signature(b, bonds_b)
 
 
 def products_isomorphic(a: Node, b: Node) -> Optional[bool]:
@@ -671,12 +828,30 @@ def products_isomorphic(a: Node, b: Node) -> Optional[bool]:
 # --------------------------------------------------------------------------
 
 
-def _optimize_nodes(engine: Engine, nodes: List[Node], keywords: Optional[dict]) -> List[Optional[Node]]:
-    """Optimize each node; None where an optimization failed. Batch call
-    when the engine has one, falling back to one-by-one if it raises (the
-    same pattern as `run_hessian_sample`)."""
+def _optimize_one(engine: Engine, node: Node, keywords: Optional[dict]) -> Optional[Node]:
+    try:
+        try:
+            trajectory = engine.compute_geometry_optimization(node, keywords=keywords)
+        except TypeError:
+            trajectory = engine.compute_geometry_optimization(node)
+        return trajectory[-1] if trajectory else None
+    except Exception as exc:
+        logger.info("Optimization failed: %s", exc)
+        return None
+
+
+def _optimize_nodes(
+    engine: Engine, nodes: List[Node], keywords: Optional[dict], workers: int = 1,
+) -> List[Optional[Node]]:
+    """Optimize each node; None where an optimization failed. With
+    workers > 1, single optimizations run concurrently; otherwise the batch
+    call is used when the engine has one, falling back to one-by-one if it
+    raises (the same pattern as `run_hessian_sample`)."""
     if not nodes:
         return []
+    if int(workers) > 1 and len(nodes) > 1:
+        with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+            return list(pool.map(lambda n: _optimize_one(engine, n, keywords), nodes))
     batch = getattr(engine, "compute_geometry_optimizations", None)
     if callable(batch):
         try:
@@ -688,18 +863,7 @@ def _optimize_nodes(engine: Engine, nodes: List[Node], keywords: Optional[dict])
                 return [t[-1] if t else None for t in trajectories]
         except Exception as exc:
             logger.info("Batch optimization failed (%s); optimizing one by one.", exc)
-    out: List[Optional[Node]] = []
-    for node in nodes:
-        try:
-            try:
-                trajectory = engine.compute_geometry_optimization(node, keywords=keywords)
-            except TypeError:
-                trajectory = engine.compute_geometry_optimization(node)
-            out.append(trajectory[-1] if trajectory else None)
-        except Exception as exc:
-            logger.info("Optimization failed: %s", exc)
-            out.append(None)
-    return out
+    return [_optimize_one(engine, node, keywords) for node in nodes]
 
 
 def push_along_mode(node: Node, mode_cart: np.ndarray, amplitude: float) -> List[Node]:
@@ -728,8 +892,11 @@ class BranchProducts:
     ts2_verified: Optional[bool] = None
     ts2_checks: dict = field(default_factory=dict)
     degenerate: Optional[bool] = None      # P1 and P2 isomorphic
+    evidence: Optional[str] = None         # how P2 was found: "vrt_push" | "ts2_endpoint"
+    checks: Optional[dict] = None          # basin test / exact VRI / trajectories (vri_checks.check_branch)
     push_attempts: int = 0
     push_minima: List[Node] = field(default_factory=list)
+    push_outcomes: List[dict] = field(default_factory=list)  # every optimized push vs P1
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -745,10 +912,50 @@ class BranchProducts:
             "ts2_verified": self.ts2_verified,
             "ts2_checks": self.ts2_checks,
             "degenerate": self.degenerate,
+            "evidence": self.evidence,
+            "checks": self.checks,
             "push_attempts": self.push_attempts,
             "n_push_minima": len(self.push_minima),
+            "push_outcomes": self.push_outcomes,
+            "stereo_second_product": any(o.get("same_bonds") and o.get("stereo_differs") for o in self.push_outcomes),
             "notes": self.notes,
         }
+
+
+def _stereo_smiles(node: Node) -> Optional[str]:
+    try:
+        import qcinf
+
+        return qcinf.structure_to_smiles(node.structure)
+    except Exception:
+        return None
+
+
+def _push_outcomes(pushed: List[Optional[Node]], p1: Node) -> List[dict]:
+    """Where each push went relative to P1: same atom-indexed bonds or not,
+    and -- for same-bond outcomes -- whether it is a different stereoisomer
+    (stereo SMILES) or just a different conformer (RMSD). A ridge that
+    splits into two stereoisomers is a real bifurcation that bond-set
+    identity alone does not see."""
+    from mepd.discovery.vri_candidates import BOHR_TO_ANGSTROM, aligned_rmsd
+
+    ref_smiles = _stereo_smiles(p1)
+    out = []
+    for node in pushed:
+        if node is None:
+            out.append({"failed": True})
+            continue
+        bonds_same = same_species(node, p1)
+        smi = _stereo_smiles(node) if bonds_same else None
+        out.append({
+            "same_bonds": bool(bonds_same),
+            "stereo_differs": bool(bonds_same and smi and ref_smiles and smi != ref_smiles),
+            "rmsd_to_p1": float(aligned_rmsd(np.asarray(node.coords), np.asarray(p1.coords)) * BOHR_TO_ANGSTROM)
+            if _is_molecular(node) else float(np.linalg.norm(np.asarray(node.coords) - np.asarray(p1.coords))),
+            "rel_energy_to_p1_kcal": None if node._cached_energy is None or p1._cached_energy is None
+            else (float(node._cached_energy) - float(p1._cached_energy)) * 627.5095,
+        })
+    return out
 
 
 def _unique(nodes: List[Node]) -> List[Node]:
@@ -769,6 +976,7 @@ def find_bifurcation_products(
     push_amplitude: float = 0.3,
     n_push_points: int = 3,
     imaginary_cutoff: float = 50.0,
+    workers: int = 1,
     on_event: OnEvent = None,
 ) -> BranchProducts:
     """Find P1, P2 (and TS2 in the symmetric case) for a branch with a VRT.
@@ -801,12 +1009,14 @@ def find_bifurcation_products(
         seeds = push_along_mode(endpoint, end_modes.lowest_mode_cart, push_amplitude)
         out.push_attempts = len(seeds)
         _emit(on_event, "pushing", branch=branch_name, total=len(seeds))
-        minima = [m for m in _optimize_nodes(engine, seeds, opt_keywords) if m is not None]
-        minima = _confirmed_minima(minima, engine, scan, imaginary_cutoff)
+        pushed = _optimize_nodes(engine, seeds, opt_keywords, workers)
+        minima = [m for m in pushed if m is not None]
+        minima = _confirmed_minima(minima, engine, scan, imaginary_cutoff, workers)
         minima = [m for m in _unique(minima) if not any(same_species(m, r) for r in reference_nodes)]
         out.push_minima = minima
         if len(minima) >= 2:
             out.p1, out.p2 = minima[0], minima[1]
+            out.evidence = "ts2_endpoint"
             out.ts2_checks = {
                 "n_imaginary": 1,
                 "below_ts1": _below(endpoint, branch.nodes[0]),
@@ -829,16 +1039,20 @@ def find_bifurcation_products(
             seeds.extend(push_along_mode(node, mode, push_amplitude))
         out.push_attempts = len(seeds)
         _emit(on_event, "pushing", branch=branch_name, total=len(seeds))
-        minima = [m for m in _optimize_nodes(engine, seeds, opt_keywords) if m is not None]
+        pushed = _optimize_nodes(engine, seeds, opt_keywords, workers)
+        _ensure_energy_gradient([m for m in pushed if m is not None], engine)
+        out.push_outcomes = _push_outcomes(pushed, endpoint)
+        minima = [m for m in pushed if m is not None]
         minima = [
             m for m in _unique(minima)
             if not same_species(m, endpoint) and not any(same_species(m, r) for r in reference_nodes)
         ]
-        minima = _confirmed_minima(minima, engine, scan, imaginary_cutoff)
+        minima = _confirmed_minima(minima, engine, scan, imaginary_cutoff, workers)
         out.push_minima = minima
         if minima:
             _ensure_energy_gradient(minima, engine)
             out.p2 = min(minima, key=lambda n: float(n._cached_energy))
+            out.evidence = "vrt_push"
         else:
             out.notes.append("no second product found by pushing along the ridge mode")
 
@@ -853,11 +1067,13 @@ def _below(a: Node, b: Node) -> Optional[bool]:
     return float(a._cached_energy) < float(b._cached_energy)
 
 
-def _confirmed_minima(nodes: List[Node], engine: Engine, scan: VRTScan, cutoff: float) -> List[Node]:
+def _confirmed_minima(
+    nodes: List[Node], engine: Engine, scan: VRTScan, cutoff: float, workers: int = 1,
+) -> List[Node]:
     kept = []
-    for node in nodes:
-        modes = stationary_point_modes(node, engine)
+    for node, hessian in zip(nodes, compute_hessians(nodes, engine, workers)):
         scan.n_hessians += 1
+        modes = projected_frequencies(hessian, node.coords, node_masses(node), gradient=None)
         if modes.n_imaginary(cutoff) == 0:
             kept.append(node)
     return kept
@@ -879,6 +1095,13 @@ def _push_sites(branch: BranchScan, n_push_points: int):
             picks = [len(candidates) - 1]
         for i in picks:
             sites.append((candidates[i].node, candidates[i].soft_mode_cart))
+    # Where the next-softest perpendicular mode is imaginary too, the ridge may
+    # open into more than two valleys: push along that mode as well.
+    for p in branch.points:
+        if (p.chain_index is not None and p.chain_index >= first_after and p.second_mode_cart is not None
+                and len(p.lowest_freqs) > 1 and p.lowest_freqs[1] < 0):
+            sites.append((p.node, p.second_mode_cart))
+            break
     return sites
 
 
@@ -900,6 +1123,9 @@ def verify_ts2(
         "n_imaginary": modes.n_imaginary(imaginary_cutoff),
         "below_ts1": _below(ts2, ts1),
         "connects_p1_p2": None,
+        # A TS2 search from P1/P2 can land back on TS1 itself (when P2 is really
+        # TS1's other side); that is not a second saddle.
+        "distinct_from_ts1": _distinct_saddles(ts1, ts2),
     }
     if ts2_irc_nodes:
         a, b = ts2_irc_nodes[0], ts2_irc_nodes[-1]
@@ -909,8 +1135,24 @@ def verify_ts2(
         )
     checks["verified"] = bool(
         checks["n_imaginary"] == 1 and checks["below_ts1"] and checks["connects_p1_p2"]
+        and checks["distinct_from_ts1"]
     )
     return checks
+
+
+def _distinct_saddles(a: Node, b: Node, *, rmsd_min: float = 0.05, kcal_min: float = 0.5) -> bool:
+    """Different stationary points: aligned RMSD above `rmsd_min` (Angstrom)
+    or energies further apart than `kcal_min`."""
+    if _is_molecular(a) and _is_molecular(b):
+        from mepd.discovery.vri_candidates import BOHR_TO_ANGSTROM, aligned_rmsd
+
+        rmsd = aligned_rmsd(np.asarray(a.coords), np.asarray(b.coords)) * BOHR_TO_ANGSTROM
+    else:
+        rmsd = float(np.linalg.norm(np.asarray(a.coords) - np.asarray(b.coords)))
+    de = None
+    if a._cached_energy is not None and b._cached_energy is not None:
+        de = abs(float(a._cached_energy) - float(b._cached_energy)) * 627.5095
+    return bool(rmsd > rmsd_min or (de is not None and de > kcal_min))
 
 
 # --------------------------------------------------------------------------
@@ -919,22 +1161,68 @@ def verify_ts2(
 
 VERDICT_PRIORITY = [
     "bifurcation",
-    "bifurcation_ts2_unconfirmed",
+    "second_product_untested",
+    "second_product_no_split",
     "vrt_no_second_product",
     "transient_softening",
     "no_vrt",
 ]
 
 
+def basin_split(checks: Optional[dict]) -> bool:
+    """Whether sideways pushes off the IRC drained into at least two
+    different products (P1, P2 or another product; not back to the reactant
+    side, not failures)."""
+    counts = ((checks or {}).get("basin") or {}).get("counts") or {}
+    products = [k for k, n in counts.items() if n > 0 and k.startswith(("P", "other"))]
+    return len(products) >= 2
+
+
 def branch_verdict(branch: BranchScan, products: Optional[BranchProducts]) -> str:
+    """The basin test decides: a branch with a second product is a
+    bifurcation only if steepest descent from sideways pushes off the IRC
+    ends in at least two different products. (TS2 checks alone over-predict: a low saddle
+    between P1 and P2 does not mean trajectories from TS1 reach P2.)"""
+    if products is not None and products.p2 is not None:
+        if not (products.checks or {}).get("basin"):
+            return "second_product_untested"
+        return "bifurcation" if basin_split(products.checks) else "second_product_no_split"
     if branch.vrt is None:
         return "transient_softening" if branch.transient_dips else "no_vrt"
-    if products is None or products.p2 is None:
-        return "vrt_no_second_product"
-    return "bifurcation" if products.ts2_verified else "bifurcation_ts2_unconfirmed"
+    return "vrt_no_second_product"
 
 
 def overall_verdict(verdicts: Sequence[str]) -> str:
     if not verdicts:
         return "no_vrt"
     return min(verdicts, key=VERDICT_PRIORITY.index)
+
+
+def save_hessians(scan: "VRTScan", output_dir, prefix: str = "hessians") -> list:
+    """Write each branch's Hessians to `<output_dir>/<prefix>_<branch>.npz`
+    (compressed, float32): for every scanned IRC point and bisection point
+    its arc length s, chain index (-1 for bisection points), energy,
+    Cartesian gradient, coordinates (bohr) and Cartesian Hessian
+    (Eh/bohr^2). Returns the written paths."""
+    from pathlib import Path
+
+    written = []
+    for name, branch in scan.branches.items():
+        pts = list(branch.points) + list(branch.bisection_points)
+        hs = list(branch.hessians) + list(branch.bisection_hessians)
+        if not pts or len(hs) != len(pts):
+            continue
+        fp = Path(output_dir) / f"{prefix}_{name}.npz"
+        np.savez_compressed(
+            fp,
+            s=np.array([p.s for p in pts]),
+            chain_index=np.array([-1 if p.chain_index is None else p.chain_index for p in pts]),
+            bisection=np.array([p.chain_index is None for p in pts]),
+            energy=np.array([p.energy for p in pts]),
+            gradient=np.array([np.asarray(p.node._cached_gradient, dtype=np.float32).reshape(-1) for p in pts]),
+            coords=np.array([np.asarray(p.node.coords, dtype=np.float64).reshape(-1) for p in pts]),
+            symbols=np.array(list(getattr(pts[0].node, "symbols", []) or [])),
+            hessian=np.array(hs, dtype=np.float32),
+        )
+        written.append(fp)
+    return written

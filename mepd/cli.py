@@ -871,6 +871,10 @@ def _load_visualization_object(result_path: Path, charge: int, multiplicity: int
     from mepd.TreeNode import TreeNode
 
     if result_path.is_dir():
+        from mepd.viz_vri import is_vri_output, load_vri_result
+
+        if is_vri_output(result_path):
+            return load_vri_result(result_path)
         if (result_path / "adj_matrix.txt").exists():
             return TreeNode.read_from_disk(
                 result_path, chain_parameters=ChainInputs(), charge=charge, multiplicity=multiplicity
@@ -931,7 +935,10 @@ def visualize(
     For a `mepd channels` output directory, shows reactant conformers,
     product conformers, and completed MEP outputs as clickable groups. For
     a `mepd ts`/`run --use-tsopt` output directory, shows every optimized
-    TS structure and its IRC path (if computed) as clickable groups."""
+    TS structure and its IRC path (if computed) as clickable groups. For a
+    `mepd discovery vri` output directory, shows the IRC with its energy and
+    lowest-perpendicular-frequency profiles, the VRT, the ridge mode, and
+    each branch's products, TS2 and checks."""
     try:
         obj = _load_visualization_object(result_path, charge, multiplicity)
     except Exception as exc:
@@ -939,11 +946,15 @@ def visualize(
         raise typer.Exit(code=1)
 
     from mepd import viz
+    from mepd.viz_vri import VriResult, render_vri_html
 
     try:
-        html = viz.render_visualization_html(
-            obj, title=result_path.stem, show_atom_indices=show_atom_indices
-        )
+        if isinstance(obj, VriResult):
+            html = render_vri_html(obj, title=result_path.name, show_atom_indices=show_atom_indices)
+        else:
+            html = viz.render_visualization_html(
+                obj, title=result_path.stem, show_atom_indices=show_atom_indices
+            )
     except (ValueError, TypeError) as exc:
         typer.echo(f"Could not build visualization: {exc}")
         raise typer.Exit(code=1)

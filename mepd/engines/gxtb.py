@@ -141,6 +141,43 @@ class _GXTBASEResultsCalculator(Calculator):
         self.results["forces"] = -gradient_hartree_bohr * Hartree * ANGSTROM_TO_BOHR
 
 
+def restore_rigid_body_hessian(hessian: NDArray, coords, gradient) -> NDArray:
+    """Replace the rigid-body part of a Cartesian Hessian with its exact value.
+
+    Because the energy is invariant to rigid motion, the Hessian's action on
+    the six rigid-body directions follows from the gradient alone: H t = 0
+    for a translation, and H (a x r) = a x g (atom by atom) for a rotation
+    about axis a. Programs that project translations/rotations out of the
+    Hessian (g-xTB does) set those to zero, which is right only where g = 0;
+    at non-stationary points (along an IRC) that error shifts soft
+    frequencies by tens of cm^-1. With Q an orthonormal basis of the rigid
+    directions and P = 1 - QQ^T, this returns
+        P H P + (HQ) Q^T + Q (HQ)^T - Q (Q^T H Q) Q^T,
+    keeping the input's internal block and the exact rigid-body couplings.
+    """
+    H = np.asarray(hessian, dtype=float)
+    X = np.asarray(coords, dtype=float).reshape(-1, 3)
+    G = np.asarray(gradient, dtype=float).reshape(-1, 3)
+    n = X.size
+    r = X - X.mean(axis=0)
+    V, HV = [], []
+    for a in np.eye(3):
+        V.append(np.tile(a, (len(X), 1)).reshape(-1))
+        HV.append(np.zeros(n))
+    for a in np.eye(3):
+        V.append(np.cross(a, r).reshape(-1))
+        HV.append(np.cross(a, G).reshape(-1))
+    V, HV = np.array(V).T, np.array(HV).T
+    _, sv, Wt = np.linalg.svd(V, full_matrices=False)
+    keep = sv > 1e-8 * sv.max()
+    M = Wt[keep].T / sv[keep]
+    Q, HQ = V @ M, HV @ M
+    P = np.eye(n) - Q @ Q.T
+    QHQ = 0.5 * (Q.T @ HQ + (Q.T @ HQ).T)
+    out = P @ H @ P + HQ @ Q.T + Q @ HQ.T - Q @ QHQ @ Q.T
+    return 0.5 * (out + out.T)
+
+
 @dataclass
 class GXTBCalculator(Engine):
     """Direct local g-xTB engine using the xtb executable with the g-xTB flag."""
@@ -151,6 +188,12 @@ class GXTBCalculator(Engine):
     keep_workdirs: bool = False
     add_gxtb_flag: bool = True
     n_threads: int = 1
+    # SCC accuracy (xtb --acc) for the numerical Hessian. At the default (1.0)
+    # the displaced gradients are converged loosely enough that Hessian
+    # elements are off by ~0.01-0.03 Eh/bohr^2 (xtb itself warns "Hessian
+    # element ... is not symmetric"); 0.001 matches central differences of
+    # g-xTB gradients to ~1e-4 for ~20% more time.
+    hessian_acc: float = 0.001
     # Independent calculations (a chain's images, a batch of geometry
     # optimizations) run as up to this many concurrent g-xTB processes.
     # 0 = as many as the machine has cores for at n_threads each.
@@ -335,6 +378,13 @@ class GXTBCalculator(Engine):
                     msg="Failed to parse g-xTB Hessian output.",
                     obj=completed.stdout + completed.stderr,
                 ) from exc
+            # g-xTB projects rigid translations/rotations out of its Hessian,
+            # which is only valid at stationary points; restore the exact
+            # rigid-body part from the gradient (see restore_rigid_body_hessian).
+            gradient = node._cached_gradient
+            if gradient is None:
+                gradient = self.compute_gradients([node.copy()])[0]
+            hessian = restore_rigid_body_hessian(hessian, node.coords, gradient)
 
             if self.keep_workdirs:
                 persistent = Path.cwd() / "gxtb-workdirs"
@@ -415,6 +465,8 @@ class GXTBCalculator(Engine):
             "--chrg",
             str(charge),
             "--hess",
+            "--acc",
+            str(self.hessian_acc),
         ]
         uhf = max(0, int(multiplicity) - 1)
         if uhf:

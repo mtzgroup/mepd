@@ -155,7 +155,8 @@ def test_symmetric_surface_vrt_is_the_vri_and_irc_ends_on_ts2():
     for n in (products.p1, products.p2):
         assert float(n.coords[0]) == pytest.approx(1.2808, abs=1e-3)
     assert products.ts2_checks == {"n_imaginary": 1, "below_ts1": True, "connects_p1_p2": True}
-    assert vri.branch_verdict(forward, products) == "bifurcation"
+    # the verdict waits for the basin test
+    assert vri.branch_verdict(forward, products) == "second_product_untested"
 
 
 def test_asymmetric_surface_irc_bypasses_vri_and_push_finds_second_product():
@@ -170,7 +171,7 @@ def test_asymmetric_surface_irc_bypasses_vri_and_push_finds_second_product():
     # Tilt favours y < 0: the IRC ends there, the push finds the y > 0 product.
     assert float(products.p1.coords[1]) < -1.0
     assert float(products.p2.coords[1]) > 1.0
-    assert vri.branch_verdict(forward, products) == "bifurcation_ts2_unconfirmed"
+    assert vri.branch_verdict(forward, products) == "second_product_untested"
 
 
 def test_dead_end_ridge_reports_vrt_without_second_product():
@@ -321,13 +322,132 @@ def test_small_gradient_falls_back_to_supplied_tangent():
 
 
 def test_labeled_bond_sets_distinguish_degenerate_products():
-    # Same molecule (H2 + H), different atom bonded: atom-distinct but isomorphic.
-    def h3(bonded_to_first: bool):
-        geom = np.array([[0.0, 0, 0], [1.4, 0, 0], [8.0, 0, 0]]) if bonded_to_first else \
-            np.array([[0.0, 0, 0], [8.0, 0, 0], [9.4, 0, 0]])
-        return StructureNode(structure=Structure(symbols=["H", "H", "H"], geometry=geom, charge=0, multiplicity=2))
+    # C2 + C: same molecule, different carbon bonded -- atom-distinct but isomorphic.
+    def c3(bonded_to_first: bool):
+        geom = np.array([[0.0, 0, 0], [2.5, 0, 0], [15.0, 0, 0]]) if bonded_to_first else \
+            np.array([[0.0, 0, 0], [15.0, 0, 0], [17.5, 0, 0]])
+        return StructureNode(structure=Structure(symbols=["C", "C", "C"], geometry=geom, charge=0, multiplicity=1))
 
-    a, b = h3(True), h3(False)
+    a, b = c3(True), c3(False)
     assert not vri.same_species(a, b)
-    assert vri.same_species(a, h3(True))
+    assert vri.same_species(a, c3(True))
     assert vri.products_isomorphic(a, b) is True
+
+
+def test_parallel_scan_matches_serial():
+    surface = _Surface("sym", eps=0.05)
+    ts = _find_ts(surface, [-1.0, 0.0])
+    serial = vri.scan_irc_for_vrt(_irc(surface, ts), _AnalyticEngine(surface), **_TOY)
+    parallel = vri.scan_irc_for_vrt(_irc(surface, ts), _AnalyticEngine(surface), workers=4, **_TOY)
+    a, b = serial.branches["forward"], parallel.branches["forward"]
+    assert [p.lowest_eigval for p in a.points] == [p.lowest_eigval for p in b.points]
+    # k-section with 4 interior points per round brackets tighter, same crossing.
+    assert abs(a.vrt.s - b.vrt.s) < 0.01
+    products = vri.find_bifurcation_products(
+        parallel, "forward", _AnalyticEngine(surface),
+        reference_nodes=[parallel.branches["reverse"].nodes[-1]],
+        push_amplitude=0.3, imaginary_cutoff=0.05, workers=4,
+    )
+    assert products.p2 is not None and float(products.p2.coords[1]) > 1.0
+
+
+def test_late_dips_beyond_energy_window_are_not_vrts():
+    # The dead-end surface's dip sits ~0.6 units below TS1 (hundreds of
+    # kcal/mol once read as Hartree), so a 1 kcal/mol window excludes it.
+    surface = _Surface("dead")
+    ts = _find_ts(surface, [-1.0, 0.0])
+    scan = vri.scan_irc_for_vrt(_irc(surface, ts), _AnalyticEngine(surface), max_vrt_depth=1.0, **_TOY)
+    forward = scan.branches["forward"]
+    assert forward.vrt is None
+    assert forward.late_dips
+    assert vri.branch_verdict(forward, None) == "no_vrt"
+
+
+def test_basin_test_decides_the_verdict_for_a_second_product():
+    branch = vri.BranchScan(name="forward", nodes=[], s=np.zeros(0))
+    products = vri.BranchProducts(branch="forward", p1=object(), p2=object(), evidence="vrt_push")
+    assert vri.branch_verdict(branch, products) == "second_product_untested"
+    products.checks = {"basin": {"counts": {"P1": 30}}}
+    assert vri.branch_verdict(branch, products) == "second_product_no_split"
+    products.checks = {"basin": {"counts": {"P1": 21, "P2": 9}}}
+    assert vri.branch_verdict(branch, products) == "bifurcation"
+    products.ts2_verified = False  # a missing/unverified TS2 does not overrule the basin test
+    assert vri.branch_verdict(branch, products) == "bifurcation"
+    # a third, symmetry-equivalent product counts; returning to the reactant does not
+    products.checks = {"basin": {"counts": {"P1": 15, "P3": 15}}}
+    assert vri.branch_verdict(branch, products) == "bifurcation"
+    products.checks = {"basin": {"counts": {"P1": 20, "R": 10}}}
+    assert vri.branch_verdict(branch, products) == "second_product_no_split"
+
+
+def test_species_identity_ignores_which_equivalent_hydrogen_moved():
+    # H3 chain vs same chain with the two terminal H's swapped: identical.
+    geom = np.array([[0.0, 0, 0], [1.4, 0, 0], [8.0, 0, 0]])
+    a = StructureNode(structure=Structure(symbols=["C", "H", "H"], geometry=geom, charge=0, multiplicity=3))
+    b = StructureNode(structure=Structure(symbols=["C", "H", "H"], geometry=geom[[0, 2, 1]], charge=0, multiplicity=3))
+    assert vri.labeled_bond_set(a) != vri.labeled_bond_set(b)
+    assert vri.same_species(a, b)
+
+
+def test_gradient_hessian_engine_reproduces_an_analytic_hessian_and_caps_concurrency():
+    import threading
+    import time
+
+    class _Quartic(Engine):
+        """E = 1/2 x.A.x + 1/4 sum(x^4): an anharmonic surface with a known Hessian."""
+
+        def __init__(self):
+            rng = np.random.default_rng(4)
+            M = rng.normal(size=(9, 9))
+            self.A = M @ M.T
+            self.active = 0
+            self.peak = 0
+            self.lock = threading.Lock()
+
+        def compute_energies(self, nodes):
+            return [float(0.5 * x @ self.A @ x + 0.25 * np.sum(x**4)) for x in (n.coords.reshape(-1) for n in nodes)]
+
+        def compute_gradients(self, nodes):
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            time.sleep(0.001)
+            out = [(self.A @ x + x**3).reshape(n.coords.shape) for n, x in ((n, n.coords.reshape(-1)) for n in nodes)]
+            with self.lock:
+                self.active -= 1
+            return out
+
+        def hessian(self, x):
+            return self.A + np.diag(3 * x**2)
+
+    base = _Quartic()
+    node = _water()
+    wrapped = vri.GradientHessianEngine(base, max_concurrent=3)
+    H = wrapped.compute_hessian(node)
+    np.testing.assert_allclose(H, base.hessian(node.coords.reshape(-1)), atol=1e-4)
+    assert base.peak <= 3
+    assert wrapped.compute_energies([node]) == base.compute_energies([node])  # delegation
+
+
+def test_verify_ts2_rejects_a_ts2_that_is_ts1_itself():
+    surface = _Surface("sym")
+    engine = _AnalyticEngine(surface)
+    ts1 = _xy(surface, [-1, 0])
+    p1, p2 = _xy(surface, [1.2808, 1.1317]), _xy(surface, [1.2808, -1.1317])
+    same = vri.verify_ts2(_xy(surface, [-1, 0]), [p2, ts1, p1], p1, p2, ts1, engine, imaginary_cutoff=0.05)
+    assert same["distinct_from_ts1"] is False and not same["verified"]
+
+
+def test_scan_hessians_are_kept_and_saved(tmp_path):
+    surface = _Surface("sym")
+    ts = _find_ts(surface, [-1.0, 0.0])
+    scan = vri.scan_irc_for_vrt(_irc(surface, ts), _AnalyticEngine(surface), **_TOY)
+    forward = scan.branches["forward"]
+    assert len(forward.hessians) == len(forward.points)
+    assert len(forward.bisection_hessians) == len(forward.bisection_points)
+    np.testing.assert_allclose(forward.hessians[3], surface.H(forward.points[3].node.coords), rtol=1e-6)
+    written = vri.save_hessians(scan, tmp_path)
+    data = np.load(tmp_path / "hessians_forward.npz")
+    assert {fp.name for fp in written} == {"hessians_forward.npz", "hessians_reverse.npz"}
+    n = len(forward.points) + len(forward.bisection_points)
+    assert data["hessian"].shape == (n, 2, 2) and data["bisection"].sum() == len(forward.bisection_points)
