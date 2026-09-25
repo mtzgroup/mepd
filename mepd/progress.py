@@ -239,6 +239,33 @@ def begin_minimization(stream: str, *, label: str = "", caption: str = "", refer
     _write_minimization(state)
 
 
+def read_xyz_steps(fp: Path, natoms: int, energy_re) -> tuple[list[float], list[str]]:
+    """Energies and xyz frames of every step an optimizer has written so far
+    to a multi-frame xyz whose comment lines carry the energy (`energy_re`,
+    group 1). Cheap enough to poll while the optimizer runs; a half-written
+    last frame is skipped."""
+    try:
+        lines = Path(fp).read_text().splitlines()
+    except OSError:
+        return [], []
+    energies: list[float] = []
+    frames: list[str] = []
+    i = 0
+    while i + natoms + 1 < len(lines):
+        if lines[i].strip() != str(natoms):
+            i += 1
+            continue
+        block = lines[i + 2 : i + 2 + natoms]
+        if len(block) < natoms or any(len(row.split()) < 4 for row in block):
+            break
+        match = energy_re.search(lines[i + 1])
+        if match:
+            energies.append(float(match.group(1)))
+            frames.append("\n".join([str(natoms), lines[i + 1].strip(), *block]) + "\n")
+        i += natoms + 2
+    return energies, frames
+
+
 def minimization_sink():
     """For engines: a callable `sink(energies_hartree, frames, final=False)`
     reporting the running minimization's steps so far (`frames`: the xyz of

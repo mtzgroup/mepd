@@ -1267,7 +1267,17 @@ def optimize(
     results: list = [None] * len(nodes)
     errors: list = [None] * len(nodes)
 
+    from mepd import progress as _progress
+
+    # Live view (web UI): one minimization stream per structure.
+    live = _progress._stream_path("opt_0") is not None
+
     def _single(i: int) -> None:
+        stream = f"opt_{i}"
+        if live:
+            _progress.begin_minimization(stream, label=sources[i], caption=f"Optimizing {sources[i]}",
+                                         start_xyz=nodes[i].structure.to_xyz())
+        traj = None
         try:
             try:
                 traj = engine.compute_geometry_optimization(nodes[i], keywords=keywords)
@@ -1281,10 +1291,20 @@ def optimize(
             errors[i] = f"did not converge: {exc}"
         except Exception as exc:
             errors[i] = f"{type(exc).__name__}: {exc}"
+        if live:
+            if errors[i]:
+                _progress.end_minimization(stream, status="failed", error=errors[i].split(":")[0])
+            else:
+                _progress.end_minimization(stream, trajectory=traj)
 
     typer.echo(f"Optimizing {len(nodes)} structure(s) with {type(engine).__name__}...")
     batch = getattr(engine, "compute_geometry_optimizations", None)
     batched = False
+    # Local QCCompute "batches" one structure at a time anyway: going through
+    # _single instead gives each its own live stream. (g-xTB's batch runs in
+    # parallel and ChemCloud's remotely, so those keep batching.)
+    if live and getattr(engine, "compute_program", None) == "qccompute":
+        batch = None
     if callable(batch) and len(nodes) > 1:
         try:
             try:

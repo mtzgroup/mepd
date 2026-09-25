@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 import logging
+import re
 from numpy.typing import NDArray
 import numpy as np
 from pydantic import ValidationError
@@ -33,6 +34,10 @@ from mepd.nodes.nodehelpers import update_node_cache, displace_by_dr
 from mepd.qcdata_structure_helpers import _change_prog_input_property
 from mepd.qcdata_structure_helpers import structure_to_molecule
 import copy
+
+# Energy on an optimizer trajectory's comment lines: geomeTRIC writes
+# "Iteration 3 Energy -76.02", TeraChem's optim.xyz leads with the energy.
+_OPTIM_XYZ_ENERGY_RE = re.compile(r"(?:[Ee]nergy[:=]?\s*|^\s*)(-?\d+\.\d+(?:[Ee][+-]?\d+)?)")
 
 AVAIL_PROGRAMS = ["qccompute", "chemcloud"]
 
@@ -579,10 +584,56 @@ class QCComputeEngine(Engine):
         update_node_cache(node_list=node_list, results=all_results)
         return node_list
 
+    @contextlib.contextmanager
+    def _live_optimization(self, node: StructureNode):
+        """Stream a local optimization's steps to the live viewer, if one
+        is watching: the run gets a scratch directory mepd owns, and a thread
+        polls the trajectory the optimizer appends there (geomeTRIC's
+        qcdata_optim.xyz, TeraChem's scr*/optim.xyz). Yields the extra
+        compute() kwargs (none when nobody watches or on ChemCloud)."""
+        from mepd import progress as _progress
+
+        sink = _progress.minimization_sink()
+        if sink is None or self.compute_program != "qccompute":
+            yield {}
+            return
+        natoms = len(node.symbols)
+
+        with tempfile.TemporaryDirectory(prefix="mepd-opt-") as tmp:
+            scratch = Path(tmp) / "run"
+
+            def poll(final: bool = False) -> None:
+                for fp in [scratch / "qcdata_optim.xyz", *scratch.glob("scr*/optim.xyz")]:
+                    energies, frames = _progress.read_xyz_steps(fp, natoms, _OPTIM_XYZ_ENERGY_RE)
+                    if energies:
+                        sink(energies, frames, final=final)
+                        return
+
+            stop = threading.Event()
+
+            def watch() -> None:
+                while not stop.wait(0.5):
+                    with contextlib.suppress(Exception):
+                        poll()
+
+            thread = threading.Thread(target=watch, daemon=True)
+            thread.start()
+            try:
+                yield {"scratch_dir": scratch, "rm_scratch_dir": False}
+            finally:
+                stop.set()
+                thread.join()
+                with contextlib.suppress(Exception):
+                    poll(final=True)  # the steps written after the last poll
+
     def _compute_geom_opt_result(self, node: StructureNode, keywords=None):
         """
         this will return a ProgramOutput from qcdata geom opt call.
         """
+        with self._live_optimization(node) as live_kwargs:
+            return self._compute_geom_opt_result_inner(node, keywords, live_kwargs)
+
+    def _compute_geom_opt_result_inner(self, node: StructureNode, keywords, live_kwargs: dict):
         keywords = self._geometry_optimizer_keywords(keywords)
         frozen_override = self._coerce_frozen_atom_indices(
             keywords.pop("frozen_atom_indices", None)
@@ -599,7 +650,7 @@ class QCComputeEngine(Engine):
                 keywords=keywords,
             )
 
-            output = self.compute_func(dpi, collect_files=self.collect_files)
+            output = self.compute_func(dpi, collect_files=self.collect_files, **live_kwargs)
 
         else:  # DEC162025: Trying again... # OCT062025: bug where terachem optimizations werent being passed.
             tc_keywords = dict(
@@ -618,7 +669,7 @@ class QCComputeEngine(Engine):
                     optimizer_keywords=keywords,
                     frozen_atom_indices=frozen_override,
                 )
-                output = self.compute_func(prog_input, collect_files=True)
+                output = self.compute_func(prog_input, collect_files=True, **live_kwargs)
             else:
                 prog_input = ProgramInput(
                     program="terachem",
@@ -631,7 +682,7 @@ class QCComputeEngine(Engine):
                 )
 
                 output = self.compute_func(
-                    prog_input, collect_files=self.collect_files)
+                    prog_input, collect_files=self.collect_files, **live_kwargs)
 
         return output
 

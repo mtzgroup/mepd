@@ -1,12 +1,21 @@
-"""Live view of geometry minimizations (Hessian-sampling candidates):
-progress stream files, g-xTB step-log reading, and the web reduction."""
+"""Live view of geometry minimizations (Hessian-sampling candidates, `mepd
+optimize`): progress stream files, g-xTB step-log reading, the web
+reduction, and steps reaching the viewer while non-g-xTB engines run."""
 
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
+from qcdata import Structure
+
 from mepd import progress
+from mepd.engines.qccompute import QCComputeEngine
+from mepd.nodes.node import StructureNode
+from mepd.program_args import ProgramArgs
 from mepd.engines.gxtb import _read_xtbopt_progress
 
 WATER = "3\n{c}\nO 0.000 0.000 0.000\nH 0.758 0.000 0.504\nH -0.758 0.000 0.504\n"
@@ -87,3 +96,85 @@ def test_replay_from_live_steps_when_no_trajectory_is_handed_over(tmp_path, monk
     progress.end_minimization("c001")
     done = json.loads((tmp_path / "c001.json").read_text())
     assert done["finished"] and done["geometry"]["frame_steps"] == list(range(8))
+
+
+# ---- steps reported while a non-g-xTB optimizer runs
+
+def _water() -> StructureNode:
+    return StructureNode(structure=Structure(
+        symbols=["O", "H", "H"],
+        geometry=np.array([[0.0, 0.0, 0.0], [0.0, 1.7, 1.1], [0.0, -1.7, 1.1]]),
+        charge=0, multiplicity=1,
+    ))
+
+
+@pytest.fixture
+def watched(tmp_path, monkeypatch):
+    """A live viewer is attached; returns the steps each sink call reported."""
+    monkeypatch.setenv("MEPD_DRIVE_CHAIN_DIR", str(tmp_path / "live"))
+    calls = []
+    real = progress.minimization_sink
+
+    def recording_sink():
+        sink = real()
+        if sink is None:
+            return None
+
+        def wrapped(energies, frames, final=False):
+            calls.append((len(energies), final))
+            sink(energies, frames, final=final)
+        return wrapped
+
+    monkeypatch.setattr(progress, "minimization_sink", recording_sink)
+    progress.begin_minimization("opt_0", label="water")
+    yield calls
+    progress.end_minimization("opt_0")
+
+
+def test_ase_engine_reports_every_step(watched, tmp_path):
+    pytest.importorskip("ase")
+    from ase.calculators.emt import EMT
+
+    from mepd.engines.ase import ASEEngine
+
+    traj = ASEEngine(calculator=EMT()).compute_geometry_optimization(_water())
+    assert len(traj) > 2
+    # One report per optimizer step, while it ran.
+    assert [n for n, _ in watched] == list(range(1, len(watched) + 1))
+    assert len(watched) >= len(traj) - 1
+
+
+def test_qccompute_streams_the_optimizer_trajectory_file(watched, tmp_path, monkeypatch):
+    engine = QCComputeEngine(program="xtb", compute_program="qccompute",
+                             program_args=ProgramArgs(model={"method": "GFN2xTB"}))
+    seen_while_running = []
+
+    def fake_compute(inp_obj, **kwargs):
+        # geomeTRIC appends each step to qcdata_optim.xyz in its scratch dir.
+        scratch = kwargs["scratch_dir"]
+        scratch.mkdir(parents=True)
+        frames = ""
+        for step, energy in enumerate([-5.0, -5.1, -5.15]):
+            frames += f"3\nIteration {step} Energy {energy:.8f}\nO 0 0 0\nH 0 0.9 0.6\nH 0 -0.9 0.6\n"
+            (scratch / "qcdata_optim.xyz").write_text(frames)
+            time.sleep(0.7)
+            seen_while_running.append(len(watched))
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(engine, "compute_func", fake_compute)
+    engine._compute_geom_opt_result(_water())
+
+    assert seen_while_running[-1] >= 1          # reported before compute returned
+    assert watched[-1] == (3, True)             # and every step once it ended
+    stream = json.loads((tmp_path / "live" / "opt_0.json").read_text())
+    assert len(stream["plot"]["y"]) == 3
+
+
+def test_nothing_changes_without_a_viewer(monkeypatch):
+    monkeypatch.delenv("MEPD_DRIVE_CHAIN_DIR", raising=False)
+    engine = QCComputeEngine(program="xtb", compute_program="qccompute",
+                             program_args=ProgramArgs(model={"method": "GFN2xTB"}))
+    got = {}
+    monkeypatch.setattr(engine, "compute_func", lambda inp, **kw: got.update(kw) or SimpleNamespace())
+    engine._compute_geom_opt_result(_water())
+    assert "scratch_dir" not in got

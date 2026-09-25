@@ -71,29 +71,10 @@ _XTBOPT_ENERGY_RE = re.compile(r"energy:\s*(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)")
 
 def _read_xtbopt_progress(fp: Path, natoms: int) -> tuple[list[float], list[str]]:
     """Energies and xyz frames of every step xtb has written to its
-    optimization log so far -- cheap enough to call while the optimizer runs
-    (the file is appended to; a half-written last frame is skipped)."""
-    try:
-        lines = fp.read_text().splitlines()
-    except OSError:
-        return [], []
-    energies: list[float] = []
-    frames: list[str] = []
-    i = 0
-    while i + natoms + 1 < len(lines):
-        head = lines[i].strip()
-        if head != str(natoms):
-            i += 1
-            continue
-        block = lines[i + 2 : i + 2 + natoms]
-        if len(block) < natoms or any(len(row.split()) < 4 for row in block):
-            break
-        match = _XTBOPT_ENERGY_RE.search(lines[i + 1])
-        if match:
-            energies.append(float(match.group(1)))
-            frames.append("\n".join([str(natoms), lines[i + 1].strip(), *block]) + "\n")
-        i += natoms + 2
-    return energies, frames
+    optimization log so far (see `progress.read_xyz_steps`)."""
+    from mepd.progress import read_xyz_steps
+
+    return read_xyz_steps(fp, natoms, _XTBOPT_ENERGY_RE)
 
 
 class _GXTBASEResultsCalculator(Calculator):
