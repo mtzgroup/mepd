@@ -718,3 +718,17 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .nl-ghost { position: fixed; z-index: 60; pointer-events: none; object-fit: contain;
   background: var(--panel); border-radius: 4px; box-shadow: 0 6px 24px rgba(23, 50, 74, .18); }
 @keyframes nl-pop { from { transform: scale(.9); opacity: .4; } to { transform: none; opacity: 1; } }
+
+/* ---- Conformers (inspector list, edge pickers) ---- */
+.conformers { margin-top: 10px; }
+.conf-list { list-style: none; margin: 6px 0; padding: 0; max-height: 220px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 8px; }
+.conf-list li { display: grid; grid-template-columns: 5.5em 3.5em minmax(0, 1fr) auto; gap: 8px; align-items: center;
+  padding: 5px 8px; cursor: pointer; border-bottom: 1px solid var(--border); font-size: 13px; }
+.conf-list li:last-child { border-bottom: 0; }
+.conf-list li:hover { background: var(--hover, rgba(127,127,127,.08)); }
+.conf-list li.on { background: var(--accent-soft); }
+.conf-list .conf-e { text-align: right; }
+.conf-list .conf-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.conf-picks { display: grid; gap: 6px; margin: 8px 0; }
+.conf-picks select { width: 100%; min-width: 0; }

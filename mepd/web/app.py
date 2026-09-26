@@ -75,6 +75,7 @@ class EdgeIn(BaseModel):
 class EdgePatch(BaseModel):
     label: Optional[str] = None
     reverse: bool = False
+    conformers: Optional[dict[str, Optional[str]]] = None   # {structure id: conformer id, or None = lowest}
 
 
 class JobIn(BaseModel):
@@ -86,6 +87,7 @@ class JobIn(BaseModel):
     label: str = ""
     dry_run: bool = False
     source_job: Optional[str] = None  # follow-up operations: the job they build on
+    conformers: Optional[dict[str, str]] = None  # {structure id: conformer id} to use instead of the lowest
 
 
 class ProfileFormIn(BaseModel):
@@ -207,6 +209,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             try:
                 result = await parse_result(job, manager.job_dir(job["id"]))
                 job["summary"] = summarize(result)
+                if job["status"] == "done" and not job.get("external"):
+                    if await run_in_threadpool(attach_conformers, manager.ws, job, result):
+                        bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             except Exception as exc:
                 job["summary"] = {"headline": f"result not readable: {type(exc).__name__}: {exc}",
                                   "barrier_kcal": None, "counts": {}}
@@ -465,36 +470,48 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                                  "origin": {"kind": "smiles", "input": smi}, "smiles": smi}))
         if demo is not None:
             demo.check_structures(len(W().snapshot()["structures"]), [len(s.symbols) for s, _ in todo])
-        return [W().add_structure(s, **kw) for s, kw in todo]
+        out = []
+        for s, kw in todo:
+            added = W().add_or_merge(s, **kw)
+            out.append({**added["rec"], "merged": added["merged"], "duplicate": added["duplicate"],
+                        "added_conformer": added["conformer"]})
+        return out
 
-    def queue_optimization(sids: list[str]) -> list[dict]:
+    def queue_optimization(sids: list[str], conformers: Optional[list] = None) -> list[dict]:
         """Minimize structures at the workspace level of theory: one
         `mepd optimize` job per charge/multiplicity group. Their geometry and
-        energy are replaced in place when it finishes (apply_optimization)."""
+        energy are replaced in place when it finishes (apply_optimization).
+        `conformers` (parallel to `sids`): which conformer of each; default
+        the representative."""
         ws = W()
-        groups: dict[tuple, list[str]] = {}
-        for sid in sids:
+        groups: dict[tuple, list[tuple]] = {}
+        for i, sid in enumerate(sids):
             rec = ws.structure(sid)
             if is_ts(rec):
                 continue  # minimizing a saddle point would destroy it
-            groups.setdefault((rec["charge"], rec["multiplicity"]), []).append(sid)
+            cid = conformers[i] if conformers and i < len(conformers) else None
+            groups.setdefault((rec["charge"], rec["multiplicity"]), []).append((sid, cid))
         if not groups:
             raise WorkspaceError("nothing to optimize: transition-state structures are never minimized")
         created = []
-        for ids in groups.values():
-            names = ", ".join(ws.structure(i)["name"] for i in ids[:3]) + (f" +{len(ids) - 3}" if len(ids) > 3 else "")
+        for pairs in groups.values():
+            ids = [sid for sid, _ in pairs]
+            names = ", ".join(dict.fromkeys(ws.structure(i)["name"] for i in ids[:3])) + (
+                f" +{len(ids) - 3}" if len(ids) > 3 else "")
             created += J().submit("optimize", structure_ids=ids, edge_ids=[],
                                   params={"validate_minima_with_hessian": ws.validate_minima},
-                                  profile=ws.level_profile, label=f"Optimize: {names}")
-            ws.set_status(ids, "optimizing")
+                                  profile=ws.level_profile, label=f"Optimize: {names}",
+                                  conformers=[cid for _, cid in pairs])
+            ws.set_status(list(dict.fromkeys(ids)), "optimizing")
         return created
 
     @app.post("/api/structures")
     async def add_structures(body: StructureIn):
         added = await run_in_threadpool(_add_from_text, body.text, body.name, body.charge, body.multiplicity)
-        if body.optimize and added:
-            queue_optimization([a["id"] for a in added])
-            added = [W().structure(a["id"]) for a in added]
+        fresh = [a for a in added if not a["duplicate"]]   # a geometry we already had needs no minimization
+        if body.optimize and fresh:
+            queue_optimization([a["id"] for a in fresh], [a["added_conformer"] for a in fresh])
+            added = [{**a, **W().structure(a["id"])} for a in added]
         publish_ws()
         return added
 
@@ -549,8 +566,22 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return {"ok": True}
 
     @app.get("/api/structures/{sid}/xyz", response_class=PlainTextResponse)
-    def structure_xyz(sid: str):
-        return W().structure_path(sid).read_text()
+    def structure_xyz(sid: str, conformer: Optional[str] = None):
+        return (W().conformer_path(sid, conformer) if conformer else W().structure_path(sid)).read_text()
+
+    @app.delete("/api/structures/{sid}/conformers/{cid}")
+    def delete_conformer(sid: str, cid: str):
+        rec = W().delete_conformer(sid, cid)
+        publish_ws()
+        return rec
+
+    @app.post("/api/structures/merge-duplicates")
+    def merge_duplicates():
+        """Fold nodes that are the same molecule into one node with all
+        their conformers (for graphs built before conformers were merged)."""
+        out = W().merge_duplicates()
+        publish_ws()
+        return out
 
     @app.get("/api/depict")
     def depict(smiles: str, w: int = 220, h: int = 160):
@@ -637,7 +668,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         # It only snapshots files and builds argv, so it is quick.
         created = J().submit(body.op, structure_ids=body.structures, edge_ids=body.edges,
                              params=body.params, profile=body.profile, label=body.label,
-                             dry_run=body.dry_run, source_job_id=body.source_job)
+                             dry_run=body.dry_run, source_job_id=body.source_job, conformers=body.conformers)
         if body.op == "optimize" and not body.dry_run:
             W().set_status(body.structures, "optimizing")
             publish_ws()
@@ -751,14 +782,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             f = frames[k]
             (s,) = chem.structures_from_xyz_text(f["xyz"], job.get("charge"), job.get("multiplicity"))
             smiles = chem.perceive_smiles(s)
-            existing = _find_duplicate(W(), smiles, f["energy_hartree"], job.get("level"), jid)
+            ts_frame = (k == entry["ts_index"] and len(frames) > 1) or \
+                (len(frames) == 1 and group["kind"] in ("ts", "ts_other", "channel", "alternate", "offtarget"))
+            existing = _find_duplicate(W(), smiles, f["energy_hartree"], job.get("level"), jid) if ts_frame else None
             if existing is not None:
                 reused.append(existing)
                 in_order.append(existing)
                 continue
-            ts_frame = (k == entry["ts_index"] and len(frames) > 1) or \
-                (len(frames) == 1 and group["kind"] in ("ts", "ts_other", "channel", "alternate", "offtarget"))
             name = (smiles or chem.formula(s)) + (" [TS]" if ts_frame else "")
+            # A minimum of a molecule already in the graph becomes one more
+            # conformer of that node (or is recognized as one it has).
+            before = set(W().snapshot()["structures"])
             rec = W().add_structure(
                 s, name=name, energy=f["energy_hartree"], smiles=smiles,
                 # A minimum only counts as one if its Hessian check (when
@@ -768,7 +802,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 level=job.get("level"), role="ts" if ts_frame else "minimum",
                 validation=entry.get("validation"),
                 origin={"kind": "job", "job": jid, "entry": entry["id"], "label": entry["label"], "frame": k})
-            added.append(rec)
+            (added if rec["id"] not in before else reused).append(rec)
             in_order.append(rec)
         edge = None
         if connect and len(picks) == 2:
@@ -929,6 +963,48 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     return app
 
 
+def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
+    """Conformers a finished job sampled (RDKit/CREST) become conformers of
+    the node they belong to: a `conformers` job's of its structure, a
+    `channels` job's reactant/product pools of its start/end. Energies count
+    only when the job minimized them at its level of theory. Returns how
+    many were new."""
+    targets = job["targets"]["structures"]
+    params = job.get("params") or {}
+    if job["op"] == "conformers":
+        owner = {"conf_": targets[0] if targets else None}
+        minimized = params.get("minimize", True)
+    elif job["op"] == "channels":
+        owner = {"start_conf_": targets[0] if targets else None,
+                 "end_conf_": targets[1] if len(targets) > 1 else None}
+        minimized = params.get("minimize_ends", True)
+    else:
+        return 0
+    added = 0
+    for group in result.get("groups", []):
+        if group.get("kind") != "conformers":
+            continue
+        for entry in group["entries"]:
+            sid = next((s for prefix, s in owner.items() if entry["id"].startswith(prefix)), None)
+            if sid is None or sid not in ws.snapshot()["structures"] or not entry.get("frames"):
+                continue
+            frame = entry["frames"][0]
+            (s,) = chem.structures_from_xyz_text(frame["xyz"], job.get("charge"), job.get("multiplicity"))
+            rec = ws.structure(sid)
+            smiles = chem.perceive_smiles(s)
+            if smiles and rec.get("smiles") and chem.canonical_key(smiles) != chem.canonical_key(rec["smiles"]):
+                continue   # minimized into a different molecule: not a conformer of this one
+            energy = frame.get("energy_hartree") if minimized else None
+            validation = entry.get("validation")
+            _, duplicate = ws.add_conformer(
+                sid, s, energy=energy, level=job.get("level") if energy is not None else None,
+                optimized=energy is not None and (validation or {}).get("is_minimum", True),
+                validation=validation, origin={"kind": "job", "job": job["id"], "entry": entry["id"],
+                                               "label": entry["label"], "frame": 0})
+            added += not duplicate
+    return added
+
+
 def apply_optimization(ws: Workspace, job: dict) -> None:
     """Write a finished `optimize` job back onto its structures (in place)."""
     sids = job["targets"]["structures"]
@@ -938,12 +1014,14 @@ def apply_optimization(ws: Workspace, job: dict) -> None:
         summary = {r["index"]: r for r in json.loads((out / "summary.json").read_text())["structures"]}
     except Exception:
         pass
+    confs = job.get("target_conformers") or [None] * len(sids)
     for i, sid in enumerate(sids):
         rec = summary.get(i)
         if job["status"] == "done" and rec and rec["converged"] and (out / f"opt_{i}.xyz").exists():
             (s,) = chem.structures_from_xyz_text((out / f"opt_{i}.xyz").read_text())
             validation = {k: rec[k] for k in ("is_minimum", "min_frequency", "rescued", "validation") if k in rec} or None
-            ws.replace_geometry(sid, s, energy=rec.get("energy"), level=job.get("level"), validation=validation)
+            ws.replace_geometry(sid, s, energy=rec.get("energy"), level=job.get("level"), validation=validation,
+                                conformer=confs[i] if i < len(confs) else None)
         else:
             why = (rec or {}).get("error") or job.get("error") or job["status"]
             ws.set_status([sid], "opt_failed", f"optimization {job['status']}: {str(why).splitlines()[-1][:300]}")

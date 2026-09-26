@@ -208,7 +208,8 @@ export function Graph() {
       for (const s of Object.values(structures)) {
         ids.add(s.id);
         const img = depictUrl(s.smiles, 200, 150);
-        const data = { id: s.id, label: s.name, img: img || '', noimg: !img };
+        const nConf = (s.conformers || []).length;
+        const data = { id: s.id, label: nConf > 1 ? `${s.name} · ${nConf} conf.` : s.name, img: img || '', noimg: !img };
         const el = c.getElementById(s.id);
         if (el.nonempty()) {
           if (el.data('label') !== data.label || el.data('img') !== data.img) el.data(data);

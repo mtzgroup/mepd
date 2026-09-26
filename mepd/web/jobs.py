@@ -211,11 +211,15 @@ class JobManager:
 
     def submit(self, op_key: str, *, structure_ids: list[str], edge_ids: list[str],
                params: Optional[dict], profile: Optional[str], label: str = "",
-               dry_run: bool = False, source_job_id: Optional[str] = None) -> list[dict]:
+               dry_run: bool = False, source_job_id: Optional[str] = None,
+               conformers=None) -> list[dict]:
         """Create one job per target set. `dry_run` validates and returns
         the would-be records (with their `command`) without keeping anything.
         A follow-up operation (target "job") works on `source_job_id`'s
-        finished output, in that job's output folder, at its level of theory."""
+        finished output, in that job's output folder, at its level of theory.
+        `conformers`: which conformer of each structure to use -- a list in
+        target order, or {structure id: conformer id}; otherwise an edge's
+        chosen conformers, otherwise each node's lowest-energy one."""
         op = get_operation(op_key)
         parsed = op.parse_params(params)
         source = None
@@ -258,7 +262,14 @@ class JobManager:
                 jdir = self.job_dir(jid)
                 jdir.mkdir(parents=True)
                 dirs.append(jdir)
-                recs = [self.ws.structure(s) for s in sids]
+                chosen = {}
+                for eid in eids:
+                    chosen.update((self.ws.edge(eid).get("conformers") or {}))
+                if isinstance(conformers, dict):
+                    chosen.update({k: v for k, v in conformers.items() if v})
+                picks = [(conformers[i] if isinstance(conformers, list) and i < len(conformers) else None)
+                         or chosen.get(s) for i, s in enumerate(sids)]
+                recs = [self.ws.structure_view(s, c) for s, c in zip(sids, picks)]
                 if op.target == "structure" and op.key != "tsopt":
                     busy = [r["name"] for r in recs if r.get("status") == "optimizing"]
                     if busy:
@@ -275,6 +286,7 @@ class JobManager:
                     "returncode": None, "argv": argv,
                     "command": "mepd " + " ".join(shlex.quote(a) for a in argv),
                     "targets": {"structures": sids, "edges": eids},
+                    "target_conformers": [r.get("conformer_id") or r.get("conformer") for r in recs],
                     "charge": recs[0]["charge"] if recs else (source or {}).get("charge", 0),
                     "multiplicity": recs[0]["multiplicity"] if recs else (source or {}).get("multiplicity", 1),
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
@@ -518,7 +530,6 @@ class JobManager:
         if not end:
             return
         from mepd.web import chem
-        from mepd.web.workspace import find_duplicate
 
         seeds = job.get("targets", {}).get("structures") or []
         nodes = dict(job.get("live_nodes") or {})
@@ -537,16 +548,16 @@ class JobManager:
                     continue    # already added, or its parent was deleted
                 (s,) = chem.structures_from_xyz_text(ev["xyz"], job.get("charge"), job.get("multiplicity"))
                 smiles = chem.perceive_smiles(s) or ev.get("smiles") or None
-                rec = find_duplicate(self.ws, smiles, ev.get("energy_hartree"), job.get("level"), job["id"])
-                if rec is None:
-                    validation = ev.get("validation")
-                    rec = self.ws.add_structure(
-                        s, name=smiles or chem.formula(s), energy=ev.get("energy_hartree"), smiles=smiles,
-                        optimized=(validation or {}).get("is_minimum", True), level=job.get("level"),
-                        validation=validation,
-                        origin={"kind": "job", "job": job["id"], "entry": f"min_{ev['index']}",
-                                "label": f"Minimum {ev['index']}", "frame": 0, "parent": parent, "live": True})
-                    known = self.ws.snapshot()["structures"]
+                validation = ev.get("validation")
+                # A molecule already in the graph gets this geometry as one
+                # more conformer rather than a second node.
+                rec = self.ws.add_structure(
+                    s, name=smiles or chem.formula(s), energy=ev.get("energy_hartree"), smiles=smiles,
+                    optimized=(validation or {}).get("is_minimum", True), level=job.get("level"),
+                    validation=validation,
+                    origin={"kind": "job", "job": job["id"], "entry": f"min_{ev['index']}",
+                            "label": f"Minimum {ev['index']}", "frame": 0, "parent": parent, "live": True})
+                known = self.ws.snapshot()["structures"]
                 nodes[str(ev["index"])] = rec["id"]
                 a, b = parent, rec["id"]
             elif ev.get("event") == "reaction":

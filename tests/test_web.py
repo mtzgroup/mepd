@@ -25,11 +25,20 @@ H 0.758 0.000 0.504
 H -0.758 0.000 0.504
 """
 
+# A different species with water's atoms (one H pulled off), so it is its own
+# node: two geometries of the *same* molecule are one node with two conformers.
 WATER_BENT_XYZ = """3
-water, stretched
+water, one H pulled off
 O 0.000 0.000 0.000
-H 0.900 0.000 0.450
+H 2.600 0.000 0.450
 H -0.758 0.000 0.504
+"""
+
+HCN_XYZ = """3
+hydrogen cyanide
+H 0.000 0.000 -1.066
+C 0.000 0.000 0.000
+N 0.000 0.000 1.156
 """
 
 
@@ -246,8 +255,8 @@ def test_import_existing_output_and_pull_irc_ends_into_graph(client, tmp_path):
     out = tmp_path / "mepd_ts_output"
     out.mkdir()
     _write_chain(out / "ts.xyz", [WATER_BENT_XYZ], [-76.30])
-    _write_chain(out / "irc.xyz", [WATER_XYZ, WATER_BENT_XYZ, WATER_XYZ.replace("0.758 0.000 0.504", "0.700 0.100 0.500", 1)],
-                 [-76.40, -76.30, -76.38])
+    _write_chain(out / "irc.xyz", [WATER_XYZ, WATER_XYZ.replace("0.758 0.000 0.504", "1.300 0.000 0.480", 1),
+                                   WATER_BENT_XYZ], [-76.40, -76.30, -76.38])
 
     job = client.post("/api/jobs/import", json={"path": str(out)}).json()
     assert job["op"] == "tsopt" and job["status"] == "done" and job["external"]
@@ -367,7 +376,7 @@ def test_optimize_on_add_puts_structures_at_the_workspace_level(client):
 
 
 def test_bulk_delete_and_downloads(client, tmp_path, quick_op):
-    a, b, c = _add(client, WATER_XYZ + WATER_BENT_XYZ + WATER_XYZ)
+    a, b, c = _add(client, WATER_XYZ + WATER_BENT_XYZ + HCN_XYZ)
     e1 = client.post("/api/edges", json={"source": a["id"], "target": b["id"]}).json()
     e2 = client.post("/api/edges", json={"source": b["id"], "target": c["id"]}).json()
 
@@ -501,7 +510,9 @@ def test_hessian_sample_validates_minima_and_marks_rejects(client, tmp_path):
     assert "Hessian-validated, 1 rejected" in r["headline"]
     kinds = {g["kind"]: g for g in r["groups"]}
     assert "Hessian ✓" in kinds["minima"]["entries"][0]["note"]
-    good = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": "min_0", "frames": "one", "frame": 0}).json()["added"][0]
+    # min_0 is the seed's own molecule: it joins that node as a conformer.
+    good = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": "min_0", "frames": "one", "frame": 0}).json()["reused"][0]
+    assert good["id"] == s["id"] and len(good["conformers"]) == 2
     bad = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": "rejected_0", "frames": "one", "frame": 0}).json()["added"][0]
     assert good["optimized"] and good["validation"]["is_minimum"]
     assert not bad["optimized"]  # a rejected structure is never trusted as a minimum
@@ -726,11 +737,12 @@ def test_bulk_add_to_graph(client, tmp_path):
     (out / "summary.json").write_text(json.dumps({"seed_energy": -76.40}))
     job = client.post("/api/jobs/import", json={"path": str(out)}).json()
     r = client.post(f"/api/jobs/{job['id']}/import-entries", json={"entries": ["min_0", "min_2"]}).json()
-    assert len(r["added"]) == 2
-    assert {x["origin"]["entry"] for x in r["added"]} == {"min_0", "min_2"}
+    # Two conformers of water: one node holding both.
+    assert len(r["added"]) == 1 and len(r["reused"]) == 1
+    assert len(r["added"][0]["conformers"]) == 2 or len(client.get("/api/state").json()["workspace"]["structures"][r["added"][0]["id"]]["conformers"]) == 2
     r = client.post(f"/api/jobs/{job['id']}/import-entries", json={"entries": ["min_0", "min_1"]}).json()
     assert len(r["added"]) == 1 and len(r["reused"]) == 1          # min_0 was already in the Graph
-    assert len(client.get("/api/state").json()["workspace"]["structures"]) == 3
+    assert len(client.get("/api/state").json()["workspace"]["structures"]) == 2
     assert client.post(f"/api/jobs/{job['id']}/import-entries", json={"entries": ["nope"]}).status_code == 404
 
 
@@ -1050,12 +1062,13 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
            "charge": 0, "multiplicity": 1, "level": None}
     live = jobs.job_dir("j_live") / "live"
     live.mkdir(parents=True)
-    bent = WATER_XYZ.replace("0.504", "0.604")
     events = [
-        {"event": "species", "index": 1, "parent": 0, "xyz": bent, "energy_hartree": -1.0, "caption": "+O0–H1"},
-        {"event": "species", "index": 2, "parent": 1, "xyz": WATER_XYZ, "energy_hartree": -2.0,
+        {"event": "species", "index": 1, "parent": 0, "xyz": WATER_BENT_XYZ, "energy_hartree": -1.0, "caption": "+O0–H1"},
+        {"event": "species", "index": 2, "parent": 1, "xyz": HCN_XYZ, "energy_hartree": -2.0,
          "validation": {"is_minimum": True}},
         {"event": "reaction", "source": 0, "target": 2, "caption": ""},
+        # Another geometry of the seed's own molecule: a conformer of the seed, no new node or edge.
+        {"event": "species", "index": 3, "parent": 1, "xyz": WATER_XYZ.replace("0.504", "0.604"), "energy_hartree": -3.0},
     ]
     fp = live / "events.jsonl"
     fp.write_text(json.dumps(events[0]) + "\n" + json.dumps(events[1])[:20])   # second line half-written
@@ -1076,3 +1089,6 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
     second = job["live_nodes"]["2"]
     assert pairs == {(seed["id"], first["id"]), (first["id"], second), (seed["id"], second)}
     assert snap["structures"][second]["origin"]["parent"] == first["id"]
+    assert job["live_nodes"]["3"] == seed["id"] and len(snap["structures"][seed["id"]]["conformers"]) == 2
+    # The seed is represented by its lower-energy conformer.
+    assert snap["structures"][seed["id"]]["energy"] == -3.0

@@ -290,6 +290,34 @@ class NetworkSplitsParams(Params):
                                    advanced=True, group="Recursive splitting", ge=0)
 
 
+class ConformersParams(Params):
+    backend: Literal["rdkit", "crest"] = P("rdkit", "Sampler", "RDKit: ETKDG embeddings relaxed with MMFF "
+                                           "(seconds). CREST: metadynamics at GFN2/GFN-FF (minutes, single-threaded).",
+                                           cli="--backend")
+    n_conformers: int = P(20, "Keep at most", "Distinct conformers kept (0 = no cap).", cli="--n-conformers", ge=0)
+    minimize: bool = P(True, "Minimize at the profile's level", "So their energies are comparable and the "
+                       "lowest one can represent the molecule. Off: the sampler's geometries, without energies.",
+                       cli="--minimize", kind="toggle")
+    validate_minima_with_hessian: bool = P(False, "Hessian-check each", cli="--validate-minima-with-hessian",
+                                           kind="toggle", requires="minimize")
+    rmsd_cutoff: float = P(0.5, "Distinct beyond RMSD (bohr)", cli="--rmsd-cutoff", gt=0, advanced=True,
+                           group="Sampling")
+    crest_method: Literal["--gfn2", "--gfnff", "--gfn2//gfnff"] = P(
+        "--gfn2", "CREST level", cli="--crest-method", advanced=True, group="Sampling", requires="backend=crest")
+    crest_ewin: float = P(6.0, "CREST window (kcal/mol)", cli="--crest-ewin", gt=0, advanced=True,
+                          group="Sampling", requires="backend=crest")
+
+
+def _build_conformers(ctx: JobContext, p: ConformersParams) -> list[str]:
+    rec = ctx.structures[0]
+    if is_ts(rec):
+        raise WorkspaceError(f"{rec['name']} is a transition state: conformers are sampled for minima")
+    if p.backend == "crest" and shutil.which("crest") is None:
+        raise WorkspaceError("CREST isn't installed here (no `crest` on PATH); use the RDKit sampler")
+    seed = ctx.snapshot_structure(rec, "seed")
+    return ["conformers", str(seed), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
 class ExpandParams(Params):
     rounds: int = P(1, "Rounds", "Round 2 proposes products of round 1's new species, and so on.", cli="--rounds", ge=1)
     steer: Literal["auto", "flux", "window"] = P(
@@ -344,7 +372,11 @@ class JobContext:
         reproducible even if the library entry is later edited/deleted."""
         dst = self.job_dir / "inputs" / f"{name}.xyz"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.ws.structure_path(rec["id"]), dst)
+        # A chosen conformer (the edge's, or the caller's), else the node's
+        # lowest-energy one.
+        src = self.ws.conformer_path(rec["id"], rec["conformer_id"]) if rec.get("conformer_id") \
+            else self.ws.structure_path(rec["id"])
+        shutil.copyfile(src, dst)
         return dst
 
     def common_flags(self) -> list[str]:
@@ -702,11 +734,15 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         unavailable_reason="The engine can generate nanoreactor candidates "
         "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
     Operation(
+        "conformers", "Conformers", "Sample this molecule's conformers with RDKit or CREST and minimize them; "
+        "they are added to the node, and its lowest-energy conformer represents it. (`mepd conformers`)",
+        "structure", EXPLORE, ConformersParams, _build_conformers,
+        produces=["conformers of the node"], cli_path=("conformers",),
+        cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),
+    Operation(
         "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming up to two "
-        "bonds on the molecular graph (mepd's reimplementation of the enumeration of ZStruct, Zimmerman, J. Comput. "
-        "Chem. 2013, and YARP, Zhao & Savoie, Nat. Comput. Sci. 2021), keep those with a valid Lewis structure "
-        "(xyz2mol: Kim & Kim, Bull. Korean Chem. Soc. 2015), optimize them, and grow the network from the species "
-        "the kinetics reach (flux steering: Bensberg & Reiher, Isr. J. Chem. 2023). (`mepd discovery expand`)",
+        "bonds on the molecular graph, keep those with a valid Lewis structure, optimize them, and grow the network "
+        "from the species the kinetics reach. (`mepd discovery expand`)",
         "structure", EXPLORE, ExpandParams, _build_discovery("expand"),
         produces=["product species", "proposed reactions", "network edges (with path search)"],
         cli_path=("discovery", "expand"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),

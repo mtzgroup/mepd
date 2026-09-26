@@ -756,6 +756,48 @@ def collect_optimize(out: Path, charge: int, multiplicity: int) -> dict:
                    [{"label": "Failed", "value": "; ".join(failed) or None}], warnings=failed)
 
 
+def collect_conformers(out: Path, charge: int, multiplicity: int) -> dict:
+    """A `mepd conformers` folder: the minimized conformers (energies
+    relative to the lowest), or -- without --minimize -- the backend's raw
+    ones (no mepd energies)."""
+    s = _read_json(out / "summary.json") or {}
+    opt = _read_json(out / "optimized" / "summary.json")
+    nodes, notes, failed = [], [], []
+    if opt:
+        for rec in opt["structures"]:
+            chain = _load_chain(out / "optimized" / f"opt_{rec['index']}.xyz", charge, multiplicity)
+            if chain is None:
+                failed.append(f"conformer {rec['index']}: {rec.get('error') or 'no output'}")
+                continue
+            nodes.append((rec["index"], chain[0], rec))
+    else:
+        raw = _load_chain(out / "conformers.xyz", charge, multiplicity)
+        for i, node in enumerate(raw or []):
+            node._cached_energy = None   # the backend's MMFF/CREST energy, not comparable to mepd's
+            nodes.append((i, node, {}))
+    floor = _min(_node_energy(n) for _, n, _ in nodes)
+    nodes.sort(key=lambda t: (_node_energy(t[1]) is None, _node_energy(t[1]) or 0.0))
+    entries = []
+    for i, node, rec in nodes:
+        e = _node_energy(node)
+        val = {k: rec[k] for k in ("is_minimum", "min_frequency", "rescued", "validation") if k in rec} or None
+        note = _smiles(node) + ("" if not val else (" · Hessian ✓" if val.get("is_minimum") else " · not a minimum"))
+        entry = _entry(f"conf_{i}", f"Conformer {i}" + (f" ({(e - floor) * HARTREE_TO_KCAL:+.1f})"
+                                                        if e is not None and floor is not None else ""),
+                       [node], floor, note=note)
+        entry["validation"] = val
+        entries.append(entry)
+    stats = s.get("stats") or {}
+    return _result(f"{len(entries)} conformer(s) · {s.get('backend', '?')}"
+                   + ("" if opt else " (not minimized)"),
+                   [_group("Conformers", "conformers", entries)],
+                   [{"label": "Backend", "value": s.get("backend")},
+                    {"label": "Generated", "value": stats.get("n_generated")},
+                    {"label": "Kept (distinct)", "value": stats.get("n_kept")},
+                    {"label": "Minimized", "value": "yes" if opt else "no (backend geometries)"},
+                    {"label": "Failed", "value": "; ".join(failed) or None}], warnings=failed)
+
+
 _VRI_VERDICT = {
     "bifurcation": "post-TS bifurcation: the path splits into P1 and P2",
     "second_product_untested": "second product found; not yet checked (run 'Check the bifurcation')",
@@ -876,6 +918,7 @@ def collect_vri(out: Path, charge: int, multiplicity: int) -> dict:
 
 COLLECTORS = {
     "optimize": collect_optimize,
+    "conformers": collect_conformers,
     "ts": collect_ts,
     "channels": collect_channels,
     "tsopt": collect_tsopt,
@@ -932,7 +975,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 10
+RESULT_VERSION = 11
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

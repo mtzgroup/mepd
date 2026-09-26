@@ -5,6 +5,18 @@ import { api, attempt, refreshState } from '../api.js';
 import { prefs, select, useStore } from '../store.js';
 import { cls, depictUrl, levelStatus } from '../util.js';
 
+// "Added 2 structures · 1 new conformer of CCO · 1 already there"
+function addedSummary(list) {
+  const fresh = list.filter((a) => !a.merged).length;
+  const conf = list.filter((a) => a.merged && !a.duplicate);
+  const dup = list.filter((a) => a.duplicate).length;
+  const parts = [];
+  if (fresh) parts.push(`Added ${fresh} structure${fresh === 1 ? '' : 's'}`);
+  if (conf.length) parts.push(`${conf.length} new conformer${conf.length === 1 ? '' : 's'} of ${[...new Set(conf.map((a) => a.name))].join(', ')}`);
+  if (dup) parts.push(`${dup} already in the graph`);
+  return parts.join(' · ') || 'Nothing new';
+}
+
 export async function uploadFiles(files, { charge = null, multiplicity = null } = {}) {
   const fd = new FormData();
   for (const f of files) fd.append('files', f);
@@ -31,11 +43,11 @@ export function AddBox({ onDone }) {
     setBusy(true);
     const added = await attempt(() => api.post('/api/structures', {
       text, charge: charge === '' ? null : +charge, multiplicity: mult === '' ? null : +mult, optimize,
-    }), (a) => `Added ${a.length} structure${a.length === 1 ? '' : 's'}${optimize ? ` · optimizing at ${level?.label ?? 'the workspace level'}` : ''}`);
+    }), (a) => `${addedSummary(a)}${optimize && a.some((x) => !x.duplicate) ? ` · optimizing at ${level?.label ?? 'the workspace level'}` : ''}`);
     setBusy(false);
     if (added) {
       setText('');
-      select({ structures: added.map((a) => a.id) });
+      select({ structures: [...new Set(added.map((a) => a.id))] });
       onDone?.();
     }
   };
@@ -116,6 +128,7 @@ function Card({ rec, selected, order }) {
         <div class="card-name">${rec.name}</div>
         <div class="card-meta">
           <span>${rec.formula}</span>
+          ${(rec.conformers || []).length > 1 && html`<span class="badge" title="Conformers of this molecule; the lowest-energy one represents it">${rec.conformers.length} conformers</span>`}
           ${(rec.charge !== 0 || rec.multiplicity !== 1) && html`<span class="badge">${rec.charge >= 0 ? '+' : ''}${rec.charge} / ${rec.multiplicity}</span>`}
           <span class=${`origin origin-${origin}`} title=${origin === 'job' ? `From ${rec.origin.label}` : `Entered as ${origin}`}>
             ${origin === 'job' ? 'from a calculation' : origin === 'smiles' ? 'SMILES' : 'XYZ'}</span>
@@ -142,6 +155,15 @@ export function Library() {
   };
   const empty = Object.keys(structures).length === 0;
   const showAdd = adding || empty;
+  // Nodes that are the same molecule (graphs from before conformers were
+  // merged into one node): offer to fold them together.
+  const seen = {};
+  let dupes = 0;
+  for (const r of Object.values(structures)) {
+    if (r.role === 'ts' || !r.smiles || r.reacted) continue;
+    const k = `${r.smiles}|${r.charge}|${r.multiplicity}`;
+    if (seen[k]) dupes += 1; else seen[k] = true;
+  }
   return html`
     <aside class=${cls('library', drag && 'drag')}
       onDragOver=${(e) => { e.preventDefault(); setDrag(true); }}
@@ -153,6 +175,8 @@ export function Library() {
           title="Add structures from SMILES or XYZ">${adding ? 'Close' : '＋ Add'}</button>`}
       </div>
       <${LevelBar} />
+      ${dupes > 0 && html`<p class="level-note small">${dupes} structure${dupes > 1 ? 's are' : ' is'} the same molecule as another node.
+        <button class="btn-link small" onClick=${() => attempt(() => api.post('/api/structures/merge-duplicates'), 'Merged into one node per molecule')}>Merge into conformers</button></p>`}
       ${showAdd && html`<${AddBox} onDone=${() => setAdding(false)} />`}
       ${Object.keys(structures).length > 6 && html`
         <input class="search" type="search" placeholder="Filter by name, SMILES or formula" value=${q} onInput=${(e) => setQ(e.target.value)} />`}

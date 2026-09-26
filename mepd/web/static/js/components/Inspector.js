@@ -7,15 +7,63 @@ import { ActionPanel } from './Actions.js';
 import { Viewer3D } from './Viewer3D.js';
 import { LevelChip } from './Library.js';
 
-function useXyz(sid) {
+function useXyz(sid, conformer = null, version = '') {
   const [xyz, setXyz] = useState(null);
   useEffect(() => {
     let live = true;
     setXyz(null);
-    if (sid) api.get(`/api/structures/${sid}/xyz`).then((t) => live && setXyz(t)).catch(() => {});
+    const q = conformer ? `?conformer=${encodeURIComponent(conformer)}` : '';
+    if (sid) api.get(`/api/structures/${sid}/xyz${q}`).then((t) => live && setXyz(t)).catch(() => {});
     return () => { live = false; };
-  }, [sid]);
+  }, [sid, conformer, version]);
   return xyz;
+}
+
+// Conformers of a node, lowest first. ΔE only between conformers whose
+// energies come from the same level of theory as the representative's.
+export function conformerRows(rec) {
+  const confs = rec?.conformers || [];
+  const repConf = confs.find((c) => c.id === rec.conformer);
+  const key = repConf?.level?.key;
+  const same = confs.filter((c) => c.energy != null && c.level?.key === key);
+  const floor = same.length ? Math.min(...same.map((c) => c.energy)) : null;
+  const rows = confs.map((c, i) => ({
+    ...c,
+    index: i,
+    rep: c.id === rec.conformer,
+    dE: floor != null && c.energy != null && c.level?.key === key ? (c.energy - floor) * 627.509474 : null,
+    source: c.origin?.kind === 'job' ? c.origin.label : c.origin?.kind === 'smiles' ? `SMILES ${c.origin.input}` : (c.origin?.kind || ''),
+  }));
+  rows.sort((a, b) => (a.dE ?? 1e9) - (b.dE ?? 1e9) || a.index - b.index);
+  return rows;
+}
+
+export function conformerLabel(r) {
+  const e = r.dE != null ? `${r.dE >= 0 ? '+' : ''}${r.dE.toFixed(1)} kcal/mol` : (r.level ? r.level.label : 'no energy');
+  return `#${r.index + 1} · ${e}${r.rep ? ' · lowest' : ''}`;
+}
+
+function Conformers({ rec, viewing, onView }) {
+  const rows = conformerRows(rec);
+  if (rows.length <= 1) return html`<p class="small muted">One conformer. Run <b>Conformers</b> (RDKit or CREST) to sample more.</p>`;
+  const del = (cid) => attempt(() => api.del(`/api/structures/${rec.id}/conformers/${cid}`), 'Conformer removed');
+  return html`
+    <section class="conformers">
+      <h3 class="section-title">Conformers (${rows.length})</h3>
+      <p class="small muted">The lowest-energy one represents this molecule and is used unless an edge picks another. Click one to view it.</p>
+      <ul class="conf-list">
+        ${rows.map((r) => html`
+          <li class=${`${viewing === r.id || (!viewing && r.rep) ? 'on' : ''}`} onClick=${() => onView(r.rep ? null : r.id)}
+              title=${r.source}>
+            <span class="conf-name">#${r.index + 1}${r.rep ? html` <span class="badge">lowest</span>` : ''}</span>
+            <span class="conf-e mono">${r.dE != null ? `${r.dE >= 0 ? '+' : ''}${r.dE.toFixed(1)}` : '—'}</span>
+            <span class="conf-src small muted">${r.source}${r.level && r.dE == null ? ` · ${r.level.label}` : ''}${r.validation?.is_minimum === false ? ' · not a minimum' : ''}</span>
+            ${!r.rep && html`<button class="btn-icon small" title="Remove this conformer"
+              onClick=${(e) => { e.stopPropagation(); del(r.id); }}>✕</button>`}
+          </li>`)}
+      </ul>
+      <p class="small muted">ΔE in kcal/mol from the lowest, at ${rows.find((r) => r.rep)?.level?.label || 'the same level'}; — = no energy at that level.</p>
+    </section>`;
 }
 
 function JobList({ jobs }) {
@@ -43,7 +91,10 @@ function Editable({ value, onSave, className = '', placeholder = '' }) {
 }
 
 function StructureDetail({ rec }) {
-  const xyz = useXyz(rec.id);
+  const [viewing, setViewing] = useState(null);   // a conformer other than the representative
+  useEffect(() => setViewing(null), [rec.id]);
+  const shown = viewing && (rec.conformers || []).some((c) => c.id === viewing) ? viewing : null;
+  const xyz = useXyz(rec.id, shown, rec.conformer);
   const [labels, setLabels] = useState(false);
   const jobs = useStore((s) => Object.values(s.jobs).filter((j) => j.targets.structures.includes(rec.id))
     .sort((a, b) => b.created - a.created));
@@ -60,8 +111,10 @@ function StructureDetail({ rec }) {
       <${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />
       <div class="viewer-tools">
         <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
-        <a class="small" href=${`/api/structures/${rec.id}/xyz`} download=${`${rec.name}.xyz`}>Download xyz</a>
+        <a class="small" href=${`/api/structures/${rec.id}/xyz${shown ? `?conformer=${shown}` : ''}`} download=${`${rec.name}.xyz`}>Download xyz</a>
+        ${shown && html`<span class="small muted">viewing conformer #${(rec.conformers || []).findIndex((c) => c.id === shown) + 1}</span>`}
       </div>
+      <${Conformers} rec=${rec} viewing=${shown} onView=${setViewing} />
       <dl class="props">
         <dt>Formula</dt><dd>${rec.formula} (${rec.natoms} atoms)</dd>
         <dt>Charge</dt><dd><input type="number" class="tiny" value=${rec.charge} onChange=${(e) => patch({ charge: +e.target.value })} /></dd>
@@ -113,7 +166,9 @@ function EdgeDetail({ edge }) {
   const allJobs = useStore((s) => s.jobs);
   const a = structures[edge.source], b = structures[edge.target];
   const [which, setWhich] = useState(0);
-  const xyz = useXyz(which === 0 ? edge.source : edge.target);
+  const picks = edge.conformers || {};
+  const shownId = which === 0 ? edge.source : edge.target;
+  const xyz = useXyz(shownId, picks[shownId] || null, structures[shownId]?.conformer);
   const st = edgeStatus(edge, allJobs);
   const jobs = Object.values(allJobs).filter((j) => j.targets.edges.includes(edge.id)).sort((x, y) => y.created - x.created);
   const patch = (body) => attempt(() => api.patch(`/api/edges/${edge.id}`, body));
@@ -131,6 +186,16 @@ function EdgeDetail({ edge }) {
           <span class="stat-l">${st.barrier == null && st.barrierUnverified != null ? 'path max, not IRC-verified' : 'best ΔE‡ (kcal/mol)'}</span></div>
         <div class="stat"><span class="stat-v">${st.count}</span><span class="stat-l">calculations</span></div>
       </div>
+      ${[a, b].some((r) => (r?.conformers || []).length > 1) && html`<div class="conf-picks">
+        ${[['start', a], ['end', b]].map(([role, r]) => r && html`<label class="field">
+          <span class="field-label">${role} conformer · ${r.name}</span>
+          <select value=${picks[r.id] || ''} disabled=${(r.conformers || []).length <= 1}
+            onChange=${(e) => patch({ conformers: { [r.id]: e.target.value || null } })}>
+            <option value="">Lowest energy (default)</option>
+            ${conformerRows(r).map((c) => html`<option value=${c.id}>${conformerLabel(c)}</option>`)}
+          </select></label>`)}
+        <p class="small muted">Calculations on this edge start from these conformers.</p>
+      </div>`}
       ${edge.origin?.kind === 'job' && html`<p class="small muted">From <a href="#" onClick=${(e) => { e.preventDefault(); openJob(edge.origin.job); }}>a job result</a>${edge.origin.headline ? ` · ${edge.origin.headline}` : ''}</p>`}
       <div class="segmented wide">
         <button class=${which === 0 ? 'on' : ''} onClick=${() => setWhich(0)}>Start</button>
