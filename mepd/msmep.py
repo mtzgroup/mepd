@@ -61,6 +61,7 @@ def _disregard_stereochem(inputs: RunInputs) -> bool:
 
 PATH_METHODS = ["NEB", "FNEB", "MLPGI", "NEB-DLF", "GEOMETRIC-NEB", "GSM"]
 DEFAULT_CONSECUTIVE_SAME_PAIR_SPLIT_LIMIT = 5
+DEFAULT_CYCLE_REVISITS = 5  # see NEBInputs.recursive_cycle_revisits
 
 
 def _normalize_path_method(path_min_method: str) -> str:
@@ -184,6 +185,12 @@ def _chain_payload_for_worker(input_chain: Chain) -> dict:
     lineage = getattr(input_chain, "_same_pair_split_lineage", None)
     if isinstance(lineage, dict):
         payload["same_pair_split_lineage"] = copy.deepcopy(lineage)
+    ancestors = getattr(input_chain, "_split_ancestors", None)
+    if ancestors:
+        payload["split_ancestors"] = [
+            [n.to_serializable() if hasattr(n, "to_serializable") else copy.deepcopy(n) for n in pair]
+            for pair in ancestors
+        ]
     return payload
 
 
@@ -205,6 +212,12 @@ def _chain_from_worker_payload(payload: dict) -> Chain:
     lineage = payload.get("same_pair_split_lineage")
     if isinstance(lineage, dict):
         chain._same_pair_split_lineage = copy.deepcopy(lineage)
+    ancestors = payload.get("split_ancestors")
+    if ancestors:
+        chain._split_ancestors = [
+            tuple(StructureNode.from_serializable(copy.deepcopy(n)) if isinstance(n, dict) else n for n in pair)
+            for pair in ancestors
+        ]
     return chain
 
 
@@ -514,6 +527,57 @@ class MSMEP:
         for child_chain in child_chains:
             child_chain._same_pair_split_lineage = copy.deepcopy(lineage)
 
+    def _set_child_split_ancestors(self, child_chains: list[Chain], parent_chain: Chain) -> None:
+        """Every child of a split inherits the endpoint pairs of all the
+        searches above it (root first), for `_repeats_an_ancestor`. Node
+        copies travel with the chain (threads, pickling); the process-worker
+        payload serializes them."""
+        if len(parent_chain) < 2:
+            return
+        ancestors = list(getattr(parent_chain, "_split_ancestors", None) or [])
+        ancestors.append((parent_chain[0].copy(), parent_chain[-1].copy()))
+        for child_chain in child_chains:
+            child_chain._split_ancestors = list(ancestors)
+
+    def _endpoints_match(self, a: Node, b: Node) -> bool:
+        """The same minimum for cycle detection: for molecules, msmep's
+        attempt-skip test (identical coordinates, or `is_identical` within
+        node_rms_thre / node_ene_thre); for toy XY nodes, closer than
+        node_rms_thre."""
+        if isinstance(a, StructureNode) and isinstance(b, StructureNode):
+            return self._nodes_match_for_attempt_skip(a, b)
+        try:
+            dist = float(np.linalg.norm(np.asarray(a.coords, dtype=float) - np.asarray(b.coords, dtype=float)))
+            return dist < float(self.inputs.chain_inputs.node_rms_thre)
+        except Exception:
+            return False
+
+    def _resolve_cycle_revisits(self) -> int:
+        value = getattr(self.inputs.path_min_inputs, "recursive_cycle_revisits",
+                        DEFAULT_CYCLE_REVISITS)
+        return max(1, int(value))
+
+    def _repeats_an_ancestor(self, input_chain: Chain) -> bool:
+        """Whether this search has come back to an endpoint pair (either
+        direction) that is already being split higher up this branch at least
+        `recursive_cycle_revisits` times -- a cycle (A->B splits at C, C->B at
+        D, D->B at C again, ...) that would otherwise never terminate. No
+        depth limit is involved: a branch is cut only for revisiting pairs it
+        is already inside, so genuine multistep paths of any length are kept.
+        A few revisits are allowed because they are not pure repetition: the
+        sub-search starts from the path segment it inherited, which can lead
+        to a different TS."""
+        ancestors = getattr(input_chain, "_split_ancestors", None) or []
+        if len(input_chain) < 2 or not ancestors:
+            return False
+        start, end = input_chain[0], input_chain[-1]
+        hits = sum(
+            1 for a_start, a_end in ancestors
+            if (self._endpoints_match(start, a_start) and self._endpoints_match(end, a_end))
+            or (self._endpoints_match(start, a_end) and self._endpoints_match(end, a_start))
+        )
+        return hits >= self._resolve_cycle_revisits()
+
     def _same_pair_split_limit_message(self, count: int) -> str:
         return (
             f"Stopping further splitting of this branch only after {int(count)} "
@@ -753,6 +817,27 @@ class MSMEP:
             history_node.leaf_status = "max_depth_reached"
             return history_node, []
 
+        deadline = getattr(self.inputs.path_min_inputs, "recursive_split_deadline", None)
+        if deadline is not None and time.time() > deadline:
+            # --search-budget: keep this search's own path as the leaf (the
+            # output stays continuous; TS discovery still runs on it).
+            self._say("Search budget reached; keeping this path as a leaf instead of splitting it.",
+                      snapshot=True, warn=True)
+            history_node.leaf_status = "time_budget"
+            return history_node, []
+
+        if self._repeats_an_ancestor(input_chain):
+            # Keep this node's own minimized chain as the leaf so the
+            # concatenated output path stays continuous; it is marked
+            # unresolved rather than split again.
+            self._say(
+                f"Endpoint pair revisited {self._resolve_cycle_revisits()}+ times on this branch "
+                "(a cycle); keeping this path as an unresolved leaf instead of splitting it again.",
+                snapshot=True, warn=True,
+            )
+            history_node.leaf_status = "cycle"
+            return history_node, []
+
         chain_trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
         if not chain_trajectory:
             return history_node, []
@@ -768,6 +853,7 @@ class MSMEP:
         self._set_child_same_pair_split_lineage(
             sequence_of_chains, input_chain, same_pair_split_count + 1
         )
+        self._set_child_split_ancestors(sequence_of_chains, input_chain)
         _record_split_count(same_pair_split_count + 1)
         return history_node, sequence_of_chains
 
@@ -929,7 +1015,7 @@ class MSMEP:
                     is_elem_step = (
                         not child_children
                         and bool(getattr(child_history, "data", None))
-                        and leaf_status not in {"max_depth_reached", "same_pair_split_limit_reached"}
+                        and leaf_status not in {"max_depth_reached", "same_pair_split_limit_reached", "cycle", "time_budget"}
                     )
                     self._mark_attempted_pair_result(
                         job.attempt_payload,

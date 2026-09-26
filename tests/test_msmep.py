@@ -367,3 +367,92 @@ def test_recheck_on_split_refuses_a_remap_that_recreates_the_parent_endpoint(mon
     remap_to["s"] = _h3(None)  # a numbering matching neither parent endpoint: accepted
     result = m.make_sequence_of_chains(chain=parent, split_method="minima", minimization_results=[])
     assert np.allclose(result[0][-1].structure.geometry, remap_to["s"].geometry)
+
+
+def _cycling_msmep(monkeypatch):
+    """A flower-potential MSMEP whose every search 'splits' into a copy of
+    its own endpoint pair -- the simplest cycle. Without a guard the
+    recursion never ends; no depth limit is set."""
+    from types import SimpleNamespace as NS
+
+    msmep, chain = _flower_split_msmep()
+    msmep.inputs.path_min_inputs.recursive_split_max_depth = None
+    calls = []
+
+    def fake_minimize(self, input_chain):
+        calls.append(1)
+        assert len(calls) < 20, "cycle not detected"
+        return (NS(chain_trajectory=[input_chain], optimized=input_chain, converged=True),
+                NS(is_elem_step=False, new_structures=[input_chain[5]], splitting_criterion="minima",
+                   minimization_results=[]))
+
+    monkeypatch.setattr(MSMEP, "run_minimize_chain", fake_minimize)
+    monkeypatch.setattr(MSMEP, "make_sequence_of_chains",
+                        lambda self, chain, split_method, minimization_results: [chain.copy()])
+    return msmep, chain, calls
+
+
+def _leaves_with_status(node, status):
+    out = [node] if getattr(node, "leaf_status", None) == status else []
+    for child in node.children:
+        out += _leaves_with_status(child, status)
+    return out
+
+
+def test_recursive_split_stops_at_a_cycle_and_keeps_a_continuous_path(monkeypatch):
+    msmep, chain, calls = _cycling_msmep(monkeypatch)
+    history = msmep.run_recursive_minimize(chain)
+    # default recursive_cycle_revisits = 5: the root, then five revisits of
+    # the same pair; the fifth is kept as the cycle leaf
+    assert len(calls) == 6
+    assert len(_leaves_with_status(history, "cycle")) == 1
+    out = history.output_chain
+    assert np.allclose(out[0].coords, chain[0].coords) and np.allclose(out[-1].coords, chain[-1].coords)
+
+
+def test_parallel_recursive_split_stops_at_a_cycle(monkeypatch):
+    msmep, chain, calls = _cycling_msmep(monkeypatch)
+    msmep.inputs.path_min_inputs.recursive_cycle_revisits = 1
+    history = msmep.run_parallel_recursive_minimize(chain, max_workers=2)
+    assert len(calls) == 2  # cut at the first revisit
+    assert len(_leaves_with_status(history, "cycle")) == 1
+
+
+def test_split_ancestors_survive_the_process_worker_payload():
+    from mepd.msmep import _chain_from_worker_payload, _chain_payload_for_worker
+
+    m = _msmep_for_split_test()
+    a, b, c = (StructureNode(structure=_h3(p)) for p in ((0, 1), (1, 2), (0, 2)))
+    parent = Chain.model_validate({"nodes": [a, b], "parameters": ChainInputs()})
+    child = Chain.model_validate({"nodes": [a, c], "parameters": ChainInputs()})
+    m._set_child_split_ancestors([child], parent)
+    back = _chain_from_worker_payload(_chain_payload_for_worker(child))
+    (sa, sb), = back._split_ancestors
+    assert np.allclose(sa.coords, a.coords) and np.allclose(sb.coords, b.coords)
+
+
+def test_search_deadline_stops_splitting_but_keeps_the_path(monkeypatch):
+    """--search-budget: once the deadline has passed, a finished search is
+    kept as a 'time_budget' leaf with its own chain (serial and parallel)."""
+    import time as _time
+
+    for mode in ("serial", "parallel"):
+        msmep, chain, calls = _cycling_msmep(monkeypatch)
+        msmep.inputs.path_min_inputs.recursive_split_deadline = _time.time() - 1.0
+        history = (msmep.run_recursive_minimize(chain) if mode == "serial"
+                   else msmep.run_parallel_recursive_minimize(chain, max_workers=2))
+        assert len(calls) == 1, mode
+        assert getattr(history, "leaf_status", None) == "time_budget", mode
+        out = history.output_chain
+        assert np.allclose(out[0].coords, chain[0].coords) and np.allclose(out[-1].coords, chain[-1].coords)
+
+
+def test_pairs_not_started_before_the_search_deadline_are_skipped(tmp_path):
+    import time as _time
+    from types import SimpleNamespace as NS
+
+    from mepd.cli_common import _run_msmep_pairs
+
+    run_inputs = NS(path_min_inputs=NS(recursive_split_deadline=_time.time() - 1.0))
+    _run_msmep_pairs([None, None], [(0, 1)], tmp_path, run_inputs, parallel=False, parallel_workers=None)
+    assert not (tmp_path / "pair_0_1").exists()

@@ -198,6 +198,17 @@ class NEBInputs:
         splitting that branch further rather than recursing forever. For floppy
         systems that legitimately need more attempts before finding a real
         intermediate, raise this (default: 5).
+    `recursive_cycle_revisits`: how many times a branch may come back to an
+        endpoint pair it is already inside (a search matching one of its
+        ancestors, either direction, within node_rms_thre / node_ene_thre)
+        before that search is kept as an unresolved "cycle" leaf instead of
+        being split again. Revisits are not pure waste -- a sub-search
+        inherits the path segment between its minima, so the same endpoints
+        can lead to a different TS -- so this is a safety net against
+        unbounded cycles, not a speed-up. There is no depth limit. Default 5:
+        the smallest value that, replayed on the 860 Reaction-QM split trees,
+        cuts no reaction's lowest channel (4% of searches avoided; at 4,
+        rxn_747's only channel sat below a cut).
     """
 
     climb: bool = True
@@ -232,6 +243,7 @@ class NEBInputs:
     hessian_minimum_frequency_cutoff: float = 0.0
     hessian_minima_rescue_displacement: float = 0.1
     recursive_same_pair_split_limit: int = 5
+    recursive_cycle_revisits: int = 5
     ts_converged_stop: bool = True
 
     max_steps: float = 2000

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -629,6 +630,10 @@ def _run_msmep_pairs(
         # that did finish in the meantime are on disk and stay there.
         if (tree_dir / "adj_matrix.txt").exists():
             typer.echo(f"Skipping pair ({i}, {j}): already completed.")
+            return
+        deadline = getattr(run_inputs.path_min_inputs, "recursive_split_deadline", None)
+        if deadline is not None and time.time() > deadline:
+            typer.echo(f"Skipping pair ({i}, {j}): --search-budget reached before it started.")
             return
         pair_dir.mkdir(parents=True, exist_ok=True)
         typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")

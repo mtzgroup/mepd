@@ -821,6 +821,17 @@ def channels(
         "single interactive query uses the whole machine without needing to "
         "be told to.",
     ),
+    search_budget: float = typer.Option(
+        0.0, "--search-budget",
+        help="Wall-clock seconds (counted from the start of the command) after "
+        "which no new path-search work starts: pairs not yet begun are skipped "
+        "and a search that finishes is not split further (it is kept as a "
+        "'time_budget' leaf with its own path, so every tree stays continuous). "
+        "TS optimization, IRC and channel classification then run on whatever "
+        "was found, so a slow reaction still yields its channels instead of "
+        "being killed with nothing. Searches already queued at the deadline "
+        "still run once. 0 (default) = no budget.",
+    ),
     validate_minima_with_hessian: bool = typer.Option(
         True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
         help="When a minima-based autosplit is proposed during each pair's MSMEP, "
@@ -975,6 +986,10 @@ def channels(
     # Per-stage yield and wall time, rewritten after every stage so a run
     # that dies (or a --conformers-only run) still leaves what it measured.
     run_started = time.perf_counter()
+    search_budget = float(search_budget) if isinstance(search_budget, (int, float)) else 0.0
+    if search_budget < 0:
+        raise typer.BadParameter("--search-budget must be >= 0.")
+    search_deadline = time.time() + search_budget if search_budget > 0 else None
     stats: dict = {"backend": backend, "workers": workers, "conformers": {}}
     output.mkdir(parents=True, exist_ok=True)
 
@@ -1141,11 +1156,18 @@ def channels(
     pairs_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
+    if search_deadline is not None:
+        # Read by MSMEP (no further splits) and by _run_msmep_pairs (no new
+        # pairs); forked pair workers inherit it with run_inputs.
+        setattr(run_inputs.path_min_inputs, "recursive_split_deadline", search_deadline)
+        stats["search_budget_seconds"] = search_budget
     _run_msmep_pairs(
         structures, candidates, pairs_dir, run_inputs,
         parallel=parallel, parallel_workers=parallel_workers, workers=workers,
     )
     stats["msmep_seconds"] = round(time.perf_counter() - t0, 3)
+    if search_deadline is not None:
+        stats["search_budget_reached"] = time.time() > search_deadline
     _write_stats()
 
     tree_dirs = _completed_tree_dirs(pairs_dir)
