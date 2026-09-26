@@ -247,7 +247,11 @@ class JobManager:
                 issues = [i for i in issues if i not in pf["path_issues"]]
             if issues:
                 raise WorkspaceError(f"profile {profile!r} is incomplete: " + " ".join(issues))
-        if source is not None:
+        if op.target == "design":
+            if not self.ws.design:
+                raise WorkspaceError("there is no design")
+            target_sets = [([], [])]
+        elif source is not None:
             target_sets = [(structure_ids, edge_ids)]
         elif dry_run and op.target == "pair" and not edge_ids and len(structure_ids) == 2:
             target_sets = [(list(structure_ids), [])]  # don't create an edge just to preview
@@ -280,6 +284,9 @@ class JobManager:
                 names = " → ".join(r["name"] for r in recs) if op.target == "pair" else ", ".join(r["name"] for r in recs)
                 if source is not None:
                     names = source["title"]
+                design = self.ws.design if op.target == "design" else None
+                if design is not None:
+                    names = design.get("name") or design.get("formula") or "design"
                 created.append({
                     "id": jid, "op": op.key, "title": label or f"{op.title}: {names}",
                     "status": "queued", "created": time.time(), "started": None, "finished": None,
@@ -287,8 +294,11 @@ class JobManager:
                     "command": "mepd " + " ".join(shlex.quote(a) for a in argv),
                     "targets": {"structures": sids, "edges": eids},
                     "target_conformers": [r.get("conformer_id") or r.get("conformer") for r in recs],
-                    "charge": recs[0]["charge"] if recs else (source or {}).get("charge", 0),
-                    "multiplicity": recs[0]["multiplicity"] if recs else (source or {}).get("multiplicity", 1),
+                    "charge": recs[0]["charge"] if recs else (design or source or {}).get("charge", 0),
+                    "multiplicity": recs[0]["multiplicity"] if recs else (design or source or {}).get("multiplicity", 1),
+                    "design_rev": design.get("rev") if design is not None else None,
+                    # What was submitted, to go back to if a TS search fails.
+                    "design_snapshot": dict(design) if design is not None else None,
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
                     "output_dir": source["output_dir"] if source is not None else str(jdir / "output"),
                     "external": False, "source_job": source["id"] if source is not None else None,

@@ -1,7 +1,7 @@
 // Right panel: what is selected, what we know about it, what can be run on it.
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
-import { clearSelection, openJob, prefs, select, set, useStore } from '../store.js';
+import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
 import { PHONE_QUERY, STATUS_LABEL, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus } from '../util.js';
 import { ActionPanel } from './Actions.js';
 import { Viewer3D } from './Viewer3D.js';
@@ -130,7 +130,11 @@ function StructureDetail({ rec }) {
           ? html`<a href="#" onClick=${(e) => { e.preventDefault(); openJob(rec.origin.job); }}>${rec.origin.label} · ${originJob?.title || 'job'}</a>`
           : rec.origin?.kind === 'smiles' ? html`SMILES <code>${rec.origin.input}</code>` : 'XYZ'}</dd>
       </dl>
-      <button class="btn-link danger small" onClick=${del}>Delete structure</button>
+      <div class="row-actions">
+        <button class="btn small" title="Open this structure (the conformer shown) in the Design tab to edit it"
+          onClick=${() => attempt(() => api.post('/api/design/load', { structure: rec.id, conformer: shown }), 'Loaded into Design').then((d) => d && openTab('design'))}>Edit in Design</button>
+        <button class="btn-link danger small" onClick=${del}>Delete structure</button>
+      </div>
     </section>
     <${JobList} jobs=${jobs} />`;
 }

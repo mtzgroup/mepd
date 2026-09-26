@@ -664,6 +664,23 @@ class Workspace:
                 continue
         return out
 
+    # -------------------------------------------------------------- design
+    @property
+    def design(self) -> Optional[dict]:
+        """The Design tab's molecule: {molblock, name, charge, multiplicity,
+        source, energy, level, rev} (energy/level only while it is exactly
+        the geometry minimized at that level)."""
+        return self._data.get("design")
+
+    def set_design(self, design: Optional[dict]) -> dict:
+        with self._lock:
+            old = self._data.get("design") or {}
+            if design is not None:
+                design = {**design, "rev": int(old.get("rev") or 0) + 1}
+            self._data["design"] = design
+            self._save()
+            return design
+
     # ----------------------------------------------------------- positions
     def set_positions(self, positions: dict[str, dict]) -> None:
         with self._lock:

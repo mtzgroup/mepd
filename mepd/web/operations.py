@@ -29,7 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from mepd.atom_mapping_metrics import METRICS as _ATOM_MAPPING_METRICS
 from mepd.web.workspace import Workspace, WorkspaceError, is_ts
 
-Target = Literal["structure", "pair", "set", "job"]  # "job": a follow-up on another job's output
+# "job": a follow-up on another job's output; "design": the Design tab's molecule
+Target = Literal["structure", "pair", "set", "job", "design"]
 # Subscripting with a tuple lists its items, so this stays in step with
 # mepd's metric registry instead of drifting behind it (it did: the UI
 # offered three of the four for a while). `Literal[*METRICS]` would be
@@ -385,6 +386,8 @@ class JobContext:
         first = self.structures[0] if self.structures else {
             "charge": (self.source or {}).get("charge") or 0,
             "multiplicity": (self.source or {}).get("multiplicity") or 1}
+        if not self.structures and self.source is None and self.ws.design:
+            first = self.ws.design
         argv = ["--charge", str(first["charge"]), "--multiplicity", str(first["multiplicity"])]
         if self.profile:
             prof = self.job_dir / "inputs" / "profile.toml"
@@ -681,6 +684,30 @@ def _build_optimize(ctx: JobContext, p: OptimizeParams) -> list[str]:
     return ["optimize", *files, *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
 
 
+def _build_design_optimize(ctx: JobContext, p: OptimizeParams) -> list[str]:
+    from mepd.web import design
+
+    d = ctx.ws.design
+    if not d:
+        raise WorkspaceError("there is no design to minimize")
+    fp = ctx.job_dir / "inputs" / "design.xyz"
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(design.to_xyz(d["molblock"], d["charge"], d["multiplicity"]))
+    return ["optimize", str(fp), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+def _build_design_tsopt(ctx: JobContext, p: TsOptParams) -> list[str]:
+    from mepd.web import design
+
+    d = ctx.ws.design
+    if not d:
+        raise WorkspaceError("there is no design to optimize")
+    fp = ctx.job_dir / "inputs" / "guess.xyz"
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(design.to_xyz(d["molblock"], d["charge"], d["multiplicity"]))
+    return ["ts", "--guess", str(fp), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
 def _build_network_splits(ctx: JobContext, p: NetworkSplitsParams) -> list[str]:
     charges = {(r["charge"], r["multiplicity"]) for r in ctx.structures}
     if len(charges) > 1:
@@ -714,6 +741,17 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "theory, replacing their geometry and energy in place. (`mepd optimize`)",
         "set", EXPLORE, OptimizeParams, _build_optimize, min_structures=1,
         produces=["optimized geometries (in place)"]),
+    Operation(
+        "design-optimize", "Minimize the design", "Minimize the Design tab's molecule at the chosen profile's "
+        "level of theory; its geometry and energy are replaced in place. (`mepd optimize`)",
+        "design", "Design", OptimizeParams, _build_design_optimize, min_structures=0,
+        produces=["the minimized design (in place)"]),
+    Operation(
+        "design-tsopt", "Optimize the design as a TS", "Treat the Design tab's molecule as a TS guess: saddle "
+        "optimization, then an IRC to the reactant and product it connects. If it does not converge, the design "
+        "goes back to the structure submitted. (`mepd ts --guess`)",
+        "design", "Design", TsOptParams, _build_design_tsopt, min_structures=0,
+        produces=["a TS and its IRC ends, from the design"]),
     Operation(
         "tsopt", "Optimize TS from guess", "Treat the structure as a TS guess: saddle optimization, "
         "optionally followed by IRC. (`mepd ts`)",

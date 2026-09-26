@@ -1006,6 +1006,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     ts = ws.add_structure(Structure.from_xyz(WATER_BENT_XYZ), name="TS1", origin={"kind": "xyz"}, role="ts")
     _fake_ts_job(client, [a["id"], b["id"]])      # so edge operations that need a TS (VRI) can build
     src = client.post("/api/jobs/import", json={"path": str(_vri_folder(tmp_path)), "op": "vri"}).json()
+    client.post("/api/design/new", json={"smiles": "CCO"})   # so the Design tab's minimization can build
     ops = client.get("/api/state").json()["operations"]
     checked = 0
     for op in ops:
@@ -1018,6 +1019,8 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
             body["structures"] = [a["id"], b["id"]]
         elif op["target"] == "job":
             body["source_job"] = src["id"]
+        elif op["target"] == "design":
+            pass
         else:
             body["structures"] = [ts["id"] if op.get("structure_role") == "ts" else a["id"]]
         props = (op["schema"] or {}).get("properties", {})

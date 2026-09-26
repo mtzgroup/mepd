@@ -917,6 +917,8 @@ def collect_vri(out: Path, charge: int, multiplicity: int) -> dict:
 
 COLLECTORS = {
     "optimize": collect_optimize,
+    "design-optimize": collect_optimize,
+    "design-tsopt": collect_tsopt,
     "conformers": collect_conformers,
     "ts": collect_ts,
     "channels": collect_channels,
@@ -974,7 +976,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 11
+RESULT_VERSION = 12
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

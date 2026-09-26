@@ -66,6 +66,33 @@ class StructurePatch(BaseModel):
     notes: Optional[str] = None
 
 
+class DesignNew(BaseModel):
+    smiles: Optional[str] = None
+    xyz: Optional[str] = None
+    name: Optional[str] = None
+
+
+class DesignLoad(BaseModel):
+    structure: str
+    conformer: Optional[str] = None
+
+
+class DesignEdit(BaseModel):
+    op: dict
+
+
+class DesignPut(BaseModel):
+    molblock: Optional[str] = None
+    name: Optional[str] = None
+    charge: Optional[int] = None
+    multiplicity: Optional[int] = None
+
+
+class DesignMinimize(BaseModel):
+    profile: Optional[str] = None
+    params: dict = {}
+
+
 class EdgeIn(BaseModel):
     source: str
     target: str
@@ -205,6 +232,16 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         async def attach() -> None:
             if job["op"] == "optimize" and not job.get("external"):
                 await run_in_threadpool(apply_optimization, manager.ws, job)
+                bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "design-optimize":
+                await run_in_threadpool(apply_design_optimization, manager.ws, job)
+                bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "design-tsopt":
+                try:
+                    result = await parse_result(job, manager.job_dir(job["id"]))
+                except Exception:
+                    result = {"groups": [], "headline": "result not readable"}
+                await run_in_threadpool(apply_design_tsopt, manager.ws, job, result)
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             try:
                 result = await parse_result(job, manager.job_dir(job["id"]))
@@ -568,6 +605,194 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     @app.get("/api/structures/{sid}/xyz", response_class=PlainTextResponse)
     def structure_xyz(sid: str, conformer: Optional[str] = None):
         return (W().conformer_path(sid, conformer) if conformer else W().structure_path(sid)).read_text()
+
+    # ------------------------------------------------------------ design
+    def _store_design(info: dict, *, name=None, source=None, charge=None, multiplicity=None, keep=None) -> dict:
+        """Save a molecule as the design. An edit clears the energy/level (it
+        is no longer the minimized geometry) and keeps name/source/overrides."""
+        old = keep or {}
+        if name is None and old.get("name") in (None, old.get("smiles"), (old.get("source") or {}).get("input")):
+            name = info.get("smiles") or old.get("name")   # an automatic name follows the molecule
+        design = {
+            "molblock": info["molblock"], "smiles": info.get("smiles"), "formula": info.get("formula"),
+            "natoms": info.get("natoms"),
+            "name": name if name is not None else old.get("name"),
+            "source": source if source is not None else old.get("source"),
+            # Charge and spin follow the formal charges / radicals, plus whatever
+            # was set by hand (or came with a loaded structure) kept as an
+            # offset: adding Mg2+ to a neutral structure makes it +2.
+            "charge_offset": (charge - info["charge"]) if charge is not None else int(old.get("charge_offset") or 0),
+            "multiplicity_offset": (multiplicity - info["multiplicity"]) if multiplicity is not None
+            else int(old.get("multiplicity_offset") or 0),
+            "energy": None, "level": None, "warnings": info.get("warnings", []),
+        }
+        design["charge"] = info["charge"] + design["charge_offset"]
+        design["multiplicity"] = max(1, info["multiplicity"] + design["multiplicity_offset"])
+        return W().set_design(design)
+
+    def _current_design() -> dict:
+        d = W().design
+        if not d:
+            raise WorkspaceError("there is no design yet: start one from SMILES or load a structure from the graph")
+        return d
+
+    @app.get("/api/design/groups")
+    def design_groups():
+        from mepd.web import design
+
+        return list(design.GROUPS)
+
+    @app.post("/api/design/new")
+    def design_new(body: DesignNew):
+        from mepd.web import design
+
+        if body.smiles:
+            info, source = design.from_smiles(body.smiles), {"kind": "smiles", "input": body.smiles.strip()}
+            name = body.name or body.smiles.strip()
+        elif body.xyz:
+            info, warnings = design.from_xyz(body.xyz)
+            info["warnings"] = warnings
+            source, name = {"kind": "xyz"}, body.name or "design"
+        else:
+            raise WorkspaceError("give a SMILES or an xyz")
+        out = _store_design(info, name=name, source=source, keep={})
+        publish_ws()
+        return out
+
+    @app.post("/api/design/load")
+    def design_load(body: DesignLoad):
+        """A graph structure (a conformer of it, or its lowest) into the Design tab."""
+        from mepd.web import design
+
+        ws = W()
+        rec = ws.structure(body.structure)
+        xyz = (ws.conformer_path(rec["id"], body.conformer) if body.conformer else ws.structure_path(rec["id"])).read_text()
+        info, warnings = design.from_xyz(xyz, rec["charge"])
+        info["warnings"] = warnings
+        out = _store_design(info, name=f"{rec['name']} (edited)", charge=rec["charge"],
+                            multiplicity=rec["multiplicity"], keep={},
+                            source={"kind": "graph", "structure": rec["id"], "conformer": body.conformer,
+                                    "name": rec["name"], "ts": is_ts(rec)})
+        publish_ws()
+        return out
+
+    @app.post("/api/design/edit")
+    def design_edit(body: DesignEdit):
+        from mepd.web import design
+
+        d = _current_design()
+        out = _store_design(design.edit(d["molblock"], body.op), keep=d)
+        publish_ws()
+        return out
+
+    @app.post("/api/design/clean")
+    def design_clean():
+        from mepd.web import design
+
+        d = _current_design()
+        out = _store_design(design.clean(d["molblock"]), keep=d)
+        publish_ws()
+        return out
+
+    @app.put("/api/design")
+    def design_put(body: DesignPut):
+        """Set the molblock (undo/redo), the name, or a charge/multiplicity
+        set by hand (fields left out stay as they are)."""
+        from mepd.web import design
+
+        d = _current_design()
+        info = design.describe(design.read(body.molblock or d["molblock"]), sanitized=False)
+        if body.multiplicity is not None and body.multiplicity < 1:
+            raise WorkspaceError("multiplicity must be at least 1")
+        out = _store_design(info, name=body.name, keep=d, charge=body.charge, multiplicity=body.multiplicity)
+        if body.molblock is None and d.get("energy") is not None and body.charge is None and body.multiplicity is None:
+            out = W().set_design({**out, "energy": d["energy"], "level": d["level"]})   # a rename keeps the energy
+        publish_ws()
+        return out
+
+    @app.delete("/api/design")
+    def design_clear():
+        W().set_design(None)
+        publish_ws()
+        return {"ok": True}
+
+    @app.get("/api/design/xyz", response_class=PlainTextResponse)
+    def design_xyz():
+        from mepd.web import design
+
+        d = _current_design()
+        return design.to_xyz(d["molblock"], d["charge"], d["multiplicity"])
+
+    @app.post("/api/design/minimize")
+    async def design_minimize(body: DesignMinimize):
+        _current_design()
+        params = {"validate_minima_with_hessian": W().validate_minima, **(body.params or {})}
+        created = J().submit("design-optimize", structure_ids=[], edge_ids=[], params=params,
+                             profile=body.profile if body.profile is not None else W().level_profile)
+        return created
+
+    @app.get("/api/design/species")
+    def design_species():
+        from mepd.web import design
+
+        return list(design.SPECIES)
+
+    @app.post("/api/design/tsopt")
+    async def design_tsopt(body: DesignMinimize):
+        _current_design()
+        return J().submit("design-tsopt", structure_ids=[], edge_ids=[], params={"irc": True, **(body.params or {})},
+                          profile=body.profile if body.profile is not None else W().level_profile)
+
+    @app.post("/api/design/ts-to-graph")
+    async def design_ts_to_graph():
+        """The TS the design converged to, and its IRC's reactant and product
+        (which carry whatever catalyst/solvent the design added), into the
+        graph: a TS node and the two ends joined by an edge with the barrier."""
+        d = _current_design()
+        last = d.get("last_ts") or {}
+        if not last.get("ok"):
+            raise WorkspaceError("the design has no converged TS yet: run Optimize as TS first")
+        job = J().get(last["job"])
+        result = await parse_result(job, J().job_dir(job["id"]))
+
+        def run() -> dict:
+            out = {"ts": None, "edge": None, "added": [], "reused": []}
+            for group in result["groups"]:
+                if group["kind"] == "ts" and group["entries"]:
+                    r = _import_picks(job, group, group["entries"][0], [0], connect=False)
+                    out["ts"] = (r["added"] + r["reused"])[0]
+                if group["kind"] == "irc" and group["entries"]:
+                    e = group["entries"][0]
+                    r = _import_picks(job, group, e, [0, len(e["frames"]) - 1], connect=True)
+                    out["edge"] = r["edge"]
+                    out["added"] += r["added"]
+                    out["reused"] += r["reused"]
+            return out
+
+        out = await run_in_threadpool(run)
+        publish_ws()
+        return out
+
+    @app.post("/api/design/to-graph")
+    def design_to_graph():
+        """The design as a graph node (or, if the graph has that molecule, as
+        one more conformer of it)."""
+        from mepd.web import design
+
+        d = _current_design()
+        (s,) = chem.structures_from_xyz_text(design.to_xyz(d["molblock"], d["charge"], d["multiplicity"]),
+                                              d["charge"], d["multiplicity"])
+        ts = d.get("role") == "ts"   # a converged TS stays a saddle point (never merged, never minimized)
+        name = d.get("name") or d.get("smiles") or None
+        if ts and name and not name.endswith("[TS]"):
+            name += " [TS]"
+        added = W().add_or_merge(
+            s, name=name, energy=d.get("energy"), level=d.get("level"),
+            optimized=d.get("energy") is not None and not ts, smiles=None, role="ts" if ts else "minimum",
+            origin={"kind": "design", "label": "Design", "source": d.get("source")})
+        publish_ws()
+        return {**added["rec"], "merged": added["merged"], "duplicate": added["duplicate"],
+                "added_conformer": added["conformer"]}
 
     @app.delete("/api/structures/{sid}/conformers/{cid}")
     def delete_conformer(sid: str, cid: str):
@@ -1010,6 +1235,61 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
                                                "label": entry["label"], "frame": 0})
             added += not duplicate
     return added
+
+
+def apply_design_optimization(ws: Workspace, job: dict) -> None:
+    """A finished minimization of the design: its geometry and energy
+    replace the design's -- unless the design was edited meanwhile."""
+    from mepd.web import design
+
+    d = ws.design
+    out = Path(job["output_dir"])
+    if job["status"] != "done" or not d or d.get("rev") != job.get("design_rev") or not (out / "opt_0.xyz").exists():
+        return
+    rec = (_read_summary(out) or [{}])[0]
+    frames = (out / "opt_0.xyz").read_text()
+    info = design.with_coordinates(d["molblock"], frames)
+    validation = {k: rec[k] for k in ("is_minimum", "min_frequency", "rescued", "validation") if k in rec} or None
+    ws.set_design({**d, "molblock": info["molblock"], "energy": rec.get("energy"), "level": job.get("level"),
+                   "validation": validation, "minimized_by": job["id"], "warnings": []})
+
+
+def apply_design_tsopt(ws: Workspace, job: dict, result: dict) -> None:
+    """A finished TS search from the design. Converged: the design becomes
+    the TS (energy, level, barrier from its IRC). Not converged (or failed):
+    the design goes back to exactly what was submitted, so it can be edited
+    into something that converges. Either way `design.last_ts` says what
+    happened."""
+    from mepd.web import design
+
+    d = ws.design
+    snap = job.get("design_snapshot")
+    if not d or d.get("rev") != job.get("design_rev"):
+        return   # edited meanwhile: leave the user's newer design alone
+    ts_group = next((g for g in result.get("groups", []) if g.get("kind") == "ts"), None)
+    irc_group = next((g for g in result.get("groups", []) if g.get("kind") == "irc"), None)
+    entry = ts_group["entries"][0] if ts_group and ts_group.get("entries") else None
+    if job["status"] == "done" and entry is not None:
+        frame = entry["frames"][0]
+        info = design.with_coordinates(d["molblock"], frame["xyz"])
+        irc = irc_group["entries"][0] if irc_group and irc_group.get("entries") else None
+        ws.set_design({**d, "molblock": info["molblock"], "energy": frame.get("energy_hartree"),
+                       "level": job.get("level"), "role": "ts", "warnings": [],
+                       "last_ts": {"job": job["id"], "ok": True, "headline": result.get("headline"),
+                                   "barrier_kcal": entry.get("barrier_kcal"), "irc": bool(irc),
+                                   "irc_note": irc.get("note") if irc else None}})
+        return
+    why = (job.get("error") or "").strip().splitlines()[-1:] or [result.get("headline") or "no TS converged"]
+    base = snap or d
+    ws.set_design({**base, "last_ts": {"job": job["id"], "ok": False, "headline": result.get("headline"),
+                                       "error": why[0][:300]}})
+
+
+def _read_summary(out: Path) -> Optional[list]:
+    try:
+        return json.loads((out / "summary.json").read_text())["structures"]
+    except Exception:
+        return None
 
 
 def apply_optimization(ws: Workspace, job: dict) -> None:

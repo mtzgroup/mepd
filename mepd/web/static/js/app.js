@@ -9,6 +9,7 @@ import { Library } from './components/Library.js';
 import { Modals } from './components/Modals.js';
 import { ProfilesView } from './components/Profiles.js';
 import { ReferencesView } from './components/References.js';
+import { DesignView } from './components/Design.js';
 import { PlaygroundApp, layoutToggle } from './components/Playground.js';
 
 function TopBar() {
@@ -20,7 +21,7 @@ function TopBar() {
     return { running: js.filter((j) => j.status === 'running').length, queued: js.filter((j) => j.status === 'queued').length };
   });
   const lastJob = useStore((s) => s.view.jobId);
-  const tabs = [['graph', 'Graph'], ['jobs', 'Calculations'], ['profiles', 'Profiles'], ['refs', 'References']];
+  const tabs = [['graph', 'Graph'], ['design', 'Design'], ['jobs', 'Calculations'], ['profiles', 'Profiles'], ['refs', 'References']];
   const demo = useStore((s) => s.demo);
   const auth = useStore((s) => s.auth);
   const active = counts.running + counts.queued;
@@ -109,6 +110,7 @@ function App() {
         ${view.tab === 'job' && html`<${JobView} jobId=${view.jobId} />`}
         ${view.tab === 'profiles' && html`<${ProfilesView} />`}
         ${view.tab === 'refs' && html`<${ReferencesView} />`}
+        ${view.tab === 'design' && html`<${DesignView} />`}
       </section>
       ${showInspector && html`<${Inspector} />`}
     </main>
