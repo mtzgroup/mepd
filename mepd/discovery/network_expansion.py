@@ -120,11 +120,25 @@ class Proposal:
         return " ".join(parts) or "external"
 
 
-def lewis_smiles(symbols: Sequence[str], edges: Iterable[Edge], charge: int = 0, multiplicity: int = 1,
-                 *, allow_radicals: bool = False, allow_zwitterions: bool = False) -> Optional[str]:
-    """Canonical SMILES of the graph if it has a Lewis structure with the
-    given total charge (and, unless `allow_radicals`, exactly
-    `multiplicity - 1` unpaired electrons); None otherwise."""
+# Metals (and the charges they usually carry as ions, most common first). A
+# metal is kept out of the Lewis-structure check -- xyz2mol only handles
+# main-group bonding -- as an ion of one of these charges whose bonds to
+# ligands are coordination (dative) bonds; the rest must still have a Lewis
+# structure with the remaining charge.
+METAL_CHARGES = {
+    "Li": (1,), "Na": (1,), "K": (1,), "Rb": (1,), "Cs": (1,),
+    "Be": (2,), "Mg": (2,), "Ca": (2,), "Sr": (2,), "Ba": (2,),
+    "Al": (3,), "Ga": (3,), "In": (3,), "Tl": (1, 3), "Sn": (2, 4), "Pb": (2, 4),
+    "Sc": (3,), "Ti": (4, 3, 2), "V": (3, 2, 4), "Cr": (3, 2), "Mn": (2, 3), "Fe": (2, 3), "Co": (2, 3),
+    "Ni": (2, 0), "Cu": (1, 2), "Zn": (2,), "Y": (3,), "Zr": (4,), "Mo": (0, 2, 3), "Ru": (2, 3),
+    "Rh": (1, 3), "Pd": (0, 2), "Ag": (1,), "Cd": (2,), "Hf": (4,), "W": (0, 6), "Re": (1, 3), "Os": (2,),
+    "Ir": (1, 3), "Pt": (0, 2), "Au": (1, 3), "Hg": (2, 1), "La": (3,), "Ce": (3, 4),
+}
+
+
+def _lewis_mol(symbols, edges, charge, multiplicity, *, allow_radicals, allow_zwitterions):
+    """The graph with bond orders and formal charges (xyz2mol) if it has a
+    Lewis structure with the given total charge and spin; None otherwise."""
     from rdkit import Chem, RDLogger
     from rdkit.Chem import rdDetermineBonds
 
@@ -138,6 +152,8 @@ def lewis_smiles(symbols: Sequence[str], edges: Iterable[Edge], charge: int = 0,
         mol.AddBond(int(i), int(j), Chem.BondType.SINGLE)
     mol.AddConformer(Chem.Conformer(len(symbols)))
     mol = mol.GetMol()
+    if not symbols:
+        return mol if charge == 0 else None
     try:
         rdDetermineBonds.DetermineBondOrders(mol, charge=int(charge), allowChargedFragments=True)
     except Exception:
@@ -150,10 +166,84 @@ def lewis_smiles(symbols: Sequence[str], edges: Iterable[Edge], charge: int = 0,
     radicals = sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms())
     if not allow_radicals and radicals != multiplicity - 1:
         return None
+    return mol
+
+
+def _smiles(mol) -> str:
+    from rdkit import Chem
+
     try:
         return Chem.MolToSmiles(Chem.RemoveHs(mol, sanitize=False))
     except Exception:
         return Chem.MolToSmiles(mol)
+
+
+_DONORS = {"N", "O", "F", "P", "S", "Cl", "Se", "Br", "I", "As", "Te"}
+_TRANSITION = {"Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Mo", "Ru", "Rh", "Pd", "Ag",
+               "Cd", "Hf", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg"}
+
+
+def _can_coordinate(atom, metal: str) -> bool:
+    """A ligand atom that can bind a metal: a lone-pair donor (heteroatom or
+    anion), or -- for transition metals -- a carbon of a pi bond."""
+    if atom.GetFormalCharge() < 0:
+        return True
+    if atom.GetSymbol() in _DONORS:
+        return True
+    if metal in _TRANSITION and atom.GetSymbol() == "C":
+        return any(b.GetBondType() in (b.GetBondType().DOUBLE, b.GetBondType().TRIPLE, b.GetBondType().AROMATIC)
+                   for b in atom.GetBonds())
+    return False
+
+
+def lewis_smiles(symbols: Sequence[str], edges: Iterable[Edge], charge: int = 0, multiplicity: int = 1,
+                 *, allow_radicals: bool = False, allow_zwitterions: bool = False) -> Optional[str]:
+    """Canonical SMILES of the graph if it has a Lewis structure with the
+    given total charge (and, unless `allow_radicals`, exactly
+    `multiplicity - 1` unpaired electrons); None otherwise. Metal atoms (see
+    METAL_CHARGES) are ions bound to their ligands by dative bonds, so a
+    metal's binding site is part of the species (free Mg2+ and Mg2+ on a
+    carbonyl O are different species)."""
+    import itertools
+
+    from rdkit import Chem
+
+    symbols = list(symbols)
+    edges = [(int(i), int(j)) for i, j in edges]
+    metals = [k for k, s in enumerate(symbols) if s in METAL_CHARGES]
+    if not metals:
+        mol = _lewis_mol(symbols, edges, charge, multiplicity,
+                         allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions)
+        return _smiles(mol) if mol is not None else None
+    organic = [k for k in range(len(symbols)) if k not in metals]
+    where = {k: n for n, k in enumerate(organic)}
+    org_edges = [(where[i], where[j]) for i, j in edges if i in where and j in where]
+    ligand_bonds = [(i, j) if i in where else (j, i) for i, j in edges if (i in where) != (j in where)]
+    if any(i in metals and j in metals for i, j in edges):
+        return None   # metal-metal bonds: beyond this simple ionic picture
+    # Coordination does not count against a ligand atom's valence here: it
+    # donates a lone pair. Try the metals' usual charges, most common first.
+    for charges in itertools.islice(itertools.product(*(METAL_CHARGES[symbols[k]] for k in metals)), 64):
+        mol = _lewis_mol([symbols[k] for k in organic], org_edges, charge - sum(charges), multiplicity,
+                         allow_radicals=allow_radicals, allow_zwitterions=True if allow_zwitterions else False)
+        if mol is None:
+            continue
+        if not all(_can_coordinate(mol.GetAtomWithIdx(where[lig]), symbols[metal]) for lig, metal in ligand_bonds):
+            return None   # e.g. a metal "bound" to a C-H hydrogen or an sp3 carbon: not a coordination bond
+        rw = Chem.RWMol(mol)
+        index = {}
+        for k, q in zip(metals, charges):
+            atom = Chem.Atom(symbols[k])
+            atom.SetFormalCharge(int(q))
+            atom.SetNoImplicit(True)
+            index[k] = rw.AddAtom(atom)
+        for lig, metal in ligand_bonds:
+            rw.AddBond(where[lig], index[metal], Chem.BondType.DATIVE)
+        try:
+            return _smiles(rw.GetMol())
+        except Exception:
+            continue
+    return None
 
 
 def _coordination_ok(symbols, degree, charged: bool) -> bool:
