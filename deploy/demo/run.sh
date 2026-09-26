@@ -124,6 +124,8 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 # Hardening: non-root (your uid), read-only root fs and code mounts, no
 # capabilities, no privilege escalation, capped CPU/memory/processes, and the
 # port published on loopback only (Tailscale Funnel proxies to it).
+# TORCHDYNAMO_DISABLE: the image has no C++ compiler, which torch.compile
+# (used inside AIMNet2) needs on CPU; eager mode gives the same numbers.
 docker run -d --name "$NAME" --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   --read-only --tmpfs /tmp:rw,exec,size=4g \
@@ -140,6 +142,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   -e PATH=/opt/bin:/usr/local/bin:/usr/bin:/bin \
   -e GXTB_EXECUTABLE="$GXTB" -e GSM_EXECUTABLE="$GSM" \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+  -e TORCHDYNAMO_DISABLE=1 \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -w /data \
   "$IMAGE" \

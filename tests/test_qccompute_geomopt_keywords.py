@@ -278,3 +278,18 @@ def test_non_terachem_geomopt_partial_engine_keywords_keep_defaults():
     assert kw["coordsys"] == "cart"
     assert kw["maxit"] == 80
     assert kw["convergence_set"] == "GAU_TIGHT"
+
+
+@pytest.mark.parametrize("compute_program, expected", [("qccompute", "crest"), ("chemcloud", "bigchem")])
+def test_hessian_uses_bigchem_only_on_chemcloud(compute_program, expected, monkeypatch):
+    """A local engine must compute its own Hessian, not ask for a ChemCloud
+    login (which blocked `--validate-minima-with-hessian` on a prompt)."""
+    engine = QCComputeEngine(program="crest", compute_program="qccompute",
+                             program_args=ProgramArgs(model={"method": "gfn2"}))
+    engine.compute_program = compute_program
+    seen = []
+    monkeypatch.setattr(engine, "compute_func", lambda inp, **kw: seen.append(_program_of(inp)) or SimpleNamespace())
+    monkeypatch.setattr(engine, "_chemcloud_compute_with_retries",
+                        lambda prog, inp, **kw: seen.append(prog) or SimpleNamespace(results=None))
+    engine._compute_hessian_result(_node_at_x(1.4))
+    assert seen[0] == expected

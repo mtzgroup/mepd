@@ -683,7 +683,9 @@ def test_demo_form_defaults_respect_limits(demo_app):
             assert hs["default"] == 60 and hs["maximum"] == 60
             assert ops["channels"]["schema"]["properties"]["workers"]["default"] == 2
             (s1,) = c.post("/api/structures", json={"text": WATER_XYZ, "optimize": False}).json()
-            for key in ("hessian-sample", "hessian-global"):
+            expand = ops["graph-enumeration"]
+            assert expand["available"] and expand["schema"]["properties"]["max_products"]["default"] == 30
+            for key in ("hessian-sample", "hessian-global", "graph-enumeration"):
                 props = ops[key]["schema"]["properties"]
                 params = {k: v.get("default") for k, v in props.items()}
                 r = c.post("/api/jobs", json={"op": key, "structures": [s1["id"]], "params": params, "dry_run": True})

@@ -757,6 +757,11 @@ class QCComputeEngine(Engine):
 
             return False
 
+        # BigChem (parallel finite-difference Hessians) only exists on
+        # ChemCloud; a local engine computes the Hessian itself rather than
+        # asking for a ChemCloud login.
+        if self.compute_program != "chemcloud":
+            use_bigchem = False
         prog = self.program
         collect_files = self.collect_files
         if "terachem" in self.program:
