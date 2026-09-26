@@ -134,6 +134,7 @@ class JobManager:
 
     # ---------------------------------------------------------- lifecycle
     def load(self) -> None:
+        migration = self.ws.level_migration()
         for fp in sorted(self.ws.jobs_dir.glob("*/job.json")):
             try:
                 job = json.loads(fp.read_text())
@@ -146,6 +147,8 @@ class JobManager:
                 job["status"] = "interrupted"
                 job["error"] = "server stopped while the job was running; resume to continue where it left off"
                 self._write(job)
+            if self.ws.migrate_level(job.get("level"), migration):
+                self._write(job)   # recorded under the old level fingerprint
             self.jobs[job["id"]] = job
 
     async def start(self) -> None:
@@ -274,6 +277,9 @@ class JobManager:
                 picks = [(conformers[i] if isinstance(conformers, list) and i < len(conformers) else None)
                          or chosen.get(s) for i, s in enumerate(sids)]
                 recs = [self.ws.structure_view(s, c) for s, c in zip(sids, picks)]
+                if isinstance(conformers, dict) and eids and not dry_run and op.target == "pair":
+                    # The edge remembers the endpoint conformers chosen for it.
+                    self.ws.update_edge(eids[0], conformers={s: conformers.get(s) for s in sids if s in conformers})
                 if op.target == "structure" and op.key != "tsopt":
                     busy = [r["name"] for r in recs if r.get("status") == "optimizing"]
                     if busy:

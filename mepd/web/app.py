@@ -1228,6 +1228,8 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
     many were new."""
     targets = job["targets"]["structures"]
     params = job.get("params") or {}
+    if job["op"] == "ts":
+        return _attach_path_conformers(ws, job, result)
     if job["op"] == "conformers":
         owner = {"conf_": targets[0] if targets else None}
         minimized = params.get("minimize", True)
@@ -1259,6 +1261,37 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
                 validation=validation, origin={"kind": "job", "job": job["id"], "entry": entry["id"],
                                                "label": entry["label"], "frame": 0})
             added += not duplicate
+    return added
+
+
+def _attach_path_conformers(ws: Workspace, job: dict, result: dict) -> int:
+    """A path search (`mepd run`) minimizes its endpoints and, recursively,
+    every point it splits at. Those that are the start's or the end's
+    molecule -- often a conformer neither RDKit nor CREST produced -- join
+    that node's conformers when new."""
+    targets = [sid for sid in job["targets"]["structures"] if sid in ws.snapshot()["structures"]]
+    if not targets:
+        return 0
+    keys = {sid: chem.canonical_key(ws.structure(sid)["smiles"]) for sid in targets if ws.structure(sid).get("smiles")}
+    added = 0
+    for group in result.get("groups", []):
+        if group.get("kind") != "path":
+            continue
+        for entry in group["entries"]:
+            frames = entry.get("frames") or []
+            for k in {0, len(frames) - 1}:
+                if not frames or frames[k].get("energy_hartree") is None:
+                    continue
+                (s,) = chem.structures_from_xyz_text(frames[k]["xyz"], job.get("charge"), job.get("multiplicity"))
+                smiles = chem.perceive_smiles(s)
+                owner = next((sid for sid, key in keys.items() if smiles and chem.canonical_key(smiles) == key), None)
+                if owner is None:
+                    continue   # an intermediate: a different molecule
+                _, duplicate = ws.add_conformer(
+                    owner, s, energy=frames[k]["energy_hartree"], level=job.get("level"), optimized=True,
+                    origin={"kind": "job", "job": job["id"], "entry": entry["id"],
+                            "label": f"{entry['label']} ({'start' if k == 0 else 'end'})", "frame": k})
+                added += not duplicate
     return added
 
 

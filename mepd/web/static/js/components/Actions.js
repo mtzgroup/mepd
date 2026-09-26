@@ -6,7 +6,7 @@ import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, prefs, useStore, state } from '../store.js';
 import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
-import { isTs } from '../util.js';
+import { conformerLabel, conformerRows, isTs } from '../util.js';
 
 // How many jobs an operation would create for this selection (0 = not applicable).
 export function applicability(op, sel) {
@@ -76,6 +76,31 @@ function routeTsCheck(sel) {
   return { disabled: "Needs a transition state for this edge first: run 'Transition state' or 'Reaction channels'. The VRI search starts from the TS whose IRC connects the two structures." };
 }
 
+// The two structures of a pair calculation, start first: an edge's ends, or
+// two selected structures in click order.
+function pairEnds(sel, ws) {
+  if (sel.edges.length === 1 && !sel.structures.length) {
+    const e = ws.edges[sel.edges[0]];
+    return e ? [ws.structures[e.source], ws.structures[e.target]] : null;
+  }
+  if (sel.structures.length === 2 && !sel.edges.length) return sel.structures.map((id) => ws.structures[id]);
+  return null;
+}
+
+function EndpointConformers({ ends, value, onChange }) {
+  return html`<div class="field conf-picks">
+    <span class="field-label">Endpoint conformers</span>
+    ${ends.map((r, i) => r && html`<label class="small">
+      <span class="muted">${i === 0 ? 'start' : 'end'} · ${r.name}</span>
+      <select value=${value[r.id] || ''} disabled=${(r.conformers || []).length <= 1}
+        onChange=${(e) => onChange({ ...value, [r.id]: e.target.value || null })}>
+        <option value="">Lowest energy (default)</option>
+        ${conformerRows(r).map((c) => html`<option value=${c.id}>${conformerLabel(c)}</option>`)}
+      </select></label>`)}
+    <span class="field-help">The geometry each end starts from. Saved on the edge, so later calculations on it use the same ones.</span>
+  </div>`;
+}
+
 function ProfilePicker({ value, onChange }) {
   const profiles = useStore((s) => s.profiles);
   const levels = useStore((s) => s.levels);
@@ -106,9 +131,17 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
 
   // Drop remembered keys the schema no longer has.
   const clean = (v) => Object.fromEntries(Object.entries(v).filter(([k]) => k in (op.schema?.properties || {})));
+  // A pair calculation: which conformer of each end (default: its lowest).
+  const ws = useStore((s) => s.workspace);
+  const ends = op.target === 'pair' ? pairEnds(sel, ws) : null;
+  const edgePicks = sel.edges.length === 1 ? (ws.edges[sel.edges[0]]?.conformers || {}) : {};
+  const [confs, setConfs] = useState(() => ({ ...edgePicks }));
+  useEffect(() => { setConfs({ ...edgePicks }); }, [sel.edges.join(','), sel.structures.join(','), JSON.stringify(edgePicks)]);
+  const showConfs = ends && ends.some((r) => (r?.conformers || []).length > 1);
   const body = (dry) => ({
     op: op.key, structures: sel.structures, edges: sel.edges,
     params: clean(values), profile, dry_run: dry,
+    ...(showConfs ? { conformers: Object.fromEntries(ends.map((r) => [r.id, confs[r.id] || null])) } : {}),
   });
 
   const run = async () => {
@@ -176,6 +209,7 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
         <div class="op-body">
           <${ParamForm} schema=${op.schema} values=${values} onChange=${setValues} />
           <${ProfilePicker} value=${profile} onChange=${setProfile} />
+          ${showConfs && html`<${EndpointConformers} ends=${ends} value=${confs} onChange=${setConfs} />`}
           ${fit.note && html`<p class="small muted">${fit.note}</p>`}
           ${levelNote && html`<p class="level-note small">${levelNote}</p>`}
           ${pairNotes.map((n) => html`<p class="level-note small">${n}</p>`)}

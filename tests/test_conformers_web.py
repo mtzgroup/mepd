@@ -116,3 +116,54 @@ def test_job_input_is_the_chosen_conformer(tmp_path):
     chosen = ctx.snapshot_structure(ws.structure_view(rec["id"], cid), "b").read_text()
     assert lowest == ws.structure_path(rec["id"]).read_text()
     assert chosen == ws.conformer_path(rec["id"], cid).read_text() != lowest
+
+
+def test_path_search_conformers_join_their_endpoint_nodes(tmp_path):
+    ws = Workspace(tmp_path / "ws")
+    start = ws.add_structure(_s(WATER_XYZ), origin={"kind": "xyz"}, energy=-76.0, level=LEVEL)
+    end = ws.add_structure(_s(WATER_BENT_XYZ), origin={"kind": "xyz"})
+    new_conf = WATER_XYZ.replace("0.758 0.000 0.504", "0.600 0.200 0.600", 1)
+    result = {"groups": [{"kind": "path", "entries": [
+        {"id": "mep", "label": "MEP", "frames": [
+            {"xyz": new_conf, "energy_hartree": -76.3},           # the start's molecule, a new conformer
+            {"xyz": HCN_XYZ, "energy_hartree": -75.0},            # (not an endpoint's molecule)
+            {"xyz": WATER_XYZ, "energy_hartree": -76.0}]}]}]}     # the start's existing conformer, again
+    job = {"id": "j1", "op": "ts", "targets": {"structures": [start["id"], end["id"]], "edges": []},
+           "params": {}, "level": LEVEL, "charge": 0, "multiplicity": 1}
+    assert attach_conformers(ws, job, result) == 1
+    rec = ws.structure(start["id"])
+    assert len(rec["conformers"]) == 2 and rec["energy"] == -76.3   # the new one is lower: it represents the node
+    assert rec["conformers"][-1]["origin"]["label"] == "MEP (start)"
+
+
+def test_chosen_endpoint_conformers_are_saved_on_the_edge(client):
+    first = _add(client, WATER_XYZ)[0]
+    conf = client.post("/api/structures", json={"text": WATER_2, "optimize": False}).json()[0]
+    (b,) = _add(client, WATER_BENT_XYZ)
+    cid = conf["added_conformer"]
+    (job,) = client.post("/api/jobs", json={"op": "ts", "structures": [first["id"], b["id"]], "profile": "default",
+                                           "params": {"endpoints": "xyz"}, "conformers": {first["id"]: cid}}).json()
+    assert job["target_conformers"][0] == cid
+    edge = client.get("/api/state").json()["workspace"]["edges"][job["targets"]["edges"][0]]
+    assert edge["conformers"] == {first["id"]: cid}
+    client.post(f"/api/jobs/{job['id']}/cancel")
+
+
+def test_level_fingerprint_is_the_effective_level_and_old_records_migrate(tmp_path):
+    from mepd.web.workspace import _legacy_level_key, level_key
+
+    restated = 'engine_name = "gxtb"\nprogram = "xtb"\n[gxtb_engine_kwds]\nn_threads = 8\nn_parallel = 4\n'
+    assert level_key(restated) == level_key(None)                       # same energies: same level
+    assert level_key('engine_name = "gxtb"\n[gxtb_engine_kwds]\nextra_args = "--alpb water"\n') != level_key(None)
+    mlip = 'engine_name = "mlip"\n[mlip_engine_kwds]\nmodel = "{}"\n'
+    assert level_key(mlip.format("aimnet2")) != level_key(mlip.format("ani-2x"))   # were equal before
+    # A structure recorded under the old fingerprint of a profile gets the new one.
+    ws = Workspace(tmp_path / "ws")
+    ws.write_profile("p", restated)
+    rec = ws.add_structure(_s(WATER_XYZ), origin={"kind": "xyz"}, energy=-1.0,
+                           level={"profile": "p", "key": _legacy_level_key(restated), "label": "gxtb"})
+    data = json.loads(ws._fp.read_text())
+    data.pop("level_keys", None)
+    ws._fp.write_text(json.dumps(data))
+    ws = Workspace(tmp_path / "ws")
+    assert ws.structure(rec["id"])["level"]["key"] == level_key(None)

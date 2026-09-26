@@ -2,7 +2,9 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
-import { PHONE_QUERY, STATUS_LABEL, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus } from '../util.js';
+import { PHONE_QUERY, STATUS_LABEL, conformerLabel, conformerRows, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus } from '../util.js';
+
+export { conformerLabel, conformerRows };
 import { ActionPanel } from './Actions.js';
 import { Viewer3D } from './Viewer3D.js';
 import { LevelChip } from './Library.js';
@@ -17,30 +19,6 @@ function useXyz(sid, conformer = null, version = '') {
     return () => { live = false; };
   }, [sid, conformer, version]);
   return xyz;
-}
-
-// Conformers of a node, lowest first. ΔE only between conformers whose
-// energies come from the same level of theory as the representative's.
-export function conformerRows(rec) {
-  const confs = rec?.conformers || [];
-  const repConf = confs.find((c) => c.id === rec.conformer);
-  const key = repConf?.level?.key;
-  const same = confs.filter((c) => c.energy != null && c.level?.key === key);
-  const floor = same.length ? Math.min(...same.map((c) => c.energy)) : null;
-  const rows = confs.map((c, i) => ({
-    ...c,
-    index: i,
-    rep: c.id === rec.conformer,
-    dE: floor != null && c.energy != null && c.level?.key === key ? (c.energy - floor) * 627.509474 : null,
-    source: c.origin?.kind === 'job' ? c.origin.label : c.origin?.kind === 'smiles' ? `SMILES ${c.origin.input}` : (c.origin?.kind || ''),
-  }));
-  rows.sort((a, b) => (a.dE ?? 1e9) - (b.dE ?? 1e9) || a.index - b.index);
-  return rows;
-}
-
-export function conformerLabel(r) {
-  const e = r.dE != null ? `${r.dE >= 0 ? '+' : ''}${r.dE.toFixed(1)} kcal/mol` : (r.level ? r.level.label : 'no energy');
-  return `#${r.index + 1} · ${e}${r.rep ? ' · lowest' : ''}`;
 }
 
 function Conformers({ rec, viewing, onView }) {

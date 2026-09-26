@@ -69,9 +69,9 @@ def is_ts(rec: dict) -> bool:
 LEVEL_FIELDS = ("engine_name", "program", "program_kwds", "gxtb_engine_kwds", "ase_engine_kwds")
 
 
-def level_key(profile_text: Optional[str]) -> str:
-    """Fingerprint of a profile's level of theory (see LEVEL_FIELDS). `None`
-    means mepd's built-in defaults."""
+def _legacy_level_key(profile_text: Optional[str]) -> str:
+    """The fingerprint used before 2026-09-26 (raw LEVEL_FIELDS text), kept
+    to migrate stored records (see Workspace._migrate_levels)."""
     import hashlib
 
     import tomli
@@ -79,6 +79,65 @@ def level_key(profile_text: Optional[str]) -> str:
     data = tomli.loads(profile_text) if profile_text else {}
     picked = {k: data.get(k) for k in LEVEL_FIELDS if data.get(k) not in (None, "", {})}
     return hashlib.sha1(json.dumps(picked, sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
+def effective_level(profile_text: Optional[str]) -> dict:
+    """What decides energies for a profile, with mepd's defaults filled in
+    and everything else (threads, parallelism, executables, optimizer and
+    path settings) left out: two profiles with the same effective level give
+    comparable energies."""
+    import tomli
+
+    data = tomli.loads(profile_text) if profile_text else {}
+
+    def table(key):
+        t = data.get(key)
+        return t if isinstance(t, dict) else {}
+
+    def clean(d: dict, keep) -> dict:
+        return {k: d[k] for k in keep if d.get(k) not in (None, "", {}, [])}
+
+    engine = str(data.get("engine_name") or "gxtb").lower()
+    if engine == "gxtb":
+        # Everything but how it runs: extra arguments (e.g. solvation) or
+        # add_gxtb_flag = false change the method; threads etc. do not.
+        runtime = {"executable", "n_threads", "n_parallel", "hessian_acc", "keep_workdirs"}
+        kw = {k: v for k, v in table("gxtb_engine_kwds").items() if k not in runtime and v not in (None, "", {}, [])}
+        if kw.get("add_gxtb_flag") is True:
+            kw.pop("add_gxtb_flag")      # the default
+        return {"engine": "gxtb", **kw}
+    if engine in ("qccompute", "chemcloud"):
+        kw = table("program_kwds")
+        return {"engine": "qc", "program": str(data.get("program") or "xtb").lower(),
+                **clean({"model": kw.get("model"), "keywords": kw.get("keywords")}, ("model", "keywords"))}
+    if engine == "mlip":
+        return {"engine": "mlip", **clean(table("mlip_engine_kwds"),
+                                          ("model", "family", "checkpoint", "calculator", "calculator_kwds", "options"))}
+    if engine == "fairchem":
+        kw = table("fairchem_engine_kwds")
+        return {"engine": "fairchem", "model": kw.get("model") or "uma-s-1p2p1", "task": kw.get("task") or "omol",
+                **clean(kw, ("checkpoint", "inference_settings"))}
+    if engine == "ase":
+        kw = table("ase_engine_kwds")
+        calc = kw.get("calculator")
+        try:
+            from mepd.engines.ase_calculators import resolve_path
+
+            calc = resolve_path(calc) if calc else calc
+        except Exception:
+            pass
+        return {"engine": "ase", **clean({"calculator": calc, "calculator_kwds": kw.get("calculator_kwds"),
+                                          "program": data.get("program"), "program_kwds": data.get("program_kwds")},
+                                         ("calculator", "calculator_kwds", "program", "program_kwds"))}
+    return {"engine": engine, **clean(data, LEVEL_FIELDS)}
+
+
+def level_key(profile_text: Optional[str]) -> str:
+    """Fingerprint of a profile's effective level of theory (see
+    `effective_level`). `None` means mepd's built-in defaults."""
+    import hashlib
+
+    return hashlib.sha1(json.dumps(effective_level(profile_text), sort_keys=True, default=str).encode()).hexdigest()[:10]
 
 
 def path_summary(profile_text: Optional[str]) -> dict:
@@ -156,6 +215,8 @@ class Workspace:
         self._data.setdefault("validate_minima", True)
         if any([self._ensure_conformers(rec) for rec in self._data["structures"].values()]):
             self._save()   # an older workspace: each structure becomes its own first conformer
+        if self._migrate_levels():
+            self._save()
 
     # ------------------------------------------------------------------ io
     def _save(self) -> None:
@@ -248,6 +309,64 @@ class Workspace:
             self._ensure_conformers(rec)
             self._save()
         return {"rec": rec, "conformer": rec["conformer"], "merged": False, "duplicate": False}
+
+    def level_migration(self) -> dict:
+        """Old level fingerprint -> new, for every profile as it is now (and
+        the built-in defaults): records made under the old fingerprint get the
+        new one, so equal levels compare equal (e.g. a profile that only
+        restates mepd's defaults and the defaults themselves)."""
+        out = {_legacy_level_key(None): level_key(None)}
+        for name in self.profile_names():
+            try:
+                text = self.read_profile(name)
+            except Exception:
+                continue
+            out.setdefault(_legacy_level_key(text), level_key(text))
+        return out
+
+    def migrate_level(self, level: Optional[dict], table: Optional[dict] = None) -> bool:
+        if not isinstance(level, dict) or not level.get("key"):
+            return False
+        table = table if table is not None else self.level_migration()
+        new = table.get(level["key"])
+        if new and new != level["key"]:
+            level["key"] = new
+            return True
+        return False
+
+    def _migrate_levels(self) -> bool:
+        if self._data.get("level_keys") == 2:
+            return False
+        table = self.level_migration()
+        for rec in self._data["structures"].values():
+            self.migrate_level(rec.get("level"), table)
+            for conf in rec.get("conformers", []):
+                self.migrate_level(conf.get("level"), table)
+            self._drop_repeated_conformers(rec)
+        if isinstance(self._data.get("design"), dict):
+            self.migrate_level(self._data["design"].get("level"), table)
+        self._data["level_keys"] = 2
+        return True
+
+    def _drop_repeated_conformers(self, rec: dict) -> None:
+        """Conformers that now turn out to be the same one (same level, energy
+        within 0.05 kcal/mol, e.g. once equal levels compare equal) are kept
+        once; edges that chose a dropped one move to the one kept."""
+        kept = []
+        for conf in rec.get("conformers", []):
+            twin = next((k for k in kept if conf.get("energy") is not None and k.get("energy") is not None
+                         and (k.get("level") or {}).get("key") == (conf.get("level") or {}).get("key")
+                         and abs(k["energy"] - conf["energy"]) * HARTREE_TO_KCAL < 0.05), None)
+            if twin is None:
+                kept.append(conf)
+                continue
+            (self.structures_dir / rec["id"] / f"{conf['id']}.xyz").unlink(missing_ok=True)
+            for e in self._data["edges"].values():
+                if (e.get("conformers") or {}).get(rec["id"]) == conf["id"]:
+                    e["conformers"][rec["id"]] = twin["id"]
+            if rec.get("conformer") == conf["id"]:
+                rec["conformer"] = twin["id"]
+        rec["conformers"] = kept
 
     # ---------------------------------------------------------- conformers
     def conformer_path(self, sid: str, cid: Optional[str] = None) -> Path:
