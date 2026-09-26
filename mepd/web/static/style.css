@@ -732,3 +732,18 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .conf-list .conf-src { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .conf-picks { display: grid; gap: 6px; margin: 8px 0; }
 .conf-picks select { width: 100%; min-width: 0; }
+
+/* References tab */
+.refs-view { padding-bottom: 24px; }
+.refs-body { padding: 0 24px; max-width: 900px; }
+.refs-group { margin: 0 0 22px; }
+.refs-group h3 { margin: 0 0 2px; font: 600 12px/1.4 var(--font-ui); text-transform: uppercase; letter-spacing: .09em;
+  color: var(--label); }
+.refs-group + .refs-group { border-top: 1px solid var(--border); padding-top: 16px; }
+.refs-group > p { margin: 0 0 8px; }
+.refs-group dl { margin: 0; }
+.refs-group dt { font-weight: 600; margin-top: 8px; }
+.refs-group dd { margin: 2px 0 0 0; }
+.refs-group ul { margin: 2px 0 0; padding-left: 18px; }
+.refs-group li { margin: 2px 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) { .refs-body { padding: 0 16px; } }

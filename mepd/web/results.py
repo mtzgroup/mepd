@@ -706,8 +706,7 @@ def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict
         {"label": "Hessian validation", "value": "on" if (s.get("settings") or {}).get("hessian_validation") else "off"},
         {"label": "Energies relative to", "value": "seed structure (species 0)"},
         {"label": "Grown by", "value": _steering_note(s.get("steering"), s.get("steps"), species)},
-        *({"label": stage.replace("_", " ").capitalize(), "value": m["method"] + (" — " + "; ".join(m["cite"]) if m["cite"] else "")}
-          for stage, m in (s.get("methods") or {}).items()),
+        # Each stage's method and citations: the References tab.
     ], validation=[sp.get("validation") for sp in species]
         if (s.get("settings") or {}).get("hessian_validation") else None)
     if (out / "pairs").is_dir() or (out / "network.json").exists():

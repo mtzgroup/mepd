@@ -617,6 +617,13 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         W().set_positions(positions)
         return {"ok": True}  # not broadcast: layout is per-drag noise
 
+    @app.get("/api/references")
+    def get_references():
+        """The methods behind each feature, with citations (References tab)."""
+        from mepd.web.references import references
+
+        return references()
+
     # --------------------------------------------------------- profiles
     @app.get("/api/profiles/{name}", response_class=PlainTextResponse)
     def get_profile(name: str):

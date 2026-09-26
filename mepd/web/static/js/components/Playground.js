@@ -15,6 +15,7 @@ import { JobView } from './JobView.js';
 import { JobsView } from './Jobs.js';
 import { AddBox, LevelBar } from './Library.js';
 import { ProfilesView } from './Profiles.js';
+import { ReferencesView } from './References.js';
 
 // Small line icons (24px grid, stroke = currentColor).
 const ICONS = {
@@ -65,7 +66,7 @@ function TopLeft() {
 function Tabs() {
   const view = useStore((s) => s.view);
   const active = useStore((s) => Object.values(s.jobs).filter((j) => j.status === 'running' || j.status === 'queued').length);
-  const tabs = [['graph', 'Graph'], ['jobs', 'Calculations'], ['profiles', 'Profiles']];
+  const tabs = [['graph', 'Graph'], ['jobs', 'Calculations'], ['profiles', 'Profiles'], ['refs', 'References']];
   return html`
     <nav class="pg-tabs" aria-label="Pages">
       ${tabs.map(([k, l]) => html`<button class=${view.tab === k || (k === 'jobs' && view.tab === 'job') ? 'on' : ''}
@@ -220,7 +221,8 @@ export function PlaygroundApp() {
   }, []);
   const page = view.tab === 'jobs' ? html`<${JobsView} />`
     : view.tab === 'job' ? html`<${JobView} jobId=${view.jobId} />`
-      : view.tab === 'profiles' ? html`<${ProfilesView} />` : null;
+      : view.tab === 'profiles' ? html`<${ProfilesView} />`
+        : view.tab === 'refs' ? html`<${ReferencesView} />` : null;
   return html`
     <div class=${`pg pg-${bg}`}>
       <div class="pg-canvas"><${Graph} /></div>
@@ -228,7 +230,7 @@ export function PlaygroundApp() {
       <${Tabs} />
       ${onGraph && html`<${TopRight} />`}
       ${onGraph && nSel > 0 && !panel && html`<div class="pg-sheet pg-inspector"><${Inspector} /></div>`}
-      ${page && html`<${Sheet} className="pg-page" label=${view.tab === 'profiles' ? 'Compute profiles' : 'Calculations'}
+      ${page && html`<${Sheet} className="pg-page" label=${{ profiles: 'Compute profiles', refs: 'References' }[view.tab] || 'Calculations'}
         onClose=${() => { clearSelection(); openTab('graph'); }}>${page}<//>`}
       ${panel === 'add' && html`<${Sheet} className="pg-add" title="Add structures" onClose=${() => set({ pgPanel: null })}>
         <${LevelBar} /><${AddBox} onDone=${() => set({ pgPanel: null })} /><//>`}

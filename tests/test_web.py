@@ -283,6 +283,23 @@ def test_import_existing_output_and_pull_irc_ends_into_graph(client, tmp_path):
     assert (out / "ts.xyz").exists()
 
 
+def test_references_tab_lists_every_cited_method(client):
+    refs = client.get("/api/references").json()
+    features = {g["feature"]: g for g in refs}
+    assert {"Initial path", "Reaction network expansion", "Valley-ridge inflection"} <= set(features)
+    cites = [c for g in refs for item in g["items"] for c in item["cite"]]
+    assert all(c["text"] for c in cites)
+    # DOIs become links; network expansion's come from the method's own REFERENCES.
+    urls = {c["url"] for c in cites}
+    assert "https://doi.org/10.1063/1.4878664" in urls        # IDPP
+    assert "https://doi.org/10.1002/jcc.23271" in urls        # ZStruct
+    guess = next(i for i in features["Reaction network expansion"]["items"] if i["what"] == "Guess geometry")
+    assert guess["cite"] == [] and guess["note"]
+    # ...and the operation forms explain features without inline citations.
+    ops = {o["key"]: o for o in client.get("/api/state").json()["operations"]}
+    assert "Zimmerman" not in ops["graph-enumeration"]["summary"]
+
+
 def test_profiles_crud_and_toml_check(client):
     assert client.put("/api/profiles/fast", json={"text": 'engine_name = "gxtb"\n'}).status_code == 200
     assert "fast" in client.get("/api/state").json()["profiles"]

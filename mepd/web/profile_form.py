@@ -50,7 +50,7 @@ PROGRAMS = ["xtb", "terachem", "psi4", "pyscf", "orca", "crest"]
 INTERPOLATIONS = [
     ("geodesic", "Geodesic", "Geodesic interpolation in internal coordinates: curved paths that keep bonds sensible."),
     ("idpp", "IDPP", "Image-dependent pair potential: interatomic distances interpolated, images relaxed together "
-                     "and evenly spaced (Smidstrup 2014)."),
+                     "and evenly spaced."),
     ("lst", "LST", "Linear synchronous transit: each image matches linearly interpolated interatomic distances "
                    "(images can be unevenly spaced)."),
     ("linear", "Linear", "Straight lines in Cartesian space (after aligning the two structures). Atoms can pass close."),
