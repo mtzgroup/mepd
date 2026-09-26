@@ -1336,6 +1336,8 @@ def optimize(
         for i, node in enumerate(results):
             if node is None:
                 continue
+            typer.echo(f"  Hessian check {sources[i]} ({len(node.structure.symbols)} atoms; for a large or floppy "
+                       "structure, e.g. with explicit solvent, this and any rescue can take minutes)...")
             results[i], validations[i] = validate_minimum_with_rescue(
                 node, engine, frequency_cutoff=hessian_minimum_frequency_cutoff,
                 rescue_displacement=hessian_minima_rescue_displacement, label=sources[i],

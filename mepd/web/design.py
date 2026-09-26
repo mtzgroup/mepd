@@ -14,10 +14,12 @@ Edits (see `edit`):
   add       {atom, element}           bond a new atom to `atom` (taking one of its H's place if it has one)
   delete    {atom}                    remove an atom (and its hydrogens)
   bond      {a, b, order}             set a bond order 1/2/3, 1.5 aromatic, 0 = remove it
-  group     {atom, group}             swap a hydrogen, or a terminal group, for a functional group
+  group     {atom, group | smiles}    swap a hydrogen, or a terminal group, for a functional group
+                                      (a named one, or any SMILES with [*] where it attaches)
   charge    {atom, delta}             change an atom's formal charge by +-1
   hydrogens {}                        re-add hydrogens everywhere from valences
-  place     {atom, species, count}    put whole molecules/ions (water, Li+, Mg2+, BF3, ...) next to
+  place     {atom, species | smiles,  put whole molecules/ions (water, Li+, Mg2+, BF3, any SMILES) next to
+             count}
                                       `atom`, not bonded: count waters make a small solvation shell
 """
 from __future__ import annotations
@@ -480,9 +482,16 @@ def _edit_group(mol, op):
     Chem = _chem()
     from rdkit.Chem import AllChem
 
-    idx, name = int(op["atom"]), str(op.get("group"))
-    if name not in GROUPS:
-        raise WorkspaceError(f"unknown group {name!r}")
+    idx = int(op["atom"])
+    if op.get("smiles"):
+        name, group_smiles = str(op["smiles"]).strip(), str(op["smiles"]).strip()
+        if group_smiles.count("*") != 1:
+            raise WorkspaceError("a custom group is a SMILES with exactly one [*] where it attaches, e.g. [*]C(=O)N(C)C")
+    else:
+        name = str(op.get("group"))
+        if name not in GROUPS:
+            raise WorkspaceError(f"unknown group {name!r}")
+        group_smiles = GROUPS[name]
     nbrs = _neighbors(mol, idx)
     heavy_nbrs = [n for n in nbrs if mol.GetAtomWithIdx(n).GetAtomicNum() != 1]
     if mol.GetAtomWithIdx(idx).GetAtomicNum() == 1:
@@ -499,7 +508,10 @@ def _edit_group(mol, op):
     direction /= np.linalg.norm(direction)
 
     # The group in 3D, its attachment atom's bond to [*] pointing along -direction.
-    frag = Chem.AddHs(Chem.MolFromSmiles(GROUPS[name]))
+    parsed = Chem.MolFromSmiles(group_smiles)
+    if parsed is None:
+        raise WorkspaceError(f"could not read the group SMILES {group_smiles!r}")
+    frag = Chem.AddHs(parsed)
     if AllChem.EmbedMolecule(frag, randomSeed=7) != 0:
         AllChem.EmbedMolecule(frag, randomSeed=7, useRandomCoords=True)
     try:
@@ -574,14 +586,31 @@ def _edit_place(mol, op):
     Chem = _chem()
     from rdkit.Chem import AllChem
 
-    idx, name = int(op["atom"]), str(op.get("species"))
+    idx = int(op["atom"])
     count = max(1, min(int(op.get("count", 1)), 30))
-    if name not in SPECIES:
-        raise WorkspaceError(f"unknown species {name!r}")
-    smiles, contact = SPECIES[name]
+    if op.get("smiles"):
+        smiles = str(op["smiles"]).strip()
+        contact = None
+    else:
+        name = str(op.get("species"))
+        if name not in SPECIES:
+            raise WorkspaceError(f"unknown species {name!r}")
+        smiles, contact = SPECIES[name]
+    parsed = Chem.MolFromSmiles(smiles)
+    if parsed is None:
+        raise WorkspaceError(f"could not read the SMILES {smiles!r}")
+    if contact is None:
+        # Any species: a contact (ion, metal) or non-bonded (neutral) distance
+        # from covalent radii, measured to its first atom.
+        pt = Chem.GetPeriodicTable()
+        first = parsed.GetAtomWithIdx(0)
+        r = pt.GetRcovalent(mol.GetAtomWithIdx(idx).GetAtomicNum()) + pt.GetRcovalent(first.GetAtomicNum())
+        metal = first.GetAtomicNum() in (3, 4, 11, 12, 13, 19, 20) or 21 <= first.GetAtomicNum() <= 30 \
+            or first.GetAtomicNum() >= 37 and first.GetSymbol() not in ("Kr", "I", "Xe", "Te", "Sb", "Rn", "At")
+        contact = r + (0.25 if (first.GetFormalCharge() or metal) else 1.2)
     if mol.GetAtomWithIdx(idx).GetAtomicNum() == 1:
         contact -= 0.9   # clicked a hydrogen: an H-bond / contact to the H itself, not to its heavy atom
-    frag = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    frag = Chem.AddHs(parsed)
     if frag.GetNumAtoms() > 1:
         if AllChem.EmbedMolecule(frag, randomSeed=11) != 0:
             AllChem.EmbedMolecule(frag, randomSeed=11, useRandomCoords=True)

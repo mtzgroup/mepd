@@ -137,3 +137,35 @@ def test_ts_search_from_the_design_snaps_back_when_it_fails(tmp_path):
     apply_design_tsopt(ws, ok, result)
     assert ws.design["role"] == "ts" and ws.design["energy"] == -153.7
     assert ws.design["last_ts"]["ok"] and ws.design["last_ts"]["barrier_kcal"] == 40.0
+
+
+def test_any_species_or_group_as_smiles():
+    mb = d.from_smiles("CC=O")["molblock"]
+    assert d.edit(mb, {"op": "place", "atom": 2, "smiles": "[Cl-]"})["charge"] == -1
+    assert d.edit(mb, {"op": "place", "atom": 2, "smiles": "[Pd]"})["smiles"] == "CC=O.[Pd]"
+    assert d.edit(mb, {"op": "group", "atom": 0, "smiles": "[*]C(=O)N(C)C"})["smiles"] == "CN(C)C(=O)C=O"
+    with pytest.raises(WorkspaceError, match=r"\[\*\]"):
+        d.edit(mb, {"op": "group", "atom": 0, "smiles": "CC"})
+    with pytest.raises(WorkspaceError, match="could not read"):
+        d.edit(mb, {"op": "place", "atom": 2, "smiles": "not(a smiles"})
+
+
+def test_elements_outside_the_level_of_theory_are_flagged():
+    from mepd.web.coverage import element_warnings
+
+    assert element_warnings(None, ["C", "H", "Pd"]) == []                         # g-xTB covers H-Lr
+    assert "not parametrized for Og" in element_warnings(None, ["C", "Og"])[0]
+    xtb = 'engine_name = "qccompute"\nprogram = "xtb"\n'
+    assert "GFN2-xTB is not parametrized for U" in element_warnings(xtb, ["C", "U"])[0]
+    mlip = 'engine_name = "mlip"\n[mlip_engine_kwds]\nmodel = "aimnet2-rxn"\n'
+    assert "Mg" in element_warnings(mlip, ["C", "H", "Mg"])[0]
+    assert "Check that psi4" in element_warnings('engine_name = "qccompute"\nprogram = "psi4"\n', ["C", "Pd"])[0]
+
+
+def test_design_minimize_skips_the_hessian_check_unless_asked(client):
+    client.post("/api/design/new", json={"smiles": "CCO"})
+    assert client.get("/api/design/coverage").json()["method"] == "g-xTB"
+    for flag in (False, True):
+        (job,) = client.post("/api/jobs", json={"op": "design-optimize", "dry_run": True,
+                                               "params": {"validate_minima_with_hessian": flag}}).json()
+        assert ("--validate-minima-with-hessian" in job["argv"]) == flag

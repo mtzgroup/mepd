@@ -628,7 +628,24 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         }
         design["charge"] = info["charge"] + design["charge_offset"]
         design["multiplicity"] = max(1, info["multiplicity"] + design["multiplicity_offset"])
+        design["coverage"] = _coverage_warnings(info["molblock"])
         return W().set_design(design)
+
+    def _level_text() -> Optional[str]:
+        ws = W()
+        try:
+            return ws.read_profile(ws.level_profile) if ws.level_profile else None
+        except Exception:
+            return None
+
+    def _coverage_warnings(molblock: str) -> list[str]:
+        from mepd.web import coverage, design
+
+        try:
+            symbols = [a.GetSymbol() for a in design.read(molblock).GetAtoms()]
+            return coverage.element_warnings(_level_text(), symbols)
+        except Exception:
+            return []
 
     def _current_design() -> dict:
         d = W().design
@@ -730,6 +747,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         created = J().submit("design-optimize", structure_ids=[], edge_ids=[], params=params,
                              profile=body.profile if body.profile is not None else W().level_profile)
         return created
+
+    @app.get("/api/design/coverage")
+    def design_coverage():
+        """Which elements the workspace level of theory covers (None = unknown)."""
+        from mepd.web import coverage
+
+        name, covered = coverage.coverage(_level_text())
+        return {"method": name, "elements": sorted(covered) if covered is not None else None}
 
     @app.get("/api/design/species")
     def design_species():

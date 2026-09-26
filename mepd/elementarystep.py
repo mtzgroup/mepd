@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 from mepd.chain import Chain
 from mepd.nodes.node import Node
 import numpy as np
@@ -455,6 +455,7 @@ def _emit_hessian_validation_message(
     *,
     accepted: bool,
     verbose: bool,
+    status: Optional[str] = "Checking if elementary step",
 ):
     if verbose:
         if _rich_available:
@@ -467,7 +468,8 @@ def _emit_hessian_validation_message(
     elif not accepted:
         stop_status()
         print_persistent(msg)
-        update_status("Checking if elementary step")
+        if status:
+            update_status(status)
 
 
 # Pushes tried after the configured one, in bohr, when a rescue fails. A
@@ -493,6 +495,7 @@ def _hessian_rescue_failed_candidate(
     rescue_displacement: float,
     verbose: bool,
     label: str,
+    status: Optional[str] = "Checking if elementary step",
 ) -> tuple[Node | None, HessianMinimaValidation | None, int]:
     """Push a Hessian-rejected structure along its lowest mode, both ways,
     and reoptimize -- first by `rescue_displacement`, then by each larger step
@@ -505,7 +508,7 @@ def _hessian_rescue_failed_candidate(
             f"Could not rescue {label} split candidate after Hessian rejection: "
             "no usable unstable normal mode was available."
         )
-        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
         return None, None, 0
 
     schedule = _rescue_schedule(rescue_displacement)
@@ -515,11 +518,15 @@ def _hessian_rescue_failed_candidate(
         f"{', '.join(f'±{d:.3f}' for d in schedule)} bohr (in that order, until one "
         "reoptimizes to a minimum)."
     )
-    _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+    _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
 
     rescue_grad_calls = 0
     best_validation: HessianMinimaValidation | None = None
-    for signed_dr in [s * d for d in schedule for s in (1.0, -1.0)]:
+    pushes = [s * d for d in schedule for s in (1.0, -1.0)]
+    for k, signed_dr in enumerate(pushes, start=1):
+        if status is None:   # say what is running (e.g. `mepd optimize`), not a generic status
+            update_status(f"Hessian rescue of {label}: {signed_dr:+.2f} bohr push, re-optimizing and "
+                          f"re-checking ({k}/{len(pushes)})")
         try:
             displaced = displace_by_dr(node=node, displacement=mode, dr=signed_dr)
             opt_traj = _run_geom_opt(displaced, engine=engine)
@@ -529,7 +536,7 @@ def _hessian_rescue_failed_candidate(
                 f"{signed_dr:+.3f} bohr reoptimization "
                 f"({type(exc).__name__}: {exc})."
             )
-            _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+            _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
             continue
 
         rescue_grad_calls += len(opt_traj)
@@ -558,14 +565,14 @@ def _hessian_rescue_failed_candidate(
                 f"Hessian rescue accepted {label} split candidate after "
                 f"{signed_dr:+.3f} bohr displacement: {rescued_validation.reason}"
             )
-            _emit_hessian_validation_message(msg, accepted=True, verbose=verbose)
+            _emit_hessian_validation_message(msg, accepted=True, verbose=verbose, status=status)
             return rescued, rescued_validation, rescue_grad_calls
 
         msg = (
             f"Hessian rescue rejected {label} split candidate after "
             f"{signed_dr:+.3f} bohr displacement: {rescued_validation.reason}"
         )
-        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose)
+        _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
 
     return None, best_validation, rescue_grad_calls
 
@@ -587,12 +594,13 @@ def validate_minimum_with_rescue(
     succeeds the returned node is the rescued geometry; otherwise it is the
     input node, with is_minimum False (callers decide whether to drop it).
     """
+    update_status(f"Hessian check of {label} ({len(node.structure.symbols)} atoms)")
     check = _validate_hessian_minimum(node, engine, frequency_cutoff=frequency_cutoff)
     rescued = False
     if not check.is_minimum and check.hessian_result is not None:
         new_node, new_check, _ = _hessian_rescue_failed_candidate(
             node, engine, validation=check, frequency_cutoff=frequency_cutoff,
-            rescue_displacement=rescue_displacement, verbose=False, label=label,
+            rescue_displacement=rescue_displacement, verbose=False, label=label, status=None,
         )
         if new_node is not None and new_check is not None and new_check.is_minimum:
             node, check, rescued = new_node, new_check, True

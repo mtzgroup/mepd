@@ -10,7 +10,47 @@ import { api, attempt } from '../api.js';
 import { openJob, openTab, prefs, select, toast, useStore } from '../store.js';
 import { conformerRows, conformerLabel } from './Inspector.js';
 
-const ELEMENTS = ['H', 'C', 'N', 'O', 'F', 'P', 'S', 'Cl', 'Br', 'I', 'B', 'Si', 'Se', 'Li', 'Na', 'Mg'];
+const COMMON = ['H', 'C', 'N', 'O', 'F', 'P', 'S', 'Cl', 'Br', 'I', 'B', 'Si'];
+// The periodic table as [symbol, row, column] (lanthanides/actinides on rows 8-9).
+const PT_ROWS = [
+  'H . . . . . . . . . . . . . . . . He',
+  'Li Be . . . . . . . . . . B C N O F Ne',
+  'Na Mg . . . . . . . . . . Al Si P S Cl Ar',
+  'K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr',
+  'Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe',
+  'Cs Ba * Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn',
+  'Fr Ra ** Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og',
+  '. . La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu .',
+  '. . Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr .',
+];
+const TABLE = PT_ROWS.flatMap((row, r) => row.split(' ').map((sym, c) => [sym, r + 1, c + 1]))
+  .filter(([sym]) => sym !== '.' && !sym.startsWith('*'));
+
+// Pick any element: common ones up front, the whole table one click away.
+// Elements the workspace level of theory is not parametrized for are marked.
+function ElementPicker({ value, onPick, covered, method }) {
+  const [open, setOpen] = useState(false);
+  const off = (sym) => covered && !covered.includes(sym);
+  const pick = (sym) => {
+    onPick(sym);
+    if (off(sym)) toast(`${method} is not parametrized for ${sym}: results with it are unlikely to be meaningful`, 'error', 7000);
+  };
+  const btn = (sym) => html`<button class=${`el ${value === sym ? 'on' : ''} ${off(sym) ? 'uncovered' : ''}`}
+    title=${off(sym) ? `${sym}: not covered by ${method}` : sym} onClick=${() => pick(sym)}>${sym}</button>`;
+  return html`<div>
+    <div class="palette">${COMMON.map(btn)}
+      <button class=${`el wide ${open ? 'on' : ''}`} onClick=${() => setOpen(!open)}>${open ? 'Hide table' : 'All elements…'}</button></div>
+    ${open && html`<div class="ptable">${TABLE.map(([sym, r, c]) => html`<button style=${`grid-row:${r};grid-column:${c}`}
+      class=${`pt ${value === sym ? 'on' : ''} ${off(sym) ? 'uncovered' : ''}`} title=${off(sym) ? `${sym}: not covered by ${method}` : sym}
+      onClick=${() => pick(sym)}>${sym}</button>`)}</div>
+      ${covered && html`<p class="small muted">Greyed: not covered by ${method}.</p>`}`}
+  </div>`;
+}
+
+// Numbered "what to do now" for the tools that act on a clicked atom.
+function Steps({ steps }) {
+  return html`<ol class="steps-mini">${steps.map((s) => html`<li>${s}</li>`)}</ol>`;
+}
 const TOOLS = [
   ['view', 'View', 'Rotate and zoom; click an atom to see what it is.'],
   ['element', 'Element', 'Click an atom to turn it into the chosen element (hydrogens are re-added to fit).'],
@@ -27,7 +67,7 @@ function themeBackground() {
   return getComputedStyle(document.documentElement).getPropertyValue('--viewer-bg').trim() || '#ffffff';
 }
 
-function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels }) {
+function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable }) {
   const host = useRef(null);
   const viewer = useRef(null);
   const last = useRef({ n: 0 });
@@ -75,7 +115,7 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels }) {
     v.render();
   }, [molblock, liveXyz, picked.join(','), changed.join(','), labels]);
 
-  return html`<div class="design-canvas" ref=${host}></div>`;
+  return html`<div class=${`design-canvas ${clickable ? 'picking' : ''}`} ref=${host}></div>`;
 }
 
 function Start({ structures }) {
@@ -116,6 +156,10 @@ export function DesignView() {
   const [species, setSpecies] = useState([]);
   const [placeWhat, setPlaceWhat] = useState('water');
   const [placeCount, setPlaceCount] = useState(1);
+  const [placeSmiles, setPlaceSmiles] = useState('');
+  const [groupSmiles, setGroupSmiles] = useState('');
+  const [hessian, setHessian] = useState(() => prefs.get('designHessian', false));
+  const [cov, setCov] = useState({ method: '', elements: null });
   const [picked, setPicked] = useState([]);
   const [changed, setChanged] = useState([]);
   const [labels, setLabels] = useState(false);
@@ -128,6 +172,7 @@ export function DesignView() {
     api.get('/api/design/groups').then(setGroups).catch(() => {});
     api.get('/api/design/species').then(setSpecies).catch(() => {});
   }, []);
+  useEffect(() => { api.get('/api/design/coverage').then(setCov).catch(() => {}); }, [levelProfile, level?.key]);
   useEffect(() => { prefs.set('designTool', tool); setPicked([]); }, [tool]);
 
   // The minimization of this design that is running (its frames animate here).
@@ -161,8 +206,9 @@ export function DesignView() {
     if (tool === 'view') { setPicked([idx]); setInfo(`Atom ${idx + 1}`); return; }
     if (tool === 'element') edit({ op: 'element', atom: idx, element });
     else if (tool === 'add') edit({ op: 'add', atom: idx, element });
-    else if (tool === 'group') edit({ op: 'group', atom: idx, group });
-    else if (tool === 'place') edit({ op: 'place', atom: idx, species: placeWhat, count: placeCount });
+    else if (tool === 'group') edit(groupSmiles.trim() ? { op: 'group', atom: idx, smiles: groupSmiles.trim() } : { op: 'group', atom: idx, group });
+    else if (tool === 'place') edit(placeSmiles.trim() ? { op: 'place', atom: idx, smiles: placeSmiles.trim(), count: placeCount }
+      : { op: 'place', atom: idx, species: placeWhat, count: placeCount });
     else if (tool === 'delete') edit({ op: 'delete', atom: idx });
     else if (tool === 'charge') edit({ op: 'charge', atom: idx, delta: order === 0 ? -1 : 1 });
     else if (tool === 'bond') {
@@ -217,7 +263,8 @@ export function DesignView() {
       { label: 'Show', run: () => { select({ structures: ids }); openTab('graph'); } });
   };
   const minimize = async () => {
-    const created = await attempt(() => api.post('/api/design/minimize', { profile: levelProfile ?? null }));
+    const created = await attempt(() => api.post('/api/design/minimize', {
+      profile: levelProfile ?? null, params: { validate_minima_with_hessian: hessian } }));
     if (created) toast(`Minimizing at ${level?.label ?? 'the workspace level'}…`, 'info');
   };
 
@@ -234,9 +281,11 @@ export function DesignView() {
       <div class="design-body">
         <div class="design-tools">
           ${TOOLS.map(([k, label, help]) => html`<button class=${`tool ${tool === k ? 'on' : ''}`} title=${help} onClick=${() => setTool(k)}>${label}</button>`)}
-          ${(tool === 'element' || tool === 'add') && html`<div class="palette">
-            ${ELEMENTS.map((el) => html`<button class=${`el ${element === el ? 'on' : ''}`} onClick=${() => setElement(el)}>${el}</button>`)}
-            <input class="el-other" placeholder="other" maxlength="2" onChange=${(e) => e.target.value && setElement(e.target.value.trim())} />
+          ${(tool === 'element' || tool === 'add') && html`<div>
+            <${Steps} steps=${[`Pick the element (now ${element}).`, tool === 'add'
+              ? 'Click the atom in the 3D view to bond it to: it takes one of that atom\'s hydrogens, or points away from its neighbours.'
+              : 'Click the atom in the 3D view to change: its hydrogens are redone to fit.']} />
+            <${ElementPicker} value=${element} onPick=${setElement} covered=${cov.elements} method=${cov.method} />
           </div>`}
           ${tool === 'bond' && html`<div class="palette">
             ${ORDERS.map(([o, l]) => html`<button class=${`el wide ${order === o ? 'on' : ''}`} onClick=${() => setOrder(o)}>${l}</button>`)}
@@ -245,17 +294,28 @@ export function DesignView() {
             <button class=${`el ${order !== 0 ? 'on' : ''}`} onClick=${() => setOrder(1)}>+</button>
             <button class=${`el ${order === 0 ? 'on' : ''}`} onClick=${() => setOrder(0)}>−</button>
           </div>`}
-          ${tool === 'place' && html`<div class="palette groups">
-            ${species.map((g) => html`<button class=${`el wide ${placeWhat === g ? 'on' : ''}`} onClick=${() => setPlaceWhat(g)}>${g}</button>`)}
+          ${tool === 'place' && html`<div>
+            <${Steps} steps=${[`Choose what to add (now ${placeSmiles.trim() || placeWhat}${placeCount > 1 ? ` ×${placeCount}` : ''}), or type any SMILES.`,
+              'Click the atom in the 3D view it should go next to: it lands in the free space beside that atom, not bonded (click a hydrogen to H-bond to it).']} />
+            <input class="smiles-in" placeholder="any molecule or ion, as SMILES (e.g. [Pd], [Cl-], O=C=O)" value=${placeSmiles}
+              onInput=${(e) => setPlaceSmiles(e.target.value)} />
+            <div class="palette groups">
+              ${species.map((g) => html`<button class=${`el wide ${!placeSmiles.trim() && placeWhat === g ? 'on' : ''}`} onClick=${() => { setPlaceWhat(g); setPlaceSmiles(''); }}>${g}</button>`)}
+            </div>
             <label class="small place-count">how many <input type="number" min="1" max="30" value=${placeCount}
               onChange=${(e) => setPlaceCount(Math.max(1, Math.min(30, +e.target.value || 1)))} /></label>
           </div>`}
-          ${tool === 'group' && html`<div class="palette groups">
-            ${groups.map((g) => html`<button class=${`el wide ${group === g ? 'on' : ''}`} onClick=${() => setGroup(g)}>${g}</button>`)}
+          ${tool === 'group' && html`<div>
+            <${Steps} steps=${[`Choose the new group (now ${groupSmiles.trim() || group}), or type any group as SMILES with [*] where it attaches.`,
+              'Click a hydrogen to replace, or the first atom of a terminal group (e.g. a methyl carbon) to replace that whole group.']} />
+            <input class="smiles-in" placeholder="any group, e.g. [*]C(=O)N(C)C" value=${groupSmiles} onInput=${(e) => setGroupSmiles(e.target.value)} />
+            <div class="palette groups">
+              ${groups.map((g) => html`<button class=${`el wide ${!groupSmiles.trim() && group === g ? 'on' : ''}`} onClick=${() => { setGroup(g); setGroupSmiles(''); }}>${g}</button>`)}
+            </div>
           </div>`}
         </div>
         <div class="design-stage">
-          <${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} />
+          <${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} clickable=${tool !== 'view'} />
           <div class="design-hint small">${running ? html`${running.op === 'design-tsopt' ? 'Optimizing as a TS (then IRC)' : 'Minimizing'} at ${level?.label ?? 'the workspace level'}… <a href="#" onClick=${(e) => { e.preventDefault(); openJob(running.id); }}>details</a>`
             : busy ? 'Working…' : tool === 'bond' && picked.length ? `Atom ${picked[0] + 1} picked: click the second atom.` : toolHelp}</div>
           <div class="design-bar">
@@ -268,6 +328,8 @@ export function DesignView() {
               title=${`Treat this structure as a TS guess: saddle optimization at ${level?.label ?? 'the workspace level'}, then an IRC. If it doesn't converge, the design goes back to what you submitted.`}>Optimize as TS</button>
             <button class="btn small primary" disabled=${busy || running} onClick=${minimize}
               title=${`Minimize at ${level?.label ?? 'the workspace level'} (mepd optimize); the result replaces the design`}>Minimize</button>
+            <label class="small" title="After minimizing, check for imaginary frequencies (and try to push off a saddle). Slow for large or floppy structures, e.g. with explicit solvent or ions, which rarely pass a strict check.">
+              <input type="checkbox" checked=${hessian} onChange=${(e) => { setHessian(e.target.checked); prefs.set('designHessian', e.target.checked); }} /> Hessian check</label>
             <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom numbers</label>
           </div>
         </div>
@@ -297,6 +359,7 @@ export function DesignView() {
               <p class="small">Edit it (e.g. move the catalyst closer to the bonds that change, or start from a better guess) and try again.</p>`}
             <a class="small" href="#" onClick=${(e) => { e.preventDefault(); openJob(design.last_ts.job); }}>Calculation details</a>
           </div>`}
+          ${(design.coverage || []).map((w) => html`<p class="warn-box small">${w}</p>`)}
           ${(design.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
           ${info && tool === 'view' && html`<p class="small muted">${info}</p>`}
           <div class="design-actions">

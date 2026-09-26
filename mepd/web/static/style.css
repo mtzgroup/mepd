@@ -794,3 +794,13 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .ts-status.ok { border-color: var(--ok); }
 .ts-status.failed { border-color: var(--warn); }
 .ts-status p { margin: 6px 0; }
+.design-canvas.picking canvas { cursor: crosshair; }
+.steps-mini { margin: 8px 0 6px; padding-left: 18px; font-size: 12.5px; line-height: 1.4; color: var(--text); }
+.steps-mini li { margin: 2px 0; }
+.smiles-in { width: 100%; min-width: 0; font: inherit; font-size: 13px; margin: 2px 0 4px; }
+.palette .el.uncovered, .ptable .pt.uncovered { opacity: .45; text-decoration: line-through; }
+.ptable { display: grid; grid-template-columns: repeat(18, minmax(0, 1fr)); gap: 2px; margin: 6px 0; width: 100%; }
+.ptable .pt { padding: 2px 0; font-size: 9.5px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel);
+  color: var(--text); cursor: pointer; min-width: 0; }
+.ptable .pt.on { border-color: var(--accent); background: var(--accent-soft); }
+.design-body { grid-template-columns: 260px minmax(0, 1fr) 300px; }
