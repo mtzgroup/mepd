@@ -292,12 +292,24 @@ class NetworkSplitsParams(Params):
 
 class ExpandParams(Params):
     rounds: int = P(1, "Rounds", "Round 2 proposes products of round 1's new species, and so on.", cli="--rounds", ge=1)
+    steer: Literal["auto", "flux", "window"] = P(
+        "auto", "Grow the network by", "flux: find a verified TS for every reaction, simulate the kinetics from "
+        "the seed, and expand only species that enough material flows into (the network stops growing on its "
+        "own). window: expand every new species within the energy window. auto: flux when rounds > 1.",
+        cli="--steer")
+    temperature: float = P(298.15, "Temperature (K)", cli="--temperature", gt=0, requires="steer=auto|flux",
+                           group="Kinetics")
+    time_s: float = P(3600.0, "Simulated time (s)", cli="--time", gt=0, requires="steer=auto|flux", group="Kinetics")
+    flux_threshold: float = P(0.01, "Flux threshold", "Expand a species once the material that flowed into it "
+                              "(as a fraction of the seed) reaches this.", cli="--flux-threshold", gt=0,
+                              requires="steer=auto|flux", group="Kinetics")
     n_break: int = P(2, "Bonds broken (max)", cli="--n-break", ge=0)
     n_form: int = P(2, "Bonds formed (max)", cli="--n-form", ge=0)
     max_products: int = P(50, "Proposals per species", "Fewest bond changes first.", cli="--max-products", ge=1)
     energy_window: float = P(60.0, "Expand species within (kcal/mol)", "Only species this close to the seed "
-                             "are expanded in the next round.", cli="--energy-window")
-    form_distance: float = P(4.0, "Form bonds within (Å)", cli="--form-distance", gt=0, advanced=True, group="Rules")
+                             "are expanded in the next round.", cli="--energy-window", requires="steer=auto|window")
+    form_distance: float = P(4.0, "Form bonds within (Å)", "Raise it to also close rings between atoms that "
+                             "start far apart.", cli="--form-distance", gt=0, advanced=True, group="Rules")
     allow_radicals: bool = P(False, "Allow radicals and carbenes", cli="--allow-radicals", kind="toggle",
                              advanced=True, group="Rules")
     allow_zwitterions: bool = P(False, "Allow charge-separated products", "Needed for e.g. isocyanides and CO.",
@@ -691,10 +703,10 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
     Operation(
         "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming up to two "
-        "bonds on the molecular graph (the ZStruct/YARP enumeration: Zimmerman, J. Comput. Chem. 2013; Zhao & "
-        "Savoie, Nat. Comput. Sci. 2021), keep those with a valid Lewis structure (xyz2mol: Kim & Kim, Bull. Korean "
-        "Chem. Soc. 2015), optimize them, and repeat from the new species; optionally connect each reaction by a "
-        "path search. (`mepd discovery expand`)",
+        "bonds on the molecular graph (mepd's reimplementation of the enumeration of ZStruct, Zimmerman, J. Comput. "
+        "Chem. 2013, and YARP, Zhao & Savoie, Nat. Comput. Sci. 2021), keep those with a valid Lewis structure "
+        "(xyz2mol: Kim & Kim, Bull. Korean Chem. Soc. 2015), optimize them, and grow the network from the species "
+        "the kinetics reach (flux steering: Bensberg & Reiher, Isr. J. Chem. 2023). (`mepd discovery expand`)",
         "structure", EXPLORE, ExpandParams, _build_discovery("expand"),
         produces=["product species", "proposed reactions", "network edges (with path search)"],
         cli_path=("discovery", "expand"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),

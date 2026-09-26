@@ -684,6 +684,16 @@ def collect_hessian_global(out: Path, charge: int, multiplicity: int) -> dict:
     ], extra_headline=f" · {s['rounds_run']} rounds" if s.get("rounds_run") else "")
 
 
+def _steering_note(steering: Optional[dict], steps: Optional[list], species: list) -> Optional[str]:
+    if not steering:
+        return None
+    if steering.get("mode") != "flux":
+        return f"energy window ({steering.get('energy_window_kcal')} kcal/mol)"
+    fluxed = sum(1 for sp in species[1:] if (sp.get("flux") or 0) >= steering.get("flux_threshold", 0))
+    return (f"kinetic flux at {steering.get('temperature_K')} K over {steering.get('time_s'):g} s, threshold "
+            f"{steering.get('flux_threshold')} · {len(steps or [])} verified TS steps · {fluxed} species reached")
+
+
 def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict:
     s = _read_json(out / "summary.json") or {}
     species = s.get("species") or []
@@ -695,6 +705,7 @@ def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict
         {"label": "Reactions to connect", "value": len(s.get("connections") or []) or None},
         {"label": "Hessian validation", "value": "on" if (s.get("settings") or {}).get("hessian_validation") else "off"},
         {"label": "Energies relative to", "value": "seed structure (species 0)"},
+        {"label": "Grown by", "value": _steering_note(s.get("steering"), s.get("steps"), species)},
         *({"label": stage.replace("_", " ").capitalize(), "value": m["method"] + (" — " + "; ".join(m["cite"]) if m["cite"] else "")}
           for stage, m in (s.get("methods") or {}).items()),
     ], validation=[sp.get("validation") for sp in species]

@@ -133,7 +133,7 @@ def test_cli_writes_species_and_reactions(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli_common, "_open_run_inputs", run_inputs)
     out = tmp_path / "out"
-    res = CliRunner().invoke(app, ["discovery", "expand", "C#N", "--allow-zwitterions", "--rounds", "2", "-o", str(out)])
+    res = CliRunner().invoke(app, ["discovery", "expand", "C#N", "--allow-zwitterions", "--rounds", "2", "--steer", "window", "-o", str(out)])
     assert res.exit_code == 0, res.output
     summary = json.loads((out / "summary.json").read_text())
     assert [s["smiles"] for s in summary["species"]] == ["C#N", "[C-]#[NH+]"]
@@ -210,3 +210,51 @@ def test_summary_names_the_methods_and_references(tmp_path, monkeypatch):
     assert "doi:10.1002/jcc.23271" in " ".join(methods["enumeration"]["cite"])       # ZStruct
     assert "doi:10.1002/bkcs.10334" in " ".join(methods["lewis_filter"]["cite"])     # xyz2mol
     assert "not a published method" in methods["guess_geometry"]["method"]
+
+
+def test_flux_steering_expands_only_species_the_kinetics_reach():
+    """HCN -> HNC: a low TS lets flux into HNC (so it is expanded); a high
+    one does not (so the network stops after round 1)."""
+    calls = []
+
+    def connector(ts_kcal):
+        def connect(pairs, nodes):
+            calls.append(list(pairs))
+            out = []
+            for i, j in pairs:
+                ts = nodes[i].copy()
+                ts._cached_energy = max(nodes[i].energy, nodes[j].energy) + ts_kcal / 627.509
+                out.append({"start": nodes[i], "end": nodes[j], "ts": ts, "label": f"{i}-{j}"})
+            return out
+        return connect
+
+    low = expand_network(_node("C#N"), _GraphEngine(), rounds=3, allow_zwitterions=True, steer="flux",
+                         connect=connector(5.0))
+    assert [r["sources"] for r in low.rounds][:2] == [[0], [1]]
+    assert low.kinetics.flux[1] > 0.01 and len(low.steps) == 1
+    assert calls[0] == [(0, 1)] and calls[1:] == []  # round 2's back-reaction is already connected
+
+    calls.clear()
+    high = expand_network(_node("C#N"), _GraphEngine(), rounds=3, allow_zwitterions=True, steer="flux",
+                          connect=connector(60.0))
+    assert len(high.rounds) == 1 and high.rounds[0]["expanded_next"] == []
+    assert high.kinetics.flux[1] < 1e-6
+
+
+def test_flux_steering_needs_a_connector():
+    with pytest.raises(ValueError, match="connect"):
+        expand_network(_node("C#N"), _GraphEngine(), steer="flux")
+
+
+def test_the_same_ts_found_by_two_searches_counts_once():
+    def connect(pairs, nodes):
+        ts = nodes[0].copy()
+        ts._cached_energy = nodes[0].energy + 0.05
+        twin = ts.copy()
+        twin._cached_energy = ts._cached_energy + 1e-6  # same TS, found again
+        other = ts.copy()
+        other._cached_energy = ts._cached_energy + 0.01  # a second, higher channel
+        return [{"start": nodes[0], "end": nodes[1], "ts": t, "label": str(k)} for k, t in enumerate((ts, twin, other))]
+
+    res = expand_network(_node("C#N"), _GraphEngine(), rounds=2, allow_zwitterions=True, steer="flux", connect=connect)
+    assert [s.label for s in res.steps] == ["0", "2"]

@@ -11,23 +11,28 @@ DetermineBondOrders), and builds each product's 3D guess from the reactant
 geometry by a restrained relaxation onto the new bonds -- so every product
 keeps the reactant's atom order and can go straight into a path search.
 
-Methods (see REFERENCES):
-  * the break/form enumeration over the bond graph is the ZStruct scheme
-    (Zimmerman 2013), in the n-break/n-form form YARP uses (Zhao & Savoie
-    2021);
+Methods (see REFERENCES). mepd reimplements published methods; it uses no
+code from ZStruct, YARP or Chemoton:
+  * the break/form enumeration over the bond graph is based on ZStruct
+    (Zimmerman 2013) and on YARP's n-break/n-form ("b2f2") enumeration
+    (Zhao & Savoie 2021);
   * the Lewis-structure filter is RDKit's DetermineBondOrders, an
     implementation of xyz2mol (Kim & Kim 2015);
+  * flux steering (steer="flux") follows the concentration-flux criterion of
+    Bensberg & Reiher (2023) and the rate-based model enlargement of Susnow
+    et al. (1997); see mepd.discovery.kinetics;
   * the restrained relaxation that builds each product guess is mepd's own
     heuristic (springs on the product bonds, repulsion elsewhere, a weak
     tether to the source geometry), not a published method;
   * the live view's animations are geodesic interpolations (Zhu, Thompson &
     Martinez 2019).
 
-Any other generator plugs in by import path: a callable
+Generators are registered in mepd/discovery/generators.py ("bond-rules" is
+the built-in one); any other plugs in by import path: a callable
 `generate(structure, **options)` returning product Structures in the same
-atom order (or xyz paths); `products_file` imports products an external
-tool (autodE, Chemoton, YARP, ...) already wrote, as a multi-frame xyz in
-the reactant's atom order.
+atom order (or xyz paths). `products_file` imports products an external
+tool (autodE, Chemoton, ...) already wrote, as a multi-frame xyz in the
+reactant's atom order.
 """
 from __future__ import annotations
 
@@ -48,7 +53,9 @@ OnEvent = Optional[Callable[[str, dict], None]]
 # shown by the CLI and the web UI).
 REFERENCES = {
     "enumeration": {
-        "method": "break up to n bonds and form up to m bonds on the molecular graph (ZStruct; the b2f2 enumeration of YARP)",
+        "method": "break up to n bonds and form up to m bonds on the molecular graph: mepd's reimplementation of "
+                  "the enumeration of ZStruct and of YARP's b2f2 scheme (based on their published methods; no code "
+                  "from either is used)",
         "cite": ["P. M. Zimmerman, J. Comput. Chem. 34, 1385-1392 (2013), doi:10.1002/jcc.23271",
                  "Q. Zhao, B. M. Savoie, Nat. Comput. Sci. 1, 479-490 (2021), doi:10.1038/s43588-021-00101-3"],
     },
@@ -59,6 +66,15 @@ REFERENCES = {
     "guess_geometry": {
         "method": "mepd heuristic: restrained relaxation of the source geometry onto the product bonds (not a published method)",
         "cite": [],
+    },
+    "kinetics": {
+        "method": "flux steering: Eyring rates from each verified TS (electronic barriers, lowest conformer of each "
+                  "species), first-order microkinetics from the seed, expand species whose concentration flux "
+                  "reaches the threshold",
+        "cite": ["concentration-flux criterion: M. Bensberg, M. Reiher, Isr. J. Chem. 63, "
+                 "e202200123 (2023), doi:10.1002/ijch.202200123",
+                 "rate-based model enlargement (RMG): R. G. Susnow, A. M. Dean, W. H. Green, P. Peczak, "
+                 "L. J. Broadbelt, J. Phys. Chem. A 101, 3731-3740 (1997), doi:10.1021/jp9637690"],
     },
     "animation": {
         "method": "geodesic interpolation between source and product (live view only)",
@@ -278,7 +294,9 @@ def _structure_with(structure, coords_angstrom):
 def _import_generator(path: str) -> Callable:
     module_name, _, attr = str(path).replace(":", ".").rpartition(".")
     if not module_name:
-        raise ValueError(f"generator must be 'bond-rules' or 'package.module:function', got {path!r}.")
+        from mepd.discovery.generators import get_generator
+
+        get_generator(path)   # raises, naming the built-in generators
     return getattr(importlib.import_module(module_name), attr)
 
 
@@ -325,6 +343,8 @@ class ExpansionResult:
     edges: List[ProposedEdge] = field(default_factory=list)
     rounds: List[dict] = field(default_factory=list)
     rejected: List[StructureNode] = field(default_factory=list)  # not minima after the Hessian check
+    steps: list = field(default_factory=list)  # flux steering: verified elementary steps (kinetics.Step)
+    kinetics: object = None  # flux steering: the latest kinetics.KineticsResult
 
     def connections(self) -> list[tuple[int, int]]:
         """Distinct (source, product) species pairs to connect by path search."""
@@ -551,7 +571,8 @@ def expand_network(
     products_file: Optional[str] = None, maxiter: int = 500, n_break: int = 2, n_form: int = 2,
     form_distance: float = 4.0, max_products: int = 50, allow_radicals: bool = False,
     allow_zwitterions: bool = False, max_species: int = 200, validate_minima: Optional[dict] = None,
-    workers: int = 1, on_event: OnEvent = None,
+    workers: int = 1, steer: str = "window", connect: Optional[Callable] = None,
+    kinetics: Optional[dict] = None, on_event: OnEvent = None,
 ) -> ExpansionResult:
     """Breadth-first network expansion from `seed`. Each round proposes
     products of every species found in the previous round (within
@@ -560,7 +581,28 @@ def expand_network(
     (conformers of one species are merged). A proposal whose SMILES is an
     already-known species becomes an edge to it without being optimized
     again. `validate_minima` ({"frequency_cutoff", "rescue_displacement"})
-    Hessian-checks every new species before it is accepted."""
+    Hessian-checks every new species before it is accepted.
+
+    `steer` decides which species the next round expands:
+      * "window": every new species within `energy_window_kcal` of the seed;
+      * "flux": after each round, `connect(pairs, species_nodes)` finds a
+        verified TS for every new reaction (returning, per elementary step,
+        {"start", "end", "ts", "label", "files"}; IRC ends that are no known
+        species join the network as intermediates), microkinetics runs on
+        every verified step (`kinetics`: temperature, time_s, threshold;
+        see mepd.discovery.kinetics), and only species whose concentration
+        flux reaches the threshold are expanded. The network stops growing
+        when none does."""
+    if steer not in ("window", "flux"):
+        raise ValueError(f"steer must be 'window' or 'flux', got {steer!r}.")
+    if steer == "flux" and connect is None:
+        raise ValueError("steer='flux' needs a `connect` callback that finds each reaction's TS.")
+    kin = {"temperature": 298.15, "time_s": 3600.0, "threshold": 0.01, **(kinetics or {})}
+    from mepd.discovery.generators import get_generator, is_named
+    from mepd.discovery.generators import propose as propose_products
+
+    if products_file is None and is_named(generator):
+        get_generator(generator).check()   # fail before any energy is computed
     seed = seed.copy()
     if seed._cached_energy is None:
         engine.compute_energies([seed])
@@ -588,15 +630,89 @@ def expand_network(
         _emit(on_event, "species_found", index=idx, smiles=smi, rel_energy_kcal=rel, round=rnd)
         return ProposedEdge(p.source, p, "new_species", idx, intended)
 
+    def _species_for(node) -> tuple[int, bool]:
+        """The species an IRC end is. One that is no known species is
+        minimized first (an IRC stops short of the minimum), then added as an
+        intermediate; the IRC end never replaces a known species' geometry."""
+        def match_of(n):
+            return next((k for k, s in enumerate(result.species) if _connectivity_matches(n, s.node)), None)
+
+        match = match_of(node)
+        if match is None:
+            opt = _optimize(engine, [StructureNode(structure=node.structure)], maxiter, None)[0]
+            if isinstance(opt, Exception):
+                return -1, False
+            node, match = opt, match_of(opt)
+        if match is not None:
+            return match, False
+        if len(result.species) >= max_species:
+            return -1, False
+        rel = (float(node.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
+        smi = lewis_smiles(symbols, graph_edges(node), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
+        result.species.append(Species(node.copy(), smi, rnd, rel))
+        _emit(on_event, "species_found", index=len(result.species) - 1, smiles=smi, rel_energy_kcal=rel, round=rnd)
+        return len(result.species) - 1, True
+
+    def _steer_by_flux(round_edges: list[ProposedEdge]) -> list[int]:
+        from mepd.discovery.kinetics import Step, select_for_expansion, simulate
+
+        pairs = []
+        for e in round_edges:
+            if e.target is not None and e.target != e.source:
+                pair = (e.source, e.target)
+                if pair not in connected and pair[::-1] not in connected and pair not in pairs:
+                    pairs.append(pair)
+        connected.update(pairs)
+        _emit(on_event, "connecting", round=rnd, total=len(pairs))
+        for found in connect(pairs, [s.node for s in result.species]) if pairs else []:
+            (a, new_a), (b, new_b) = _species_for(found["start"]), _species_for(found["end"])
+            for idx, new, parent in ((a, new_a, b), (b, new_b, a)):
+                if new and live.enabled:  # an intermediate the IRC found: tell the live view
+                    live._event(ProposedEdge(parent, Proposal(parent, (), (), result.species[idx].smiles),
+                                             "new_species", idx, None), result.species)
+            if a == b or a < 0 or b < 0:
+                continue
+            ts_e = float(found["ts"].energy)
+            # Two path searches can find the same TS; counting it twice would
+            # double that channel's rate. Distinct TSs between the same pair
+            # stay (parallel channels).
+            if any({st.a, st.b} == {a, b} and abs(st.ts_energy - ts_e) * HARTREE_TO_KCAL_PER_MOL < 0.1
+                   for st in result.steps):
+                continue
+            result.steps.append(Step(a, b, ts_e, found.get("label", ""), dict(found.get("files") or {})))
+        energies = [float(s.node.energy) for s in result.species]
+        kinetic = simulate(len(result.species), result.steps, energies, temperature=kin["temperature"],
+                           time_s=kin["time_s"])
+        result.kinetics = kinetic
+        picks = select_for_expansion(kinetic, expanded, kin["threshold"])
+        result.rounds[-1]["kinetics"] = {
+            "connected_pairs": [list(p) for p in pairs], "verified_steps": len(result.steps),
+            "flux": kinetic.flux, "max_concentration": kinetic.max_concentration,
+            "final_concentration": kinetic.final_concentration}
+        _emit(on_event, "kinetics", round=rnd, flux=kinetic.flux, picks=picks)
+        return picks
+
+    connected: set[tuple[int, int]] = set()
+    expanded: set[int] = set()
     frontier = [0]
     for rnd in range(1, rounds + 1):
         if not frontier:
             break
+        expanded.update(frontier)
+        n_edges_before = len(result.edges)
         proposals, stats_all = [], []
         for src in frontier:
             node = result.species[src].node
             coords = np.asarray(node.coords) / ANGSTROM_TO_BOHR
-            if products_file is not None or generator != "bond-rules":
+            if products_file is None and is_named(generator):
+                props, stats = propose_products(
+                    generator, symbols, coords, graph_edges(node), options=generator_options, charge=charge,
+                    multiplicity=mult, n_break=n_break, n_form=n_form, form_distance=form_distance,
+                    max_products=max_products, allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions,
+                    source=src,
+                )
+                _build_guesses(props, node, coords, live, workers)
+            else:   # imported products, or a generator given by import path
                 if products_file is not None:  # an external tool's products of the seed
                     from mepd.qcdata_structure_helpers import read_multiple_structure_from_file
                     items = read_multiple_structure_from_file(products_file, charge, mult) if src == 0 else []
@@ -604,13 +720,6 @@ def expand_network(
                     items = _import_generator(generator)(node.structure, **dict(generator_options or {}))
                 props = external_proposals(items, node.structure, src)
                 stats = {"external": len(props)}
-            else:
-                props, stats = enumerate_bond_changes(
-                    symbols, coords, graph_edges(node), charge=charge, multiplicity=mult,
-                    n_break=n_break, n_form=n_form, form_distance=form_distance, max_products=max_products,
-                    allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions, source=src,
-                )
-                _build_guesses(props, node, coords, live, workers)
             stats_all.append({"source": src, **stats})
             proposals.extend(props)
         known = {s.smiles: k for k, s in enumerate(result.species) if s.smiles}
@@ -649,6 +758,10 @@ def expand_network(
         found = [e.target for e in result.edges if e.outcome == "new_species" and result.species[e.target].round == rnd]
         result.rounds.append({"round": rnd, "sources": frontier, "proposed": len(proposals),
                               "new_species": found, "expanded_next": new_frontier, "generator_stats": stats_all})
+        if steer == "flux":
+            new_frontier = _steer_by_flux(result.edges[n_edges_before:])
+            result.rounds[-1]["expanded_next"] = new_frontier
+            result.rounds[-1]["new_species"] = [k for k, s in enumerate(result.species) if s.round == rnd and k]
         frontier = new_frontier
     live.close()
     return result

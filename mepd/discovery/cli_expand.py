@@ -26,6 +26,65 @@ def _parse_options(values: List[str]) -> dict:
     return out
 
 
+def _ts_connector(run_inputs, output: Path, workers: int):
+    """`connect` for flux steering: a recursive path search (MSMEP) for each
+    (source, product) pair, then TS optimization + IRC of every leaf's TS
+    guess. Returns one record per step whose IRC runs between two different
+    minima: its two IRC ends and TS. Resumable: finished pair trees and
+    TS/IRC files are reused from `output`."""
+    from mepd.cli_channels import _load_ts_and_irc_from_disk
+    from mepd.cli_common import _fork_map, _optimize_ts_and_irc, _run_msmep_pairs, _ts_guess_tasks_from_tree
+    from mepd.inputs import ChainInputs
+    from mepd.TreeNode import TreeNode
+
+    pairs_dir, ts_dir = output / "pairs", output / "ts"
+
+    def connect(pairs, nodes):
+        pairs_dir.mkdir(parents=True, exist_ok=True)
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        charge, mult = int(nodes[0].structure.charge), int(nodes[0].structure.multiplicity)
+        _run_msmep_pairs([n.copy() for n in nodes], list(pairs), pairs_dir, run_inputs,
+                         parallel=False, parallel_workers=None, workers=workers)
+        tasks = []
+        for i, j in pairs:
+            tree_dir = pairs_dir / f"pair_{i}_{j}" / "tree"
+            if not (tree_dir / "node_0.xyz").exists():
+                typer.echo(f"No path found for reaction {i} -> {j}; it carries no flux.")
+                continue
+            try:
+                tree = TreeNode.read_from_disk(tree_dir, chain_parameters=ChainInputs(), charge=charge,
+                                               multiplicity=mult)
+            except Exception as exc:
+                typer.echo(f"Could not read the path search for {i} -> {j}: {type(exc).__name__}: {exc}")
+                continue
+            tasks.extend(_ts_guess_tasks_from_tree(tree, f"pair_{i}_{j}_"))
+
+        def ts_and_irc(task):
+            label, guess = task
+            if _load_ts_and_irc_from_disk(ts_dir, label, charge, mult) is None:
+                _optimize_ts_and_irc(guess, run_inputs, ts_dir, run_irc=True, label=label)
+            return label
+
+        _fork_map(ts_and_irc, tasks, workers)
+        found = []
+        for label, _ in tasks:
+            res = _load_ts_and_irc_from_disk(ts_dir, label, charge, mult)
+            if res is None or res.irc_chain is None or len(res.irc_chain) < 2:
+                continue
+            ts = res.ts_node
+            if ts._cached_energy is None:
+                run_inputs.engine.compute_energies([ts])
+            ends = [res.irc_chain[0], res.irc_chain[-1]]
+            missing = [n for n in ends if n._cached_energy is None]
+            if missing:
+                run_inputs.engine.compute_energies(missing)
+            found.append({"start": ends[0], "end": ends[1], "ts": ts, "label": label,
+                          "files": {"ts": str(ts_dir / f"{label}.xyz"), "irc": str(ts_dir / f"{label}_irc.xyz")}})
+        return found
+
+    return connect
+
+
 @discovery_app.command("expand")
 def expand(
     structure: str = typer.Argument(..., help="Seed structure: a path to an xyz file, or a SMILES string."),
@@ -35,6 +94,18 @@ def expand(
     multiplicity: Optional[int] = typer.Option(None, "--multiplicity", help="Override the seed's spin multiplicity."),
     rounds: int = typer.Option(
         1, "--rounds", help="Expansion depth: round 2 proposes products of round 1's new species, and so on."),
+    steer: str = typer.Option(
+        "auto", "--steer",
+        help="Which species the next round expands. 'flux': find a verified TS (path search, TS opt, IRC) for "
+        "every reaction, run microkinetics from the seed, and expand only species whose concentration flux "
+        "reaches --flux-threshold, so the network stops growing on its own. 'window': every new species "
+        "within --energy-window. 'auto' (default): flux when --rounds > 1, else window."),
+    temperature: float = typer.Option(298.15, "--temperature", help="--steer flux: temperature (K) for the rates."),
+    time_s: float = typer.Option(3600.0, "--time", help="--steer flux: simulated time (s), starting from pure seed."),
+    flux_threshold: float = typer.Option(
+        0.01, "--flux-threshold",
+        help="--steer flux: expand a species once the material that flowed into it (fraction of the seed) "
+        "reaches this."),
     n_break: int = typer.Option(2, "--n-break", help="Most bonds broken in one proposed step."),
     n_form: int = typer.Option(2, "--n-form", help="Most bonds formed in one proposed step."),
     form_distance: float = typer.Option(
@@ -51,13 +122,14 @@ def expand(
         False, "--allow-zwitterions", help="Also propose products that need separated formal charges."),
     generator: str = typer.Option(
         "bond-rules", "--generator",
-        help="'bond-rules' (built in), or 'package.module:function' for your own generator: "
-        "function(structure, **options) returning product Structures (or xyz paths) in the same atom order."),
+        help="Which tool proposes the products: 'bond-rules' (built in: the ZStruct/YARP break-and-form "
+        "enumeration, reimplemented), or 'package.module:function' for your own: function(structure, "
+        "**options) returning product Structures (or xyz paths) in the same atom order."),
     generator_option: List[str] = typer.Option(
         [], "--generator-option", help="key=value passed to a custom --generator (values parsed as JSON). Repeatable."),
     products: Optional[Path] = typer.Option(
         None, "--products", exists=True, dir_okay=False,
-        help="Import products another tool proposed (autodE, Chemoton, YARP, ...): a multi-frame xyz, "
+        help="Import products another tool proposed (autodE, Chemoton, ...): a multi-frame xyz, "
         "atom-mapped to the seed (same atoms, same order). Replaces the generator for the seed."),
     maxiter: int = typer.Option(500, "--maxiter", help="Maximum geometry-optimization steps per proposal."),
     max_species: int = typer.Option(200, "--max-species", help="Stop adding species beyond this many."),
@@ -84,13 +156,17 @@ def expand(
     """Reaction network expansion: propose products of the seed by breaking
     and forming bonds (no Hessian sampling), optimize them, and repeat from
     the new species; optionally connect each proposed reaction by a path
-    search.
+    search. With --rounds > 1 the network grows only where the kinetics
+    say material flows (--steer flux).
 
-    Methods: break/form enumeration on the bond graph as in ZStruct
+    Based on published methods, reimplemented in mepd (no code from them is
+    used): the break/form enumeration on the bond graph is that of ZStruct
     (Zimmerman, J. Comput. Chem. 2013) and YARP (Zhao & Savoie, Nat. Comput.
-    Sci. 2021); Lewis-structure filter by RDKit DetermineBondOrders, i.e.
-    xyz2mol (Kim & Kim, Bull. Korean Chem. Soc. 2015); product guesses by a
-    restrained relaxation of mepd's own. Full references in summary.json.
+    Sci. 2021); the Lewis-structure filter is RDKit DetermineBondOrders, i.e.
+    xyz2mol (Kim & Kim, Bull. Korean Chem. Soc. 2015); flux steering follows
+    Bensberg & Reiher (Isr. J. Chem. 2023) and the rate-based enlargement of
+    Susnow et al. (J. Phys. Chem. A 1997). Product guesses use a restrained
+    relaxation of mepd's own. Full references in summary.json.
 
     Writes species.xyz (the seed first, then every species found),
     species/species_<k>.xyz, proposals.xyz (every product guess, before
@@ -112,6 +188,26 @@ def expand(
     if n_break < 0 or n_form < 0 or n_break + n_form == 0:
         raise typer.BadParameter("--n-break and --n-form must be >= 0 and not both 0.")
 
+    from mepd.discovery.generators import get_generator, is_named
+
+    if products is None and is_named(generator):
+        try:
+            get_generator(generator).check()
+        except ImportError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--generator") from None
+    elif products is None and ":" not in generator and "." not in generator:
+        try:
+            get_generator(generator)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--generator") from None
+
+    steer = steer.strip().lower()
+    if steer not in ("auto", "window", "flux"):
+        raise typer.BadParameter("--steer must be auto, window or flux.")
+    if steer == "auto":
+        steer = "flux" if rounds > 1 else "window"
+    if steer == "flux" and (temperature <= 0 or time_s <= 0 or flux_threshold <= 0):
+        raise typer.BadParameter("--temperature, --time and --flux-threshold must be positive.")
     run_inputs = _open_run_inputs(inputs)
     _echo_run_inputs_summary(run_inputs)
     seed = StructureNode(structure=_load_structure_from_smiles_or_xyz(structure, charge, multiplicity))
@@ -142,7 +238,9 @@ def expand(
                 generator_options=_parse_options(generator_option), products_file=str(products) if products else None,
                 maxiter=maxiter, n_break=n_break, n_form=n_form, form_distance=form_distance,
                 max_products=max_products, allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions,
-                max_species=max_species, workers=workers, on_event=on_event,
+                max_species=max_species, workers=workers, on_event=on_event, steer=steer,
+                connect=_ts_connector(run_inputs, output, workers) if steer == "flux" else None,
+                kinetics={"temperature": temperature, "time_s": time_s, "threshold": flux_threshold},
                 validate_minima={"frequency_cutoff": validation["hessian_minimum_frequency_cutoff"],
                                  "rescue_displacement": validation["hessian_minima_rescue_displacement"]}
                 if validation else None,
@@ -186,9 +284,19 @@ def expand(
         "reactions": [{"source": e.source, "target": e.target, "outcome": e.outcome, "proposed_smiles": e.proposal.smiles,
                        "broken": [list(b) for b in e.proposal.broken], "formed": [list(f) for f in e.proposal.formed],
                        "landed_as_proposed": e.intended, "error": e.error or None} for e in result.edges],
-        "methods": REFERENCES if products is None and generator == "bond-rules"
-        else {k: v for k, v in REFERENCES.items() if k == "animation"},
+        # A named generator swaps in its own enumeration reference; imported
+        # products and custom generators only share the animation.
+        "methods": {**({k: v for k, v in REFERENCES.items() if k != "kinetics"}
+                       if products is None and is_named(generator)
+                       else {k: v for k, v in REFERENCES.items() if k == "animation"}),
+                    **(get_generator(generator).references if products is None and is_named(generator) else {}),
+                    **({"kinetics": REFERENCES["kinetics"]} if steer == "flux" else {})},
         "rounds": result.rounds,
+        "steering": {"mode": steer, **({"temperature_K": temperature, "time_s": time_s, "flux_threshold": flux_threshold}
+                                        if steer == "flux" else {"energy_window_kcal": energy_window})},
+        "steps": [{"a": st.a, "b": st.b, "ts_energy": st.ts_energy, "barrier_kcal": list(bar), "label": st.label,
+                   "files": st.files}
+                  for st, bar in zip(result.steps, result.kinetics.barriers_kcal if result.kinetics else [])],
         "connections": [list(p) for p in pairs],
         "output_files": files,
     }
@@ -197,15 +305,22 @@ def expand(
         counts[e.outcome] = counts.get(e.outcome, 0) + 1
     summary["outcomes"] = counts
 
+    if result.kinetics is not None:
+        for rec, f, cmax, cend in zip(summary["species"], result.kinetics.flux, result.kinetics.max_concentration,
+                                      result.kinetics.final_concentration):
+            rec.update(flux=f, max_concentration=cmax, final_concentration=cend)
     network_note = ""
+    if steer == "flux":
+        connect = True   # the pair trees exist already: network.json is built from them below
     if connect and pairs:
         if len(pairs) > max_pairs:
             typer.echo(f"{len(pairs)} reactions to connect, capping at --max-pairs={max_pairs}.")
             pairs = pairs[:max_pairs]
         pairs_dir = output / "pairs"
         pairs_dir.mkdir(exist_ok=True)
-        _run_msmep_pairs([s.node.copy() for s in result.species], pairs, pairs_dir, run_inputs,
-                         parallel=parallel, parallel_workers=parallel_workers)
+        if steer != "flux":
+            _run_msmep_pairs([s.node.copy() for s in result.species], pairs, pairs_dir, run_inputs,
+                             parallel=parallel, parallel_workers=parallel_workers)
         tree_dirs = _completed_tree_dirs(pairs_dir)
         if tree_dirs:
             from mepd.inputs import NetworkInputs
