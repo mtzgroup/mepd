@@ -713,7 +713,39 @@ def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict
         paths = collect_network_splits(out, charge, multiplicity)
         result["groups"] += paths["groups"]
         result["headline"] += " · " + paths["headline"]
+    ts_entries, irc_entries = _expansion_steps(out, s, charge, multiplicity)
+    result["groups"] += [g for g in (_group("Transition states (verified steps)", "ts", ts_entries),
+                                     _group("IRC paths", "irc", irc_entries)) if g]
     return result
+
+
+def _expansion_steps(out: Path, s: dict, charge: int, multiplicity: int) -> tuple[list, list]:
+    """Each verified step of a flux-steered expansion: its TS and its IRC
+    (drawn from species a to species b), barriers from species a. Entry
+    ids are the step label (`<label>` TS, `<label>_irc` IRC), which the
+    graph edge for that step points at."""
+    names = {sp.get("index"): sp.get("smiles") or f"species {sp.get('index')}" for sp in s.get("species") or []}
+    ts_entries, irc_entries = [], []
+    for st in s.get("steps") or []:
+        label, files = st.get("label") or f"step_{st['a']}_{st['b']}", st.get("files") or {}
+        ts = _load_chain(Path(files["ts"]), charge, multiplicity) if files.get("ts") else None
+        irc = _load_chain(Path(files["irc"]), charge, multiplicity) if files.get("irc") else None
+        if ts is None:
+            continue
+        barriers = st.get("barrier_kcal") or []
+        forward = barriers[0] if barriers else None
+        note = f"{names.get(st['a'], st['a'])}  ⇌  {names.get(st['b'], st['b'])}"
+        e_ts = _node_energy(ts[0])
+        floor = e_ts - forward / HARTREE_TO_KCAL if forward is not None and e_ts is not None else None
+        ts_entries.append(_entry(label, f"TS {st['a']} → {st['b']}", [ts[0]], floor, barrier=forward, note=note))
+        if irc is not None:
+            first, last = _node_energy(irc[0]), _node_energy(irc[-1])
+            if len(irc) > 1 and None not in (floor, first, last) and abs(last - floor) < abs(first - floor):
+                irc = irc.copy()
+                irc.nodes.reverse()   # start at species a's side (its energy), like the edge
+            irc_entries.append(_entry(f"{label}_irc", f"IRC {st['a']} → {st['b']}", irc.nodes, floor,
+                                      barrier=forward, note=note))
+    return ts_entries, irc_entries
 
 
 def collect_network_splits(out: Path, charge: int, multiplicity: int) -> dict:
@@ -976,7 +1008,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 12
+RESULT_VERSION = 13
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

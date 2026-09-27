@@ -236,6 +236,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if job["op"] == "design-optimize":
                 await run_in_threadpool(apply_design_optimization, manager.ws, job)
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "graph-enumeration" and job["status"] == "done":
+                if await run_in_threadpool(adopt_expansion_steps, manager, job):
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "design-tsopt":
                 try:
                     result = await parse_result(job, manager.job_dir(job["id"]))
@@ -1262,6 +1265,24 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
                                                "label": entry["label"], "frame": 0})
             added += not duplicate
     return added
+
+
+def adopt_expansion_steps(manager: JobManager, job: dict) -> bool:
+    """A finished expansion's verified steps (summary.json) onto its graph
+    edges -- the same as the live events do while it runs; this covers runs
+    without a live view and steps whose events were missed."""
+    try:
+        summary = json.loads((Path(job["output_dir"]) / "summary.json").read_text())
+    except Exception:
+        return False
+    nodes = dict(job.get("live_nodes") or {})
+    known = manager.ws.snapshot()["structures"]
+    changed = False
+    for st in summary.get("steps") or []:
+        ev = {"event": "step", "a": st["a"], "b": st["b"], "label": st.get("label"),
+              "barrier_kcal": st.get("barrier_kcal")}
+        changed |= manager._adopt_step(job, ev, nodes, known)
+    return changed
 
 
 def _attach_path_conformers(ws: Workspace, job: dict, result: dict) -> int:

@@ -576,6 +576,9 @@ class JobManager:
                 known = self.ws.snapshot()["structures"]
                 nodes[str(ev["index"])] = rec["id"]
                 a, b = parent, rec["id"]
+            elif ev.get("event") == "step":
+                changed |= self._adopt_step(job, ev, nodes, known)
+                continue
             elif ev.get("event") == "reaction":
                 a, b = nodes.get(str(ev.get("source"))), nodes.get(str(ev.get("target")))
                 if a not in known or b not in known:
@@ -596,6 +599,35 @@ class JobManager:
         self._write(job)
         if changed:
             self.bus.publish("workspace", self.ws.snapshot())
+
+    def _adopt_step(self, job: dict, ev: dict, nodes: dict, known: dict) -> bool:
+        """A verified step (TS + IRC between species a and b) of a running
+        expansion: the edge between their nodes stops being "proposed" and
+        carries the barrier (in the edge's direction), and points at the
+        step's TS/IRC in the job's result. The lowest barrier wins when
+        several TSs join the same pair."""
+        a, b = nodes.get(str(ev.get("a"))), nodes.get(str(ev.get("b")))
+        if a not in known or b not in known or a == b:
+            return False
+        edge = self.ws.find_edge(a, b)
+        if edge is None:
+            try:
+                edge = self.ws.add_edge(a, b, origin={"kind": "job", "job": job["id"]})
+            except WorkspaceError:
+                return False
+        fwd, rev = (list(ev.get("barrier_kcal") or []) + [None, None])[:2]
+        barrier = fwd if edge["source"] == a else rev
+        old = edge.get("origin") or {}
+        if not old.get("proposed") and old.get("barrier_kcal") is not None and barrier is not None \
+                and old["barrier_kcal"] <= barrier:
+            return False   # already the lower barrier of this pair
+        label = ev.get("label") or f"step_{ev.get('a')}_{ev.get('b')}"
+        with self.ws._lock:
+            edge["origin"] = {"kind": "job", "job": job["id"], "entry": f"{label}_irc", "group": "irc",
+                              "has_ts": True, "barrier_kcal": barrier, "label": label,
+                              "headline": "TS + IRC from the flux-steered expansion"}
+            self.ws._save()
+        return True
 
     def progress_snapshot(self, jid: str) -> dict:
         """Current progress state in full, for a client that opens a job's
