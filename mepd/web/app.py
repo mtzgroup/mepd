@@ -1277,11 +1277,19 @@ def adopt_expansion_steps(manager: JobManager, job: dict) -> bool:
         return False
     nodes = dict(job.get("live_nodes") or {})
     known = manager.ws.snapshot()["structures"]
-    changed = False
+    # Each pair's lowest step, with its final barriers (they may differ from
+    # the live ones: species energies can drop later in a run).
+    best: dict[frozenset, dict] = {}
     for st in summary.get("steps") or []:
+        key = frozenset((st["a"], st["b"]))
+        if key not in best or (st.get("ts_energy") is not None and best[key].get("ts_energy") is not None
+                               and st["ts_energy"] < best[key]["ts_energy"]):
+            best[key] = st   # the lower TS: the lower barrier both ways
+    changed = False
+    for st in best.values():
         ev = {"event": "step", "a": st["a"], "b": st["b"], "label": st.get("label"),
               "barrier_kcal": st.get("barrier_kcal")}
-        changed |= manager._adopt_step(job, ev, nodes, known)
+        changed |= manager._adopt_step(job, ev, nodes, known, final=True)
     return changed
 
 

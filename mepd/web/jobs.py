@@ -600,12 +600,14 @@ class JobManager:
         if changed:
             self.bus.publish("workspace", self.ws.snapshot())
 
-    def _adopt_step(self, job: dict, ev: dict, nodes: dict, known: dict) -> bool:
+    def _adopt_step(self, job: dict, ev: dict, nodes: dict, known: dict, final: bool = False) -> bool:
         """A verified step (TS + IRC between species a and b) of a running
         expansion: the edge between their nodes stops being "proposed" and
         carries the barrier (in the edge's direction), and points at the
         step's TS/IRC in the job's result. The lowest barrier wins when
-        several TSs join the same pair."""
+        several TSs join the same pair. `final` (the finished run's summary,
+        already reduced to each pair's lowest step) replaces what the live
+        events set, whose barriers may predate a species' final energy."""
         a, b = nodes.get(str(ev.get("a"))), nodes.get(str(ev.get("b")))
         if a not in known or b not in known or a == b:
             return False
@@ -618,7 +620,11 @@ class JobManager:
         fwd, rev = (list(ev.get("barrier_kcal") or []) + [None, None])[:2]
         barrier = fwd if edge["source"] == a else rev
         old = edge.get("origin") or {}
-        if not old.get("proposed") and old.get("barrier_kcal") is not None and barrier is not None \
+        if final:
+            if old.get("job") == job["id"] and old.get("barrier_kcal") == barrier and not old.get("proposed") \
+                    and old.get("label") == ev.get("label"):
+                return False   # already exactly this
+        elif not old.get("proposed") and old.get("barrier_kcal") is not None and barrier is not None \
                 and old["barrier_kcal"] <= barrier:
             return False   # already the lower barrier of this pair
         label = ev.get("label") or f"step_{ev.get('a')}_{ev.get('b')}"

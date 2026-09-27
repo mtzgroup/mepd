@@ -55,3 +55,22 @@ def test_finished_expansion_backfills_steps_from_its_summary(tmp_path):
     (edge,) = ws.snapshot()["edges"].values()
     assert edge["origin"]["barrier_kcal"] == 12.0 and not edge["origin"].get("proposed")
     assert not adopt_expansion_steps(jobs, job)      # nothing new the second time
+
+
+def test_the_finished_summary_replaces_live_barriers(tmp_path):
+    from mepd.web.app import adopt_expansion_steps
+
+    ws, jobs, (s0, s1, _) = _ws(tmp_path)
+    job = {"id": "j", "live_nodes": {"0": s0, "1": s1}}
+    live = {"event": "step", "a": 0, "b": 1, "label": "early", "barrier_kcal": [5.0, 1.0]}
+    jobs._adopt_step(job, live, job["live_nodes"], ws.snapshot()["structures"])
+    out = tmp_path / "out"
+    out.mkdir()
+    # Species 0 was found lower later: the same TS is now 8 kcal/mol above it. Two TSs join the pair;
+    # the lower one (by TS energy) is kept.
+    (out / "summary.json").write_text(json.dumps({"steps": [
+        {"a": 0, "b": 1, "label": "early", "ts_energy": -1.00, "barrier_kcal": [8.0, 1.0]},
+        {"a": 0, "b": 1, "label": "high", "ts_energy": -0.90, "barrier_kcal": [70.0, 63.0]}]}))
+    assert adopt_expansion_steps(jobs, {**job, "output_dir": str(out)})
+    (edge,) = ws.snapshot()["edges"].values()
+    assert edge["origin"]["barrier_kcal"] == 8.0 and edge["origin"]["label"] == "early"

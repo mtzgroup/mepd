@@ -771,10 +771,14 @@ def expand_network(
                 continue
             result.steps.append(Step(a, b, ts_e, found.get("label", ""), dict(found.get("files") or {})))
             if live.enabled:   # the web graph fills that edge in (barrier, TS, IRC) as it happens
+                from mepd.discovery.kinetics import barriers
+
+                # The same barriers the kinetics use (a TS below an end counts as 0); the finished
+                # run's summary replaces these if a species' energy drops later.
+                fwd, rev = barriers([result.steps[-1]], [float(s.node.energy) for s in result.species])[0]
                 live._progress.append_live_event({
                     "event": "step", "a": a, "b": b, "label": found.get("label", ""), "ts_energy": ts_e,
-                    "barrier_kcal": [(ts_e - float(result.species[k].node.energy)) * HARTREE_TO_KCAL_PER_MOL
-                                     for k in (a, b)]})
+                    "barrier_kcal": [fwd, rev]})
         energies = [float(s.node.energy) for s in result.species]
         kinetic = simulate(len(result.species), result.steps, energies, temperature=kin["temperature"],
                            time_s=kin["time_s"])
