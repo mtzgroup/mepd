@@ -115,7 +115,7 @@ function ProfilePicker({ value, onChange }) {
       </select>
       ${summary && html`<span class="field-help">Path search: <b>${summary.text}</b></span>`}
       ${summary?.warnings.map((w) => html`<p class="level-note small">${w}</p>`)}
-      <span class="field-help">RunInputs TOML: engine, level of theory, path-minimizer settings. Edit under Profiles.</span>
+      <span class="field-help">RunInputs TOML: engine, level of theory, path-minimizer settings. Edit under Settings.</span>
     </div>`;
 }
 

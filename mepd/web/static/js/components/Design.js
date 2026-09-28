@@ -353,7 +353,7 @@ export function DesignView() {
               <b>TS converged.</b> ${design.last_ts.barrier_kcal != null ? html`Barrier ${design.last_ts.barrier_kcal.toFixed(1)} kcal/mol from its IRC. ` : ''}
               ${design.last_ts.irc_note && html`<div class="small mono">${design.last_ts.irc_note}</div>`}
               <p class="small">Its IRC ends are the reactant and product <i>with</i> everything you added (catalyst, solvent): add all three to the graph to compare with the uncatalyzed step.</p>
-              <button class="btn small primary" onClick=${tsToGraph}>Add TS + IRC ends to Graph</button>`
+              <button class="btn small primary" onClick=${tsToGraph}>Add TS + IRC ends to Explore</button>`
             : html`<b>The TS optimization did not converge</b>; the design is back to the structure you submitted.
               <div class="small">${design.last_ts.error || design.last_ts.headline}</div>
               <p class="small">Edit it (e.g. move the catalyst closer to the bonds that change, or start from a better guess) and try again.</p>`}
@@ -363,7 +363,7 @@ export function DesignView() {
           ${(design.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
           ${info && tool === 'view' && html`<p class="small muted">${info}</p>`}
           <div class="design-actions">
-            <button class="btn primary" onClick=${toGraph} disabled=${busy || running}>Add to Graph</button>
+            <button class="btn primary" onClick=${toGraph} disabled=${busy || running}>Add to Explore</button>
             <a class="btn" href="/api/design/xyz" download=${`${design.name || 'design'}.xyz`}>Download xyz</a>
             <button class="btn-link small" onClick=${() => { if (confirm('Start a new design? The current one is not kept (add it to the graph first if you want it).')) attempt(() => api.del('/api/design')); }}>New design…</button>
           </div>

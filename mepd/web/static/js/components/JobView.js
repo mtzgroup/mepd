@@ -301,11 +301,11 @@ class EntryNav extends Component {
               ${g.entries.map((e) => html`
                 <li class=${e.id === entryId ? 'on' : ''} onClick=${() => onSelect(e.id)} title=${e.note}>
                   ${pickable && (inGraph.has(e.id)
-                    ? html`<span class="in-graph" title="Already in the Graph">✓</span>`
+                    ? html`<span class="in-graph" title="Already in Explore">✓</span>`
                     : html`<input type="checkbox" class="pick" checked=${picked.has(e.id)}
                         onClick=${(ev) => { ev.stopPropagation(); onPick([e.id], !picked.has(e.id)); }} />`)}
                   <span class="entry-label">${e.label}</span>
-                  ${inGraph.has(e.id) && html`<span class="badge">in Graph</span>`}
+                  ${inGraph.has(e.id) && html`<span class="badge">in Explore</span>`}
                   ${e.barrier_kcal != null && html`<span class="barrier">${fmtKcal(e.barrier_kcal)}</span>`}
                 </li>`)}
             </ul>
@@ -341,7 +341,7 @@ function BulkBar({ group, picked, inGraph, onSet, onAdd, busy }) {
             <button class="btn-link small" onClick=${() => onSet(byEnergy.slice(0, lowest).map((e) => e.id))}>Pick</button></div>`}
       </div>`}
       <button class="btn primary" disabled=${!n || busy} onClick=${onAdd}>
-        ${busy ? 'Adding…' : n ? `Add ${n} to Graph` : 'Tick structures to add'}</button>
+        ${busy ? 'Adding…' : n ? `Add ${n} to Explore` : 'Tick structures to add'}</button>
     </div>`;
 }
 
@@ -399,14 +399,14 @@ function ResultPanel({ job }) {
 
   const reportAdded = (out) => {
     const n = out.added.length, r = out.reused.length;
-    const msg = [n && `Added ${n} structure${n > 1 ? 's' : ''} to the Graph`, r && `${r} already there`, out.edge && 'edge added']
+    const msg = [n && `Added ${n} structure${n > 1 ? 's' : ''} to Explore`, r && `${r} already there`, out.edge && 'edge added']
       .filter(Boolean).join(', ') || 'Nothing to add';
     const ids = [...out.added, ...out.reused].map((x) => x.id);
     const show = () => {
       if (out.edge) select({ edges: [out.edge.id] }); else select({ structures: ids });
       set({ view: { tab: 'graph', jobId: job.id } });
     };
-    toast(msg, 'ok', 7000, ids.length || out.edge ? { label: 'Show in Graph', run: show } : null);
+    toast(msg, 'ok', 7000, ids.length || out.edge ? { label: 'Show in Explore', run: show } : null);
   };
   const importEntry = async (frames, extra = {}) => {
     const out = await attempt(() => api.post(`/api/jobs/${job.id}/import-entry`, { entry: entry.id, frames, ...extra }));
@@ -491,12 +491,12 @@ function ResultPanel({ job }) {
               <span class="divider"></span>
               ${multi ? html`
                 <button class="btn small primary" onClick=${() => importEntry('endpoints', { connect: true })}
-                  title="Add both ends to the Graph and connect them with an edge carrying this result">Add ends + edge to Graph</button>
-                ${entry.ts_index != null && html`<button class="btn small" onClick=${() => importEntry('ts')}>Add TS to Graph</button>`}
-                <button class="btn small ghost" onClick=${() => importEntry('one', { frame })}>Add this frame to Graph</button>`
+                  title="Add both ends to Explore and connect them with an edge carrying this result">Add ends + edge to Explore</button>
+                ${entry.ts_index != null && html`<button class="btn small" onClick=${() => importEntry('ts')}>Add TS to Explore</button>`}
+                <button class="btn small ghost" onClick=${() => importEntry('one', { frame })}>Add this frame to Explore</button>`
               : inGraph.has(entry.id)
-                ? html`<span class="badge">✓ in Graph</span>`
-                : html`<button class="btn small primary" onClick=${() => importEntry('one', { frame: 0 })}>Add to Graph</button>`}
+                ? html`<span class="badge">✓ in Explore</span>`
+                : html`<button class="btn small primary" onClick=${() => importEntry('one', { frame: 0 })}>Add to Explore</button>`}
             </div>
           </div>`}
       </div>

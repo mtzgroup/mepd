@@ -71,7 +71,7 @@ export function ProfilesView() {
   return html`
     <div class="profiles-view">
       <div class="view-head">
-        <h2>Compute profiles</h2>
+        <h2>Settings</h2>
         <p class="small muted">Each profile is a <code>RunInputs</code> TOML (the file <code>mepd … --inputs</code> takes): engine, program and level of theory, path minimizer, optimizer, thresholds. A job copies its profile into its own folder, so editing one later never changes past results.</p>
       </div>
       <div class="profiles-body">

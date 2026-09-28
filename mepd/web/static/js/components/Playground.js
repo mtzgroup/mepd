@@ -67,7 +67,7 @@ function TopLeft() {
 function Tabs() {
   const view = useStore((s) => s.view);
   const active = useStore((s) => Object.values(s.jobs).filter((j) => j.status === 'running' || j.status === 'queued').length);
-  const tabs = [['graph', 'Graph'], ['design', 'Design'], ['jobs', 'Calculations'], ['profiles', 'Profiles'], ['refs', 'References']];
+  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
   return html`
     <nav class="pg-tabs" aria-label="Pages">
       ${tabs.map(([k, l]) => html`<button class=${view.tab === k || (k === 'jobs' && view.tab === 'job') ? 'on' : ''}
@@ -232,7 +232,7 @@ export function PlaygroundApp() {
       <${Tabs} />
       ${onGraph && html`<${TopRight} />`}
       ${onGraph && nSel > 0 && !panel && html`<div class="pg-sheet pg-inspector"><${Inspector} /></div>`}
-      ${page && html`<${Sheet} className="pg-page" label=${{ profiles: 'Compute profiles', refs: 'References' }[view.tab] || 'Calculations'}
+      ${page && html`<${Sheet} className="pg-page" label=${{ profiles: 'Settings', refs: 'References' }[view.tab] || 'Calculations'}
         onClose=${() => { clearSelection(); openTab('graph'); }}>${page}<//>`}
       ${panel === 'add' && html`<${Sheet} className="pg-add" title="Add structures" onClose=${() => set({ pgPanel: null })}>
         <${LevelBar} /><${AddBox} onDone=${() => set({ pgPanel: null })} /><//>`}

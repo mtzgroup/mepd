@@ -16,7 +16,7 @@ _DOI = re.compile(r"doi:\s*(10\.\S+?)[.,;)]*$")
 _OTHER = [
     {
         "feature": "Initial path",
-        "where": "Profile › Initial path",
+        "where": "Settings › Initial path",
         "items": [
             {"what": "Geodesic interpolation (the default)",
              "cite": ["X. Zhu, K. C. Thompson, T. J. Martínez, J. Chem. Phys. 150, 164103 (2019), "
@@ -31,7 +31,7 @@ _OTHER = [
     },
     {
         "feature": "Path search",
-        "where": "Profile › Advanced",
+        "where": "Settings › Advanced",
         "items": [
             {"what": "Energy-weighted spring constants (k, delta_k)",
              "cite": ["doi:10.1021/acs.jctc.1c00462"]},

@@ -72,4 +72,4 @@ def element_warnings(profile_text: Optional[str], symbols) -> list[str]:
         return []
     return [f"{name} is not parametrized for {', '.join(outside)}: energies, geometries and barriers involving "
             f"{'it' if len(outside) == 1 else 'them'} are unlikely to be meaningful. Pick a level of theory that "
-            "covers them (Profiles) before trusting results."]
+            "covers them (Settings tab) before trusting results."]

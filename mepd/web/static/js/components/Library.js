@@ -91,7 +91,7 @@ export function LevelBar() {
     (js) => `Re-optimizing ${off.length} structure${off.length > 1 ? 's' : ''} (${js.length} job${js.length > 1 ? 's' : ''})`);
   return html`
     <div class="level-bar">
-      <label class="level-field" title="Every structure in this session is minimized at this level of theory, so all energies are comparable. Edit a profile's engine and method under Profiles.">
+      <label class="level-field" title="Every structure in this session is minimized at this level of theory, so all energies are comparable. Edit a profile's engine and method under Settings.">
         <span class="field-label">Level of theory</span>
         <select value=${levelProfile ?? ''} onChange=${(e) => setLevel(e.target.value)}>
           ${profiles.map((p) => html`<option value=${p}>${levels[p]?.label ?? p} · ${p}</option>`)}

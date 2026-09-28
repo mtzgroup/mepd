@@ -21,7 +21,7 @@ function TopBar() {
     return { running: js.filter((j) => j.status === 'running').length, queued: js.filter((j) => j.status === 'queued').length };
   });
   const lastJob = useStore((s) => s.view.jobId);
-  const tabs = [['graph', 'Graph'], ['design', 'Design'], ['jobs', 'Calculations'], ['profiles', 'Profiles'], ['refs', 'References']];
+  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
   const demo = useStore((s) => s.demo);
   const auth = useStore((s) => s.auth);
   const active = counts.running + counts.queued;
