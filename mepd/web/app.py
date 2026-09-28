@@ -937,16 +937,16 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return created
 
     @app.get("/api/jobs/{jid}/channels-map")
-    async def channels_map_view(jid: str, mode: str = "bonds"):
+    async def channels_map_view(jid: str, mode: str = "bonds", ts: Optional[str] = None):
         """Every path a channels run relaxes, placed on one approximate energy
         map (mepd/web/channels_pes.py); cheap enough to poll while it runs."""
         from mepd.web.channels_pes import channels_map
 
-        if mode not in ("bonds", "distance"):
-            raise HTTPException(400, "mode is 'bonds' or 'distance'")
+        if mode not in ("bonds", "distance", "irc"):
+            raise HTTPException(400, "mode is 'bonds', 'distance' or 'irc'")
         job = J().get(jid)
         return await run_in_threadpool(channels_map, J().job_dir(jid), mode, 64, job["status"] == "running",
-                                       Path(job["output_dir"]))
+                                       Path(job["output_dir"]), ts)
 
     @app.get("/api/jobs/{jid}/vri-viewer", response_class=HTMLResponse)
     def vri_viewer(jid: str):

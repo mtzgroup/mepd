@@ -119,3 +119,30 @@ def test_optimized_ts_are_marked_with_how_close_the_chain_came(tmp_path):
     assert abs(mark["e"] - 14.0) < 1e-6 and np.allclose(mark["q"], m["paths"][0]["points"][3][:2])
     assert mark["closest"]["image"] == 3 and mark["closest"]["rmsd"] < 1e-6
     assert channels_map(job, "bonds")["ts"] == []                    # no output folder given: no marks
+
+
+def test_irc_frame_places_chains_along_and_off_the_true_path(tmp_path):
+    frames = _exchange(9)
+    job = tmp_path / "job"
+    energies = [0, 5, 12, 18, 20, 18, 12, 5, -1]
+    _write_stream(job / "live", "pair_0_1", frames, energies)
+    # A second chain displaced sideways from the path.
+    off = [f.replace(" 0.0000 0.0000\n", " 0.4000 0.0000\n", 1) for f in frames]
+    _write_stream(job / "live", "pair_0_2", off, energies)
+    out = job / "output"
+    (out / "ts").mkdir(parents=True)
+    (out / "ts" / "ts_pair_0_1_leaf_0.xyz").write_text(frames[4])
+    (out / "ts" / "ts_pair_0_1_leaf_0.energies").write_text(f"{-1.0 + 20 / H2K}\n")
+    (out / "ts" / "ts_pair_0_1_leaf_0_irc.xyz").write_text("".join(frames[::-1]))     # written product first
+    (out / "ts" / "ts_pair_0_1_leaf_0_irc.energies").write_text(
+        "\n".join(str(-1.0 + e / H2K) for e in energies[::-1]) + "\n")
+    m = channels_map(job, "irc", output_dir=out)
+    assert m["irc"]["ts"] == "ts_pair_0_1_leaf_0" and [c["label"] for c in m["irc_choices"]] == ["ts_pair_0_1_leaf_0"]
+    on = next(p for p in m["paths"] if p["pair"] == "pair_0_1")["points"]
+    xs = [q[0] for q in on]
+    assert all(abs(q[1]) < 1e-6 for q in on)              # the IRC's own frames lie on it
+    assert xs == sorted(xs) and xs[0] < 0 < xs[-1]         # reactant first (reoriented), TS at 0
+    assert abs(xs[4]) < 1e-6
+    offp = next(p for p in m["paths"] if p["pair"] == "pair_0_2")["points"]
+    assert all(q[1] > 0.01 for q in offp[1:-1])            # the displaced chain sits off the IRC
+    assert channels_map(job, "irc")["warnings"]            # no output folder: says an IRC is needed

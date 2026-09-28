@@ -48,7 +48,8 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
   const canvas = useRef(null);
   const { x: xs, y: ys, E } = map;
   const marks = map.ts || [];
-  const pts = map.paths.flatMap((p) => p.points).concat(marks.map((m) => [m.q[0], m.q[1], m.e]));
+  const ircPts = map.irc?.points || [];
+  const pts = map.paths.flatMap((p) => p.points).concat(marks.map((m) => [m.q[0], m.q[1], m.e]), ircPts);
   const allX = pts.map((q) => q[0]).concat(xs), allY = pts.map((q) => q[1]).concat(ys);
   const x0 = Math.min(...allX), x1 = Math.max(...allX), y0 = Math.min(...allY), y1 = Math.max(...allY);
   const energies = (E.flat ? E.flat() : []).filter((v) => v !== null).concat(pts.map((q) => q[2]).filter((v) => v !== null));
@@ -92,6 +93,10 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
               opacity=${dim ? 0.3 : 1} onMouseEnter=${() => setHover({ p, k, q })} />`)}
           </g>`;
         })}
+        ${ircPts.length > 1 && html`<g style="pointer-events:none">
+          <polyline points=${ircPts.map((q) => `${sx(q[0]).toFixed(1)},${sy(q[1]).toFixed(1)}`).join(' ')} fill="none" stroke="rgba(23,50,74,.55)" stroke-width="5" />
+          <polyline points=${ircPts.map((q) => `${sx(q[0]).toFixed(1)},${sy(q[1]).toFixed(1)}`).join(' ')} fill="none" stroke="#ffffff" stroke-width="2.8" />
+        </g>`}
         ${marks.map((m) => {
           const X = sx(m.q[0]), Y = sy(m.q[1]), col = pairColor(m.pair), r = 7;
           const on = selected && selected.startsWith(`${m.pair}/`);
@@ -163,6 +168,7 @@ export function ChannelsMap({ job }) {
   const [mode, setModeState] = useState(() => prefs.get('channelsMapMode', 'bonds'));
   const setMode = (m) => { setModeState(m); prefs.set('channelsMapMode', m); };
   const [map, setMap] = useState(null);
+  const [ircTs, setIrcTs] = useState(null);
   const [err, setErr] = useState(null);
   const [selected, setSelected] = useState(null);
   const [hover, setHover] = useState(null);
@@ -181,9 +187,10 @@ export function ChannelsMap({ job }) {
   useEffect(() => {
     if (busy.current) return;
     busy.current = true;
-    api.get(`/api/jobs/${job.id}/channels-map?mode=${mode}`).then((m) => { setMap(m); setErr(null); })
+    api.get(`/api/jobs/${job.id}/channels-map?mode=${mode}${mode === 'irc' && ircTs ? `&ts=${encodeURIComponent(ircTs)}` : ''}`).then((m) => { setMap(m); setErr(null); })
       .catch((e) => setErr(e.message)).finally(() => { busy.current = false; });
-  }, [mode, beat, tick, job.status]);
+  }, [mode, ircTs, beat, tick, job.status]);
+  const choices = map?.irc_choices || [];
 
   const pairs = map ? [...new Set(map.paths.map((p) => p.pair))] : [];
   const pairColor = (pair) => LINE[Math.max(0, pairs.indexOf(pair)) % LINE.length];
@@ -193,10 +200,18 @@ export function ChannelsMap({ job }) {
       <div class="segmented">
         <button class=${mode === 'bonds' ? 'on' : ''} onClick=${() => setMode('bonds')} title="Each path's own bonds, 0 to 1: broken vs formed, or two groups of bonds formed (More O'Ferrall-Jencks)">Bond progress</button>
         <button class=${mode === 'distance' ? 'on' : ''} onClick=${() => setMode('distance')} title="Distance from the lowest reactant and product conformers, the same for every atom mapping">Distance to reactant vs product</button>
+        <button class=${mode === 'irc' ? 'on' : ''} disabled=${!choices.length && mode !== 'irc'} onClick=${() => setMode('irc')}
+          title=${choices.length ? 'Post hoc: every chain measured against a computed IRC -- along it, and how far off it' : 'Needs a finished TS optimization with its IRC'}>Along an IRC</button>
       </div>
+      ${mode === 'irc' && choices.length > 0 && html`<label class="small">IRC of
+        <select value=${map?.irc?.ts || ''} onChange=${(e) => setIrcTs(e.target.value)}>
+          ${choices.map((c) => html`<option value=${c.label}>${c.pair.replace(/_/g, ' ')} · ${c.e.toFixed(1)} kcal/mol · ${c.kind === 'direct' ? 'direct channel' : c.kind === 'multi-step' ? 'multi-step' : 'unconnected'}</option>`)}
+        </select></label>`}
       <span class="small muted">${map ? `${map.paths.length} path${map.paths.length === 1 ? '' : 's'} · ${pairs.length} pair${pairs.length === 1 ? '' : 's'}` : ''}${job.status === 'running' ? ' · updating live' : ''}</span>
     </div>
-    <p class="small muted">${mode === 'bonds'
+    <p class="small muted">${mode === 'irc'
+      ? 'Post hoc, against a computed IRC (white; its TS at 0, 0): x is where each image lands along that IRC (Å from the TS, reactant to the left), y how far it is from it (Å, the same numbering-independent distance as the distance view, so every atom mapping is measured against the true path). A chain that found this channel converges onto the white line near x = 0; one that went elsewhere stays off it. '
+      : mode === 'bonds'
       ? 'x: how far the bonds that break have stretched; y: how far the bonds that form have closed (0 at the reactant, 1 at the product), each path with its own bonds, so different atom mappings share the square. A concerted path runs along the diagonal; a stepwise one hugs an edge. When a reaction only forms (or only breaks) bonds, e.g. a Diels–Alder, its bonds are split in two groups plotted against each other: synchronous along the diagonal, asynchronous bowed toward an edge. Dashed: sub-paths of a recursive split. '
       : 'x, y: how far each structure is from the lowest reactant and the lowest product conformer (differences of sorted interatomic distances), independent of atom numbering: paths that pass through similar structures run close together.'}
       The colours are a surface fitted to the computed images: their energies and their gradients projected onto these two coordinates. A 2D map keeps only two of a molecule's many directions, so it is exact at the images and approximate between them; hatched: no image nearby.</p>

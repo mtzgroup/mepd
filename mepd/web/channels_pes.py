@@ -22,6 +22,12 @@ Coordinates (`mode`):
             lowest reactant / product conformer (RMS difference of sorted
             interatomic distances per element pair, in Angstrom), the same
             for every path whatever its atom numbering.
+  irc       post hoc, relative to one computed IRC (`ts` = its TS label):
+            x = where a structure projects onto that IRC (arc length from
+            the TS, Angstrom; reactant side < 0), y = how far it is from
+            the IRC -- with the same numbering-independent distance, so
+            every chain, whatever its atom mapping, is measured against the
+            true path. The IRC itself runs along y = 0 through the TS.
 
 Energies are kcal/mol relative to the lowest reactant-side image found (the
 lowest conformer, as barriers are measured). The surface is fitted to the
@@ -56,6 +62,10 @@ def _bonds(symbols, X, scale: float = 1.25) -> set:
     d = np.linalg.norm(X[:, None] - X[None], axis=-1)
     n = len(symbols)
     return {(i, j) for i in range(n) for j in range(i + 1, n) if d[i, j] < scale * (r[i] + r[j])}
+
+
+def _xyz_text(symbols, X) -> str:
+    return f"{len(symbols)}\n\n" + "".join(f"{s} {x:.6f} {y:.6f} {z:.6f}\n" for s, (x, y, z) in zip(symbols, X))
 
 
 def _dist(X, i, j) -> float:
@@ -174,6 +184,86 @@ def _aligned_rmsd(A: np.ndarray, B: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.sum((A @ rot - B) ** 2, axis=1))))
 
 
+def _fp_distance(f, pairs, X, ref, scale):
+    """Fingerprint distance to `ref` and its derivative d/dX (flat, per A)."""
+    diff = f - ref
+    D = float(np.linalg.norm(diff))
+    grad = np.zeros_like(X)
+    if D > 1e-9:
+        for c, (i, j) in zip(diff, pairs):
+            if c:
+                grad += (c / (scale * D)) * _ddist(X, i, j)
+    return D / scale, grad.reshape(-1)
+
+
+def _read_multiframe(fp: Path) -> list[str]:
+    lines, out, i = fp.read_text().splitlines(), [], 0
+    while i < len(lines):
+        if not lines[i].strip():
+            i += 1
+            continue
+        n = int(lines[i].split()[0])
+        out.append("\n".join(lines[i:i + n + 2]) + "\n")
+        i += n + 2
+    return out
+
+
+def _sidecar(fp: Path, suffix: str, n: int, width: Optional[int] = None):
+    try:
+        vals = np.loadtxt(fp.with_suffix(suffix))
+    except Exception:
+        return None
+    vals = np.atleast_1d(vals) if width is None else np.atleast_2d(vals)
+    if width is not None and vals.size == n * width:
+        vals = vals.reshape(n, width)
+    return vals if len(vals) == n else None
+
+
+class _IrcFrame:
+    """Coordinates relative to one IRC: (s, distance) of any structure,
+    and their derivatives, from fingerprint distances to the IRC frames."""
+
+    def __init__(self, frames_xyz: list[str], energies, reactant_fp):
+        self.fps = [_fingerprint(*_frame(x)) for x in frames_xyz]
+        self.scale = np.sqrt(len(self.fps[0])) or 1.0
+        # Reactant side first: the end nearer the lowest reactant conformer.
+        if reactant_fp is not None and len(reactant_fp) == len(self.fps[0]) and \
+                np.linalg.norm(self.fps[-1] - reactant_fp) < np.linalg.norm(self.fps[0] - reactant_fp):
+            self.fps.reverse()
+            frames_xyz = frames_xyz[::-1]
+            energies = None if energies is None else energies[::-1]
+        self.frames, self.energies = frames_xyz, energies
+        steps = [np.linalg.norm(b - a) / self.scale for a, b in zip(self.fps, self.fps[1:])]
+        s = np.concatenate([[0.0], np.cumsum(steps)])
+        ts = int(np.argmax(energies)) if energies is not None else len(s) // 2
+        self.s = s - s[ts]
+        self.ts_index = ts
+
+    def place(self, xyz: str):
+        """(x, y, dq/dX as a 2 x 3N array) or None (different molecule)."""
+        sym, X = _frame(xyz)
+        f, pairs = _fingerprint(sym, X, pairs=True)
+        if len(f) != len(self.fps[0]):
+            return None
+        d = np.array([np.linalg.norm(f - F) / self.scale for F in self.fps])
+        k = int(np.argmin(d))
+        n = len(self.fps)
+        j = k + 1 if k == 0 else k - 1 if k == n - 1 else (k - 1 if d[k - 1] < d[k + 1] else k + 1)
+        L = abs(self.s[j] - self.s[k]) or 1e-9
+        dk, gk = _fp_distance(f, pairs, X, self.fps[k], self.scale)
+        dj, gj = _fp_distance(f, pairs, X, self.fps[j], self.scale)
+        a = (dk * dk - dj * dj + L * L) / (2 * L)          # along the segment k -> j, from k
+        da = (dk * gk - dj * gj) / L
+        if a < 0 or a > L:                                  # beyond the segment: stay at frame k
+            a, da = 0.0, np.zeros_like(gk)
+        sign = 1.0 if self.s[j] > self.s[k] else -1.0
+        x = float(self.s[k] + sign * a)
+        y2 = dk * dk - a * a
+        y = float(np.sqrt(max(y2, 0.0)))
+        dy = (dk * gk - a * da) / y if y > 1e-6 else np.zeros_like(gk)
+        return x, y, np.array([sign * da, dy])
+
+
 def _optimized_ts(output_dir: Optional[Path]) -> list[dict]:
     """Every TS the run optimized (output/ts/ts_<pair>_leaf_<k>.xyz, energy
     from its sidecar) and what its IRC made of it: a direct channel, a step
@@ -200,12 +290,14 @@ def _optimized_ts(output_dir: Optional[Path]) -> list[dict]:
         except Exception:
             continue
         kind, group = kind_of.get(fp.stem, ("other", ""))
-        found.append({"label": fp.stem, "stream": stream, "xyz": xyz, "energy": energy, "kind": kind, "group": group})
+        irc = fp.with_name(f"{fp.stem}_irc.xyz")
+        found.append({"label": fp.stem, "stream": stream, "xyz": xyz, "energy": energy, "kind": kind, "group": group,
+                      "irc": str(irc) if irc.exists() else None})
     return found
 
 
 def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bool = True,
-                 output_dir: Optional[Path] = None) -> dict:
+                 output_dir: Optional[Path] = None, ts: Optional[str] = None) -> dict:
     """The map for the web UI: {mode, axes, x, y, E (grid, None = blank),
     paths: [{id, pair, monitor, points: [[x, y, kcal]], active}],
     ts: [{label, pair, q, e, kind, closest}], reference, warnings}."""
@@ -227,7 +319,51 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         if p["stream"] not in roots or p["monitor"] in ("branch-0", "main"):
             roots[p["stream"]] = p
     placed = []
-    if mode == "distance":
+    all_ts = _optimized_ts(output_dir)
+    irc_choices = [{"label": t["label"], "pair": t["stream"], "kind": t["kind"], "group": t["group"],
+                    "e": round((t["energy"] - e_ref) * H2K, 2)} for t in all_ts if t["irc"]]
+    irc_line, chosen_ts = None, None
+    if mode == "irc":
+        pick = next((t for t in all_ts if t["label"] == ts and t["irc"]), None) or min(
+            (t for t in all_ts if t["irc"]), key=lambda t: (t["kind"] != "direct", t["energy"]), default=None)
+        if pick is None:
+            return {"mode": mode, "paths": [], "x": [], "y": [], "E": [], "axes": {}, "ts": [], "irc_choices": [],
+                    "warnings": ["No IRC has been computed yet: this view needs a finished TS optimization and its IRC."]}
+        irc_fp = Path(pick["irc"])
+        irc_frames = _read_multiframe(irc_fp)
+        irc_e = _sidecar(irc_fp, ".energies", len(irc_frames))
+        lowest_r = min(paths, key=lambda p: p["energies"][0] if p["energies"][0] is not None else 1e9)
+        frame = _IrcFrame(irc_frames, irc_e, _fingerprint(*_frame(lowest_r["frames"][0])))
+
+        def place_ts(stream, X, sym):
+            got = frame.place(_xyz_text(sym, X))
+            return None if got is None else [got[0], got[1]]
+
+        for p in paths:
+            pts = []
+            for k, (xyz, e) in enumerate(zip(p["frames"], p["energies"])):
+                got = frame.place(xyz)
+                if got is None:
+                    continue
+                x, y, B = got
+                g = _projected_gradient(B, p["gradients"][k]) if p["gradients"] else None
+                pts.append([x, y, None if e is None else (e - e_ref) * H2K, g])
+            placed.append((p, pts))
+        # The IRC itself: y = 0, real energies and gradients (a data line of its own).
+        irc_g = _sidecar(irc_fp, ".gradients", len(irc_frames), width=3 * len(_frame(irc_frames[0])[0]))
+        if irc_g is not None and frame.frames is not irc_frames:
+            irc_g = irc_g[::-1]
+        irc_line = []
+        for k, xyz in enumerate(frame.frames):
+            got = frame.place(xyz)
+            e = None if frame.energies is None else (float(frame.energies[k]) - e_ref) * H2K
+            g = _projected_gradient(got[2], irc_g[k]) if (got is not None and irc_g is not None) else None
+            irc_line.append([round(float(frame.s[k]), 4), 0.0, None if e is None else round(e, 3), g])
+        axes = {"x": f"position along the IRC of {pick['label'].replace('ts_', '').replace('_', ' ')} (Å from its TS; "
+                     "reactant ←, → product)",
+                "y": "distance from that IRC (Å, numbering-independent)", "x_short": "along IRC", "y_short": "off IRC"}
+        chosen_ts = pick["label"]
+    elif mode == "distance":
         lowest_r = min(paths, key=lambda p: p["energies"][0] if p["energies"][0] is not None else 1e9)
         lowest_p = min(paths, key=lambda p: p["energies"][-1] if p["energies"][-1] is not None else 1e9)
         fr = _fingerprint(*_frame(lowest_r["frames"][0]))
@@ -332,7 +468,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
 
     # Optimized TSs, placed with their own pair's coordinates; how close did its chains get?
     ts_marks = []
-    for ts in _optimized_ts(output_dir):
+    for ts in all_ts:
         sym, X = _frame(ts["xyz"])
         q = place_ts(ts["stream"], X, sym)
         if q is None:
@@ -354,6 +490,8 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
                          "closest": closest, "xyz": ts["xyz"]})
 
     data = [(x, y, e, g) for _, pts in placed for x, y, e, g in pts if e is not None]
+    if irc_line:
+        data += [(x, y, e, g) for x, y, e, g in irc_line if e is not None]
     # A TS is a real stationary point: its energy, with zero slope, anchors the fit at the saddle.
     data += [(m["q"][0], m["q"][1], m["e"], np.zeros(2)) for m in ts_marks]
     xs = ys = np.array([])
@@ -384,5 +522,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
                    "points": [[round(x, 4), round(y, 4), None if e is None else round(e, 3)] for x, y, e, _ in pts]}
                   for p, pts in placed if pts],
         "ts": ts_marks,
+        "irc_choices": irc_choices,
+        "irc": {"ts": chosen_ts, "points": [[round(x, 4), round(y, 4), e] for x, y, e, _ in irc_line]} if irc_line else None,
         "warnings": warnings,
     }
