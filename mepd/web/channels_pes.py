@@ -24,9 +24,12 @@ Coordinates (`mode`):
             for every path whatever its atom numbering.
 
 Energies are kcal/mol relative to the lowest reactant-side image found (the
-lowest conformer, as barriers are measured). The surface is a Shepard
-interpolation of the computed images only (no gradients in the live data),
-so it is approximate between paths and left blank far from all of them.
+lowest conformer, as barriers are measured). The surface is fitted to the
+computed images -- their energies and, when the live data has them, their
+gradients projected onto the two map coordinates (dE/dq from the Cartesian
+gradient through the coordinates' Jacobian) -- so it follows the slopes the
+paths actually feel; it is still approximate between paths, and left blank
+far from all of them.
 """
 from __future__ import annotations
 
@@ -37,6 +40,7 @@ from typing import Optional
 import numpy as np
 
 H2K = 627.509474
+BOHR = 0.529177210903   # Angstrom
 
 
 def _frame(xyz: str):
@@ -58,17 +62,41 @@ def _dist(X, i, j) -> float:
     return float(np.linalg.norm(X[i] - X[j]))
 
 
-def _fingerprint(symbols, X) -> np.ndarray:
+def _fingerprint(symbols, X, pairs: bool = False):
     """Sorted interatomic distances, grouped by element pair: the same for
-    any atom numbering (and rotation/translation)."""
+    any atom numbering (and rotation/translation). With `pairs`, also the
+    (i, j) behind each entry (for derivatives)."""
     order = sorted(range(len(symbols)), key=lambda k: symbols[k])
     d = np.linalg.norm(X[:, None] - X[None], axis=-1)
     groups: dict = {}
     for a in range(len(order)):
         for b in range(a + 1, len(order)):
             i, j = order[a], order[b]
-            groups.setdefault(tuple(sorted((symbols[i], symbols[j]))), []).append(d[i, j])
-    return np.concatenate([np.sort(groups[k]) for k in sorted(groups)])
+            groups.setdefault(tuple(sorted((symbols[i], symbols[j]))), []).append((d[i, j], i, j))
+    entries = [e for k in sorted(groups) for e in sorted(groups[k])]
+    f = np.array([e[0] for e in entries])
+    return (f, [(e[1], e[2]) for e in entries]) if pairs else f
+
+
+def _ddist(X, i, j) -> np.ndarray:
+    """d|Xi - Xj| / dX (per Angstrom), as a (n, 3) array."""
+    g = np.zeros_like(X)
+    u = X[i] - X[j]
+    u = u / (np.linalg.norm(u) or 1.0)
+    g[i], g[j] = u, -u
+    return g
+
+
+def _projected_gradient(B: np.ndarray, grad_hartree_bohr) -> Optional[np.ndarray]:
+    """dE/dq (kcal/mol per unit q) from a Cartesian gradient: the least-
+    squares solution of B^T g_q = g_x, with B = dq/dX per Angstrom."""
+    if grad_hartree_bohr is None:
+        return None
+    g = np.asarray(grad_hartree_bohr, dtype=float).reshape(-1) / BOHR   # Hartree / Angstrom
+    if g.size != B.shape[1]:
+        return None
+    g_q, *_ = np.linalg.lstsq(B.T, g, rcond=None)
+    return g_q * H2K
 
 
 def _paths(job_dir: Path) -> list[dict]:
@@ -85,6 +113,9 @@ def _paths(job_dir: Path) -> list[dict]:
             monitors = {"main": data}
         for mid, m in monitors.items():
             frames = ((m.get("geometry") or {}).get("frames")) or []
+            grads = ((m.get("geometry") or {}).get("gradients")) or None
+            if grads is not None and len(grads) != len(frames):
+                grads = None
             plot = m.get("plot") or {}
             y = plot.get("y") or []
             if len(frames) < 2 or len(y) != len(frames):
@@ -92,18 +123,36 @@ def _paths(job_dir: Path) -> list[dict]:
             ref = plot.get("energy_ref_hartree")
             energies = [None if v is None else (v / H2K + (ref if ref is not None else 0.0)) for v in y]
             out.append({"stream": fp.stem, "monitor": mid, "frames": frames, "energies": energies,
+                        "gradients": grads,
                         "absolute": ref is not None, "active": bool(m.get("active")),
                         "finished": bool(data.get("finished")), "caption": plot.get("caption") or ""})
     return out
 
 
-def _surface(Q: np.ndarray, E: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+def _surface(Q: np.ndarray, E: np.ndarray, xs: np.ndarray, ys: np.ndarray, slopes=None, step=None) -> np.ndarray:
     """A smooth surface through the images: a thin-plate-spline radial basis
     fit with a little smoothing (images of one path sit close together and
     would otherwise make it ripple), falling back to inverse-distance
-    weighting if the fit is singular."""
+    weighting if the fit is singular. With `slopes` (dE/dq per image, None
+    where unknown), each image also contributes four close neighbours at
+    +-`step` along x and y whose energies follow its gradient -- the fit
+    then honours the slopes, not just the heights."""
     from scipy.interpolate import RBFInterpolator
 
+    if slopes is not None and step is not None:
+        extra_q, extra_e = [], []
+        for q, e, g in zip(Q, E, slopes):
+            if g is None or not np.all(np.isfinite(g)):
+                continue
+            for axis in (0, 1):
+                for sign in (1.0, -1.0):
+                    dq = np.zeros(2)
+                    dq[axis] = sign * step[axis]
+                    extra_q.append(q + dq)
+                    extra_e.append(e + float(np.dot(g, dq)))
+        if extra_q:
+            Q = np.vstack([Q, np.array(extra_q)])
+            E = np.concatenate([E, np.array(extra_e)])
     Xg, Yg = np.meshgrid(xs, ys)
     grid_pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)
     span = np.maximum(Q.max(axis=0) - Q.min(axis=0), 1e-6)
@@ -146,12 +195,24 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         scale = np.sqrt(len(fr)) or 1.0
         for p in paths:
             pts = []
-            for xyz, e in zip(p["frames"], p["energies"]):
-                f = _fingerprint(*_frame(xyz))
+            for k, (xyz, e) in enumerate(zip(p["frames"], p["energies"])):
+                sym, X = _frame(xyz)
+                f, pairs = _fingerprint(sym, X, pairs=True)
                 if len(f) != len(fr):
                     continue
-                pts.append([float(np.linalg.norm(f - fr) / scale), float(np.linalg.norm(f - fp_) / scale),
-                            None if e is None else (e - e_ref) * H2K])
+                q, rows = [], []
+                for ref in (fr, fp_):
+                    diff = f - ref
+                    D = float(np.linalg.norm(diff))
+                    q.append(D / scale)
+                    row = np.zeros_like(X)
+                    if D > 1e-9:
+                        for c, (i, j) in zip(diff, pairs):
+                            if c:
+                                row += (c / (scale * D)) * _ddist(X, i, j)
+                    rows.append(row.reshape(-1))
+                g = _projected_gradient(np.array(rows), p["gradients"][k]) if p["gradients"] else None
+                pts.append([q[0], q[1], None if e is None else (e - e_ref) * H2K, g])
             placed.append((p, pts))
         axes = {"x": "distance from the lowest reactant conformer (Å, RMS of sorted interatomic distances)",
                 "y": "distance from the lowest product conformer (Å)", "x_short": "← reactant", "y_short": "← product"}
@@ -176,17 +237,23 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
                     br, fo = changed[:half], changed[half:]
             kinds.append(kind)
             pts = []
-            for xyz, e in zip(p["frames"], p["energies"]):
+            for k, (xyz, e) in enumerate(zip(p["frames"], p["energies"])):
                 _, X = _frame(xyz)
 
                 def progress(bonds, start, end):
-                    vals = [(_dist(X, i, j) - _dist(start, i, j)) / ((_dist(end, i, j) - _dist(start, i, j)) or 1e-9)
-                            for i, j in bonds]
-                    return float(np.mean(vals)) if vals else None
+                    """(mean progress of the bonds, its derivative d/dX per Angstrom)."""
+                    if not bonds:
+                        return 0.0, np.zeros(X.size)
+                    vals, grad = [], np.zeros_like(X)
+                    for i, j in bonds:
+                        span = (_dist(end, i, j) - _dist(start, i, j)) or 1e-9
+                        vals.append((_dist(X, i, j) - _dist(start, i, j)) / span)
+                        grad += _ddist(X, i, j) / span
+                    return float(np.mean(vals)), (grad / len(bonds)).reshape(-1)
 
-                bx, fy = progress(br, R, P), progress(fo, R, P)
-                pts.append([0.0 if bx is None else bx, 0.0 if fy is None else fy,
-                            None if e is None else (e - e_ref) * H2K])
+                (bx, dbx), (fy, dfy) = progress(br, R, P), progress(fo, R, P)
+                g = _projected_gradient(np.array([dbx, dfy]), p["gradients"][k]) if p["gradients"] else None
+                pts.append([bx, fy, None if e is None else (e - e_ref) * H2K, g])
             name = lambda bonds: [f"{sym[i]}{i + 1}–{sym[j]}{j + 1}" for i, j in bonds]  # noqa: E731
             p["bonds"] = {"x": name(br), "y": name(fo), "kind": kind}
             placed.append((p, pts))
@@ -207,17 +274,21 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
             warnings.append("Paths here change bonds in different ways (some break and form, some only form or only "
                             "break), so the axes do not mean the same for all of them: see each path's bonds.")
 
-    data = [(x, y, e) for _, pts in placed for x, y, e in pts if e is not None]
+    data = [(x, y, e, g) for _, pts in placed for x, y, e, g in pts if e is not None]
     xs = ys = np.array([])
     E = []
+    with_slopes = sum(1 for d in data if d[3] is not None)
+    if data and with_slopes < len(data):
+        warnings.append(f"{len(data) - with_slopes} of {len(data)} images have no gradient in the live data (an "
+                        "older run, or an engine that does not report them): the surface uses only their energies.")
     if len(data) >= 3:
-        Q = np.array([[x, y] for x, y, _ in data])
-        Ev = np.array([e for _, _, e in data])
+        Q = np.array([[x, y] for x, y, _, _ in data])
+        Ev = np.array([e for _, _, e, _ in data])
         lo, hi = Q.min(axis=0), Q.max(axis=0)
         pad = 0.08 * np.maximum(hi - lo, 1e-3)
         xs = np.linspace(lo[0] - pad[0], hi[0] + pad[0], grid)
         ys = np.linspace(lo[1] - pad[1], hi[1] + pad[1], grid)
-        Z = _surface(Q, Ev, xs, ys)
+        Z = _surface(Q, Ev, xs, ys, slopes=[d[3] for d in data], step=0.02 * np.maximum(hi - lo, 1e-3))
         # Blank where no computed image is near (a fraction of the map's size).
         trust = 0.12 * float(np.hypot(*(hi - lo + 2 * pad)))
         Xg, Yg = np.meshgrid(xs, ys)
@@ -229,7 +300,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         "reference": "lowest reactant-side image of all paths",
         "paths": [{"id": f"{p['stream']}/{p['monitor']}", "pair": p["stream"], "monitor": p["monitor"],
                    "active": running and p["active"] and not p["finished"], "bonds": p.get("bonds"),
-                   "points": [[round(x, 4), round(y, 4), None if e is None else round(e, 3)] for x, y, e in pts]}
+                   "points": [[round(x, 4), round(y, 4), None if e is None else round(e, 3)] for x, y, e, _ in pts]}
                   for p, pts in placed if pts],
         "warnings": warnings,
     }

@@ -176,7 +176,7 @@ export function ChannelsMap({ job }) {
     <p class="small muted">${mode === 'bonds'
       ? 'x: how far the bonds that break have stretched; y: how far the bonds that form have closed (0 at the reactant, 1 at the product), each path with its own bonds, so different atom mappings share the square. A concerted path runs along the diagonal; a stepwise one hugs an edge. When a reaction only forms (or only breaks) bonds, e.g. a Diels–Alder, its bonds are split in two groups plotted against each other: synchronous along the diagonal, asynchronous bowed toward an edge. Dashed: sub-paths of a recursive split. '
       : 'x, y: how far each structure is from the lowest reactant and the lowest product conformer (differences of sorted interatomic distances), independent of atom numbering: paths that pass through similar structures run close together.'}
-      The colours are an approximate surface fitted to the computed images only; hatched: no image nearby.</p>
+      The colours are a surface fitted to the computed images: their energies and their gradients projected onto these two coordinates. A 2D map keeps only two of a molecule's many directions, so it is exact at the images and approximate between them; hatched: no image nearby.</p>
     ${err && html`<p class="error-box small">${err}</p>`}
     ${(map?.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
     ${map && !map.paths.length && html`<p class="small muted">No paths yet: they appear here as soon as the path searches start.</p>`}

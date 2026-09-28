@@ -33,7 +33,8 @@ def test_bond_progress_runs_from_reactant_to_product(tmp_path):
     _write_stream(job / "live", "pair_0_1", _exchange(), [0, 5, 12, 15, 12, 6, -1])
     _write_stream(job / "live", "pair_1_1", _exchange(), [0, 4, 9, 11, 9, 4, -2], ref_hartree=-1.0 + 2 / H2K)
     m = channels_map(job, "bonds", running=True)
-    assert len(m["paths"]) == 2 and m["warnings"] == []
+    assert len(m["paths"]) == 2
+    assert any("no gradient" in w for w in m["warnings"])        # these streams carry no gradients: said so
     p = next(p for p in m["paths"] if p["pair"] == "pair_0_1")
     assert p["points"][0][:2] == [0.0, 0.0] and p["points"][-1][:2] == [1.0, 1.0]
     assert p["bonds"]["kind"] == "break-form" and p["bonds"]["x"] == ["H1–H2"] and p["bonds"]["y"] == ["H2–H3"]
@@ -71,3 +72,30 @@ def test_distance_coordinates_ignore_atom_numbering(tmp_path):
     m = channels_map(job, "distance")
     a, b = (p["points"] for p in m["paths"])
     assert np.allclose([q[:2] for q in a], [q[:2] for q in b], atol=1e-6)   # same structures, same place
+
+
+def test_gradients_are_projected_exactly_onto_the_bond_coordinates(tmp_path):
+    """E = a*d12 + b*d23 is linear in the two bond lengths, so dE/dq along
+    each normalized bond coordinate is exactly a*(d_end - d_start) (and b*...)."""
+    from mepd.web.channels_pes import BOHR, _ddist, _projected_gradient
+
+    X = np.array([[0.0, 0, 0], [1.3, 0.1, 0], [2.6, -0.1, 0.2]])
+    a, b = 0.02, -0.03                        # Hartree / Angstrom
+    s12, e12, s23, e23 = 0.74, 1.94, 1.94, 0.74
+    B = np.array([(_ddist(X, 0, 1) / (e12 - s12)).reshape(-1), (_ddist(X, 1, 2) / (e23 - s23)).reshape(-1)])
+    g_angstrom = (a * _ddist(X, 0, 1) + b * _ddist(X, 1, 2)).reshape(-1)
+    g_q = _projected_gradient(B, g_angstrom * BOHR)            # payload units: Hartree / bohr
+    assert np.allclose(g_q, [a * (e12 - s12) * H2K, b * (e23 - s23) * H2K])
+
+
+def test_live_gradients_reach_the_fit(tmp_path):
+    frames = _exchange()
+    job = tmp_path / "job"
+    live = job / "live"
+    live.mkdir(parents=True)
+    grads = [[0.001 * (k - 3)] * 9 for k in range(len(frames))]
+    (live / "pair_0_1.json").write_text(json.dumps({"finished": False, "monitors": {"branch-0": {
+        "active": True, "geometry": {"frames": frames, "gradients": grads},
+        "plot": {"y": [0, 5, 12, 15, 12, 6, -1], "energy_ref_hartree": -1.0}}}}))
+    m = channels_map(job, "bonds")
+    assert not any("no gradient" in w for w in m["warnings"]) and m["E"]

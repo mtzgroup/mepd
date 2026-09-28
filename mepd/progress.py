@@ -95,7 +95,16 @@ def _chain_geometry_payload(chain, energies: list) -> dict | None:
     if len(energies) == len(frames) and len(frames) > 2:
         interior = range(1, len(frames) - 1)
         ts_index = max(interior, key=lambda i: energies[i])
-    return {"frames": frames, "ts_index": ts_index}
+    out = {"frames": frames, "ts_index": ts_index}
+    # Each image's energy gradient (Hartree/bohr, as computed): lets a viewer
+    # fit slopes, not just heights (e.g. the channels path map).
+    try:
+        grads = [getattr(node, "_cached_gradient", None) for node in chain.nodes]
+        if all(g is not None for g in grads):
+            out["gradients"] = [[round(float(v), 7) for v in np.asarray(g, dtype=float).reshape(-1)] for g in grads]
+    except Exception:
+        pass
+    return out
 
 
 # Name of the path search this process is currently reporting (e.g.
