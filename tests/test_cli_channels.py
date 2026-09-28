@@ -25,7 +25,7 @@ def _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch):
     different structures distinguishable instead of all reading as
     "identical" to MSMEP's endpoint check."""
 
-    def fake_run(cmd, cwd, env, text, capture_output, check):
+    def fake_run(cmd, cwd, env, text, capture_output, check, timeout=None):
         xyz_path = cwd / cmd[1]
         lines = xyz_path.read_text().splitlines()
         coords = np.array([

@@ -172,43 +172,52 @@ def _run_gxtb_process(cmd: list[str], *, cwd: Path, env: dict, timeout_s: float,
       that is killed or stopped early never leaves g-xTB running on its own.
       (`preexec_fn` could do the same, but is unsafe with threads -- and
       this engine runs inside threaded code, e.g. GSM's engine server.)
+      Only an executable that resolves is wrapped, so a missing one still
+      fails with FileNotFoundError (and a stand-in `subprocess.run`, as in
+      tests, sees the plain command).
     * `timeout_s` > 0 bounds the wall time: the process is killed and an
       ElectronicStructureError raised.
     * `watch`, if given, is called about twice a second while it runs.
     """
-    if shutil.which(cmd[0]) is None and not Path(cmd[0]).is_file():
+    limit = float(timeout_s or 0) or None
+    full = [_SETPRIV, "--pdeathsig", "KILL", "--", *cmd] if _SETPRIV and shutil.which(cmd[0]) else list(cmd)
+
+    def timed_out(out: str = "") -> ElectronicStructureError:
+        return ElectronicStructureError(
+            msg=f"g-xTB did not finish within {limit:.0f} s (gxtb_engine_kwds.timeout_s); killed it.", obj=out)
+
+    try:
+        if watch is None:
+            kwds = {"timeout": limit} if limit is not None else {}
+            try:
+                done = subprocess.run(full, cwd=cwd, env=env, text=True, capture_output=True, check=False, **kwds)
+            except subprocess.TimeoutExpired as exc:   # run() has already killed it
+                raise timed_out(str(exc.stdout or "") + str(exc.stderr or "")) from None
+            return subprocess.CompletedProcess(cmd, done.returncode, done.stdout, done.stderr)
+        proc = subprocess.Popen(full, cwd=cwd, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
         raise ElectronicStructureError(
             msg=(
                 f"g-xTB executable `{cmd[0]}` was not found. "
                 "Set `GXTB_EXECUTABLE` or pass `executable` to GXTBCalculator."
             )
-        )
-    full = [_SETPRIV, "--pdeathsig", "KILL", "--", *cmd] if _SETPRIV else list(cmd)
-    limit = float(timeout_s or 0) or None
-    proc = subprocess.Popen(full, cwd=cwd, env=env, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ) from exc
     deadline = None if limit is None else time.monotonic() + limit
     while True:
+        wait = 0.5 if deadline is None else max(0.0, min(0.5, deadline - time.monotonic()))
         try:
-            wait = 0.5 if watch is not None else None
-            if deadline is not None:
-                left = max(0.0, deadline - time.monotonic())
-                wait = left if wait is None else min(wait, left)
             stdout, stderr = proc.communicate(timeout=wait)
             break
         except subprocess.TimeoutExpired:
             if deadline is not None and time.monotonic() >= deadline:
                 proc.kill()
                 stdout, stderr = proc.communicate()
-                raise ElectronicStructureError(
-                    msg=f"g-xTB did not finish within {limit:.0f} s (gxtb_engine_kwds.timeout_s); killed it.",
-                    obj=(stdout or "") + (stderr or ""),
-                )
-            if watch is not None:
-                try:
-                    watch()
-                except Exception:
-                    pass
+                raise timed_out((stdout or "") + (stderr or "")) from None
+            try:
+                watch()
+            except Exception:
+                pass
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 

@@ -31,7 +31,7 @@ def _water(x_offset: float = 0.0) -> Structure:
 
 
 def _install_fake_gxtb(monkeypatch, calls=None):
-    def fake_run(cmd, cwd, env, text, capture_output, check):
+    def fake_run(cmd, cwd, env, text, capture_output, check, timeout=None):
         if calls is not None:
             calls.append(cmd)
         if "--opt" in cmd:
@@ -57,7 +57,7 @@ def _install_fake_gxtb_unconverged_opt(monkeypatch, calls=None):
     """Fake gxtb whose --opt run reports FAILED TO CONVERGE, mirroring a real
     optimization that exhausted its iteration budget without converging."""
 
-    def fake_run(cmd, cwd, env, text, capture_output, check):
+    def fake_run(cmd, cwd, env, text, capture_output, check, timeout=None):
         if calls is not None:
             calls.append(cmd)
         if "--opt" in cmd:
@@ -317,7 +317,7 @@ def _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch):
     actually far apart are correctly treated as distinct.
     """
 
-    def fake_run(cmd, cwd, env, text, capture_output, check):
+    def fake_run(cmd, cwd, env, text, capture_output, check, timeout=None):
         xyz_path = cwd / cmd[1]
         lines = xyz_path.read_text().splitlines()
         coords = np.array([

@@ -36,7 +36,7 @@ def _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch):
     network logic runs. Tying energy to geometry keeps genuinely different
     minima distinguishable."""
 
-    def fake_run(cmd, cwd, env, text, capture_output, check):
+    def fake_run(cmd, cwd, env, text, capture_output, check, timeout=None):
         xyz_path = cwd / cmd[1]
         lines = xyz_path.read_text().splitlines()
         coords = np.array([
