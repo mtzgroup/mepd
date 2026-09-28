@@ -936,6 +936,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             publish_ws()
         return created
 
+    _channels_map_cache: dict = {}
+
     @app.get("/api/jobs/{jid}/channels-map")
     async def channels_map_view(jid: str, mode: str = "bonds", ts: Optional[str] = None):
         """Every path a channels run relaxes, placed on one approximate energy
@@ -945,8 +947,25 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if mode not in ("bonds", "distance", "irc"):
             raise HTTPException(400, "mode is 'bonds', 'distance' or 'irc'")
         job = J().get(jid)
-        return await run_in_threadpool(channels_map, J().job_dir(jid), mode, 64, job["status"] == "running",
-                                       Path(job["output_dir"]), ts)
+        jdir, out = J().job_dir(jid), Path(job["output_dir"])
+
+        def signature():
+            files = list((jdir / "live").glob("*.json")) + list((out / "ts").glob("ts_pair_*"))
+            return (mode, ts, job["status"] == "running", len(files),
+                    max((f.stat().st_mtime_ns for f in files), default=0))
+
+        # Rebuild only when the run's files moved on (several open tabs, or a
+        # poll between two writes, reuse the last map).
+        key = (str(jdir), mode, ts)
+        sig = await run_in_threadpool(signature)
+        hit = _channels_map_cache.get(key)
+        if hit and hit[0] == sig:
+            return hit[1]
+        result = await run_in_threadpool(channels_map, jdir, mode, 64, job["status"] == "running", out, ts)
+        _channels_map_cache[key] = (sig, result)
+        if len(_channels_map_cache) > 32:
+            _channels_map_cache.pop(next(iter(_channels_map_cache)))
+        return result
 
     @app.get("/api/jobs/{jid}/vri-viewer", response_class=HTMLResponse)
     def vri_viewer(jid: str):

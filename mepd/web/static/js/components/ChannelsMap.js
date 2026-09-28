@@ -172,24 +172,26 @@ export function ChannelsMap({ job }) {
   const [err, setErr] = useState(null);
   const [selected, setSelected] = useState(null);
   const [hover, setHover] = useState(null);
-  // Re-read whenever the run's live data moves on (and every few seconds while it runs).
-  const beat = useStore((s) => {
-    const st = s.progress[job.id]?.streams || {};
-    return Object.values(st).map((v) => v.updated || 0).join(',');
-  });
-  const [tick, setTick] = useState(0);
+  // Fetch on a view change at once; while the run goes, refresh every 3 s --
+  // never with a request already in flight (a big run's map is not instant),
+  // and never applying a late answer to an older request.
+  const busy = useRef(false);
+  const latest = useRef(0);
+  const fetchMap = (force) => {
+    if (busy.current && !force) return;
+    const id = ++latest.current;
+    busy.current = true;
+    api.get(`/api/jobs/${job.id}/channels-map?mode=${mode}${mode === 'irc' && ircTs ? `&ts=${encodeURIComponent(ircTs)}` : ''}`)
+      .then((m) => { if (id === latest.current) { setMap(m); setErr(null); } })
+      .catch((e) => { if (id === latest.current) setErr(e.message); })
+      .finally(() => { if (id === latest.current) busy.current = false; });
+  };
+  useEffect(() => { fetchMap(true); }, [mode, ircTs, job.status]);
   useEffect(() => {
     if (job.status !== 'running') return undefined;
-    const t = setInterval(() => setTick((x) => x + 1), 3000);
+    const t = setInterval(() => fetchMap(false), 3000);
     return () => clearInterval(t);
-  }, [job.status]);
-  const busy = useRef(false);
-  useEffect(() => {
-    if (busy.current) return;
-    busy.current = true;
-    api.get(`/api/jobs/${job.id}/channels-map?mode=${mode}${mode === 'irc' && ircTs ? `&ts=${encodeURIComponent(ircTs)}` : ''}`).then((m) => { setMap(m); setErr(null); })
-      .catch((e) => setErr(e.message)).finally(() => { busy.current = false; });
-  }, [mode, ircTs, beat, tick, job.status]);
+  }, [mode, ircTs, job.status]);
   const choices = map?.irc_choices || [];
 
   const pairs = map ? [...new Set(map.paths.map((p) => p.pair))] : [];

@@ -139,41 +139,23 @@ def _paths(job_dir: Path) -> list[dict]:
     return out
 
 
-def _surface(Q: np.ndarray, E: np.ndarray, xs: np.ndarray, ys: np.ndarray, slopes=None, step=None) -> np.ndarray:
-    """A smooth surface through the images: a thin-plate-spline radial basis
-    fit with a little smoothing (images of one path sit close together and
-    would otherwise make it ripple), falling back to inverse-distance
-    weighting if the fit is singular. With `slopes` (dE/dq per image, None
-    where unknown), each image also contributes four close neighbours at
-    +-`step` along x and y whose energies follow its gradient -- the fit
-    then honours the slopes, not just the heights."""
-    from scipy.interpolate import RBFInterpolator
-
-    if slopes is not None and step is not None:
-        extra_q, extra_e = [], []
-        for q, e, g in zip(Q, E, slopes):
-            if g is None or not np.all(np.isfinite(g)):
-                continue
-            for axis in (0, 1):
-                for sign in (1.0, -1.0):
-                    dq = np.zeros(2)
-                    dq[axis] = sign * step[axis]
-                    extra_q.append(q + dq)
-                    extra_e.append(e + float(np.dot(g, dq)))
-        if extra_q:
-            Q = np.vstack([Q, np.array(extra_q)])
-            E = np.concatenate([E, np.array(extra_e)])
-    Xg, Yg = np.meshgrid(xs, ys)
-    grid_pts = np.stack([Xg.ravel(), Yg.ravel()], axis=1)
-    span = np.maximum(Q.max(axis=0) - Q.min(axis=0), 1e-6)
-    try:
-        f = RBFInterpolator(Q / span, E, kernel="thin_plate_spline", smoothing=1e-3 * len(E))
-        return f(grid_pts / span).reshape(Xg.shape)
-    except Exception:
-        d = np.linalg.norm((grid_pts[:, None] - Q[None]) / span, axis=-1) + 1e-9
-        w = 1.0 / d ** 2
-        return ((w @ E) / w.sum(axis=1)).reshape(Xg.shape)
-
+def _local_surface(cells: np.ndarray, Qn: np.ndarray, E: np.ndarray, slopes, span: np.ndarray,
+                   reach: float) -> np.ndarray:
+    """Energy at `cells` (map units scaled per axis, like `Qn`) from nearby
+    images only: a modified Shepard interpolation -- each image contributes
+    its energy plus its projected gradient times the offset (the slope,
+    damped beyond `reach`), weighted by 1/d^4 -- so a cell is shaped by the
+    data around it, never by a global fit through distant images. Cost is
+    cells x images, no linear solve (a global radial-basis fit took ~20 s
+    at a few hundred images)."""
+    G = np.array([np.zeros(2) if g is None or not np.all(np.isfinite(g)) else np.asarray(g, dtype=float) * span
+                  for g in slopes])                      # dE per scaled unit
+    diff = cells[:, None, :] - Qn[None]                 # cells x images x 2
+    d2 = np.sum(diff * diff, axis=-1) + 1e-12
+    w = 1.0 / d2 ** 2
+    damp = np.exp(-d2 / (2 * reach) ** 2)
+    T = E[None, :] + np.einsum("cik,ik->ci", diff, G) * damp
+    return np.sum(w * T, axis=1) / np.sum(w, axis=1)
 
 def _aligned_rmsd(A: np.ndarray, B: np.ndarray) -> float:
     """RMSD (Angstrom) of two geometries in the same atom order after the
@@ -514,7 +496,6 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         pad = 0.08 * np.maximum(hi - lo, 1e-3)
         xs = np.linspace(lo[0] - pad[0], hi[0] + pad[0], grid)
         ys = np.linspace(lo[1] - pad[1], hi[1] + pad[1], grid)
-        Z = _surface(Q, Ev, xs, ys, slopes=[d[3] for d in data], step=0.02 * np.maximum(hi - lo, 1e-3))
         # Only where there is data: between chains nothing is known, and a fit
         # there would invent low-energy valleys no path visited. A cell is
         # shown only within `reach` of a chain -- of the segment between two
@@ -551,9 +532,12 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         dist = np.linalg.norm(G[:, None] - nearest, axis=-1)                      # cells x segments
         within = dist <= reach
         floor = np.where(within, np.array(seg_e)[None, :], np.inf).min(axis=1)
-        Zf = Z.ravel()
-        Zf = np.where(within.any(axis=1), np.maximum(Zf, floor), np.nan)
-        Z = Zf.reshape(Z.shape)
+        shown = within.any(axis=1)
+        Zf = np.full(len(G), np.nan)
+        if shown.any():
+            Zf[shown] = _local_surface(G[shown], Q / span, Ev, [d[3] for d in data], span, reach)
+            Zf[shown] = np.maximum(Zf[shown], floor[shown])
+        Z = Zf.reshape(Xg.shape)
         E = [[None if not np.isfinite(v) else round(float(v), 3) for v in row] for row in Z]
     return {
         "mode": mode, "axes": axes, "x": xs.round(4).tolist(), "y": ys.round(4).tolist(), "E": E,
