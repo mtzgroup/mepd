@@ -166,6 +166,23 @@ def _ts_dir_items(out: Path, charge: int, multiplicity: int) -> list[tuple]:
     return items
 
 
+def _oriented(irc, start, end):
+    """`irc` drawn from `start` to `end` (the job's reactant and product), so
+    an IRC reads the same way as the edge it belongs to: flipped when its
+    first frame is the product side (see `mepd.cli._irc_needs_reversal`)."""
+    from mepd.cli import _irc_needs_reversal
+
+    if irc is None or start is None:
+        return irc
+    try:
+        if _irc_needs_reversal(irc, start, end):
+            irc = irc.copy()
+            irc.nodes.reverse()
+    except Exception:
+        pass
+    return irc
+
+
 def _tree_leaf_chains(tree_dir: Path, charge: int, multiplicity: int) -> list[tuple[int, object]]:
     """(node index, final chain) of every leaf of an MSMEP split tree, in
     path order -- read straight from adj_matrix.txt and node_<i>.xyz.
@@ -209,7 +226,8 @@ def collect_ts(out: Path, charge: int, multiplicity: int) -> dict:
     network_completion/ + network.json."""
     warnings: list[str] = []
     mep = _load_chain(out / "mep_output.xyz", charge, multiplicity)
-    ts_items = _ts_dir_items(out, charge, multiplicity)
+    ts_items = [(label, ts, _oriented(irc, mep[0], mep[-1]) if mep is not None else irc)
+                for label, ts, irc in _ts_dir_items(out, charge, multiplicity)]
     ircs = [(label, irc) for label, _, irc in ts_items if irc is not None]
 
     # Floor: the path's reactant end, and any IRC end with the same
@@ -446,6 +464,13 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
     ts_items = _ts_dir_items(out, charge, multiplicity)
     ts_entries, irc_entries = [], []
     for label, ts_node, irc in ts_items:
+        # No reactant is known: the barrier is from the lower IRC end, so
+        # draw the IRC from that end (an edge made from its ends then points
+        # away from the side its barrier is measured from).
+        if irc is not None and len(irc) > 1 and None not in (_node_energy(irc[0]), _node_energy(irc[-1])) \
+                and _node_energy(irc[-1]) < _node_energy(irc[0]):
+            irc = irc.copy()
+            irc.nodes.reverse()
         floor = _min(_node_energy(n) for n in (irc.nodes if irc is not None else []))
         e = _node_energy(ts_node)
         barrier = (e - floor) * HARTREE_TO_KCAL if e is not None and floor is not None else None
@@ -464,8 +489,6 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
 
 
 def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
-    from mepd.cli import _irc_needs_reversal
-
     warnings: list[str] = []
     stats = _read_json(out / "stats.json") or {}
     start_pool = _load_chain(out / "conformers" / "start.xyz", charge, multiplicity)
@@ -474,15 +497,7 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
     ref_end = end_pool[0] if end_pool is not None else None
 
     def oriented_irc(folder: Path):
-        irc = _load_chain(folder / "irc.xyz", charge, multiplicity)
-        if irc is not None and ref_start is not None:
-            try:
-                if _irc_needs_reversal(irc, ref_start, ref_end):
-                    irc = irc.copy()
-                    irc.nodes.reverse()
-            except Exception:
-                pass
-        return irc
+        return _oriented(_load_chain(folder / "irc.xyz", charge, multiplicity), ref_start, ref_end)
 
     def members(folder: Path) -> tuple[str, list[str]]:
         try:
@@ -582,6 +597,7 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
             {m for a in alternates for s in a["steps"] for m in s["members"]}
         raw = []
         for label, ts_node, irc in items:
+            irc = _oriented(irc, ref_start, ref_end)
             e = _node_energy(ts_node)
             barrier = (e - floor) * HARTREE_TO_KCAL if e is not None and floor is not None else None
             tag = "classified" if label in classified else "unclassified"
@@ -1046,7 +1062,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 14
+RESULT_VERSION = 15
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

@@ -746,6 +746,28 @@ H 0.509 0.882 -1.160
     assert r["barrier_kcal"] == pytest.approx(0.18 * 627.509474, abs=1e-2)
     assert "IRC-verified" in r["headline"]
 
+    # An IRC written product -> reactant is drawn reactant -> product, like the
+    # edge whose barrier it sets (the barrier is measured from the reactant).
+    _write_chain(out / "ts_leaf_0_irc.xyz", [ethane_b, ethane_a, ethane_a], [-79.70, -79.62, -79.80])
+    r = collect_ts(out, 0, 1)
+    irc = {g["kind"]: g for g in r["groups"]}["irc"]["entries"][0]
+    assert [round(f["energy_kcal"], 3) for f in irc["frames"]] == \
+        [0.0, pytest.approx(0.18 * 627.509474, abs=1e-2), pytest.approx(0.10 * 627.509474, abs=1e-2)]
+    assert r["barrier_kcal"] == pytest.approx(0.18 * 627.509474, abs=1e-2)
+
+
+def test_tsopt_irc_starts_at_the_end_its_barrier_is_measured_from(tmp_path):
+    """No reactant is known for a lone TS optimization, so its barrier is from
+    the lower IRC end: the IRC (and an edge made from its ends) starts there."""
+    from mepd.web.results import collect_tsopt
+
+    out = tmp_path / "tsopt"
+    out.mkdir()
+    _write_chain(out / "ts.xyz", [WATER_BENT_XYZ], [-76.30])
+    _write_chain(out / "irc.xyz", [WATER_BENT_XYZ, WATER_BENT_XYZ, WATER_XYZ], [-76.38, -76.30, -76.40])
+    irc = {g["kind"]: g for g in collect_tsopt(out, 0, 1)["groups"]}["irc"]["entries"][0]
+    assert irc["frames"][0]["energy_kcal"] == 0.0 and irc["frames"][-1]["energy_kcal"] > 0
+
 
 def test_bulk_add_to_graph(client, tmp_path):
     """Several sampled minima in one request; already-added ones are reused."""
