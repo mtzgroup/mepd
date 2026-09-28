@@ -1384,6 +1384,19 @@ def _converges_to_an_endpoints(
         return converged_to_product, total_traj
 
 
+def _same_species(node: Node, ref: Node, disregard_stereochem: bool = False) -> bool:
+    """Whether `node` is the molecule `ref` is (bond connectivity, any
+    conformer). True when either has no molecular graph (e.g. toy
+    potentials), where only geometry can tell them apart."""
+    if getattr(node, "graph", None) is None or getattr(ref, "graph", None) is None:
+        return True
+    try:
+        return _is_connectivity_identical(node, ref, verbose=False, collect_comparison=False,
+                                          disregard_stereochem=disregard_stereochem)
+    except Exception:
+        return True
+
+
 def _distances_to_refs(ref1: Node, ref2: Node, raw_node: Node) -> List[float]:
     """
     Computes distances of `raw_node` to `ref1` and `ref2`.
@@ -1519,13 +1532,20 @@ def _chain_is_concave(
                     done = False  # chemcloud cannot do the crude irc check
                     kinked_chain = False
 
+                not_that_endpoint = False
                 if done:
                     is_r = slopes_to_ref1 < 0 and slopes_to_ref2 > 0
                     is_p = slopes_to_ref1 > 0 and slopes_to_ref2 < 0
-                    kinked_chain = is_r or is_p
-                    minimas_is_r_or_p.append(kinked_chain)
-
-                elif not done or not kinked_chain:
+                    # Drifting toward an endpoint (Cartesian RMSD) only makes
+                    # the minimum that endpoint if it IS that molecule: a
+                    # distinct species near it (e.g. 1-butene next to a
+                    # 2-butene product) is optimized and split at like any
+                    # other intermediate.
+                    if (is_r and not _same_species(min_traj[-1], chain[0], disregard_stereochem)) or \
+                            (is_p and not _same_species(min_traj[-1], chain[-1], disregard_stereochem)):
+                        not_that_endpoint = True
+                    kinked_chain = (is_r or is_p) and not not_that_endpoint
+                if not done or not_that_endpoint:
                     opt_traj = _run_geom_opt(chain[i], engine=engine)
                     n_grad_calls += len(opt_traj)
                     opt = opt_traj[-1]
