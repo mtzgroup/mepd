@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -159,6 +160,58 @@ def restore_rigid_body_hessian(hessian: NDArray, coords, gradient) -> NDArray:
     return 0.5 * (out + out.T)
 
 
+_SETPRIV = shutil.which("setpriv")
+
+
+def _run_gxtb_process(cmd: list[str], *, cwd: Path, env: dict, timeout_s: float,
+                      watch: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run one g-xTB command and return its CompletedProcess.
+
+    * On Linux the process gets a parent-death signal (`setpriv --pdeathsig
+      KILL`): it is killed when the process that started it dies, so a job
+      that is killed or stopped early never leaves g-xTB running on its own.
+      (`preexec_fn` could do the same, but is unsafe with threads -- and
+      this engine runs inside threaded code, e.g. GSM's engine server.)
+    * `timeout_s` > 0 bounds the wall time: the process is killed and an
+      ElectronicStructureError raised.
+    * `watch`, if given, is called about twice a second while it runs.
+    """
+    if shutil.which(cmd[0]) is None and not Path(cmd[0]).is_file():
+        raise ElectronicStructureError(
+            msg=(
+                f"g-xTB executable `{cmd[0]}` was not found. "
+                "Set `GXTB_EXECUTABLE` or pass `executable` to GXTBCalculator."
+            )
+        )
+    full = [_SETPRIV, "--pdeathsig", "KILL", "--", *cmd] if _SETPRIV else list(cmd)
+    limit = float(timeout_s or 0) or None
+    proc = subprocess.Popen(full, cwd=cwd, env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = None if limit is None else time.monotonic() + limit
+    while True:
+        try:
+            wait = 0.5 if watch is not None else None
+            if deadline is not None:
+                left = max(0.0, deadline - time.monotonic())
+                wait = left if wait is None else min(wait, left)
+            stdout, stderr = proc.communicate(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() >= deadline:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise ElectronicStructureError(
+                    msg=f"g-xTB did not finish within {limit:.0f} s (gxtb_engine_kwds.timeout_s); killed it.",
+                    obj=(stdout or "") + (stderr or ""),
+                )
+            if watch is not None:
+                try:
+                    watch()
+                except Exception:
+                    pass
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 @dataclass
 class GXTBCalculator(Engine):
     """Direct local g-xTB engine using the xtb executable with the g-xTB flag."""
@@ -179,6 +232,10 @@ class GXTBCalculator(Engine):
     # optimizations) run as up to this many concurrent g-xTB processes.
     # 0 = as many as the machine has cores for at n_threads each.
     n_parallel: int = 0
+    # Wall-time limit per g-xTB call (seconds; 0 = none). A calculation that
+    # hangs (e.g. an SCF that never settles) fails with an error instead of
+    # blocking its path search forever.
+    timeout_s: float = 3600.0
 
     def __post_init__(self) -> None:
         if self.executable is None:
@@ -297,40 +354,9 @@ class GXTBCalculator(Engine):
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(int(self.n_threads))
         env.update(self.env)
-        try:
-            if watch is None:
-                completed = subprocess.run(
-                    cmd,
-                    cwd=cwd,
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-            else:
-                # Same run, but call `watch()` about twice a second while it
-                # goes (a live viewer reading the optimizer's step log).
-                proc = subprocess.Popen(
-                    cmd, cwd=cwd, env=env, text=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
-                while True:
-                    try:
-                        stdout, stderr = proc.communicate(timeout=0.5)
-                        break
-                    except subprocess.TimeoutExpired:
-                        try:
-                            watch()
-                        except Exception:
-                            pass
-                completed = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-        except FileNotFoundError as exc:
-            raise ElectronicStructureError(
-                msg=(
-                    f"g-xTB executable `{self.executable}` was not found. "
-                    "Set `GXTB_EXECUTABLE` or pass `executable` to GXTBCalculator."
-                )
-            ) from exc
+        # `watch` (a live viewer reading the optimizer's step log) is called
+        # about twice a second while it runs.
+        completed = _run_gxtb_process(cmd, cwd=cwd, env=env, timeout_s=self.timeout_s, watch=watch)
         if completed.returncode != 0:
             raise ElectronicStructureError(
                 msg=f"g-xTB calculation failed with exit code {completed.returncode}.",
@@ -460,22 +486,7 @@ class GXTBCalculator(Engine):
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(int(self.n_threads))
         env.update(self.env)
-        try:
-            completed = subprocess.run(
-                cmd,
-                cwd=cwd,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise ElectronicStructureError(
-                msg=(
-                    f"g-xTB executable `{self.executable}` was not found. "
-                    "Set `GXTB_EXECUTABLE` or pass `executable` to GXTBCalculator."
-                )
-            ) from exc
+        completed = _run_gxtb_process(cmd, cwd=cwd, env=env, timeout_s=self.timeout_s)
         if completed.returncode != 0:
             raise ElectronicStructureError(
                 msg=f"g-xTB Hessian calculation failed with exit code {completed.returncode}.",

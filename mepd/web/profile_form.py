@@ -80,7 +80,7 @@ OPTIMIZER_ALIASES = {"conjugate_gradient": "cg", "velocity_projected": "vpo", "s
                      "gradient_descent": "gd", "deterministic_gradient_descent": "gd", "adaptive_momentum": "amg"}
 
 GXTB_DEFAULTS = {"executable": None, "n_threads": 1, "n_parallel": 0, "hessian_acc": 0.001,
-                 "add_gxtb_flag": True, "keep_workdirs": False}
+                 "timeout_s": 3600.0, "add_gxtb_flag": True, "keep_workdirs": False}
 FAIRCHEM_DEFAULTS = {"model": "uma-s-1p2p1", "task": "omol", "device": "", "checkpoint": None,
                      "inference_settings": "default", "batch_size": 32, "geometry_optimizer": "LBFGSLineSearch"}
 GEOMOPT_DEFAULTS = {"coordsys": "cart", "maxit": 500, "convergence_set": "GAU_TIGHT"}
@@ -182,6 +182,7 @@ HELP = {
     "n_threads": "Threads per g-xTB call. Keep 1 and parallelize across calls instead.",
     "n_parallel": "g-xTB calls at once (0: all cores).",
     "hessian_acc": "SCC accuracy for numerical Hessians (smaller = tighter).",
+    "timeout_s": "Longest one g-xTB call may run (s) before it is stopped and fails (0: no limit).",
     "coordsys": "Coordinate system for geomeTRIC optimizations.",
     "maxit": "geomeTRIC's maximum iterations.",
     "convergence_set": "geomeTRIC convergence criteria.",
@@ -214,7 +215,8 @@ _WORDS = {"thre": "threshold", "tol": "tolerance", "rtol": "relative tolerance",
           "gi": "GI", "nebk": "NEB k", "opt": "optimization", "iters": "iterations", "n": "number of",
           "acc": "accuracy", "dt": "Δt", "ene": "energy", "neb": "NEB", "grad": "gradient"}
 LABELS = {"nimages": "Images", "nnodes": "Nodes", "k": "Spring constant k", "delta_k": "Spring spread Δk",
-          "n_threads": "Threads per call", "n_parallel": "Calls at once", "maxit": "Max iterations",
+          "n_threads": "Threads per call", "n_parallel": "Calls at once", "timeout_s": "Time limit per call (s)",
+          "maxit": "Max iterations",
           "n_candidates": "Candidates", "n_min": "Steps before speeding up", "nstep": "Steps"}
 
 
