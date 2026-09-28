@@ -601,6 +601,59 @@ def _build_channels(ctx: JobContext, p: ChannelsParams) -> list[str]:
     return argv + ["--output", str(ctx.output_dir)]
 
 
+class ChannelsMoreParams(Params):
+    pairs_per_mechanism: int = P(6, "Searches per mechanism", "The new cap: more of each mechanism's "
+                                 "best-scoring conformer pairs (0 = all of them). Pairs already searched are "
+                                 "kept and skipped.", kind="custom", ge=0)
+    workers: int = P(4, "Workers", "Processes for atom mapping, path searches and TS/IRC.", kind="custom", ge=1)
+
+
+def _replace_flags(argv: list[str], flags: dict) -> list[str]:
+    """`argv` with each `--flag value` in `flags` removed, then appended with
+    its new value (None: dropped)."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a in flags:
+            skip = True
+            continue
+        out.append(a)
+    for flag, value in flags.items():
+        if value is not None:
+            out += [flag, str(value)]
+    return out
+
+
+def _build_channels_more(ctx: JobContext, p: ChannelsMoreParams) -> list[str]:
+    """Rerun a finished channels search in its own folder with a higher cap:
+    the same endpoints, level and settings, the conformer pools it saved (so
+    every conformer keeps its number, and every pair its label), and more
+    pairs per mechanism. Pairs already searched are skipped (their folders
+    are done); only the new ones run, then TS/IRC and classification over
+    all of them."""
+    src = ctx.source
+    if src is None:
+        raise WorkspaceError("Sample more paths follows up on a finished Reaction channels run")
+    old = int((src.get("params") or {}).get("pairs_per_mechanism", 0) or 0)
+    if old == 0:
+        raise WorkspaceError("that run already searched every pair of every mechanism (0 = all)")
+    if p.pairs_per_mechanism != 0 and p.pairs_per_mechanism <= old:
+        raise WorkspaceError(f"that run already searched {old} per mechanism: ask for more than {old} (or 0 = all)")
+    out = Path(src["output_dir"])
+    pools = {side: out / "conformers" / f"{side}_pool.xyz" for side in ("start", "end")}
+    missing = [side for side, fp in pools.items() if not fp.exists()]
+    if missing:
+        raise WorkspaceError(f"that run saved no {' or '.join(missing)} conformer pool (an older run): new pairs "
+                             "could not be numbered like its earlier ones, so it cannot be extended safely")
+    if not (out / "pair_mechanisms.json").exists():
+        raise WorkspaceError("that run has no pair table (pair_mechanisms.json) to extend")
+    return _replace_flags(list(src["argv"]), {
+        "--pairs-per-mechanism": p.pairs_per_mechanism, "--workers": p.workers,
+        "--start-pool": pools["start"], "--end-pool": pools["end"], "--output": out})
+
+
 def _build_tsopt(ctx: JobContext, p: TsOptParams) -> list[str]:
     guess = ctx.snapshot_structure(ctx.structures[0], "guess")
     return ["ts", "--guess", str(guess), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
@@ -871,6 +924,12 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "pair", FROM_TS, VriParams, _build_vri, min_structures=2, needs_route_ts=True,
         produces=["products P1 and P2", "TS2 between them"],
         cli_path=("discovery", "vri"), cli_extra_flags=("--skip-ts2", "--charge", "--multiplicity", "--inputs", "--output")),
+    Operation(
+        "channels-more", "Sample more paths", "Search more conformer pairs per mechanism for a finished "
+        "Reaction channels run, reusing everything it computed (its conformers, and every path already searched) "
+        "and running only the new pairs; the result then covers all of them. (`mepd channels`)",
+        "job", PAIR, ChannelsMoreParams, _build_channels_more,
+        source_ops=("channels",), cli_path=("channels",)),
     Operation(
         "vri-check", "Check the bifurcation", "Converge the exact VRI, test that sideways pushes off the IRC "
         "drain into both P1 and P2, and count trajectories into each. (`mepd discovery vri-check`)",

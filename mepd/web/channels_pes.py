@@ -109,11 +109,18 @@ def _projected_gradient(B: np.ndarray, grad_hartree_bohr) -> Optional[np.ndarray
     return g_q * H2K
 
 
-def _paths(job_dir: Path) -> list[dict]:
+def _paths(job_dir) -> list[dict]:
     """Every path in the run's live streams: {stream, monitor, frames (xyz),
-    energies (Hartree, absolute when known), active, finished}."""
+    energies (Hartree, absolute when known), active, finished}. `job_dir`
+    may be a list (a run and its follow-ups, oldest first): a stream found
+    in several is taken from the newest."""
+    dirs = [Path(d) for d in (job_dir if isinstance(job_dir, (list, tuple)) else [job_dir])]
+    newest = {}
+    for d in dirs:
+        for fp in (d / "live").glob("*.json"):
+            newest[fp.stem] = fp
     out = []
-    for fp in sorted((job_dir / "live").glob("*.json")):
+    for fp in [newest[k] for k in sorted(newest)]:
         try:
             data = json.loads(fp.read_text())
         except Exception:
@@ -283,7 +290,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
     """The map for the web UI: {mode, axes, x, y, E (grid, None = blank),
     paths: [{id, pair, monitor, points: [[x, y, kcal]], active}],
     ts: [{label, pair, q, e, kind, closest}], reference, warnings}."""
-    paths = _paths(Path(job_dir))
+    paths = _paths(job_dir)
     warnings = []
     if not paths:
         return {"mode": mode, "paths": [], "x": [], "y": [], "E": [], "warnings": [], "axes": {}}

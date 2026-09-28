@@ -121,15 +121,43 @@ def _expand_pairs_by_mechanism(
             kept += mine[:pairs_per_mechanism]
         rows = kept
 
+    # A rerun into the same folder (e.g. sampling more pairs per mechanism)
+    # must give every (reactant, product, mechanism) its earlier label: a
+    # finished pair is found -- and skipped -- by its folder name, and a label
+    # re-used for a different pair would attach its results to the wrong one.
+    # Earlier rows keep their product slots; new rows go after them.
+    prior = {}
+    if output is not None and (output / "pair_mechanisms.json").exists():
+        import json as _json
+
+        try:
+            for row in _json.loads((output / "pair_mechanisms.json").read_text()):
+                pj = int(str(row["pair"]).rsplit("_", 1)[1])
+                prior[(int(row["start_conformer"]), int(row["end_structure"]), row["mechanism"])] = pj
+        except Exception as exc:
+            typer.echo(f"--atom-mapping: could not read the earlier pair table ({exc}); numbering afresh.")
+            prior = {}
     new_structures = list(structures)
+    slots = sorted(pj for pj in prior.values() if pj >= len(structures))
+    if slots:
+        # Hold the earlier product slots (a placeholder until filled below).
+        new_structures += [structures[0]] * (slots[-1] - len(structures) + 1)
     new_candidates = []
     for r in rows:
+        earlier = prior.get((r["i"], r["j"], r["key"]))
         if r["structure"] is None:
             r["pair_j"] = r["j"]
+        elif earlier is not None and earlier >= len(structures):
+            new_structures[earlier] = StructureNode(structure=r["structure"])
+            r["pair_j"] = earlier
         else:
             new_structures.append(StructureNode(structure=r["structure"]))
             r["pair_j"] = len(new_structures) - 1
         new_candidates.append((r["i"], r["pair_j"]))
+    if prior:
+        reused = sum(1 for r in rows if (r["i"], r["j"], r["key"]) in prior)
+        typer.echo(f"--atom-mapping: {reused} path search(es) keep their earlier labels; "
+                   f"{len(rows) - reused} are new.")
 
     counts = {key: sum(1 for r in rows if r["key"] == key) for key in keys}
     typer.echo(f"--atom-mapping: {len(keys)} mechanism(s) across the pairs:")
@@ -151,6 +179,12 @@ def _expand_pairs_by_mechanism(
              "n_symmetry_variants": r["n_variants"]}
             for r in rows
         ]
+        # Earlier rows this run did not keep (e.g. a lower cap) stay listed, so their labels stay reserved.
+        kept_keys = {(r["i"], r["j"], r["key"]) for r in rows}
+        for (i, j, key), pj in prior.items():
+            if (i, j, key) not in kept_keys:
+                table.append({"pair": f"pair_{i}_{pj}", "start_conformer": i, "end_structure": j,
+                              "mechanism": key, "score": None, "n_symmetry_variants": 0, "not_in_this_run": True})
         (output / "pair_mechanisms.json").write_text(json.dumps(table, indent=2) + "\n")
 
     summary = {"n_mechanisms": len(keys), "path_searches_per_mechanism": counts}

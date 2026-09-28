@@ -455,6 +455,7 @@ function ResultPanel({ job }) {
           <ul>${result.warnings.map((w) => html`<li class="mono">${w}</li>`)}</ul>
         </details>`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
+      ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}
       <div class="result-body">
         <div class="entries-col">
           ${pickGroup && html`<${BulkBar} group=${pickGroup} picked=${picked} inGraph=${inGraph} busy=${adding}
@@ -511,9 +512,9 @@ const VRI_NEXT = {
   second_product_no_split: 'Sideways pushes all end in P1, so the second product is probably not reached from TS1 (trajectories can still be run).',
 };
 
-function FollowUpCard({ op, job, runs, done }) {
+function FollowUpCard({ op, job, runs, done, initial = {}, note = null }) {
   const [open, setOpen] = useState(false);
-  const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) }));
+  const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}), ...initial }));
   const [busy, setBusy] = useState(false);
   const last = runs[0];
   const active = last && ['queued', 'running'].includes(last.status);
@@ -537,6 +538,7 @@ function FollowUpCard({ op, job, runs, done }) {
         <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
       </button>
       ${open && html`<div class="op-body">
+        ${note && html`<p class="small muted">${note}</p>`}
         <${ParamForm} schema=${op.schema} values=${values} onChange=${setValues} />
         <div class="op-run">
           <button class="btn primary" disabled=${busy || active} onClick=${run}>
@@ -563,6 +565,28 @@ function VriFollowUps({ job, vri }) {
       ${VRI_NEXT[vri.verdict] && html`<p class="small muted">${VRI_NEXT[vri.verdict]}</p>`}
       ${ops.map((op) => html`<${FollowUpCard} key=${op.key} op=${op} job=${job} done=${done[op.key]}
         runs=${runs.filter((r) => r.op === op.key)} />`)}
+    </section>`;
+}
+
+// A finished channels run: search more conformer pairs per mechanism, reusing
+// everything it computed (the follow-up reruns it in its own folder).
+function ChannelsFollowUps({ job }) {
+  const operations = useStore((s) => s.operations);
+  const runsKey = useStore((s) => Object.values(s.jobs).filter((j) => j.source_job === job.id)
+    .map((j) => `${j.id}:${j.status}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.source_job === job.id)
+    .sort((a, b) => b.created - a.created), [runsKey]);
+  const op = operations.find((o) => o.key === 'channels-more' && o.available);
+  if (!op || job.status !== 'done' || job.op !== 'channels') return null;
+  const done = runs.filter((r) => r.status === 'done').map((r) => r.params?.pairs_per_mechanism ?? 0);
+  const cap = [job.params?.pairs_per_mechanism ?? 0, ...done].reduce((m, v) => (m === 0 || v === 0 ? 0 : Math.max(m, v)));
+  if (cap === 0) return null;   // every pair of every mechanism is already searched
+  return html`
+    <section class="followups">
+      <h3 class="section-title">Next steps</h3>
+      <${FollowUpCard} op=${op} job=${job} runs=${runs.filter((r) => r.op === op.key)}
+        initial=${{ pairs_per_mechanism: cap * 2 }}
+        note=${`So far: the best ${cap} conformer pair${cap === 1 ? '' : 's'} per mechanism. Pairs already searched are skipped, and the result and path map then cover all of them.`} />
     </section>`;
 }
 
@@ -675,7 +699,7 @@ export function JobView({ jobId }) {
       ${job.status === 'failed' && job.error && html`<pre class="error-box">${job.error}</pre>`}
       ${['cancelled', 'interrupted'].includes(job.status) && html`<p class="warn-box small">${job.error} ${!job.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${job.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
-        ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && job.op === 'channels' && ['map', 'Path map'],
+        ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && ['channels', 'channels-more'].includes(job.op) && ['map', 'Path map'],
           !job.external && ['log', 'Log'], ['files', 'Files']].filter(Boolean)
           .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live'} onClick=${() => setTab(k)}>${l}</button>`)}
       </div>

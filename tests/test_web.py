@@ -1016,6 +1016,23 @@ def _cli_options(argv: list[str]) -> set[str]:
     return opts
 
 
+def _fake_finished_channels(client, tmp_path, a, b):
+    """A finished channels run to follow up on: its real command (from a dry
+    run), and the files a rerun reuses (pools, pair table)."""
+    (cmd,) = client.post("/api/jobs", json={"op": "channels", "structures": [a, b], "profile": "default",
+                                           "dry_run": True, "params": {"pairs_per_mechanism": 2}}).json()
+    out = tmp_path / "chan_out"
+    (out / "conformers").mkdir(parents=True)
+    for side in ("start", "end"):
+        (out / "conformers" / f"{side}_pool.xyz").write_text("")
+    (out / "pair_mechanisms.json").write_text("[]")
+    jobs = client.app.state.sessions.current.jobs
+    job = {**cmd, "id": "j_chanfake", "status": "done", "output_dir": str(out)}
+    jobs.jobs[job["id"]] = job
+    jobs._write(job)
+    return job
+
+
 def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     # The web UI drives mepd through its CLI; a renamed or removed flag
     # would otherwise only show up as a failed job (it happened: VRI's
@@ -1030,6 +1047,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     _fake_ts_job(client, [a["id"], b["id"]])      # so edge operations that need a TS (VRI) can build
     src = client.post("/api/jobs/import", json={"path": str(_vri_folder(tmp_path)), "op": "vri"}).json()
     client.post("/api/design/new", json={"smiles": "CCO"})   # so the Design tab's minimization can build
+    chan = _fake_finished_channels(client, tmp_path, a["id"], b["id"])   # for "Sample more paths"
     ops = client.get("/api/state").json()["operations"]
     checked = 0
     for op in ops:
@@ -1041,7 +1059,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
         elif op["target"] == "set":
             body["structures"] = [a["id"], b["id"]]
         elif op["target"] == "job":
-            body["source_job"] = src["id"]
+            body["source_job"] = chan["id"] if "channels" in op.get("source_ops", []) else src["id"]
         elif op["target"] == "design":
             pass
         else:

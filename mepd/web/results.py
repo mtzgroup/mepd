@@ -978,6 +978,8 @@ COLLECTORS = {
     "conformers": collect_conformers,
     "ts": collect_ts,
     "channels": collect_channels,
+    # A "Sample more paths" follow-up writes into its source's folder: the same, extended, result.
+    "channels-more": collect_channels,
     "tsopt": collect_tsopt,
     "hessian-sample": collect_hessian_sample,
     "hessian-global": collect_hessian_global,

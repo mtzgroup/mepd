@@ -947,11 +947,18 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if mode not in ("bonds", "distance", "irc"):
             raise HTTPException(400, "mode is 'bonds', 'distance' or 'irc'")
         job = J().get(jid)
-        jdir, out = J().job_dir(jid), Path(job["output_dir"])
+        # A "Sample more paths" follow-up shares its source's folder: one map for the run and all of them.
+        base = J().get(job["source_job"]) if job.get("op") == "channels-more" and job.get("source_job") in J().jobs else job
+        family = [base] + sorted((j for j in J().jobs.values()
+                                  if j.get("op") == "channels-more" and j.get("source_job") == base["id"]),
+                                 key=lambda j: j["created"])
+        jdirs = [J().job_dir(j["id"]) for j in family]
+        jdir, out = jdirs[0], Path(base["output_dir"])
+        running = any(j["status"] == "running" for j in family)
 
         def signature():
-            files = list((jdir / "live").glob("*.json")) + list((out / "ts").glob("ts_pair_*"))
-            return (mode, ts, job["status"] == "running", len(files),
+            files = [f for d in jdirs for f in (d / "live").glob("*.json")] + list((out / "ts").glob("ts_pair_*"))
+            return (mode, ts, running, len(files),
                     max((f.stat().st_mtime_ns for f in files), default=0))
 
         # Rebuild only when the run's files moved on (several open tabs, or a
@@ -961,7 +968,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         hit = _channels_map_cache.get(key)
         if hit and hit[0] == sig:
             return hit[1]
-        result = await run_in_threadpool(channels_map, jdir, mode, 64, job["status"] == "running", out, ts)
+        result = await run_in_threadpool(channels_map, jdirs, mode, 64, running, out, ts)
         _channels_map_cache[key] = (sig, result)
         if len(_channels_map_cache) > 32:
             _channels_map_cache.pop(next(iter(_channels_map_cache)))
