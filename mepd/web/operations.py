@@ -181,6 +181,10 @@ class ChannelsParams(Params):
                              advanced=True, requires="backend=crest")
     rmsd_cutoff: float = P(0.5, "Dedup RMSD (bohr)", cli="--rmsd-cutoff", group="Conformers", advanced=True)
     random_seed: int = P(0, "Random seed", cli="--random-seed", group="Conformers", advanced=True)
+    reuse_conformers: bool = P(True, "Reuse conformer pools",
+                               "Take an endpoint's conformers from an earlier Reaction channels run on the same "
+                               "molecule with the same sampler settings and level of theory, instead of "
+                               "sampling and minimizing them again.", kind="custom", group="Conformers")
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
@@ -522,8 +526,74 @@ def _build_ts(ctx: JobContext, p: TsParams) -> list[str]:
     return argv + ["--output", str(ctx.output_dir)]
 
 
+# Settings that decide what a channels run's conformer pools contain.
+_POOL_KEYS = ("backend", "n_conformers", "rmsd_cutoff", "random_seed", "minimize_ends")
+_POOL_KEYS_BY_BACKEND = {"rdkit": ("n_embed", "rdkit_ewin"), "crest": ("crest_method", "crest_ewin", "crest_timeout")}
+_POOL_FILES = (".xyz", ".energies", ".gradients", "_grad_shapes.txt")
+
+
+def _pool_settings(params: dict) -> tuple:
+    p = ChannelsParams.model_validate({k: v for k, v in params.items() if k in ChannelsParams.model_fields})
+    keys = _POOL_KEYS + _POOL_KEYS_BY_BACKEND[p.backend]
+    return tuple((k, getattr(p, k)) for k in keys)
+
+
+def _saved_pool(job: dict, side: str) -> Optional[Path]:
+    """A finished channels job's final pool for `side` ("start"/"end"),
+    before mirror images were merged (so it is complete on its own)."""
+    conf = Path(job.get("output_dir") or "") / "conformers"
+    if (conf / f"{side}_pool.xyz").exists():
+        return conf / f"{side}_pool.xyz"
+    # Older runs saved only the merged pool: usable when nothing was merged.
+    try:
+        stats = json.loads((Path(job["output_dir"]) / "stats.json").read_text())
+    except (OSError, ValueError, KeyError):
+        return None
+    merged = ((stats.get("conformers") or {}).get(side) or {}).get("n_mirror_images_merged")
+    return conf / f"{side}.xyz" if merged == 0 and (conf / f"{side}.xyz").exists() else None
+
+
+def _reusable_pool(ctx: JobContext, p: ChannelsParams, rec: dict) -> Optional[tuple[Path, dict]]:
+    """The newest finished channels job that sampled `rec`'s molecule (as
+    either endpoint) with the same pool settings -- and, when its pools were
+    minimized, at this job's level of theory -- and its saved pool file."""
+    want = _pool_settings(p.model_dump())
+    level = ctx.level().get("key")
+    best = None
+    for job in (ctx.jobs or {}).values():
+        sids = job.get("targets", {}).get("structures") or []
+        if job.get("op") != "channels" or job.get("status") != "done" or rec["id"] not in sids[:2]:
+            continue
+        if job.get("charge") != rec["charge"] or job.get("multiplicity") != rec["multiplicity"]:
+            continue
+        try:
+            if _pool_settings(job.get("params") or {}) != want:
+                continue
+        except Exception:
+            continue
+        if p.minimize_ends and (job.get("level") or {}).get("key") != level:
+            continue
+        fp = _saved_pool(job, "start" if sids[0] == rec["id"] else "end")
+        if fp is not None and (best is None or (job.get("finished") or 0) > (best[1].get("finished") or 0)):
+            best = (fp, job)
+    return best
+
+
 def _build_channels(ctx: JobContext, p: ChannelsParams) -> list[str]:
     argv = ["channels", *ctx.endpoint_flags(p.endpoints), *ctx.common_flags(), *generic_flags(p)]
+    if p.reuse_conformers:
+        for side, rec in zip(("start", "end"), ctx.structures):
+            found = _reusable_pool(ctx, p, rec)
+            if found is None:
+                continue
+            src, _ = found
+            dst = ctx.job_dir / "inputs" / f"{side}_pool.xyz"   # a copy: the job stays reproducible
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            for suffix in _POOL_FILES:
+                f = src.with_name(src.stem + suffix)
+                if f.exists():
+                    shutil.copyfile(f, dst.with_name(dst.stem + suffix))
+            argv += [f"--{side}-pool", str(dst)]
     return argv + ["--output", str(ctx.output_dir)]
 
 
@@ -735,7 +805,8 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "every distinct mechanism, and classify the TSs into direct, multi-step and off-target "
         "channels. (`mepd channels`)",
         "pair", PAIR, ChannelsParams, _build_channels, min_structures=2,
-        produces=["transition states per channel", "conformers", "off-target products"]),
+        produces=["transition states per channel", "conformers", "off-target products"],
+        cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output", "--start-pool", "--end-pool")),
     Operation(
         "optimize", "Optimize geometry", "Minimize the selected structures at the chosen profile's level of "
         "theory, replacing their geometry and energy in place. (`mepd optimize`)",

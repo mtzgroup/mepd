@@ -623,6 +623,9 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
     summary = [
         {"label": "Reactant conformers", "value": conf.get("start", {}).get("n_final")},
         {"label": "Product conformers", "value": conf.get("end", {}).get("n_final")},
+        {"label": "Conformer pools", "value": ", ".join(
+            f"{name} reused from an earlier run" for side, name in (("start", "reactant"), ("end", "product"))
+            if conf.get(side, {}).get("reused_from")) or None},
         {"label": "Mechanisms", "value": stats.get("n_mechanisms")},
         {"label": "Path searches", "value": stats.get("n_path_searches")},
         {"label": "Distinct mechanisms", "value": ", ".join(sorted({m["mechanism"] for m in mechanisms if m.get("mechanism")})) or None},
@@ -1062,7 +1065,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 15
+RESULT_VERSION = 16
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

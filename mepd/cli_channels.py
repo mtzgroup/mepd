@@ -156,6 +156,29 @@ def _expand_pairs_by_mechanism(
     return new_structures, new_candidates, summary
 
 
+def _load_conformer_pool(fp: Path, endpoint, label: str, charge: int, multiplicity: int) -> list:
+    """A saved final conformer pool (--start-pool / --end-pool) for
+    `endpoint`, with its energies. Only conformers whose bonds match the
+    endpoint's atom for atom are kept: a pool saved when this molecule's atoms
+    were numbered differently (e.g. it was the other end of another pair, so
+    the atom-mapping check reordered it) would pair the wrong atoms."""
+    from mepd.inputs import ChainInputs
+
+    if not fp.exists():
+        raise typer.BadParameter(f"--{label}-pool {fp} does not exist.")
+    pool = list(Chain.from_xyz(fp, ChainInputs(), charge=charge, spinmult=multiplicity).nodes)
+
+    def bonds(node):
+        return {frozenset(e) for e in node.graph.edges()}
+
+    want_symbols, want_bonds = list(endpoint.symbols), bonds(endpoint)
+    kept = [n for n in pool if list(n.symbols) == want_symbols and bonds(n) == want_bonds]
+    if len(kept) < len(pool):
+        typer.echo(f"  {len(pool) - len(kept)} of {len(pool)} saved {label} conformer(s) are numbered or bonded "
+                   f"differently from this run's {label} endpoint; not used.")
+    return kept
+
+
 def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> list:
     """Optimize every node in a conformer pool with the QM engine, dropping
     (with a warning) any conformer that fails to converge or produces an
@@ -761,6 +784,16 @@ def channels(
         "to count as distinct.",
     ),
     random_seed: int = typer.Option(0, "--random-seed", help="Random seed for conformer embedding."),
+    start_pool: Optional[Path] = typer.Option(
+        None, "--start-pool",
+        help="Use this multi-frame xyz (with its .energies) as the start endpoint's final conformer pool "
+        "instead of sampling one: e.g. conformers/start_pool.xyz of an earlier run with the same "
+        "sampler settings. With --minimize-ends the pool must already be minimized at this run's "
+        "level of theory; it is used as is (no sampling, no minimization).",
+    ),
+    end_pool: Optional[Path] = typer.Option(
+        None, "--end-pool", help="As --start-pool, for the end endpoint.",
+    ),
     minimize_ends: bool = typer.Option(
         True, "--minimize-ends/--no-minimize-ends",
         help="Optimize endpoint geometries with the QM engine. On by default. "
@@ -997,20 +1030,47 @@ def channels(
         stats["total_seconds"] = round(time.perf_counter() - run_started, 3)
         (output / "stats.json").write_text(json.dumps(stats, indent=2) + "\n")
 
-    typer.echo(f"Generating seed pairs (--method {method})...")
-    start_confs, end_confs = generate_seed_pairs(
-        method, start_node, end_node, conformer_inputs=conformer_inputs,
-        stats=stats["conformers"],
-    )
-    typer.echo(
-        f"  -> {len(start_confs)} start-endpoint seed(s), "
-        f"{len(end_confs)} end-endpoint seed(s)."
-    )
+    # Saved final pools of an earlier run (same sampler settings and level of
+    # theory; the caller decides): used as is, not re-sampled or re-minimized.
+    endpoints = {"start": start_node, "end": end_node}
+    reused: dict = {}
+    for label, fp in (("start", start_pool), ("end", end_pool)):
+        if not isinstance(fp, (str, Path)):   # unset (None, or typer's default when called directly)
+            continue
+        node = endpoints[label]
+        pool = _load_conformer_pool(Path(fp), node, label, node.structure.charge, node.structure.multiplicity)
+        if pool:
+            reused[label] = pool
+            stats["conformers"][label] = {"reused_from": str(fp), "n_reused": len(pool)}
+            typer.echo(f"Using {len(pool)} saved {label} conformer(s) from {fp} (not re-sampled or re-minimized).")
+        else:
+            typer.echo(f"No usable saved {label} conformers in {fp}; sampling them instead.")
+    if len(reused) == 2:
+        start_confs, end_confs = reused["start"], reused["end"]
+    else:
+        typer.echo(f"Generating seed pairs (--method {method})...")
+        if not reused:
+            start_confs, end_confs = generate_seed_pairs(
+                method, start_node, end_node, conformer_inputs=conformer_inputs,
+                stats=stats["conformers"],
+            )
+        else:
+            from mepd.conformers import generate_conformers
+
+            (label,) = {"start", "end"} - set(reused)
+            sampled = generate_conformers(endpoints[label], conformer_inputs,
+                                          stats["conformers"].setdefault(label, {}))
+            start_confs = reused.get("start", sampled)
+            end_confs = reused.get("end", sampled)
+        typer.echo(
+            f"  -> {len(start_confs)} start-endpoint seed(s), "
+            f"{len(end_confs)} end-endpoint seed(s)."
+        )
 
     pools = {"start": start_confs, "end": end_confs}
     for label in ("start", "end"):
         side = stats["conformers"].setdefault(label, {})
-        if minimize_ends:
+        if minimize_ends and label not in reused:
             typer.echo(f"Minimizing {label}-endpoint conformers...")
             t0 = time.perf_counter()
             pools[label] = _minimize_conformer_pool(pools[label], label, run_inputs)
@@ -1040,6 +1100,17 @@ def channels(
                     f"complex match a kept one fragment by fragment within "
                     f"{complex_energy_tol} kcal/mol; dropped."
                 )
+
+    # Each side's final pool before mirror images are merged (a merge drops
+    # conformers from one side only, depending on the other side): what a
+    # later run with the same settings can take as its --start/--end-pool.
+    from mepd.inputs import ChainInputs as _ChainInputs
+
+    (output / "conformers").mkdir(parents=True, exist_ok=True)
+    for label in ("start", "end"):
+        if pools[label]:
+            Chain.model_validate({"nodes": pools[label], "parameters": _ChainInputs()}).write_to_disk(
+                output / "conformers" / f"{label}_pool.xyz")
 
     # Mirror-image conformers of an achiral molecule give mirror-image paths,
     # so pairs built from them repeat each other -- but they can only be
