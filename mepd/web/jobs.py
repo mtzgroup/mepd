@@ -273,7 +273,11 @@ class JobManager:
                 for eid in eids:
                     chosen.update((self.ws.edge(eid).get("conformers") or {}))
                 if isinstance(conformers, dict):
-                    chosen.update({k: v for k, v in conformers.items() if v})
+                    for k, v in conformers.items():   # None = explicitly the lowest, over an edge's saved pick
+                        if v:
+                            chosen[k] = v
+                        else:
+                            chosen.pop(k, None)
                 picks = [(conformers[i] if isinstance(conformers, list) and i < len(conformers) else None)
                          or chosen.get(s) for i, s in enumerate(sids)]
                 recs = [self.ws.structure_view(s, c) for s, c in zip(sids, picks)]

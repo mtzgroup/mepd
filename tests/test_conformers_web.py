@@ -136,6 +136,18 @@ def test_path_search_conformers_join_their_endpoint_nodes(tmp_path):
     assert rec["conformers"][-1]["origin"]["label"] == "MEP (start)"
 
 
+def test_choosing_lowest_overrides_the_edges_saved_conformer(client):
+    first = _add(client, WATER_XYZ)[0]
+    conf = client.post("/api/structures", json={"text": WATER_2, "optimize": False}).json()[0]
+    (b,) = _add(client, WATER_BENT_XYZ)
+    edge = client.post("/api/edges", json={"source": first["id"], "target": b["id"]}).json()
+    client.patch(f"/api/edges/{edge['id']}", json={"conformers": {first["id"]: conf["added_conformer"]}})
+    lowest = client.get("/api/state").json()["workspace"]["structures"][first["id"]]["conformer"]
+    (job,) = client.post("/api/jobs", json={"op": "ts", "edges": [edge["id"]], "dry_run": True,
+                                           "params": {"endpoints": "xyz"}, "conformers": {first["id"]: None}}).json()
+    assert job["target_conformers"][0] == lowest
+
+
 def test_chosen_endpoint_conformers_are_saved_on_the_edge(client):
     first = _add(client, WATER_XYZ)[0]
     conf = client.post("/api/structures", json={"text": WATER_2, "optimize": False}).json()[0]
