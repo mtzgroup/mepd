@@ -47,7 +47,8 @@ function contours(G, xs, ys, lev) {
 function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
   const canvas = useRef(null);
   const { x: xs, y: ys, E } = map;
-  const pts = map.paths.flatMap((p) => p.points);
+  const marks = map.ts || [];
+  const pts = map.paths.flatMap((p) => p.points).concat(marks.map((m) => [m.q[0], m.q[1], m.e]));
   const allX = pts.map((q) => q[0]).concat(xs), allY = pts.map((q) => q[1]).concat(ys);
   const x0 = Math.min(...allX), x1 = Math.max(...allX), y0 = Math.min(...allY), y1 = Math.max(...allY);
   const energies = (E.flat ? E.flat() : []).filter((v) => v !== null).concat(pts.map((q) => q[2]).filter((v) => v !== null));
@@ -91,12 +92,31 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
               opacity=${dim ? 0.3 : 1} onMouseEnter=${() => setHover({ p, k, q })} />`)}
           </g>`;
         })}
+        ${marks.map((m) => {
+          const X = sx(m.q[0]), Y = sy(m.q[1]), col = pairColor(m.pair), r = 7;
+          const on = selected && selected.startsWith(`${m.pair}/`);
+          const dim = selected && !on;
+          const style = m.kind === 'direct' ? '' : m.kind === 'multi-step' ? '3 2' : '1.5 2';
+          return html`<g class="cmap-ts" opacity=${dim ? 0.3 : m.kind === 'other' ? 0.75 : 1}
+            onMouseEnter=${() => setHover({ ts: m })} style="cursor:pointer">
+            <path d=${`M${X - r},${Y - r}L${X + r},${Y + r}M${X - r},${Y + r}L${X + r},${Y - r}`} stroke="#fff" stroke-width="6" stroke-linecap="round" />
+            <path d=${`M${X - r},${Y - r}L${X + r},${Y + r}M${X - r},${Y + r}L${X + r},${Y - r}`} stroke=${col} stroke-width="3.2"
+              stroke-linecap="round" stroke-dasharray=${style} />
+            <circle cx=${X} cy=${Y} r="11" fill="transparent" />
+          </g>`;
+        })}
       </g>
       ${ticks(x0, x1, 6).map((t) => html`<text x=${sx(t)} y=${H - B + 16} text-anchor="middle">${+t.toFixed(2)}</text>`)}
       ${ticks(y0, y1, 6).map((t) => html`<text x=${L - 6} y=${sy(t) + 4} text-anchor="end">${+t.toFixed(2)}</text>`)}
       <text x=${(L + W - R) / 2} y=${H - 8} text-anchor="middle">${map.axes.x}</text>
       <text x="14" y=${(T + H - B) / 2} transform=${`rotate(-90 14 ${(T + H - B) / 2})`} text-anchor="middle">${map.axes.y}</text>
-      ${hover && html`<g style="pointer-events:none">
+      ${hover?.ts && html`<g style="pointer-events:none">
+        <text x=${Math.min(sx(hover.ts.q[0]) + 12, W - 330)} y=${Math.max(sy(hover.ts.q[1]) - 34, 24)} class="cmap-tip">
+          TS ${hover.ts.pair.replace(/_/g, ' ')}: ${hover.ts.e.toFixed(1)} kcal/mol · ${hover.ts.kind === 'direct' ? `direct channel${hover.ts.group ? ` (${hover.ts.group.replace('_', ' ')})` : ''}` : hover.ts.kind === 'multi-step' ? 'step of a multi-step channel' : 'IRC does not connect the ends'}</text>
+        ${hover.ts.closest && html`<text x=${Math.min(sx(hover.ts.q[0]) + 12, W - 330)} y=${Math.max(sy(hover.ts.q[1]) - 34, 24) + 15} class="cmap-tip">
+          closest image: ${hover.ts.closest.rmsd.toFixed(2)} Å RMSD (image ${hover.ts.closest.image + 1}, ${hover.ts.closest.monitor})</text>`}
+      </g>`}
+      ${hover && !hover.ts && html`<g style="pointer-events:none">
         <circle cx=${sx(hover.q[0])} cy=${sy(hover.q[1])} r="7" fill="none" stroke="#ffd23f" stroke-width="3" />
         <text x=${Math.min(sx(hover.q[0]) + 10, W - 170)} y=${Math.max(sy(hover.q[1]) - 10, 24)} class="cmap-tip">
           ${hover.p.pair.replace(/_/g, ' ')} · ${hover.p.monitor} · image ${hover.k + 1}: ${hover.q[2] == null ? '—' : `${hover.q[2].toFixed(1)} kcal/mol`}</text>
@@ -110,7 +130,7 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
   </div>`;
 }
 
-function PathDetail({ job, path, pairColor }) {
+function PathDetail({ job, path, pairColor, marks = [] }) {
   const [frames, setFrames] = useState(null);
   const [k, setK] = useState(0);
   useEffect(() => {
@@ -129,6 +149,9 @@ function PathDetail({ job, path, pairColor }) {
       ? html`x: breaks <b>${path.bonds.x.join(', ') || '—'}</b> · y: forms <b>${path.bonds.y.join(', ') || '—'}</b>`
       : html`x: ${path.bonds.kind} <b>${path.bonds.x.join(', ')}</b> · y: ${path.bonds.kind} <b>${path.bonds.y.join(', ') || '—'}</b>`}</p>`}
     <p class="small muted">Highest image ${top > -1e9 ? `${top.toFixed(1)} kcal/mol` : '—'} on this map's scale.</p>
+    ${marks.filter((m) => m.pair === path.pair).map((m) => html`<p class="small">
+      ✕ Optimized TS ${m.e.toFixed(1)} kcal/mol (${m.kind === 'direct' ? 'direct channel' : m.kind === 'multi-step' ? 'multi-step channel' : "its IRC doesn't connect the ends"})${m.closest
+        ? html` · the chain came within <b>${m.closest.rmsd.toFixed(2)} Å</b> RMSD of it (image ${m.closest.image + 1})` : ''}</p>`)}
     ${frames && frames.length > 0 && html`
       <${Viewer3D} frames=${frames} frame=${Math.min(k, frames.length - 1)} height=${220} />
       <input type="range" min="0" max=${frames.length - 1} value=${Math.min(k, frames.length - 1)} onInput=${(e) => setK(+e.target.value)} />
@@ -180,12 +203,13 @@ export function ChannelsMap({ job }) {
     ${err && html`<p class="error-box small">${err}</p>`}
     ${(map?.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
     ${map && !map.paths.length && html`<p class="small muted">No paths yet: they appear here as soon as the path searches start.</p>`}
+    ${(map?.ts || []).length > 0 && html`<p class="small muted cmap-ts-key">✕ optimized TSs, in their path's colour: solid = a direct channel, dashed = a step of a multi-step channel, dotted = the IRC does not connect the ends. Hover one for how close its chains came.</p>`}
     ${map && map.paths.length > 0 && html`<div class="cmap-body">
       <${Surface} map=${map} pairColor=${pairColor} selected=${selected} onSelect=${setSelected} hover=${hover} setHover=${setHover} />
       <div class="cmap-side">
         <ul class="cmap-pairs small">${map.paths.map((p) => html`<li class=${p.id === selected ? 'on' : ''} onClick=${() => setSelected(p.id === selected ? null : p.id)}>
           <span class="cmap-swatch" style=${`background:${pairColor(p.pair)}`}></span>${p.pair.replace(/_/g, ' ')} <span class="muted">· ${p.monitor}</span>${p.active ? html` <span class="badge">relaxing</span>` : ''}</li>`)}</ul>
-        ${sel ? html`<${PathDetail} job=${job} path=${sel} pairColor=${pairColor} />` : html`<p class="small muted">Click a path to see its bonds and step through its images.</p>`}
+        ${sel ? html`<${PathDetail} job=${job} path=${sel} pairColor=${pairColor} marks=${map.ts || []} />` : html`<p class="small muted">Click a path to see its bonds and step through its images.</p>`}
       </div>
     </div>`}
   </div>`;

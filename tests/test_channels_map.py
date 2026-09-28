@@ -99,3 +99,23 @@ def test_live_gradients_reach_the_fit(tmp_path):
         "plot": {"y": [0, 5, 12, 15, 12, 6, -1], "energy_ref_hartree": -1.0}}}}))
     m = channels_map(job, "bonds")
     assert not any("no gradient" in w for w in m["warnings"]) and m["E"]
+
+
+def test_optimized_ts_are_marked_with_how_close_the_chain_came(tmp_path):
+    frames = _exchange()
+    job = tmp_path / "job"
+    _write_stream(job / "live", "pair_0_1", frames, [0, 5, 12, 15, 12, 6, -1])
+    out = job / "output"
+    (out / "ts").mkdir(parents=True)
+    ts = frames[3].replace("\n\n", "\nFrame 1\n", 1)                   # the chain's own highest image as the TS
+    (out / "ts" / "ts_pair_0_1_leaf_0.xyz").write_text(ts)
+    (out / "ts" / "ts_pair_0_1_leaf_0.energies").write_text(f"{-1.0 + 14 / H2K}\n")
+    (out / "ts" / "ts_pair_0_1_leaf_0_irc.xyz").write_text(ts)       # an IRC file is not a TS
+    (out / "channels" / "channel_0").mkdir(parents=True)
+    (out / "channels" / "channel_0" / "members.txt").write_text("ts_pair_0_1_leaf_0\n")
+    m = channels_map(job, "bonds", output_dir=out)
+    (mark,) = m["ts"]
+    assert mark["pair"] == "pair_0_1" and mark["kind"] == "direct" and mark["group"] == "channel_0"
+    assert abs(mark["e"] - 14.0) < 1e-6 and np.allclose(mark["q"], m["paths"][0]["points"][3][:2])
+    assert mark["closest"]["image"] == 3 and mark["closest"]["rmsd"] < 1e-6
+    assert channels_map(job, "bonds")["ts"] == []                    # no output folder given: no marks

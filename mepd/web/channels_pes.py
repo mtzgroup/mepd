@@ -165,10 +165,50 @@ def _surface(Q: np.ndarray, E: np.ndarray, xs: np.ndarray, ys: np.ndarray, slope
         return ((w @ E) / w.sum(axis=1)).reshape(Xg.shape)
 
 
-def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bool = True) -> dict:
+def _aligned_rmsd(A: np.ndarray, B: np.ndarray) -> float:
+    """RMSD (Angstrom) of two geometries in the same atom order after the
+    best rigid overlay."""
+    A, B = A - A.mean(axis=0), B - B.mean(axis=0)
+    u, _, vt = np.linalg.svd(A.T @ B)
+    rot = u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
+    return float(np.sqrt(np.mean(np.sum((A @ rot - B) ** 2, axis=1))))
+
+
+def _optimized_ts(output_dir: Optional[Path]) -> list[dict]:
+    """Every TS the run optimized (output/ts/ts_<pair>_leaf_<k>.xyz, energy
+    from its sidecar) and what its IRC made of it: a direct channel, a step
+    of a multi-step channel, or neither (off-target / unconnected)."""
+    if output_dir is None or not (Path(output_dir) / "ts").is_dir():
+        return []
+    out_dir = Path(output_dir)
+    kind_of: dict[str, tuple[str, str]] = {}
+    for members in out_dir.rglob("members.txt"):
+        rel = members.relative_to(out_dir).parts
+        kind = "direct" if rel[0] == "channels" else "multi-step" if rel[0].startswith("alternate") else "other"
+        for line in members.read_text().splitlines():
+            label = line.strip()
+            if label.startswith("ts_") and label not in kind_of:
+                kind_of[label] = (kind, rel[-2] if len(rel) > 1 else "")
+    found = []
+    for fp in sorted((out_dir / "ts").glob("ts_pair_*.xyz")):
+        if fp.stem.endswith("_irc"):
+            continue
+        stream = fp.stem[len("ts_"):].split("_leaf_")[0]
+        try:
+            xyz = "\n".join(fp.read_text().splitlines()[:int(fp.read_text().split()[0]) + 2]) + "\n"
+            energy = float(fp.with_suffix(".energies").read_text().split()[0])
+        except Exception:
+            continue
+        kind, group = kind_of.get(fp.stem, ("other", ""))
+        found.append({"label": fp.stem, "stream": stream, "xyz": xyz, "energy": energy, "kind": kind, "group": group})
+    return found
+
+
+def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bool = True,
+                 output_dir: Optional[Path] = None) -> dict:
     """The map for the web UI: {mode, axes, x, y, E (grid, None = blank),
     paths: [{id, pair, monitor, points: [[x, y, kcal]], active}],
-    reference, warnings}."""
+    ts: [{label, pair, q, e, kind, closest}], reference, warnings}."""
     paths = _paths(Path(job_dir))
     warnings = []
     if not paths:
@@ -193,6 +233,11 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         fr = _fingerprint(*_frame(lowest_r["frames"][0]))
         fp_ = _fingerprint(*_frame(lowest_p["frames"][-1]))
         scale = np.sqrt(len(fr)) or 1.0
+
+        def place_ts(stream, X, sym):
+            f = _fingerprint(sym, X)
+            return None if len(f) != len(fr) else [float(np.linalg.norm(f - fr) / scale),
+                                                   float(np.linalg.norm(f - fp_) / scale)]
         for p in paths:
             pts = []
             for k, (xyz, e) in enumerate(zip(p["frames"], p["energies"])):
@@ -219,6 +264,16 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
     else:
         skipped = 0
         kinds: list[str] = []
+        pair_bonds: dict = {}
+
+        def place_ts(stream, X, sym):
+            if stream not in pair_bonds:
+                return None
+            br_, fo_, R_, P_ = pair_bonds[stream]
+            prog = lambda bonds: float(np.mean([(_dist(X, i, j) - _dist(R_, i, j)) / ((_dist(P_, i, j) - _dist(R_, i, j)) or 1e-9)  # noqa: E731
+                                                for i, j in bonds])) if bonds else 0.0
+            return [prog(br_), prog(fo_)]
+
         for p in paths:
             root = roots[p["stream"]]
             sym, R = _frame(root["frames"][0])
@@ -236,6 +291,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
                     half = (len(changed) + 1) // 2
                     br, fo = changed[:half], changed[half:]
             kinds.append(kind)
+            pair_bonds.setdefault(p["stream"], (br, fo, R, P))
             pts = []
             for k, (xyz, e) in enumerate(zip(p["frames"], p["energies"])):
                 _, X = _frame(xyz)
@@ -274,7 +330,32 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
             warnings.append("Paths here change bonds in different ways (some break and form, some only form or only "
                             "break), so the axes do not mean the same for all of them: see each path's bonds.")
 
+    # Optimized TSs, placed with their own pair's coordinates; how close did its chains get?
+    ts_marks = []
+    for ts in _optimized_ts(output_dir):
+        sym, X = _frame(ts["xyz"])
+        q = place_ts(ts["stream"], X, sym)
+        if q is None:
+            continue
+        closest = None
+        for p, pts in placed:
+            if p["stream"] != ts["stream"]:
+                continue
+            for k, xyz in enumerate(p["frames"]):
+                _, F = _frame(xyz)
+                if F.shape != X.shape:
+                    continue
+                r = _aligned_rmsd(F, X)
+                if closest is None or r < closest["rmsd"]:
+                    closest = {"rmsd": round(r, 3), "image": k, "monitor": p["monitor"],
+                               "map_distance": round(float(np.hypot(pts[k][0] - q[0], pts[k][1] - q[1])), 4)}
+        ts_marks.append({"label": ts["label"], "pair": ts["stream"], "q": [round(q[0], 4), round(q[1], 4)],
+                         "e": round((ts["energy"] - e_ref) * H2K, 3), "kind": ts["kind"], "group": ts["group"],
+                         "closest": closest, "xyz": ts["xyz"]})
+
     data = [(x, y, e, g) for _, pts in placed for x, y, e, g in pts if e is not None]
+    # A TS is a real stationary point: its energy, with zero slope, anchors the fit at the saddle.
+    data += [(m["q"][0], m["q"][1], m["e"], np.zeros(2)) for m in ts_marks]
     xs = ys = np.array([])
     E = []
     with_slopes = sum(1 for d in data if d[3] is not None)
@@ -302,5 +383,6 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
                    "active": running and p["active"] and not p["finished"], "bonds": p.get("bonds"),
                    "points": [[round(x, 4), round(y, 4), None if e is None else round(e, 3)] for x, y, e, _ in pts]}
                   for p, pts in placed if pts],
+        "ts": ts_marks,
         "warnings": warnings,
     }

@@ -945,7 +945,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if mode not in ("bonds", "distance"):
             raise HTTPException(400, "mode is 'bonds' or 'distance'")
         job = J().get(jid)
-        return await run_in_threadpool(channels_map, J().job_dir(jid), mode, 64, job["status"] == "running")
+        return await run_in_threadpool(channels_map, J().job_dir(jid), mode, 64, job["status"] == "running",
+                                       Path(job["output_dir"]))
 
     @app.get("/api/jobs/{jid}/vri-viewer", response_class=HTMLResponse)
     def vri_viewer(jid: str):
