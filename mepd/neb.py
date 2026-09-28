@@ -518,17 +518,13 @@ class NEB(PathMinimizer):
             self.parameters.early_stop_force_thre = (
                 0.0  # setting it to 0 so we don't check it over and over
             )
-            if (
-                not stop_early
-                and early_stop_ready
-                and elem_step_results.is_elem_step
-                and getattr(self.parameters, "ts_converged_stop", False)
-            ):
-                # The TS region has converged and the chain is one elementary
-                # step: the rest of the band won't change either answer.
-                self._say("TS region converged and the chain is an elementary step; stopping.")
-                self.optimized = chain
-                return True, elem_step_results
+            # An elementary chain is not stopped here: early_stop_force_thre
+            # is the loose threshold for *triggering* this check, not a TS
+            # criterion -- stopping on it left TS guesses unconverged (RMS
+            # |g| ~1e-2 at step ~50) and sent TS optimizations to other
+            # saddles. It keeps optimizing until the main loop's
+            # _ts_region_converged (ts_grad_thre, ts_spring_thre and a stable
+            # barrier) or full convergence.
             return stop_early, elem_step_results
 
         else:
