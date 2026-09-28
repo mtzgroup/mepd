@@ -615,6 +615,15 @@ class ProgressPrinter:
             if self.use_rich and (self._live is not None or self._active_monitor_ids):
                 self._render_live_monitors()
 
+    def set_monitor_verdict(self, monitor_id: str, verdict: str) -> None:
+        with self._lock:
+            monitor = str(monitor_id or "").strip()
+            if not monitor:
+                return
+            state = self._state_for_monitor(monitor)
+            state["verdict"] = verdict
+            self._write_current_payload(monitor, state)
+
     def clear_path_so_far(self) -> None:
         with self._lock:
             state = self._state_for_monitor(self._path_monitor_id)
@@ -818,6 +827,10 @@ class ProgressPrinter:
                 "geometry": state.get("chain_geometry"),
                 "status_message": state.get("status_message"),
                 "active": monitor_id in self._active_monitor_ids,
+                # What the path search concluded about this chain: "elementary",
+                # "split" (not elementary: it was split into sub-paths), or a
+                # leaf that stopped short ("unresolved"); None while it runs.
+                "verdict": state.get("verdict"),
             }
         return payload
 
@@ -1504,6 +1517,16 @@ def log_at_level(message: str, level: str = "info") -> None:
         "error": printer.print_error,
         "success": printer.print_convergence,
     }.get(level, printer.update_status)(message)
+
+
+def set_monitor_verdict(verdict: str, monitor_id: Optional[str] = None) -> None:
+    """Record what the path search concluded about the chain of the current
+    (or given) monitor -- "elementary", "split" or "unresolved" -- for live
+    viewers (e.g. the channels path map draws split chains dashed)."""
+    try:
+        get_progress_printer().set_monitor_verdict(monitor_id or _active_monitor_id(), verdict)
+    except Exception:
+        pass
 
 
 def update_status(message: str):

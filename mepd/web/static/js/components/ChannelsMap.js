@@ -88,7 +88,7 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
           return html`<g style="cursor:pointer" onClick=${() => onSelect(on ? null : p.id)}>
             <polyline points=${poly(p)} fill="none" stroke="rgba(23,50,74,.55)" stroke-width=${on ? 6 : 4} opacity=${dim ? 0.25 : 1} />
             <polyline points=${poly(p)} fill="none" stroke=${col} stroke-width=${on ? 3.6 : 2.2} opacity=${dim ? 0.35 : 1}
-              class=${p.active ? 'cmap-active' : ''} stroke-dasharray=${p.monitor !== 'branch-0' && p.monitor !== 'main' ? '5 3' : ''} />
+              class=${p.active ? 'cmap-active' : ''} stroke-dasharray=${p.verdict === 'split' ? '6 4' : p.verdict === 'unresolved' ? '1.5 3' : ''} />
             ${p.points.map((q, k) => html`<circle cx=${sx(q[0])} cy=${sy(q[1])} r=${on ? 3.4 : 2.2} fill=${col} stroke="#fff" stroke-width="0.8"
               opacity=${dim ? 0.3 : 1} onMouseEnter=${() => setHover({ p, k, q })} />`)}
           </g>`;
@@ -214,18 +214,19 @@ export function ChannelsMap({ job }) {
     <p class="small muted">${mode === 'irc'
       ? 'Post hoc, against a computed IRC (white; its TS at 0, 0): x is where each image lands along that IRC (Å from the TS, reactant to the left), y how far it is from it (Å, the same numbering-independent distance as the distance view, so every atom mapping is measured against the true path). A chain that found this channel converges onto the white line near x = 0; one that went elsewhere stays off it. '
       : mode === 'bonds'
-      ? 'x: how far the bonds that break have stretched; y: how far the bonds that form have closed (0 at the reactant, 1 at the product), each path with its own bonds, so different atom mappings share the square. A concerted path runs along the diagonal; a stepwise one hugs an edge. When a reaction only forms (or only breaks) bonds, e.g. a Diels–Alder, its bonds are split in two groups plotted against each other: synchronous along the diagonal, asynchronous bowed toward an edge. Dashed: sub-paths of a recursive split. '
+      ? 'x: how far the bonds that break have stretched; y: how far the bonds that form have closed (0 at the reactant, 1 at the product), each path with its own bonds, so different atom mappings share the square. A concerted path runs along the diagonal; a stepwise one hugs an edge. When a reaction only forms (or only breaks) bonds, e.g. a Diels–Alder, its bonds are split in two groups plotted against each other: synchronous along the diagonal, asynchronous bowed toward an edge. '
       : 'x, y: how far each structure is from the lowest reactant and the lowest product conformer (differences of sorted interatomic distances), independent of atom numbering: paths that pass through similar structures run close together.'}
       The colours are a surface fitted to the computed images: their energies and their gradients projected onto these two coordinates. It is drawn only along the explored chains (and around the TSs): between them nothing was computed, so nothing is shown -- hatched means unexplored, not high or low -- and no shown value is lower than the computed energies next to it. A 2D map keeps only two of a molecule's many directions, so it is exact at the images and approximate along the bands.</p>
     ${err && html`<p class="error-box small">${err}</p>`}
     ${(map?.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
     ${map && !map.paths.length && html`<p class="small muted">No paths yet: they appear here as soon as the path searches start.</p>`}
+    <p class="small muted">Chains: <b>solid</b> = being relaxed, or found to be an elementary step · <b>dashed</b> = found not elementary (split into the sub-paths drawn from it) · <b>dotted</b> = the search stopped on it undecided (depth, time or cycle limit).</p>
     ${(map?.ts || []).length > 0 && html`<p class="small muted cmap-ts-key">✕ optimized TSs, in their path's colour: solid = a direct channel, dashed = a step of a multi-step channel, dotted = the IRC does not connect the ends. Hover one for how close its chains came.</p>`}
     ${map && map.paths.length > 0 && html`<div class="cmap-body">
       <${Surface} map=${map} pairColor=${pairColor} selected=${selected} onSelect=${setSelected} hover=${hover} setHover=${setHover} />
       <div class="cmap-side">
         <ul class="cmap-pairs small">${map.paths.map((p) => html`<li class=${p.id === selected ? 'on' : ''} onClick=${() => setSelected(p.id === selected ? null : p.id)}>
-          <span class="cmap-swatch" style=${`background:${pairColor(p.pair)}`}></span>${p.pair.replace(/_/g, ' ')} <span class="muted">· ${p.monitor}</span>${p.active ? html` <span class="badge">relaxing</span>` : ''}</li>`)}</ul>
+          <span class="cmap-swatch" style=${`background:${pairColor(p.pair)}`}></span>${p.pair.replace(/_/g, ' ')} <span class="muted">· ${p.monitor}</span>${p.active ? html` <span class="badge">relaxing</span>` : p.verdict === 'split' ? html` <span class="muted">· split</span>` : p.verdict === 'elementary' ? html` <span class="muted">· elementary</span>` : p.verdict === 'unresolved' ? html` <span class="muted">· unresolved</span>` : ''}</li>`)}</ul>
         ${sel ? html`<${PathDetail} job=${job} path=${sel} pairColor=${pairColor} marks=${map.ts || []} />` : html`<p class="small muted">Click a path to see its bonds and step through its images.</p>`}
       </div>
     </div>`}

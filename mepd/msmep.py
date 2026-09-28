@@ -45,6 +45,7 @@ from mepd.progress import (
     get_progress_printer,
     preserve_chain_snapshot,
     progress_monitor,
+    set_monitor_verdict,
     start_status,
     update_status,
     stop_status,
@@ -842,6 +843,7 @@ class MSMEP:
         history_node = TreeNode(data=root_neb_obj, children=[], index=tree_node_index)
 
         if elem_step_results.is_elem_step:
+            set_monitor_verdict("elementary")
             return history_node, []
 
         def _record_split_count(n: int) -> None:
@@ -865,10 +867,12 @@ class MSMEP:
                 snapshot=True, warn=True,
             )
             history_node.leaf_status = "same_pair_split_limit_reached"
+            set_monitor_verdict("unresolved")
             return history_node, []
 
         if resolved_max_depth is not None and tree_depth >= resolved_max_depth:
             history_node.leaf_status = "max_depth_reached"
+            set_monitor_verdict("unresolved")
             return history_node, []
 
         deadline = getattr(self.inputs.path_min_inputs, "recursive_split_deadline", None)
@@ -878,6 +882,7 @@ class MSMEP:
             self._say("Search budget reached; keeping this path as a leaf instead of splitting it.",
                       snapshot=True, warn=True)
             history_node.leaf_status = "time_budget"
+            set_monitor_verdict("unresolved")
             return history_node, []
 
         if self._repeats_an_ancestor(input_chain):
@@ -890,11 +895,13 @@ class MSMEP:
                 snapshot=True, warn=True,
             )
             history_node.leaf_status = "cycle"
+            set_monitor_verdict("unresolved")
             return history_node, []
 
         chain_trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
         if not chain_trajectory:
             return history_node, []
+        set_monitor_verdict("split")
         self._say(
             f"Splitting chains based on: {elem_step_results.splitting_criterion}",
             snapshot=True,
@@ -1097,6 +1104,10 @@ class MSMEP:
                         SimpleNamespace(is_elem_step=is_elem_step),
                     )
                     progress_printer.mark_monitor_inactive(f"branch-{job.index}")
+                    # The worker's own verdict may not reach this process's live view: set it here too.
+                    progress_printer.set_monitor_verdict(
+                        f"branch-{job.index}",
+                        "split" if child_children else "elementary" if is_elem_step else "unresolved")
                     if child_children:
                         _submit_children(
                             executor, child_history, child_children, parent_depth=job.depth,

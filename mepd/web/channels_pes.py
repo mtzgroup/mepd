@@ -133,7 +133,7 @@ def _paths(job_dir: Path) -> list[dict]:
             ref = plot.get("energy_ref_hartree")
             energies = [None if v is None else (v / H2K + (ref if ref is not None else 0.0)) for v in y]
             out.append({"stream": fp.stem, "monitor": mid, "frames": frames, "energies": energies,
-                        "gradients": grads,
+                        "gradients": grads, "verdict": m.get("verdict"),
                         "absolute": ref is not None, "active": bool(m.get("active")),
                         "finished": bool(data.get("finished")), "caption": plot.get("caption") or ""})
     return out
@@ -544,6 +544,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         "reference": "lowest reactant-side image of all paths",
         "paths": [{"id": f"{p['stream']}/{p['monitor']}", "pair": p["stream"], "monitor": p["monitor"],
                    "active": running and p["active"] and not p["finished"], "bonds": p.get("bonds"),
+                   "verdict": p.get("verdict"),
                    "points": [[round(x, 4), round(y, 4), None if e is None else round(e, 3)] for x, y, e, _ in pts]}
                   for p, pts in placed if pts],
         "ts": ts_marks,

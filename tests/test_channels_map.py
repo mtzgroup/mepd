@@ -181,3 +181,28 @@ def test_no_surface_between_chains_and_no_false_valleys(tmp_path):
     d = np.min(np.hypot(X.ravel()[:, None] - pts[:, 0][None], Y.ravel()[:, None] - pts[:, 1][None]), axis=1)
     far_cells = d.reshape(E.shape) > 0.5 * np.hypot(np.ptp(m["x"]), np.ptp(m["y"])) / 4
     assert far_cells.any() and np.isnan(E[far_cells]).all()
+
+
+def test_chain_verdicts_reach_the_map(tmp_path, monkeypatch):
+    """MSMEP's verdict on each chain (elementary / split / unresolved) is
+    written to the live stream and shown per path (split chains dashed)."""
+    from mepd import progress
+
+    live = tmp_path / "job" / "live"
+    monkeypatch.setenv("MEPD_DRIVE_CHAIN_DIR", str(live))
+    printer = progress.ProgressPrinter(use_rich=False)
+    monkeypatch.setattr(progress, "get_progress_printer", lambda: printer)
+    frames = _exchange()
+    _write_stream(live, "pair_0_1", frames, [0, 5, 12, 15, 12, 6, -1])
+    data = json.loads((live / "pair_0_1.json").read_text())
+    state = printer._state_for_monitor("branch-0")
+    state["chain_geometry"] = data["monitors"]["branch-0"]["geometry"]
+    state["chain_plot_payload"] = data["monitors"]["branch-0"]["plot"]
+    with progress.progress_monitor("branch-0"):
+        progress.set_monitor_verdict("split")
+    payload = printer._monitors_payload()
+    assert payload["branch-0"]["verdict"] == "split"
+    (live / "pair_0_1.json").write_text(json.dumps({"finished": False, "monitors": {"branch-0": {
+        **data["monitors"]["branch-0"], "verdict": "split"}, "branch-1": {**data["monitors"]["branch-0"], "verdict": "elementary"}}}))
+    m = channels_map(tmp_path / "job", "bonds")
+    assert {p["monitor"]: p["verdict"] for p in m["paths"]} == {"branch-0": "split", "branch-1": "elementary"}
