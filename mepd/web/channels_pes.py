@@ -496,10 +496,17 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
     data += [(m["q"][0], m["q"][1], m["e"], np.zeros(2)) for m in ts_marks]
     xs = ys = np.array([])
     E = []
-    with_slopes = sum(1 for d in data if d[3] is not None)
-    if data and with_slopes < len(data):
-        warnings.append(f"{len(data) - with_slopes} of {len(data)} images have no gradient in the live data (an "
-                        "older run, or an engine that does not report them): the surface uses only their energies.")
+    # Chain images without a gradient (a string's pinned endpoints normally have none: not worth a word).
+    missing = {p["id"] if "id" in p else f"{p['stream']}/{p['monitor']}": sum(1 for q in pts[1:-1] if q[3] is None)
+               for p, pts in placed}
+    missing = {k: v for k, v in missing.items() if v}
+    if missing:
+        n = sum(missing.values())
+        warnings.append(f"{n} interior image{'s' if n > 1 else ''} of {', '.join(sorted(missing)[:4])}"
+                        f"{' and more' if len(missing) > 4 else ''} have no gradient in the live data, so the surface "
+                        "uses only their energies there. The path method may not report them (GSM did not before "
+                        "2026-09-28), the run may predate gradients in the live view, or the engine may not "
+                        "provide them.")
     if len(data) >= 3:
         Q = np.array([[x, y] for x, y, _, _ in data])
         Ev = np.array([e for _, _, e, _ in data])

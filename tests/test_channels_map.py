@@ -34,7 +34,7 @@ def test_bond_progress_runs_from_reactant_to_product(tmp_path):
     _write_stream(job / "live", "pair_1_1", _exchange(), [0, 4, 9, 11, 9, 4, -2], ref_hartree=-1.0 + 2 / H2K)
     m = channels_map(job, "bonds", running=True)
     assert len(m["paths"]) == 2
-    assert any("no gradient" in w for w in m["warnings"])        # these streams carry no gradients: said so
+    assert any("no gradient" in w and "pair_0_1/branch-0" in w for w in m["warnings"])   # none here: said, per path
     p = next(p for p in m["paths"] if p["pair"] == "pair_0_1")
     assert p["points"][0][:2] == [0.0, 0.0] and p["points"][-1][:2] == [1.0, 1.0]
     assert p["bonds"]["kind"] == "break-form" and p["bonds"]["x"] == ["H1–H2"] and p["bonds"]["y"] == ["H2–H3"]
@@ -146,3 +146,16 @@ def test_irc_frame_places_chains_along_and_off_the_true_path(tmp_path):
     offp = next(p for p in m["paths"] if p["pair"] == "pair_0_2")["points"]
     assert all(q[1] > 0.01 for q in offp[1:-1])            # the displaced chain sits off the IRC
     assert channels_map(job, "irc")["warnings"]            # no output folder: says an IRC is needed
+
+
+def test_only_missing_interior_gradients_are_worth_a_warning(tmp_path):
+    """A GSM string's pinned endpoints have no gradient; that alone is normal."""
+    frames = _exchange()
+    job = tmp_path / "job"
+    live = job / "live"
+    live.mkdir(parents=True)
+    grads = [None] + [[0.001] * 9 for _ in frames[1:-1]] + [None]
+    (live / "pair_0_1.json").write_text(json.dumps({"finished": False, "monitors": {"branch-0": {
+        "active": True, "geometry": {"frames": frames, "gradients": grads},
+        "plot": {"y": [0, 5, 12, 15, 12, 6, -1], "energy_ref_hartree": -1.0}}}}))
+    assert not any("no gradient" in w for w in channels_map(job, "bonds")["warnings"])

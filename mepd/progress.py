@@ -99,9 +99,11 @@ def _chain_geometry_payload(chain, energies: list) -> dict | None:
     # Each image's energy gradient (Hartree/bohr, as computed): lets a viewer
     # fit slopes, not just heights (e.g. the channels path map).
     try:
+        # None for an image without one (e.g. a GSM string's pinned endpoints).
         grads = [getattr(node, "_cached_gradient", None) for node in chain.nodes]
-        if all(g is not None for g in grads):
-            out["gradients"] = [[round(float(v), 7) for v in np.asarray(g, dtype=float).reshape(-1)] for g in grads]
+        if any(g is not None for g in grads):
+            out["gradients"] = [None if g is None else [round(float(v), 7) for v in np.asarray(g, dtype=float).reshape(-1)]
+                                for g in grads]
     except Exception:
         pass
     return out
