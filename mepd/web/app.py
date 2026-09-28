@@ -114,7 +114,9 @@ class JobIn(BaseModel):
     label: str = ""
     dry_run: bool = False
     source_job: Optional[str] = None  # follow-up operations: the job they build on
-    conformers: Optional[dict[str, str]] = None  # {structure id: conformer id} to use instead of the lowest
+    # {structure id: conformer id} to use instead of the lowest; None = the lowest
+    # (the run form sends every endpoint, None for the ones left on 'lowest').
+    conformers: Optional[dict[str, Optional[str]]] = None
 
 
 class ProfileFormIn(BaseModel):

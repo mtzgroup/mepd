@@ -147,6 +147,16 @@ def test_chosen_endpoint_conformers_are_saved_on_the_edge(client):
     edge = client.get("/api/state").json()["workspace"]["edges"][job["targets"]["edges"][0]]
     assert edge["conformers"] == {first["id"]: cid}
     client.post(f"/api/jobs/{job['id']}/cancel")
+    # The run form sends every endpoint, null for those left on "lowest": a
+    # null resets the edge's choice instead of failing validation.
+    r = client.post("/api/jobs", json={"op": "ts", "edges": job["targets"]["edges"], "profile": "default",
+                                       "params": {"endpoints": "xyz"},
+                                       "conformers": {first["id"]: None, b["id"]: None}})
+    assert r.status_code == 200, r.text
+    (job2,) = r.json()
+    edge = client.get("/api/state").json()["workspace"]["edges"][job["targets"]["edges"][0]]
+    assert edge.get("conformers") == {}
+    client.post(f"/api/jobs/{job2['id']}/cancel")
 
 
 def test_level_fingerprint_is_the_effective_level_and_old_records_migrate(tmp_path):
