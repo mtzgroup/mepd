@@ -159,3 +159,25 @@ def test_only_missing_interior_gradients_are_worth_a_warning(tmp_path):
         "active": True, "geometry": {"frames": frames, "gradients": grads},
         "plot": {"y": [0, 5, 12, 15, 12, 6, -1], "energy_ref_hartree": -1.0}}}}))
     assert not any("no gradient" in w for w in channels_map(job, "bonds")["warnings"])
+
+
+def test_no_surface_between_chains_and_no_false_valleys(tmp_path):
+    """Between two explored chains nothing is known: the map must not show
+    a (typically lower) interpolated energy there, and nowhere may it show
+    an energy lower than the computed images around it."""
+    job = tmp_path / "job"
+    base = _exchange(9)
+    far = [f.replace(" 0.0000 0.0000\n", " 1.5000 0.0000\n", 1) for f in base]    # a second chain, well apart
+    e = [0, 8, 20, 30, 34, 30, 20, 8, -2]
+    _write_stream(job / "live", "pair_0_1", base, e)
+    _write_stream(job / "live", "pair_0_2", far, [v + 3 for v in e])
+    m = channels_map(job, "distance")
+    E = np.array([[np.nan if v is None else v for v in row] for row in m["E"]])
+    pts = np.array([q for p in m["paths"] for q in p["points"]])
+    lowest = float(np.nanmin(pts[:, 2]))
+    assert np.nanmin(E) >= lowest - 1e-6                           # never below what was computed
+    # A grid cell far from every image is blank.
+    X, Y = np.meshgrid(m["x"], m["y"])
+    d = np.min(np.hypot(X.ravel()[:, None] - pts[:, 0][None], Y.ravel()[:, None] - pts[:, 1][None]), axis=1)
+    far_cells = d.reshape(E.shape) > 0.5 * np.hypot(np.ptp(m["x"]), np.ptp(m["y"])) / 4
+    assert far_cells.any() and np.isnan(E[far_cells]).all()

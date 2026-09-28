@@ -515,11 +515,45 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         xs = np.linspace(lo[0] - pad[0], hi[0] + pad[0], grid)
         ys = np.linspace(lo[1] - pad[1], hi[1] + pad[1], grid)
         Z = _surface(Q, Ev, xs, ys, slopes=[d[3] for d in data], step=0.02 * np.maximum(hi - lo, 1e-3))
-        # Blank where no computed image is near (a fraction of the map's size).
-        trust = 0.12 * float(np.hypot(*(hi - lo + 2 * pad)))
+        # Only where there is data: between chains nothing is known, and a fit
+        # there would invent low-energy valleys no path visited. A cell is
+        # shown only within `reach` of a chain -- of the segment between two
+        # neighbouring images, or of a lone point (a TS, an IRC frame) -- with
+        # reach half the typical image spacing (map units scaled per axis;
+        # never less than 1.5 grid cells), and never lower than the lowest
+        # computed energy it is near (no false valleys even inside the band).
+        span = np.maximum(hi - lo + 2 * pad, 1e-9)
+        segs, seg_e = [], []
+        for _, pts in placed:
+            good = [q for q in pts if q[2] is not None]
+            for a, b in zip(good, good[1:]):
+                segs.append((np.array(a[:2]) / span, np.array(b[:2]) / span))
+                seg_e.append(min(a[2], b[2]))
+        if irc_line:
+            good = [q for q in irc_line if q[2] is not None]
+            for a, b in zip(good, good[1:]):
+                segs.append((np.array(a[:2]) / span, np.array(b[:2]) / span))
+                seg_e.append(min(a[2], b[2]))
+        for m in ts_marks:
+            q = np.array(m["q"]) / span
+            segs.append((q, q))
+            seg_e.append(m["e"])
+        steps = [float(np.linalg.norm(b - a)) for a, b in segs if np.any(a != b)]
+        cell = float(np.hypot(*(np.array([xs[1] - xs[0], ys[1] - ys[0]]) / span)))
+        reach = max(0.5 * float(np.median(steps)) if steps else 0.05, 1.5 * cell)
         Xg, Yg = np.meshgrid(xs, ys)
-        near = np.min(np.hypot(Xg.ravel()[:, None] - Q[:, 0][None], Yg.ravel()[:, None] - Q[:, 1][None]), axis=1)
-        Z = np.where(near.reshape(Z.shape) <= trust, Z, np.nan)
+        G = np.stack([Xg.ravel(), Yg.ravel()], axis=1) / span
+        A = np.array([a for a, _ in segs])
+        Bv = np.array([b for _, b in segs]) - A
+        L2 = np.maximum(np.sum(Bv * Bv, axis=1), 1e-12)
+        t = np.clip(np.einsum("gsk,sk->gs", G[:, None, :] - A[None], Bv) / L2[None], 0.0, 1.0)
+        nearest = A[None] + t[..., None] * Bv[None]
+        dist = np.linalg.norm(G[:, None] - nearest, axis=-1)                      # cells x segments
+        within = dist <= reach
+        floor = np.where(within, np.array(seg_e)[None, :], np.inf).min(axis=1)
+        Zf = Z.ravel()
+        Zf = np.where(within.any(axis=1), np.maximum(Zf, floor), np.nan)
+        Z = Zf.reshape(Z.shape)
         E = [[None if not np.isfinite(v) else round(float(v), 3) for v in row] for row in Z]
     return {
         "mode": mode, "axes": axes, "x": xs.round(4).tolist(), "y": ys.round(4).tolist(), "E": E,
