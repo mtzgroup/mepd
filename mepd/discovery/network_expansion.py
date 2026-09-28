@@ -661,7 +661,7 @@ def expand_network(
     products_file: Optional[str] = None, maxiter: int = 500, n_break: int = 2, n_form: int = 2,
     form_distance: float = 4.0, max_products: int = 50, allow_radicals: bool = False,
     allow_zwitterions: bool = False, max_species: int = 200, validate_minima: Optional[dict] = None,
-    workers: int = 1, steer: str = "window", connect: Optional[Callable] = None,
+    workers: int = 1, minimize_seed: bool = True, steer: str = "window", connect: Optional[Callable] = None,
     kinetics: Optional[dict] = None, on_event: OnEvent = None,
 ) -> ExpansionResult:
     """Breadth-first network expansion from `seed`. Each round proposes
@@ -693,8 +693,24 @@ def expand_network(
 
     if products_file is None and is_named(generator):
         get_generator(generator).check()   # fail before any energy is computed
+    # Every barrier and relative energy is measured from minima at this level,
+    # so the seed must be one too: a SMILES embedding or a structure from
+    # another level is not (and would give too-low, even negative, barriers).
     seed = seed.copy()
-    if seed._cached_energy is None:
+    if minimize_seed:
+        opt = _optimize(engine, [StructureNode(structure=seed.structure)], maxiter, None)[0]
+        if isinstance(opt, Exception):
+            raise RuntimeError(f"Could not minimize the seed at this level of theory: {type(opt).__name__}: {opt}")
+        if validate_minima is not None:
+            from mepd.elementarystep import validate_minimum_with_rescue
+
+            opt, record = validate_minimum_with_rescue(
+                opt, engine, frequency_cutoff=float(validate_minima.get("frequency_cutoff", 0.0)),
+                rescue_displacement=float(validate_minima.get("rescue_displacement", 0.1)), label="seed")
+            if not record["is_minimum"]:
+                raise RuntimeError(f"The seed is not a minimum at this level of theory: {record.get('validation')}")
+        seed = opt
+    elif seed._cached_energy is None:
         engine.compute_energies([seed])
     e0 = float(seed.energy)
     symbols = list(seed.symbols)
@@ -703,13 +719,17 @@ def expand_network(
                                                                  allow_radicals=True, allow_zwitterions=True) or "", 0)])
     live = _LiveReactions(seed, e0, workers=workers)
 
+    def _adopt_if_lower(k: int, node) -> None:
+        """Keep the lowest conformer found as species k's reference."""
+        if float(node.energy) < float(result.species[k].node.energy):
+            result.species[k].node = node.copy()
+            result.species[k].rel_energy_kcal = (float(node.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
+
     def _classify(p, guess, opt, record) -> ProposedEdge:
         intended = _connectivity_matches(opt, guess) if p.broken or p.formed else None
         match = next((k for k, s in enumerate(result.species) if _connectivity_matches(opt, s.node)), None)
         if match is not None:
-            if match != p.source and float(opt.energy) < float(result.species[match].node.energy):
-                result.species[match].node = opt.copy()  # keep the lowest conformer found
-                result.species[match].rel_energy_kcal = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
+            _adopt_if_lower(match, opt)
             return ProposedEdge(p.source, p, "reverted" if match == p.source else "known_species", match, intended)
         if len(result.species) >= max_species:
             return ProposedEdge(p.source, p, "failed", error="max_species reached")
@@ -721,19 +741,18 @@ def expand_network(
         return ProposedEdge(p.source, p, "new_species", idx, intended)
 
     def _species_for(node) -> tuple[int, bool]:
-        """The species an IRC end is. One that is no known species is
-        minimized first (an IRC stops short of the minimum), then added as an
-        intermediate; the IRC end never replaces a known species' geometry."""
-        def match_of(n):
-            return next((k for k, s in enumerate(result.species) if _connectivity_matches(n, s.node)), None)
-
-        match = match_of(node)
-        if match is None:
-            opt = _optimize(engine, [StructureNode(structure=node.structure)], maxiter, None)[0]
-            if isinstance(opt, Exception):
-                return -1, False
-            node, match = opt, match_of(opt)
+        """The species an IRC end is. The end is minimized first (an IRC stops
+        short of the minimum). If it is a known species in a lower conformer
+        than the one on record, that conformer becomes the species' reference
+        (barriers are measured from the lowest conformer found); otherwise
+        it joins the network as an intermediate."""
+        opt = _optimize(engine, [StructureNode(structure=node.structure)], maxiter, None)[0]
+        if isinstance(opt, Exception):
+            return -1, False
+        node = opt
+        match = next((k for k, s in enumerate(result.species) if _connectivity_matches(node, s.node)), None)
         if match is not None:
+            _adopt_if_lower(match, node)
             return match, False
         if len(result.species) >= max_species:
             return -1, False

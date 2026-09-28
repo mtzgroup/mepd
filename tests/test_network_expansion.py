@@ -85,7 +85,7 @@ def test_expansion_rounds_add_species_and_link_known_ones_without_reoptimizing()
     result = expand_network(_node("C#N"), eng, rounds=2, allow_zwitterions=True)
     assert [s.smiles for s in result.species] == ["C#N", "[C-]#[NH+]"]
     assert [(e.source, e.target, e.outcome) for e in result.edges] == [(0, 1, "new_species"), (1, 0, "known_species")]
-    assert eng.optimized == 1  # the back-reaction to HCN is not optimized again
+    assert eng.optimized == 2  # the seed and HNC; the back-reaction to HCN is not optimized again
     assert result.connections() == [(0, 1)]
 
 
@@ -258,3 +258,55 @@ def test_the_same_ts_found_by_two_searches_counts_once():
 
     res = expand_network(_node("C#N"), _GraphEngine(), rounds=2, allow_zwitterions=True, steer="flux", connect=connect)
     assert [s.label for s in res.steps] == ["0", "2"]
+
+
+class _ShiftEngine(_GraphEngine):
+    """Energies also fall as atom 0 moves along +x (so a translated copy of a
+    species is a lower 'conformer'); minimizing a structure lowers it by a
+    further 1 mHa, so unminimized input sits above its own minimum."""
+
+    def _energize(self, node, relaxed=False):
+        node = super()._energize(node)
+        node._cached_energy += -1e-4 * float(np.asarray(node.coords)[0, 0]) - (1e-3 if relaxed else 0.0)
+        return node
+
+    def compute_energies(self, nodes):
+        for n in nodes:
+            n._cached_energy = self._energize(n)._cached_energy
+        return [n._cached_energy for n in nodes]
+
+    def compute_geometry_optimization(self, node, keywords=None):
+        self.optimized += 1
+        return [self._energize(node, relaxed=True)]
+
+
+def test_the_seed_is_minimized_before_anything_is_measured_from_it():
+    seed = _node("C#N")
+    raw = _ShiftEngine().compute_energies([seed.copy()])[0]
+    res = expand_network(seed, _ShiftEngine(), allow_zwitterions=True)
+    assert res.species[0].node.energy == pytest.approx(raw - 1e-3)
+    unminimized = expand_network(seed, _ShiftEngine(), allow_zwitterions=True, minimize_seed=False)
+    assert unminimized.species[0].node.energy == pytest.approx(raw)
+
+
+def test_a_lower_conformer_reached_by_an_irc_becomes_the_reference():
+    def connect(pairs, nodes):
+        out = []
+        for i, j in pairs:
+            low = nodes[i].copy()
+            low.structure = low.structure.model_copy(
+                update={"geometry": np.asarray(low.coords) + np.array([10.0, 0.0, 0.0])})
+            low._cached_energy = None
+            ts = nodes[j].copy()
+            ts._cached_energy = max(nodes[i].energy, nodes[j].energy) + 0.02
+            out.append({"start": low, "end": nodes[j], "ts": ts, "label": f"{i}-{j}"})
+        return out
+
+    before = _ShiftEngine().compute_energies([_node("C#N")])[0]
+    res = expand_network(_node("C#N"), _ShiftEngine(), rounds=2, allow_zwitterions=True, steer="flux",
+                         connect=connect)
+    seed = res.species[0]
+    assert seed.rel_energy_kcal < -0.5          # the shifted (lower) seed conformer is now the reference
+    assert float(seed.node.energy) < before - 1e-3
+    energies = [float(s.node.energy) for s in res.species]
+    assert all(st.ts_energy >= max(energies[st.a], energies[st.b]) for st in res.steps)  # no negative barrier
