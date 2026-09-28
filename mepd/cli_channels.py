@@ -22,6 +22,7 @@ import typer
 
 from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
 from mepd.chain import Chain
+from mepd.nodes.nodehelpers import _is_connectivity_identical
 from mepd.cli_common import (
     TsIrcResult,
     _check_endpoint_atom_mapping,
@@ -570,6 +571,22 @@ def _discover_channels(
         for key, cands in edge_candidates.items()
     }
     species_labels = [_species_label(node) for node in species]
+    # A step that reaches a stereo variant of --start/--end (same bonds,
+    # different stereochemistry) is not what was queried: say so, rather
+    # than leave it to be read as an off-target exit or a missing channel.
+    mismatches = []
+    for key in edge_steps:
+        for k in key:
+            if k in (start_cls, end_cls):
+                continue
+            for q, name in ((start_node, "--start"), (end_node, "--end")):
+                if _is_connectivity_identical(species[k], q, verbose=False, collect_comparison=False,
+                                              disregard_stereochem=True):
+                    mismatches.append(f"a step reaches {species_labels[k]}, a stereo variant of {name} "
+                                      f"({_species_label(q)}), not {name} itself")
+    mismatch_warnings = list(dict.fromkeys(mismatches))
+    for msg in mismatch_warnings:
+        typer.echo(f"WARNING: result does not match the queried endpoints: {msg}.")
 
     graph = nx.Graph()
     graph.add_nodes_from(range(len(species)))
@@ -622,6 +639,19 @@ def _discover_channels(
             )
             n_offtarget += 1
 
+    # Off-target results: under --direct-only every leg that ran was meant
+    # to join --start and --end, so each step that doesn't is a mismatch;
+    # in any mode, a run that found nothing but off-target steps is one.
+    offtarget_keys = [key for key in edge_steps if key not in on_route_edges]
+    if offtarget_keys and (getattr(run_inputs.path_min_inputs, "direct_only", False)
+                           or not (channel_clusters or multistep_routes)):
+        for key in offtarget_keys:
+            i, j = sorted(key)
+            mismatch_warnings.append(
+                f"an IRC-verified step connects {species_labels[i]} <-> {species_labels[j]}, "
+                f"not the queried {species_labels[start_cls]} <-> {species_labels[end_cls]}")
+            typer.echo(f"WARNING: result does not match the queried endpoints: {mismatch_warnings[-1]}.")
+
     n_contributing = sum(len(c) for c in channel_clusters)
     typer.echo(
         f"{len(channel_clusters)} channel(s) found for the requested pair "
@@ -629,6 +659,7 @@ def _discover_channels(
         f"{len(multistep_routes)} alternate channel(s), "
         f"{n_offtarget} off-target exit channel(s), {n_failed} failed."
     )
+    return mismatch_warnings
 
 
 def channels(
@@ -865,6 +896,14 @@ def channels(
         "being killed with nothing. Searches already queued at the deadline "
         "still run once. 0 (default) = no budget.",
     ),
+    direct_only: Optional[bool] = typer.Option(
+        None, "--direct-only/--allow-multistep",
+        help="--direct-only: focus compute on the queried pair. When a path search splits, only the pieces "
+        "between queried species (the start or end, in any conformer or stereo variant) are run; legs through other species "
+        "are not. E.g. A->B splitting into A->C, C->D, D->A', A'->B runs only A'->B. Multistep mechanisms "
+        "through intermediates are therefore not characterized. Default: the profile's "
+        "path_min_inputs.direct_only, else every piece is followed.",
+    ),
     validate_minima_with_hessian: bool = typer.Option(
         True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
         help="When a minima-based autosplit is proposed during each pair's MSMEP, "
@@ -949,6 +988,8 @@ def channels(
     from mepd.NetworkBuilder import NetworkBuilder
 
     run_inputs = _open_run_inputs(inputs)
+    if isinstance(direct_only, bool):
+        run_inputs.path_min_inputs.direct_only = direct_only
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
@@ -1239,10 +1280,21 @@ def channels(
     stats["msmep_seconds"] = round(time.perf_counter() - t0, 3)
     if search_deadline is not None:
         stats["search_budget_reached"] = time.time() > search_deadline
+    if getattr(run_inputs.path_min_inputs, "direct_only", False):
+        # Legs through other species that were not run; pairs left with
+        # nothing to search, and pairs with some legs dropped.
+        from mepd.cli_common import direct_only_counts
+
+        stats["direct_only"] = direct_only_counts(pairs_dir)
     _write_stats()
 
     tree_dirs = _completed_tree_dirs(pairs_dir)
     if not tree_dirs:
+        if (stats.get("direct_only") or {}).get("pairs_not_characterized"):
+            # Expected with --direct-only, not a failure: every search needed an intermediate.
+            typer.echo("No direct channel: every pair's path goes through species other than the start and "
+                       "end, and --direct-only does not run those legs. Rerun without it to characterize them.")
+            return
         typer.echo("No pairs completed successfully; nothing to build a network from.")
         raise typer.Exit(code=1)
 
@@ -1261,8 +1313,10 @@ def channels(
     )
 
     t0 = time.perf_counter()
-    _discover_channels(
+    mismatch_warnings = _discover_channels(
         output, start_node, end_node, run_inputs, charge, multiplicity, workers=workers,
     )
+    if mismatch_warnings:
+        stats["endpoint_mismatch_warnings"] = mismatch_warnings
     stats["ts_discovery_seconds"] = round(time.perf_counter() - t0, 3)
     _write_stats()

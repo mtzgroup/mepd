@@ -454,6 +454,39 @@ def _check_endpoint_atom_mapping(
     return result.winner.end_structure
 
 
+def _tree_leaves(tree_dir: Path) -> tuple[set[int], set[int]]:
+    """(searched leaves, direct_only-rejected branches) of a tree on disk,
+    from adj_matrix.txt and the node files alone (no NEB is loaded)."""
+    import numpy as np
+
+    adj = np.atleast_2d(np.loadtxt(tree_dir / "adj_matrix.txt"))
+    n = adj.shape[0]
+    has_children = {i for i in range(n) if any(adj[i, j] for j in range(i + 1, n))}
+    searched = {i for i in range(n) if (tree_dir / f"node_{i}.xyz").exists() and i not in has_children}
+    rejected = {i for i in range(n) if (tree_dir / f"node_{i}_rejected.xyz").exists()}
+    return searched, rejected
+
+
+def _uncharacterized_by_direct_only(tree_dir: Path) -> bool:
+    """A pair tree in which --direct-only left nothing to search: every
+    branch was a leg through other species."""
+    try:
+        searched, rejected = _tree_leaves(tree_dir)
+    except Exception:
+        return False
+    return bool(rejected) and not searched
+
+
+def direct_only_counts(pairs_dir: Path) -> dict:
+    trees = [t for t in pairs_dir.glob("*/tree") if (t / "adj_matrix.txt").exists()]
+    return {
+        "legs_not_run": len(list(pairs_dir.glob("*/tree/node_*_rejected_*.xyz"))),
+        "pairs_not_characterized": sum(1 for t in trees if _uncharacterized_by_direct_only(t)),
+        "pairs_partly_characterized": sum(
+            1 for t in trees if list(t.glob("node_*_rejected_*.xyz")) and not _uncharacterized_by_direct_only(t)),
+    }
+
+
 def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
     """Pair trees that finished AND have a usable root. A pair whose very
     first NEB failed still writes a tree (adj_matrix.txt, with the root saved
@@ -466,6 +499,13 @@ def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
         p / "tree" for p in completion_dir.iterdir()
         if (p / "tree" / "adj_matrix.txt").exists()
     ]
+    rejected = [t for t in trees if _uncharacterized_by_direct_only(t)]
+    if rejected:
+        typer.echo(
+            f"{len(rejected)} pair(s) have no path between the queried species and were not characterized "
+            "(--direct-only): " + ", ".join(t.parent.name for t in sorted(rejected))
+        )
+    trees = [t for t in trees if t not in rejected]
     failed = [t for t in trees if not (t / "node_0.xyz").exists()]
     if failed:
         typer.echo(
@@ -820,6 +860,8 @@ def _collect_ts_guess_tasks(
                     tree_dir = pair_dir / "tree"
                     if not (tree_dir / "adj_matrix.txt").exists():
                         continue
+                    if not (tree_dir / "node_0.xyz").exists():
+                        continue   # root search failed or was not run (--direct-only): already reported
                     try:
                         pair_tree = TreeNode.read_from_disk(
                             tree_dir, chain_parameters=ChainInputs(),

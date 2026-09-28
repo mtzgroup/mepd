@@ -10,10 +10,10 @@ from types import SimpleNamespace
 
 import numpy as np
 from mepd.helper_functions import pairwise
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from mepd.nodes.node import Node, StructureNode
-from mepd.nodes.nodehelpers import _is_connectivity_identical
+from mepd.nodes.nodehelpers import _connectivity_matches, _is_connectivity_identical
 from mepd.elementarystep import elem_step_check_kwargs, check_if_elem_step
 
 from mepd.chain import Chain
@@ -539,6 +539,60 @@ class MSMEP:
         for child_chain in child_chains:
             child_chain._split_ancestors = list(ancestors)
 
+    def _split_pieces_on_target(self, input_chain: Chain, pieces: list[Chain]) -> tuple[list[Chain], list[str]]:
+        """With path_min_inputs.direct_only: (the pieces of a split whose two
+        ends are both queried species -- the root search's endpoints, in any
+        conformer or stereo variant -- and labels of the other species the
+        rest reach).
+
+        A -> B splitting into A -> C, C -> D, D -> A', A' -> B keeps only
+        A' -> B: the legs through C and D are not run. With the option off,
+        or when molecular graphs are disabled (species can't be told apart),
+        every piece is kept."""
+        if not getattr(self.inputs.path_min_inputs, "direct_only", False):
+            return list(pieces), []
+        ancestors = getattr(input_chain, "_split_ancestors", None) or []
+        query = ancestors[0] if ancestors else (input_chain[0], input_chain[-1])
+
+        def queried(node) -> Optional[bool]:
+            """Same bonds as a queried species, stereochemistry aside: a
+            split point that is a stereo variant of an endpoint (e.g.
+            trans-cyclohexene for cyclohexene) still bounds a leg that can
+            hold the direct TS, so that leg is run."""
+            if not isinstance(node, StructureNode) or getattr(node, "graph", None) is None:
+                return None
+            return any(_is_connectivity_identical(node, q, verbose=False, collect_comparison=False,
+                                                  disregard_stereochem=True) for q in query)
+
+        def stereo_variant(node) -> bool:
+            return bool(queried(node)) and not any(_connectivity_matches(node, q) for q in query)
+
+        kept, off, seen = [], [], []
+        for piece in pieces:
+            ends = [piece[0], piece[-1]]
+            flags = [queried(n) for n in ends]
+            if None in flags or all(flags):
+                kept.append(piece)
+                variants = [n for n in ends if flags[0] is not None and stereo_variant(n)]
+                if variants:
+                    try:
+                        names = ", ".join(n.graph.force_smiles() for n in variants)
+                    except Exception:
+                        names = "a stereoisomer"
+                    self._say(f"direct_only: running a leg that ends at a stereo variant of a queried endpoint "
+                              f"({names}), not the endpoint itself; its TS may connect to that variant instead.",
+                              snapshot=True, warn=True)
+                continue
+            for node, ok in zip(ends, flags):
+                if ok or any(_connectivity_matches(node, x) for x in seen):
+                    continue
+                seen.append(node)
+                try:
+                    off.append(node.graph.force_smiles())
+                except Exception:
+                    off.append("an unnamed species")
+        return kept, off
+
     def _endpoints_match(self, a: Node, b: Node) -> bool:
         """The same minimum for cycle detection: for molecules, msmep's
         attempt-skip test (identical coordinates, or `is_identical` within
@@ -729,9 +783,9 @@ class MSMEP:
                 f"({type(exc).__name__}: {exc}). Continuing."
             )
         else:
-            update_status(
-                f"Branch {index} failed with {type(exc).__name__}; continuing recursive search."
-            )
+            # Always say why (the full traceback goes to node_<i>_failed.txt).
+            self._say(f"Branch {index} failed ({type(exc).__name__}: {exc}); continuing the recursive search.",
+                      snapshot=True, warn=True)
         return _failed_leaf(index, status="path_minimization_error", exc=exc, chain=chain)
 
     def _run_recursive_step(
@@ -850,6 +904,26 @@ class MSMEP:
             split_method=elem_step_results.splitting_criterion,
             minimization_results=elem_step_results.minimization_results,
         )
+        kept, offtarget = self._split_pieces_on_target(input_chain, sequence_of_chains)
+        if len(kept) < len(sequence_of_chains):
+            # direct_only: no compute on legs through intermediates. Legs
+            # between queried species (e.g. A' -> B) still run.
+            dropped = len(sequence_of_chains) - len(kept)
+            self._say(
+                f"direct_only: not running {dropped} of {len(sequence_of_chains)} pieces of this split "
+                f"(they reach {', '.join(offtarget)}, not the queried endpoints)"
+                + (f"; running the {len(kept)} between queried species." if kept else "."),
+                snapshot=True, warn=True,
+            )
+            history_node.rejected_chains = [p.copy() for p in sequence_of_chains if p not in kept]
+            if not kept:
+                # The branch ends here without a leaf chain, so no TS is
+                # searched for it; its path is kept (node_<i>_rejected.xyz).
+                leaf = _empty_leaf(tree_node_index, status="offtarget_split_rejected")
+                leaf.rejected_chain = chain_trajectory[-1].copy()
+                leaf.rejected_chains = history_node.rejected_chains
+                return leaf, []
+            sequence_of_chains = kept
         self._set_child_same_pair_split_lineage(
             sequence_of_chains, input_chain, same_pair_split_count + 1
         )

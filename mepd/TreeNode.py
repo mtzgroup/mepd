@@ -4,6 +4,7 @@ from mepd.neb import NEB
 from pathlib import Path
 import numpy as np
 import networkx as nx
+import re
 import shutil
 from mepd.chain import Chain
 from mepd.inputs import ChainInputs, NEBInputs, GIInputs
@@ -96,6 +97,21 @@ class TreeNode:
                     fp=folder_name / f"node_{i}_failed.xyz",
                     write_qcio=write_qcio,
                 )
+                if getattr(node, "leaf_error", None):
+                    (folder_name / f"node_{i}_failed.txt").write_text(
+                        f"{getattr(node, 'leaf_status', 'failed')}: "
+                        f"{getattr(node, 'leaf_error_type', 'Error')}: {node.leaf_error}\n\n"
+                        f"{getattr(node, 'leaf_traceback', '') or ''}")
+            elif getattr(node, "rejected_chain", None) is not None:
+                # direct_only: a path none of whose split pieces joins the
+                # queried endpoints (see MSMEP).
+                node.rejected_chain.write_to_disk(
+                    fp=folder_name / f"node_{i}_rejected.xyz",
+                    write_qcio=write_qcio,
+                )
+            # direct_only: the pieces of this node's split that were not run.
+            for k, piece in enumerate(getattr(node, "rejected_chains", None) or []):
+                piece.write_to_disk(fp=folder_name / f"node_{i}_rejected_{k}.xyz", write_qcio=write_qcio)
 
     def draw(self):
         foo = self.adj_matrix - np.identity(len(self.adj_matrix))
@@ -140,7 +156,11 @@ class TreeNode:
         adj_mat = np.loadtxt(folder_name / "adj_matrix.txt")
         if len(adj_mat.shape) > 0:
 
-            nodes = list(folder_name.glob("node*.xyz"))
+            # Only node_<i>.xyz holds a search; node_<i>_failed.xyz and
+            # node_<i>_rejected*.xyz are records of branches that have none.
+            nodes = sorted((p for p in folder_name.glob("node_*.xyz") if re.fullmatch(r"node_\d+", p.stem)),
+                           key=lambda p: int(p.stem.split("_")[1]))
+            rejected = {int(p.stem.split("_")[1]) for p in folder_name.glob("node_*_rejected.xyz")}
             true_node_indices = [int(p.stem.split("_")[1]) for p in nodes]
             node_list_indices = list(range(len(true_node_indices)))
 
@@ -166,6 +186,7 @@ class TreeNode:
                 matrix=adj_mat,
                 list_of_nodes=neb_nodes,
                 indices_translator=translator,
+                rejected=rejected,
             )
         else:
             neb_nodes = [
@@ -185,7 +206,7 @@ class TreeNode:
 
     @classmethod
     def _get_node_helper(
-        cls, true_node_index, matrix, list_of_nodes, indices_translator
+        cls, true_node_index, matrix, list_of_nodes, indices_translator, rejected=frozenset()
     ):
 
         node = list_of_nodes[indices_translator[true_node_index]]
@@ -193,18 +214,23 @@ class TreeNode:
         ind_nonzero_nodes = row.nonzero()[0] + true_node_index
         ind_children = ind_nonzero_nodes[1:]
         if len(ind_children):
-            children = [
-                cls._get_node_helper(
-                    true_node_index=true_child_index,
-                    matrix=matrix,
-                    list_of_nodes=list_of_nodes,
-                    indices_translator=indices_translator,
-                )
-                for true_child_index in ind_children
-                if matrix[true_child_index]
-                .nonzero()[0]
-                .any()  # i.e. if it was not a 'None' Node
-            ]
+            children = []
+            for true_child_index in ind_children:
+                if matrix[true_child_index].nonzero()[0].any():  # i.e. if it was not a 'None' Node
+                    children.append(cls._get_node_helper(
+                        true_node_index=true_child_index,
+                        matrix=matrix,
+                        list_of_nodes=list_of_nodes,
+                        indices_translator=indices_translator,
+                        rejected=rejected,
+                    ))
+                elif true_child_index in rejected:
+                    # direct_only: a branch that was not run. Kept as an
+                    # empty leaf so its parent is not mistaken for a leaf
+                    # (and TS-optimized) after reloading.
+                    leaf = cls(data=None, children=[], index=int(true_child_index))
+                    leaf.leaf_status = "offtarget_split_rejected"
+                    children.append(leaf)
             return cls(data=node, children=children, index=true_node_index)
         else:
             return cls(data=node, children=[], index=true_node_index)

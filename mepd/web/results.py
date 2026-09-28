@@ -628,6 +628,10 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
             if conf.get(side, {}).get("reused_from")) or None},
         {"label": "Mechanisms", "value": stats.get("n_mechanisms")},
         {"label": "Path searches", "value": stats.get("n_path_searches")},
+        {"label": "Direct only", "value": (
+            f"{stats['direct_only']['legs_not_run']} legs through other species not run, "
+            f"{stats['direct_only']['pairs_not_characterized']} pairs with no direct path"
+            if stats.get("direct_only") else None)},
         {"label": "Distinct mechanisms", "value": ", ".join(sorted({m["mechanism"] for m in mechanisms if m.get("mechanism")})) or None},
         {"label": "Wall time", "value": f"{stats['total_seconds']:.0f} s" if stats.get("total_seconds") else None},
         {"label": "Barrier reference", "value": "lowest reactant conformer / reactant-side IRC end"},

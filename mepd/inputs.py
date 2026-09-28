@@ -209,6 +209,12 @@ class NEBInputs:
         the smallest value that, replayed on the 860 Reaction-QM split trees,
         cuts no reaction's lowest channel (4% of searches avoided; at 4,
         rxn_747's only channel sat below a cut).
+    `direct_only`: during recursive autosplitting, run only the pieces of a
+        split whose two ends are both queried species (the root search's
+        endpoints, in any conformer or stereo variant); pieces reaching any other species are
+        not run. A -> B splitting into A -> C, C -> D, D -> A', A' -> B runs
+        only A' -> B. So no compute goes to intermediates, and multistep
+        routes through them are not characterized. Default False.
     """
 
     climb: bool = True
@@ -244,6 +250,7 @@ class NEBInputs:
     hessian_minima_rescue_displacement: float = 0.1
     recursive_same_pair_split_limit: int = 5
     recursive_cycle_revisits: int = 5
+    direct_only: bool = False
     ts_converged_stop: bool = True
 
     max_steps: float = 2000

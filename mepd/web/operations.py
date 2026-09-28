@@ -162,6 +162,10 @@ class ChannelsParams(Params):
                      cli="--workers", ge=1)
     conformers_only: bool = P(False, "Conformers only", "Stop after conformer pools and pair selection.",
                               cli="--conformers-only", kind="switch")
+    direct_only: bool = P(False, "Only legs between start and end", "When a path search splits, run only the "
+                          "pieces between the start and end species (any conformer or stereoisomer), not legs through other "
+                          "species: A→B splitting into A→C, C→D, D→A′, A′→B runs only A′→B. Multistep routes "
+                          "through intermediates are then not characterized.", cli="--direct-only", kind="switch")
     minimize_ends: bool = P(True, "Minimize endpoints", cli="--minimize-ends", kind="toggle",
                             group="Endpoints", advanced=True)
     endpoints: EndpointMode = P("auto", "Endpoint source", _ENDPOINTS_HELP, kind="custom",
