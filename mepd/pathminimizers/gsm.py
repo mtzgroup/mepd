@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import re
 import shutil
 import socket
 import subprocess
@@ -12,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+
+from typing import Optional
 
 import numpy as np
 
@@ -86,10 +89,12 @@ if __name__ == "__main__":
 # unpickle cost -- but only once for however many hundreds of node
 # requests the run makes, instead of once per request.
 _ENGINE_SERVER_SOURCE = '''#!/usr/bin/env python3
+import json
 import os
 import pickle
 import socket
 import sys
+import threading
 import traceback
 
 import numpy as np
@@ -112,12 +117,17 @@ LIVE_PATH = "live_string.xyz0000"
 # updating chain profile the same way it already does for NEB
 # (mepd.progress.print_chain_step).
 known_nodes = {}
+n_requests = 0
+# GSM built with OpenMP over nodes sends several requests at once: each is
+# served on its own thread, and everything shared below is updated under this.
+_lock = threading.Lock()
 
 
 def _write_live_snapshot():
-    lines = []
+    lines, grads = [], []
     for idx in sorted(known_nodes):
-        symbols, coords, energy, e_reactant = known_nodes[idx]
+        symbols, coords, energy, e_reactant, grad = known_nodes[idx]
+        grads.append(grad)
         v_kcal = (energy - e_reactant) * KCAL_PER_HARTREE
         lines.append(" {}".format(len(symbols)))
         lines.append(" {:.10f}".format(v_kcal))
@@ -127,6 +137,12 @@ def _write_live_snapshot():
     with open(tmp_path, "w") as fh:
         fh.write("\\n".join(lines) + "\\n")
     os.replace(tmp_path, LIVE_PATH)  # atomic, so a concurrent poll never sees a partial write
+    # Each node's gradient (Hartree/Bohr), in snapshot order: lets the live
+    # view fit slopes, not just energies. Written after the string, so a
+    # reader that finds a mismatched count just ignores it.
+    with open(LIVE_PATH + ".grad.tmp", "w") as fh:
+        json.dump(grads, fh)
+    os.replace(LIVE_PATH + ".grad.tmp", LIVE_PATH + ".grad")
 
 
 def handle(endstr, engine, template_node, e_reactant):
@@ -152,16 +168,36 @@ def handle(endstr, engine, template_node, e_reactant):
         for row in gradient_scaled:
             fh.write("{} {} {}\\n".format(row[0], row[1], row[2]))
 
-    with open("grad_calls.count", "a") as fh:
-        fh.write("1\\n")
-
     try:
         node_index = int(endstr.rsplit(".", 1)[-1])
     except ValueError:
         node_index = None
-    if node_index is not None:
-        known_nodes[node_index] = (list(template_node.symbols), coords, energy, e_reactant)
-        _write_live_snapshot()
+    global n_requests
+    with _lock:
+        with open("grad_calls.count", "a") as fh:
+            fh.write("1\\n")
+        # Every request, in order (diagnostics). "node" is GSM's file suffix,
+        # which is its node index + 1; these are the geometries GSM evaluated,
+        # not the strings it holds at the end of an iteration (see
+        # GSM._iteration_strings).
+        n_requests += 1
+        with open("requests.log", "a") as fh:
+            fh.write(json.dumps({"n": n_requests, "node": node_index, "E": energy, "xyz": coords}) + "\\n")
+        if node_index is not None:
+            known_nodes[node_index] = (list(template_node.symbols), coords, energy, e_reactant,
+                                       [round(float(v), 8) for v in gradient.reshape(-1)])
+            _write_live_snapshot()
+
+
+def _serve(conn, engine, template_node, e_reactant, data):
+    try:
+        try:
+            handle(data, engine, template_node, e_reactant)
+            conn.sendall(b"OK")
+        except Exception:
+            conn.sendall(("ERROR\\n" + traceback.format_exc()).encode())
+    finally:
+        conn.close()
 
 
 def main():
@@ -184,18 +220,13 @@ def main():
     try:
         while True:
             conn, _ = server.accept()
-            try:
-                data = conn.recv(4096).decode().strip()
-                if data == "__SHUTDOWN__":
-                    conn.sendall(b"OK")
-                    break
-                try:
-                    handle(data, engine, template_node, e_reactant)
-                    conn.sendall(b"OK")
-                except Exception:
-                    conn.sendall(("ERROR\\n" + traceback.format_exc()).encode())
-            finally:
+            data = conn.recv(4096).decode().strip()
+            if data == "__SHUTDOWN__":
+                conn.sendall(b"OK")
                 conn.close()
+                break
+            threading.Thread(target=_serve, args=(conn, engine, template_node, e_reactant, data),
+                             daemon=True).start()
     finally:
         server.close()
         if os.path.exists(SOCKET_PATH):
@@ -289,6 +320,16 @@ class GSM(PathMinimizer):
             self.gi_inputs = ri.gi_inputs
         self.grad_calls_made = 0
         self.geom_grad_calls_made = 0
+        # One record per molecularGSM invocation (see _gsm_outcome): how it
+        # ended, so callers can tell converged strings from snapshots.
+        self.gsm_attempts: list[dict] = []
+
+    @property
+    def gsm_converged(self) -> Optional[bool]:
+        """Whether the last GSM invocation converged its string (GSM's own
+        -TS-/-XTS- end), False if it ran out of iterations or ended any
+        other way, None if it never ran."""
+        return self.gsm_attempts[-1]["converged"] if self.gsm_attempts else None
 
     def _log(self, *parts, level: str = "info", verbose: int = 1):
         if getattr(self.parameters, "verbosity", 1) < verbose:
@@ -305,6 +346,7 @@ class GSM(PathMinimizer):
         product = chain.nodes[-1]
 
         # Cost of evaluating the two endpoints, mirrors FreezingNEB.optimize_chain.
+        self.gsm_attempts = []
         self.engine.compute_energies([reactant, product])
         self.grad_calls_made += 2
         e_reactant = float(reactant.energy)
@@ -398,9 +440,12 @@ class GSM(PathMinimizer):
                 "growth for this attempt.",
                 level="warning",
             )
-            return self._execute_gsm_attempt(
+            result = self._execute_gsm_attempt(
                 chain, reactant, product, e_reactant, None, allow_early_stop
             )
+            if self.gsm_attempts:
+                self.gsm_attempts[-1]["fell_back_to_scratch"] = True
+            return result
 
     def _execute_gsm_attempt(
         self, chain, reactant, product, e_reactant, seed_nodes, allow_early_stop
@@ -445,6 +490,21 @@ class GSM(PathMinimizer):
 
             n_calls = counter_fp.read_text().count("\n")
             self.grad_calls_made += n_calls
+            chunks = getattr(self, "_last_stdout", [])
+            for _ in range(20):   # the drain thread lags the process exit a little
+                if early_stopped or any("opt_iters over" in c for c in chunks):
+                    break
+                time.sleep(0.05)
+            outcome = self._gsm_outcome("".join(chunks), seeded=bool(seed_nodes),
+                                        early_stopped=early_stopped, n_calls=n_calls)
+            outcome["early_stop_iteration"] = self._early_stop_iteration if early_stopped else None
+            outcome["node_threads"] = getattr(self.parameters, "node_threads", None)
+            self.gsm_attempts.append(outcome)
+            if outcome["stop"] == "max_iter":
+                self._log(f"molecularGSM stopped at max_opt_iters ({outcome['opt_iters']}) without converging "
+                          f"(gradrms {outcome['gradrms']} vs conv_tol "
+                          f"{getattr(self.parameters, 'conv_tol', 0.0005)}); the string is a snapshot.",
+                          level="warning")
             self._log(f"molecularGSM made {n_calls} gradient/energy calls", verbose=2)
             if n_calls == 0:
                 # Even a RESTART from a finished string needs gradients, so
@@ -458,12 +518,9 @@ class GSM(PathMinimizer):
                 ))
 
             if early_stopped:
-                # A killed process never writes stringfile.xyz0000 -- the
-                # last live snapshot (already has pinned, correct
-                # reactant/product endpoints; see _build_live_chain) is the
-                # best final chain there is until/unless optimize_chain's
-                # resume logic decides to try again.
-                final_chain = history[-1]
+                # The string at the end of the iteration the stop fired on
+                # (see _run_gsm), not whatever GSM held when it was killed.
+                final_chain = self._early_stop_chain
             else:
                 final_chain = self._parse_stringfile(
                     workdir, reactant, e_reactant, chain.parameters
@@ -732,6 +789,13 @@ class GSM(PathMinimizer):
         env = os.environ.copy()
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+        # `node_threads`: a molecularGSM build with OpenMP over nodes (see
+        # docs; the stock ASE build runs nodes serially) optimizes this many
+        # nodes of an iteration at once (bit-identical results for any value,
+        # given a build against sequential MKL). None: inherit OMP_NUM_THREADS.
+        node_threads = getattr(self.parameters, "node_threads", None)
+        if node_threads:
+            env["OMP_NUM_THREADS"] = str(int(node_threads))
 
         timeout = getattr(self.parameters, "timeout", None)
         live_path = workdir / "live_string.xyz0000"
@@ -779,8 +843,9 @@ class GSM(PathMinimizer):
         seeded = bool(seed_nodes)
         nnodes_target = len(seed_nodes) if seeded else int(getattr(self.parameters, "nnodes", 9))
         persistence_window = int(
-            getattr(self.parameters, "early_stop_persistence_window", 3)
+            getattr(self.parameters, "early_stop_persistence_window", 10)
         )
+        min_opt_iters = int(getattr(self.parameters, "early_stop_min_opt_iters", 20))
         persistence_rtol = float(
             getattr(self.parameters, "early_stop_minima_rtol", 0.02)
         )
@@ -788,6 +853,28 @@ class GSM(PathMinimizer):
             getattr(self.parameters, "early_stop_minima_min_depth_kcal", 1.0)
         )
         persistence_state = {"index": None, "energy_kcal": None, "count": 0}
+        iteration_state = {"seen": 0}
+        self._early_stop_chain = None
+        self._early_stop_iteration = None
+
+        def _check_iterations() -> bool:
+            """Run the persistent-minimum test on every optimization iteration
+            GSM has completed and we haven't examined yet, in order. The
+            decision and the string returned depend only on GSM's own
+            iterations, never on when this happens to run."""
+            for it, it_chain in self._iteration_strings(
+                workdir, "".join(stdout_chunks), iteration_state,
+                reactant, product, e_reactant, chain_parameters, n_nodes=nnodes_target,
+            ):
+                triggered = self._track_persistent_minima(
+                    it_chain, nnodes_target, persistence_window, persistence_rtol,
+                    persistence_min_depth_kcal, persistence_state,
+                )
+                if triggered and it >= min_opt_iters:
+                    self._early_stop_chain = it_chain
+                    self._early_stop_iteration = it
+                    return True
+            return False
 
         start_time = time.time()
         last_mtime = None
@@ -808,32 +895,53 @@ class GSM(PathMinimizer):
                     live_path, reactant, product, e_reactant, chain_parameters
                 )
                 if live_chain is not None:
-                    history.append(live_chain)
+                    history.append(live_chain)   # display only
                     self._print_live_chain(live_chain, nnodes_target, seeded)
-                    triggered = allow_early_stop and self._track_persistent_minima(
-                        live_chain,
-                        nnodes_target,
-                        persistence_window,
-                        persistence_rtol,
-                        persistence_min_depth_kcal,
-                        persistence_state,
-                    )
-                    if triggered:
-                        self._log(
-                            "Persistent local minimum detected in the live "
-                            "GSM string; stopping early to verify it "
-                            "against check_if_elem_step.",
-                            level="warning",
-                        )
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5.0)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                            proc.wait(timeout=5.0)
-                        early_stopped = True
-                        break
+            if (allow_early_stop and not iteration_state.get("unsupported")
+                    and any("opt_iter:" in c for c in stdout_chunks)
+                    and not (workdir / "scratch" / "iterations.xyz").exists()):
+                # GSM is optimizing but writes no per-iteration strings: the
+                # stock binary. Stopping on an inexact string would make the
+                # result depend on when we looked, so don't stop at all.
+                iteration_state["unsupported"] = True
+                self._log(
+                    "early_stop_on_minima needs mepd's patched molecularGSM (it writes each "
+                    "iteration's string to scratch/iterations.xyz); this binary does not, so GSM "
+                    "runs without early stopping.",
+                    level="warning",
+                )
+            if allow_early_stop and not iteration_state.get("unsupported") and _check_iterations():
+                self._log(
+                    f"Persistent local minimum in GSM's string at optimization iteration "
+                    f"{self._early_stop_iteration}; stopping early to verify it against "
+                    "check_if_elem_step.",
+                    level="warning",
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5.0)
+                early_stopped = True
+                break
             time.sleep(poll_interval)
+
+        if not early_stopped and allow_early_stop and not iteration_state.get("unsupported"):
+            # Iterations GSM finished after our last check (or before it
+            # exited) still count: whether the stop fires must not depend on
+            # when we looked. Wait for the stdout drain to catch up first.
+            for _ in range(40):
+                if any("opt_iters over" in c for c in stdout_chunks):
+                    break
+                time.sleep(0.05)
+            if _check_iterations():
+                self._log(
+                    f"Persistent local minimum in GSM's string at optimization iteration "
+                    f"{self._early_stop_iteration} (found after GSM had finished); using that iteration.",
+                    level="warning",
+                )
+                early_stopped = True
 
         if not early_stopped:
             # One last refresh in case a final write raced the process exit
@@ -853,13 +961,28 @@ class GSM(PathMinimizer):
                     history.append(live_chain)
                     self._print_live_chain(live_chain, nnodes_target, seeded)
 
-            if proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists():
+            if not early_stopped and (proc.returncode != 0 or not (workdir / "stringfile.xyz0000").exists()):
                 raise ElectronicStructureError(
                     msg=f"GSM calculation failed with exit code {proc.returncode}.",
                     obj="".join(stdout_chunks),
                 )
 
+        self._last_stdout = stdout_chunks
         return history, early_stopped
+
+    @staticmethod
+    def _gsm_outcome(stdout: str, *, seeded: bool, early_stopped: bool, n_calls: int) -> dict:
+        """How one molecularGSM run ended, from its stdout: its closing
+        "opt_iters over ... -<marker>-" line (-max_iter- = out of
+        iterations; -TS- / -XTS- = converged climbing/exact TS; -FL- = flat
+        string, no TS), the last optimization iteration and gradient RMS."""
+        ends = re.findall(r"opt_iters over[^\n]*?gradrms:\s*([\d.]+)[^\n]*?-(max_iter|XTS|TS|FL|diss growth)-", stdout)
+        iters = re.findall(r"\boi:\s*(\d+)", stdout) or re.findall(r"opt_iter:\s*(\d+)", stdout)
+        gradrms, marker = (float(ends[-1][0]), ends[-1][1]) if ends else (None, None)
+        stop = "early_stop" if early_stopped else (marker or "unknown")
+        return {"seeded": seeded, "stop": stop, "converged": marker in ("TS", "XTS") and not early_stopped,
+                "opt_iters": int(iters[-1]) if iters else None, "gradrms": gradrms, "grad_calls": n_calls,
+                "fell_back_to_scratch": False}
 
     @staticmethod
     def _track_persistent_minima(
@@ -951,6 +1074,69 @@ class GSM(PathMinimizer):
         state["energy_kcal"] = energy
         return state["count"] >= max(1, window)
 
+    def _iteration_strings(self, workdir: Path, stdout: str, state: dict, reactant, product,
+                           e_reactant: float, chain_parameters, n_nodes: int | None = None) -> list:
+        """Strings at the end of GSM optimization iterations not returned
+        before (`state["seen"]`, updated), as `[(iteration, Chain), ...]` in
+        order, from `scratch/iterations.xyz` -- written after every
+        optimization iteration by mepd's patched molecularGSM build (the
+        stock binary does not write it; then this returns []).
+
+        Each node's energy is GSM's own V_profile value, i.e. from before
+        that node's last step, while its geometry is after it (GSM's final
+        stringfile has the same one-step lag; 0-4 kcal/mol early on, well
+        under 1 near convergence). The stock binary gives no exact
+        per-iteration string: the engine requests (requests.log) are neither
+        the post-step geometries nor always the energies GSM reports (its
+        kNNR surrogate skips some gradients), so no fallback is attempted.
+        """
+        from qcconst.constants import ANGSTROM_TO_BOHR
+
+        natoms = len(reactant.symbols)
+        out = []
+        it_fp = workdir / "scratch" / "iterations.xyz"
+        if not it_fp.exists():
+            return out
+        lines = it_fp.read_text().splitlines()
+        i = 0
+        while i < len(lines):
+            head = lines[i].split()
+            if not head or head[0] != "ITER":
+                i += 1
+                continue
+            it, nnodes = int(head[1]), int(head[3])
+            end = i + 1 + nnodes * (natoms + 2)
+            if end >= len(lines) or lines[end].split()[:1] != ["END_ITER"]:
+                break  # incomplete (still being written)
+            if it > state["seen"]:
+                blocks = []
+                for k in range(nnodes):
+                    b = i + 1 + k * (natoms + 2)
+                    v_kcal = float(lines[b + 1])
+                    coords = [[float(x) for x in row.split()[1:4]] for row in lines[b + 2:b + 2 + natoms]]
+                    blocks.append((v_kcal, coords))
+                out.append((it, self._chain_from_blocks(blocks, reactant, product, e_reactant, chain_parameters)))
+                state["seen"] = it
+            i = end + 1
+        return out
+
+    def _chain_from_blocks(self, blocks, reactant, product, e_reactant: float, chain_parameters) -> Chain:
+        """`[(energy kcal/mol vs reactant, coords Angstrom), ...]` -> Chain with
+        cached energies and the real reactant/product pinned as endpoints."""
+        from qcconst.constants import ANGSTROM_TO_BOHR
+
+        nodes = []
+        for v_kcal, coords in blocks:
+            if coords is None:  # an endpoint placeholder, replaced below
+                nodes.append(reactant)
+                continue
+            node = reactant.update_coords(np.asarray(coords, dtype=float) * ANGSTROM_TO_BOHR)
+            node._cached_energy = e_reactant + v_kcal / _KCAL_PER_HARTREE
+            nodes.append(node)
+        if len(nodes) >= 2:
+            nodes[0], nodes[-1] = reactant, product
+        return Chain.model_validate({"nodes": nodes, "parameters": chain_parameters})
+
     def _print_live_chain(self, live_chain: Chain, nnodes_target: int, seeded: bool) -> None:
         """Render an already-built live chain (see `_build_live_chain`) as a
         live, in-place-updating ASCII profile -- the GSM analogue of the live
@@ -1010,11 +1196,21 @@ class GSM(PathMinimizer):
 
         from qcconst.constants import ANGSTROM_TO_BOHR
 
+        import json
+
+        try:
+            grads = json.loads(live_path.with_name(live_path.name + ".grad").read_text())
+            if len(grads) != len(blocks):
+                grads = None   # written for another snapshot than the one just read
+        except (OSError, ValueError):
+            grads = None
         nodes = []
-        for v_kcal, coords in blocks:
+        for k, (v_kcal, coords) in enumerate(blocks):
             coords_bohr = np.asarray(coords, dtype=float) * ANGSTROM_TO_BOHR
             node = reactant.update_coords(coords_bohr)
             node._cached_energy = e_reactant + v_kcal / _KCAL_PER_HARTREE
+            if grads is not None and grads[k] is not None:
+                node._cached_gradient = np.asarray(grads[k], dtype=float).reshape(-1, 3)
             nodes.append(node)
         if len(nodes) >= 2:
             nodes[0] = reactant

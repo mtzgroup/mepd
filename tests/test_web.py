@@ -807,14 +807,15 @@ def test_overflowing_client_gets_resync_instead_of_silent_loss():
     assert ("resync", {}, None) in items and len(items) < 1000
 
 
-def test_gsm_early_stop_is_off_by_default_and_flagged_when_on():
+def test_gsm_early_stop_is_on_by_default_and_flagged_when_off():
     from mepd.inputs import RunInputs
     from mepd.web.workspace import path_summary
 
-    assert RunInputs(path_min_method="GSM").path_min_inputs.early_stop_on_minima is False
-    assert "early stop off" in path_summary('path_min_method = "GSM"\n')["text"]
-    on = path_summary('path_min_method = "GSM"\n[path_min_inputs]\nearly_stop_on_minima = true\n')
-    assert "early stop on" in on["text"] and any("early_stop_on_minima" in w for w in on["warnings"])
+    pmi = RunInputs(path_min_method="GSM").path_min_inputs
+    assert pmi.early_stop_on_minima is True and pmi.max_opt_iters == 500
+    assert "early stop on" in path_summary('path_min_method = "GSM"\n')["text"]
+    off = path_summary('path_min_method = "GSM"\n[path_min_inputs]\nearly_stop_on_minima = false\n')
+    assert "early stop off" in off["text"] and any("early_stop_on_minima" in w for w in off["warnings"])
 
 
 def test_ts_uses_minimized_geometries_not_the_typed_smiles(client):

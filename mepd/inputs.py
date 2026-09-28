@@ -545,7 +545,10 @@ class RunInputs:
             default_kwds = {
                 "executable": None,  # falls back to $GSM_EXECUTABLE, then "gsm"
                 "nnodes": 9,
-                "max_opt_iters": 80,
+                # Room to actually converge: at 80, strings routinely stopped
+                # unconverged (gradrms 2e-3..9e-3 vs conv_tol 5e-4), and an
+                # unconverged snapshot amplifies tiny input differences.
+                "max_opt_iters": 500,
                 "step_opt_iters": 30,
                 "conv_tol": 0.0005,
                 "add_node_tol": 0.1,
@@ -561,16 +564,25 @@ class RunInputs:
                 "timeout": None,
                 "keep_workdirs": False,
                 "seed_with_geodesic_interpolation": True,
-                # Off by default: when on, GSM is killed once a local minimum
-                # in the live string has held steady for
+                # On by default: GSM is stopped once a local minimum in the
+                # live string has held steady for
                 # `early_stop_persistence_window` consecutive updates (only
                 # checked once growth has finished, and only when
-                # do_elem_step_checks is also True -- see GSM._run_gsm). In
-                # practice it cut runs short too often; the elementary-step
-                # check on the fully converged string still splits real
-                # multi-step paths.
-                "early_stop_on_minima": False,
-                "early_stop_persistence_window": 3,
+                # do_elem_step_checks is also True -- see GSM._run_gsm). A
+                # multistep path has no single TS to converge to, so without
+                # this it runs to max_opt_iters for nothing; the stop is
+                # verified by check_if_elem_step, and GSM resumes to full
+                # convergence when that finds the path elementary after all.
+                "early_stop_on_minima": True,
+                # Counted in GSM optimization iterations (read from the
+                # patched binary's per-iteration strings, never wall-clock
+                # polls), and never before early_stop_min_opt_iters.
+                "early_stop_persistence_window": 10,
+                "early_stop_min_opt_iters": 20,
+                # OpenMP threads over nodes for mepd's patched molecularGSM
+                # (bit-identical results for any count); None = inherit
+                # OMP_NUM_THREADS.
+                "node_threads": None,
                 "early_stop_minima_rtol": 0.02,
                 "early_stop_minima_min_depth_kcal": 1.0,
                 "do_elem_step_checks": True,

@@ -169,12 +169,12 @@ def path_summary(profile_text: Optional[str]) -> dict:
                     "or seed_with_geodesic_interpolation = false to let GSM grow to nnodes itself.")
         else:
             text = f"GSM · grows its own string to {nnodes} nodes"
-        if bool(pmi.get("early_stop_on_minima", False)):
+        if bool(pmi.get("early_stop_on_minima", True)):
             text += " · early stop on"
-            warnings.append("early_stop_on_minima = true: GSM may be stopped at the first intermediate that looks "
-                            "stable, before the string has converged. mepd's default is false.")
         else:
             text += " · early stop off"
+            warnings.append("early_stop_on_minima = false: a multistep path runs to max_opt_iters before it is "
+                            "split. mepd's default is true.")
     else:
         text = f"{method} · {nimages} images"
     return {"text": text, "warnings": warnings}
