@@ -178,6 +178,7 @@ function EdgeDetail({ edge }) {
           </select></label>`)}
         <p class="small muted">Calculations on this edge start from these conformers.</p>
       </div>`}
+      ${st.warning && html`<p class="warn-box small">⚠ ${st.warning}</p>`}
       ${edge.origin?.kind === 'job' && html`<p class="small muted">From <a href="#" onClick=${(e) => { e.preventDefault(); openJob(edge.origin.job); }}>a job result</a>${edge.origin.headline ? ` · ${edge.origin.headline}` : ''}</p>`}
       <div class="segmented wide">
         <button class=${which === 0 ? 'on' : ''} onClick=${() => setWhich(0)}>Start</button>

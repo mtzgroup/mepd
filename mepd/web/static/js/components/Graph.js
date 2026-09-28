@@ -99,7 +99,7 @@ function spawnSpot(c, parent, taken) {
 
 function edgeLabel(e, st) {
   const parts = [];
-  if (st.barrier != null) parts.push(`${st.barrier.toFixed(1)}`);
+  if (st.barrier != null) parts.push(`${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`);
   else if (st.barrierUnverified != null) parts.push(`≈${st.barrierUnverified.toFixed(1)}?`);
   else if (st.status === 'running') parts.push('running…');
   else if (st.status === 'queued') parts.push('queued');

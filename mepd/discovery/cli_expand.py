@@ -179,6 +179,7 @@ def expand(
         _run_msmep_pairs,
     )
     from mepd.discovery.network_expansion import REFERENCES, expand_network
+    from mepd.discovery.kinetics import negative_barrier_warning, raw_barriers
     from mepd.nodes.node import StructureNode
 
     for name, value in (("--rounds", rounds), ("--max-products", max_products), ("--maxiter", maxiter),
@@ -228,6 +229,8 @@ def expand(
                                                total=payload["total"] or None)
             elif event == "candidate_done" and task["id"] is not None:
                 progress.update(task["id"], completed=payload["index"])
+            elif event == "warning":
+                progress.console.print(f"[bold red]WARNING[/bold red] {payload['message']}", highlight=False)
             elif event == "species_found":
                 progress.console.print(f"[green]✓ species {payload['index']}[/green] {payload['smiles']}  "
                                        f"ΔE={payload['rel_energy_kcal']:+.1f} kcal/mol", highlight=False)
@@ -294,9 +297,13 @@ def expand(
         "rounds": result.rounds,
         "steering": {"mode": steer, **({"temperature_K": temperature, "time_s": time_s, "flux_threshold": flux_threshold}
                                         if steer == "flux" else {"energy_window_kcal": energy_window})},
-        "steps": [{"a": st.a, "b": st.b, "ts_energy": st.ts_energy, "barrier_kcal": list(bar), "label": st.label,
-                   "files": st.files}
-                  for st, bar in zip(result.steps, result.kinetics.barriers_kcal if result.kinetics else [])],
+        # barrier_kcal: as computed (a negative one is a problem, flagged in `warning`);
+        # kinetics_barrier_kcal: what the rates used (the TS never below an end).
+        "steps": [{"a": st.a, "b": st.b, "ts_energy": st.ts_energy, "barrier_kcal": list(raw),
+                   "kinetics_barrier_kcal": list(bar), "label": st.label, "files": st.files,
+                   "warning": negative_barrier_warning(st.label, st.a, st.b, *raw)}
+                  for st, bar, raw in zip(result.steps, result.kinetics.barriers_kcal if result.kinetics else [],
+                                          raw_barriers(result.steps, [float(s.node.energy) for s in result.species]))],
         "connections": [list(p) for p in pairs],
         "output_files": files,
     }
@@ -304,6 +311,9 @@ def expand(
     for e in result.edges:
         counts[e.outcome] = counts.get(e.outcome, 0) + 1
     summary["outcomes"] = counts
+    summary["warnings"] = [st["warning"] for st in summary["steps"] if st.get("warning")]
+    for w in summary["warnings"]:
+        typer.echo(f"WARNING: {w}")
 
     if result.kinetics is not None:
         for rec, f, cmax, cend in zip(summary["species"], result.kinetics.flux, result.kinetics.max_concentration,

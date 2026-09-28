@@ -68,7 +68,44 @@ def rate_constants(steps: Sequence[Step], energies: Sequence[float], temperature
     return out
 
 
+# A barrier below this (kcal/mol) is reported, never absorbed: with one level
+# of theory, minimized endpoints and a dense enough path it cannot happen.
+NEGATIVE_BARRIER_TOL = -0.1
+
+
+def raw_barriers(steps: Sequence[Step], energies: Sequence[float]) -> list[tuple[float, float]]:
+    """(TS - E_a, TS - E_b) in kcal/mol as computed: may be negative, which
+    signals a problem (see negative_barrier_warnings)."""
+    return [((s.ts_energy - energies[s.a]) * HARTREE_TO_KCAL_PER_MOL,
+             (s.ts_energy - energies[s.b]) * HARTREE_TO_KCAL_PER_MOL) for s in steps]
+
+
+def negative_barrier_warning(label: str, a: int, b: int, forward: float, reverse: float) -> Optional[str]:
+    """The warning for a step whose TS lies below one of its ends, or None."""
+    bad = [(k, v) for k, v in ((a, forward), (b, reverse)) if v < NEGATIVE_BARRIER_TOL]
+    if not bad:
+        return None
+    where = ", ".join(f"{-v:.1f} kcal/mol below species {k}" for k, v in bad)
+    return (f"Negative barrier for step {label or f'{a} -> {b}'}: its TS is {where}. That cannot happen with one "
+            "level of theory, minimized endpoints and a dense enough path, so something is wrong: an endpoint not "
+            "minimized at this level (e.g. a lower conformer found later), energies from different levels, or a "
+            "path too sparse to catch the real maximum. The kinetics treat this TS as level with that end; the "
+            "raw barrier is what is reported.")
+
+
+def negative_barrier_warnings(steps: Sequence[Step], energies: Sequence[float]) -> list[str]:
+    out = []
+    for s, (f, r) in zip(steps, raw_barriers(steps, energies)):
+        w = negative_barrier_warning(getattr(s, "label", ""), s.a, s.b, f, r)
+        if w:
+            out.append(w)
+    return out
+
+
 def barriers(steps: Sequence[Step], energies: Sequence[float]) -> list[tuple[float, float]]:
+    """The barriers the rate constants use: the TS never below either end.
+    For reporting, use raw_barriers and negative_barrier_warnings -- this
+    clamp must never hide a negative barrier from the user."""
     return [((max(s.ts_energy, energies[s.a], energies[s.b]) - energies[s.a]) * HARTREE_TO_KCAL_PER_MOL,
              (max(s.ts_energy, energies[s.a], energies[s.b]) - energies[s.b]) * HARTREE_TO_KCAL_PER_MOL)
             for s in steps]

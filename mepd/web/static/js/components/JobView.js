@@ -447,6 +447,7 @@ function ResultPanel({ job }) {
       ${result.summary.length > 0 && html`<dl class="summary">
         ${result.summary.map((s) => html`<div><dt>${s.label}</dt><dd>${s.value}</dd></div>`)}
       </dl>`}
+      ${(result.barrier_warnings || []).map((w) => html`<p class="error-box small">⚠ ${w}</p>`)}
       ${result.warnings.length > 0 && html`
         <details class="warn-box small warnings">
           <summary>${result.warnings.length} warning${result.warnings.length > 1 ? 's' : ''} reported by mepd — check before trusting every number</summary>

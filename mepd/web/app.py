@@ -1288,7 +1288,7 @@ def adopt_expansion_steps(manager: JobManager, job: dict) -> bool:
     changed = False
     for st in best.values():
         ev = {"event": "step", "a": st["a"], "b": st["b"], "label": st.get("label"),
-              "barrier_kcal": st.get("barrier_kcal")}
+              "barrier_kcal": st.get("barrier_kcal"), "warning": st.get("warning")}
         changed |= manager._adopt_step(job, ev, nodes, known, final=True)
     return changed
 

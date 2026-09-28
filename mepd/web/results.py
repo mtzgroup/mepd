@@ -713,6 +713,7 @@ def collect_graph_enumeration(out: Path, charge: int, multiplicity: int) -> dict
         paths = collect_network_splits(out, charge, multiplicity)
         result["groups"] += paths["groups"]
         result["headline"] += " · " + paths["headline"]
+    result["warnings"] += list(s.get("warnings") or [])   # e.g. negative barriers the run found
     ts_entries, irc_entries = _expansion_steps(out, s, charge, multiplicity)
     result["groups"] += [g for g in (_group("Transition states (verified steps)", "ts", ts_entries),
                                      _group("IRC paths", "irc", irc_entries)) if g]
@@ -981,7 +982,44 @@ def collect(job: dict, job_dir: Optional[Path] = None) -> dict:
     result = fn(out, int(job.get("charge") or 0), int(job.get("multiplicity") or 1))
     if not job.get("external"):
         result["warnings"] += _log_warnings(out.parent / "stdout.log")
+    _flag_negative_barriers(result)
     return result
+
+
+NEGATIVE_BARRIER_TOL = -0.1  # kcal/mol
+
+
+def negative_barrier_text(barrier: float, what: str = "the barrier") -> str:
+    return (f"{what} is negative ({barrier:.1f} kcal/mol): the TS lies below a minimum it connects. That cannot happen "
+            "with one level of theory, minimized endpoints and a dense enough path, so check that the endpoints were "
+            "minimized at this level (a lower conformer may have been found elsewhere), that every energy comes from "
+            "the same level, and that the path has enough images to catch the real maximum.")
+
+
+def _flag_negative_barriers(result: dict) -> None:
+    """Never let a negative barrier pass quietly: every entry with one is
+    marked, and the result carries a warning for it."""
+    seen = set(result.get("warnings") or [])
+    result.setdefault("barrier_warnings", [])
+    for g in result.get("groups", []):
+        for e in g["entries"]:
+            b = e.get("barrier_kcal")
+            if b is not None and b < NEGATIVE_BARRIER_TOL:
+                e["note"] = ("⚠ negative barrier · " + e["note"]) if e.get("note") else "⚠ negative barrier"
+                e["negative_barrier"] = True
+                w = negative_barrier_text(b, f"{e['label']}: the barrier")
+                if w not in seen:
+                    seen.add(w)
+                    result["barrier_warnings"].append(w)
+    b = result.get("barrier_kcal")
+    if b is not None and b < NEGATIVE_BARRIER_TOL:
+        w = negative_barrier_text(b, "The reported barrier")
+        if w not in seen:
+            result["barrier_warnings"].insert(0, w)
+    # Warnings the run itself reported about negative barriers (e.g. an expansion's steps) go up there too.
+    moved = [w for w in result.get("warnings", []) if "negative barrier" in w.lower()]
+    result["warnings"] = [w for w in result.get("warnings", []) if w not in moved]
+    result["barrier_warnings"] += [w for w in moved if w not in result["barrier_warnings"]]
 
 
 _WARNING_MARKERS = ("failed", "warning", "error", "not converged", "did not converge", "skipping")
@@ -1008,7 +1046,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 13
+RESULT_VERSION = 14
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:
@@ -1043,6 +1081,8 @@ def summarize(result: dict) -> dict:
             # False: the barrier is not backed by IRCs connecting the job's
             # two ends (edges then show it as unconfirmed).
             "barrier_verified": result.get("barrier_verified", True), "counts": counts,
+            "barrier_warning": negative_barrier_text(result["barrier_kcal"])
+            if result.get("barrier_kcal") is not None and result["barrier_kcal"] < NEGATIVE_BARRIER_TOL else None,
             # Which TS sets that barrier (no geometry: that is in route_ts.xyz).
             "route_ts": {k: v for k, v in result["route_ts"].items() if k != "xyz"} if result.get("route_ts") else None}
 

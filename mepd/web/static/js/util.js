@@ -59,7 +59,10 @@ export function edgeStatus(edge, jobs = state.jobs) {
   else if (has('failed')) status = 'failed';
   // Proposed by a network expansion, no path search yet.
   else if (edge.origin?.proposed) status = 'proposed';
-  return { status, barrier, barrierUnverified, count: related.length };
+  // A negative barrier is a problem to see, not a small number: say why.
+  const warning = edge.origin?.barrier_warning || done.map((j) => j.summary?.barrier_warning).find(Boolean)
+    || (barrier != null && barrier < -0.1 ? `Negative barrier (${barrier.toFixed(1)} kcal/mol): the TS lies below an endpoint. With one level of theory, minimized endpoints and a dense enough path this cannot happen: check the endpoints' minimization and level, and the path's density.` : null);
+  return { status, barrier, barrierUnverified, count: related.length, warning };
 }
 
 // Latest status line: live progress if we have it, else what the record had.

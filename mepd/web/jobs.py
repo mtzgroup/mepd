@@ -628,10 +628,18 @@ class JobManager:
                 and old["barrier_kcal"] <= barrier:
             return False   # already the lower barrier of this pair
         label = ev.get("label") or f"step_{ev.get('a')}_{ev.get('b')}"
+        warning = ev.get("warning")
+        if barrier is not None and barrier < -0.1:
+            from mepd.web.results import negative_barrier_text
+
+            # In the edge's direction: this end is above its TS. Shown as it is, never as 0.
+            warning = negative_barrier_text(barrier, "This edge's barrier")
         with self.ws._lock:
             edge["origin"] = {"kind": "job", "job": job["id"], "entry": f"{label}_irc", "group": "irc",
                               "has_ts": True, "barrier_kcal": barrier, "label": label,
-                              "headline": "TS + IRC from the flux-steered expansion"}
+                              "headline": "TS + IRC from the flux-steered expansion",
+                              # A negative barrier is shown as it is, with why it is a problem.
+                              "barrier_warning": warning}
             self.ws._save()
         return True
 

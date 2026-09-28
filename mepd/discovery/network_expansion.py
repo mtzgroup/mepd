@@ -790,23 +790,29 @@ def expand_network(
                 continue
             result.steps.append(Step(a, b, ts_e, found.get("label", ""), dict(found.get("files") or {})))
             if live.enabled:   # the web graph fills that edge in (barrier, TS, IRC) as it happens
-                from mepd.discovery.kinetics import barriers
+                from mepd.discovery.kinetics import negative_barrier_warning, raw_barriers
 
-                # The same barriers the kinetics use (a TS below an end counts as 0); the finished
+                # The raw barriers -- a negative one is shown and flagged, never hidden; the finished
                 # run's summary replaces these if a species' energy drops later.
-                fwd, rev = barriers([result.steps[-1]], [float(s.node.energy) for s in result.species])[0]
+                fwd, rev = raw_barriers([result.steps[-1]], [float(s.node.energy) for s in result.species])[0]
                 live._progress.append_live_event({
                     "event": "step", "a": a, "b": b, "label": found.get("label", ""), "ts_energy": ts_e,
-                    "barrier_kcal": [fwd, rev]})
+                    "barrier_kcal": [fwd, rev],
+                    "warning": negative_barrier_warning(found.get("label", ""), a, b, fwd, rev)})
         energies = [float(s.node.energy) for s in result.species]
         kinetic = simulate(len(result.species), result.steps, energies, temperature=kin["temperature"],
                            time_s=kin["time_s"])
         result.kinetics = kinetic
         picks = select_for_expansion(kinetic, expanded, kin["threshold"])
+        from mepd.discovery.kinetics import negative_barrier_warnings
+
+        warnings = negative_barrier_warnings(result.steps, energies)
+        for w in warnings:
+            _emit(on_event, "warning", message=w)
         result.rounds[-1]["kinetics"] = {
             "connected_pairs": [list(p) for p in pairs], "verified_steps": len(result.steps),
             "flux": kinetic.flux, "max_concentration": kinetic.max_concentration,
-            "final_concentration": kinetic.final_concentration}
+            "final_concentration": kinetic.final_concentration, "warnings": warnings}
         _emit(on_event, "kinetics", round=rnd, flux=kinetic.flux, picks=picks)
         return picks
 
