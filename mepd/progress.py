@@ -1025,12 +1025,17 @@ class ProgressPrinter:
                 except Exception:
                     y_vals = []
             start_smiles, end_smiles = _endpoint_smiles_for_chain(chain)
+            try:   # y is relative to the first image; this puts paths on one scale (e.g. the channels map)
+                energy_ref = float(chain.energies[0])
+            except Exception:
+                energy_ref = None
             chain_plot_payload = {
                 "caption": caption,
                 "x": x_vals,
                 "y": y_vals,
                 "reactant_smiles": start_smiles if start_smiles != "N/A" else "",
                 "product_smiles": end_smiles if end_smiles != "N/A" else "",
+                "energy_ref_hartree": energy_ref,
             }
             state["chain_plot_payload"] = chain_plot_payload
             # Kept outside chain_plot_history on purpose: geometry for the
