@@ -19,6 +19,9 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
+import threading
+import re
 import tempfile
 from pathlib import Path
 
@@ -32,6 +35,48 @@ def missing_programs() -> list[str]:
 def install_hint() -> str:
     return ("needs the CREST (3.x) and xtb programs on PATH: e.g. `conda install -c conda-forge crest xtb`, or the "
             "release binaries from github.com/crest-lab/crest and github.com/grimme-lab/xtb")
+
+
+_DISTORTIONS = re.compile(r"# of distortions\s+(\d+)\s*\n((?:[ \t]*\d+)*)")
+
+
+def _run_with_progress(argv: list[str], cwd: Path, env: dict, timeout: float) -> tuple[int, str]:
+    """Run CREST, reporting its msreact progress as a status line (the
+    terminal spinner, and the web UI's live line via progress.log) about
+    once a second. Returns (exit code, combined output)."""
+    from mepd.progress import update_status
+
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    chunks: list[bytes] = []
+    done_reading = threading.Event()
+
+    def read() -> None:
+        while True:
+            data = proc.stdout.read1(65536)
+            if not data:
+                break
+            chunks.append(data)
+        done_reading.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    update_status("CREST MSReact: distorting the molecule and re-optimizing each distortion...")
+    deadline = time.monotonic() + float(timeout) if timeout else None
+    last = None
+    while not done_reading.wait(1.0):
+        if deadline is not None and time.monotonic() > deadline:
+            proc.kill()
+            reader.join(5)
+            raise subprocess.TimeoutExpired(argv, timeout)
+        m = _DISTORTIONS.findall(b"".join(chunks).decode(errors="replace"))
+        if m:
+            total, finished = int(m[-1][0]), len(m[-1][1].split())
+            if (finished, total) != last:
+                last = (finished, total)
+                update_status(f"CREST MSReact: {finished}/{total} distorted structures optimized")
+    proc.wait()
+    reader.join(5)
+    return proc.returncode, b"".join(chunks).decode(errors="replace")
 
 
 def msreact_products(structure, *, max_products: int = 50, mode: str = "all", nbonds: int = 3, nshifts: int = 0,
@@ -64,13 +109,17 @@ def msreact_products(structure, *, max_products: int = 50, mode: str = "all", nb
             argv.append("-msnoiso")
         elif mode == "isomers":
             argv.append("-msiso")
-        env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_STACKSIZE": "1G"}
-        proc = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, timeout=timeout)
-        (work / "crest.log").write_text(proc.stdout + proc.stderr)
+        # Unbuffered (gfortran buffers a pipe otherwise), so its progress --
+        # "# of distortions N", then 1 2 3 ... as each distorted structure is
+        # optimized -- arrives while it runs and reaches the live view.
+        env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_STACKSIZE": "1G",
+               "GFORTRAN_UNBUFFERED_ALL": "y"}
+        returncode, log = _run_with_progress(argv, work, env, timeout)
+        (work / "crest.log").write_text(log)
         out = work / "crest_msreact_products.xyz"
-        if proc.returncode != 0 or not out.exists():
-            tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-8:])
-            raise RuntimeError(f"crest --msreact failed (exit {proc.returncode}):\n{tail}")
+        if returncode != 0 or not out.exists():
+            tail = "\n".join(log.strip().splitlines()[-8:])
+            raise RuntimeError(f"crest --msreact failed (exit {returncode}):\n{tail}")
         frames = read_multiple_structure_from_file(out, int(structure.charge), int(structure.multiplicity))
         products = []
         for s in frames[: max(1, int(max_products))]:

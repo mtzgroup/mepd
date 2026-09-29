@@ -212,6 +212,10 @@ def expand(
     run_inputs = _open_run_inputs(inputs)
     _echo_run_inputs_summary(run_inputs)
     seed = StructureNode(structure=_load_structure_from_smiles_or_xyz(structure, charge, multiplicity))
+    # A plain line after the settings table: what runs next (the live view
+    # shows the latest line, and a first step such as CREST can be silent).
+    typer.echo(f"Expanding the network from the seed: {rounds} round(s), products proposed by "
+               f"{products and 'the --products file' or generator}.")
     validation = _validation_kwargs(validate_minima_with_hessian, hessian_minimum_frequency_cutoff,
                                     hessian_minima_rescue_displacement)
 

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import sys
@@ -86,6 +87,24 @@ class Broadcaster:
                 while not q.empty():
                     q.get_nowait()
                 q.put_nowait(("resync", {}, None))
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_BOX = set("│┃║╭╮╰╯┏┓┗┛┡┩└┘┌┐├┤┬┴┼─━═╔╗╚╝╠╣╦╩╬ ")
+
+
+def _status_line(lines: list[str]) -> str:
+    """The last line worth showing as a job's live status: not blank, and
+    not a row or border of a table or box a CLI printed (e.g. the settings
+    table `mepd discovery expand` prints first, whose last row would
+    otherwise stand for the job while a silent step such as CREST runs).
+    progress.log's "[main] " prefix is dropped."""
+    for line in reversed(lines or []):
+        text = _ANSI.sub("", line).strip()
+        if not text or text[0] in _BOX or set(text) <= _BOX:
+            continue
+        return text.removeprefix("[main] ")
+    return ""
 
 
 def _tail_lines(fp: Path, n: int = 1, max_bytes: int = 8192) -> list[str]:
@@ -506,8 +525,8 @@ class JobManager:
         if sizes != state.get("sizes"):
             state["sizes"] = sizes
             newest = max(("progress.log", "stdout.log"), key=lambda n: _mtime(jdir / n))
-            last = _tail_lines(jdir / newest) or _tail_lines(jdir / "stdout.log")
-            payload["last_line"] = last[-1] if last else ""
+            last = _tail_lines(jdir / newest, n=40) or _tail_lines(jdir / "stdout.log", n=40)
+            payload["last_line"] = _status_line(last)
             payload["log_size"] = sizes["stdout.log"]
             job["last_line"] = payload["last_line"]
             changed = True
