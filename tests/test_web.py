@@ -174,8 +174,8 @@ def test_invalid_params_are_reported(client):
     assert r.status_code == 400 and "Optimize TS" in r.json()["detail"]
     r = client.post("/api/jobs", json={**body, "params": {"no_such_knob": 1}})
     assert r.status_code == 400 and "no_such_knob" in r.json()["detail"]
-    r = client.post("/api/jobs", json={"op": "nanoreactor", "structures": [s["id"]]})
-    assert r.status_code == 400 and "not available" in r.json()["detail"]
+    r = client.post("/api/jobs", json={"op": "no-such-op", "structures": [s["id"]]})
+    assert r.status_code in (400, 404) and "no-such-op" in r.json()["detail"]
     r = client.post("/api/jobs", json={"op": "ts", "structures": [s["id"]]})
     assert r.status_code == 400
 
@@ -1044,7 +1044,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     (a,) = _add(client, "C=CCOC=C")
     (b,) = _add(client, "C=CCCC=O")
     ts = ws.add_structure(Structure.from_xyz(WATER_BENT_XYZ), name="TS1", origin={"kind": "xyz"}, role="ts")
-    _fake_ts_job(client, [a["id"], b["id"]])      # so edge operations that need a TS (VRI) can build
+    ts_job = _fake_ts_job(client, [a["id"], b["id"]])   # so edge operations that need a TS (VRI) can build
     src = client.post("/api/jobs/import", json={"path": str(_vri_folder(tmp_path)), "op": "vri"}).json()
     client.post("/api/design/new", json={"smiles": "CCO"})   # so the Design tab's minimization can build
     chan = _fake_finished_channels(client, tmp_path, a["id"], b["id"])   # for "Sample more paths"
@@ -1059,7 +1059,8 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
         elif op["target"] == "set":
             body["structures"] = [a["id"], b["id"]]
         elif op["target"] == "job":
-            body["source_job"] = chan["id"] if "channels" in op.get("source_ops", []) else src["id"]
+            body["source_job"] = chan["id"] if "channels" in op.get("source_ops", []) \
+                else ts_job if "ts" in op.get("source_ops", []) else src["id"]
         elif op["target"] == "design":
             pass
         else:

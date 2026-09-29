@@ -73,6 +73,28 @@ _OTHER = [
         ],
     },
     {
+        "feature": "Solvent effects and reaction conditions",
+        "where": "Solvent effects (a TS search's follow-ups); Explore › Conditions",
+        "items": [
+            {"what": "Implicit solvent: ALPB (analytical linearized Poisson–Boltzmann), the default",
+             "cite": ["S. Ehlert, M. Stahn, S. Spicher, S. Grimme, J. Chem. Theory Comput. 17, 4250–4261 (2021), "
+                      "doi:10.1021/acs.jctc.1c00471"]},
+            {"what": "Implicit solvent: GBSA (generalized Born, surface area) in xtb",
+             "cite": ["S. Grimme, C. Bannwarth, P. Shushkov, J. Chem. Theory Comput. 13, 1989–2009 (2017), "
+                      "doi:10.1021/acs.jctc.7b00118"]},
+            {"what": "Implicit solvent: CPCM-X",
+             "cite": ["M. Stahn, S. Ehlert, S. Grimme, J. Phys. Chem. A 127, 7036–7043 (2023), "
+                      "doi:10.1021/acs.jpca.3c04382"]},
+            {"what": "GFN2-xTB, which gives the solvation free energy added to other engines' energies",
+             "note": "mepd's own composite: E(engine) + [E(GFN2-xTB, solvent) − E(GFN2-xTB, gas)]",
+             "cite": ["C. Bannwarth, S. Ehlert, S. Grimme, J. Chem. Theory Comput. 15, 1652–1671 (2019), "
+                      "doi:10.1021/acs.jctc.8b01176"]},
+            {"what": "Rates, half-lives and predicted outcomes (Eyring equation)",
+             "note": "electronic barriers stand in for free energies of activation",
+             "cite": ["H. Eyring, J. Chem. Phys. 3, 107–115 (1935), doi:10.1063/1.1749604"]},
+        ],
+    },
+    {
         "feature": "Valley-ridge inflection",
         "where": "Valley-ridge inflection, Check the bifurcation",
         "items": [
@@ -102,10 +124,15 @@ def references() -> list[dict]:
     """[{feature, where, items: [{what, note?, cite: [{text, url}]}]}]"""
     from mepd.discovery.network_expansion import REFERENCES as EXPANSION
 
+    from mepd.discovery.generators import GENERATORS
+
     expansion = {
         "feature": "Reaction network expansion",
         "where": "Reaction network expansion",
         "items": [{"what": stage.replace("_", " ").capitalize(), "note": m["method"], "cite": m["cite"]}
-                  for stage, m in EXPANSION.items()],
+                  for stage, m in EXPANSION.items()]
+        # Product generators beyond the bond rules (e.g. CREST msreact).
+        + [{"what": gen.label, "note": ref["method"], "cite": ref["cite"]}
+           for gen in GENERATORS.values() for ref in gen.references.values()],
     }
     return [_with_links(e) for e in [*_OTHER, expansion]]

@@ -828,7 +828,13 @@ def expand_network(
         for src in frontier:
             node = result.species[src].node
             coords = np.asarray(node.coords) / ANGSTROM_TO_BOHR
-            if products_file is None and is_named(generator):
+            gen = get_generator(generator) if products_file is None and is_named(generator) else None
+            if gen is not None and gen.kind == "structures":   # e.g. crest-msreact: product geometries
+                gen.check()
+                items = gen.propose(node.structure, max_products=max_products, options=dict(generator_options or {}))
+                props = external_proposals(items, node.structure, src)
+                stats = {gen.name: len(props)}
+            elif gen is not None:
                 props, stats = propose_products(
                     generator, symbols, coords, graph_edges(node), options=generator_options, charge=charge,
                     multiplicity=mult, n_break=n_break, n_form=n_form, form_distance=form_distance,

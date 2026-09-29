@@ -130,12 +130,37 @@ YARP 65, with 39 in common. YARP's extras include ring closures between
 atoms that start more than 4 Å apart; a larger `--form-distance` brings those
 in. mepd in turn keeps some products that YARP's filters drop.
 
+## CREST msreact (`--generator crest-msreact`)
+
+CREST's mass-spectrometry fragment generator (`crest <xyz> --msreact`,
+CREST 3) adds repulsive potentials on bonds (and attractive ones between H
+and lone pairs), optimizes with GFN2-xTB, and keeps the distinct fragments
+and isomers. Every product keeps the input's atoms in order, so mepd
+re-optimizes them at the run's level of theory, classifies and connects
+them like bond-rule products. Use it for a molecule's likely fragments (read
+backwards: precursors) and nearby isomers without enumerating bond changes.
+
+    mepd discovery expand seed.xyz -i inputs.toml --generator crest-msreact \
+        --generator-option mode=fragments      # all | fragments | isomers
+
+Options: `mode`, `nbonds` (how many bonds apart the repulsive potential
+reaches, default 3), `nshifts` (extra optimizations from randomly shifted
+atoms). `--max-products` keeps the lowest GFN2-xTB energies. It needs the
+`crest` and `xtb` programs on PATH (msreact runs `xtb` for its constrained
+optimizations); CREST runs single-threaded. CREST's `-reactor` mode is not
+used: it only analyses an xtb metadynamics trajectory made beforehand.
+
+In the web UI, Bond rules, CREST msreact, Hessian sampling and basin hopping
+are the methods of one "Reaction network expansion" card.
+
 ## Other generators
 
-Generators are registered in `mepd/discovery/generators.py`; `bond-rules` is
-the built-in one. To add one (autodE, Chemoton, …), write a
+Generators are registered in `mepd/discovery/generators.py`: `bond-rules`
+and `crest-msreact` are built in. To add one (autodE, Chemoton, …), write a
 `propose(symbols, coords, edges, **settings)` that returns
-`(proposals, stats)` and register it in `GENERATORS`.
+`(proposals, stats)` (or, with `kind="structures"`,
+`propose(structure, *, max_products, options)` returning product
+Structures) and register it in `GENERATORS`.
 
 These plug in in place of the built-in generator:
 

@@ -328,6 +328,9 @@ def _build_conformers(ctx: JobContext, p: ConformersParams) -> list[str]:
 
 
 class ExpandParams(Params):
+    # Chosen by the method switch (Bond rules / CREST msreact), not in the form.
+    generator: Literal["bond-rules", "crest-msreact"] = P("bond-rules", "Product generator", kind="custom",
+                                                          group="Hidden")
     rounds: int = P(1, "Rounds", "Round 2 proposes products of round 1's new species, and so on.", cli="--rounds", ge=1)
     steer: Literal["auto", "flux", "window"] = P(
         "auto", "Grow the network by", "flux: find a verified TS for every reaction, simulate the kinetics from "
@@ -340,9 +343,19 @@ class ExpandParams(Params):
     flux_threshold: float = P(0.01, "Flux threshold", "Expand a species once the material that flowed into it "
                               "(as a fraction of the seed) reaches this.", cli="--flux-threshold", gt=0,
                               requires="steer=auto|flux", group="Kinetics")
-    n_break: int = P(2, "Bonds broken (max)", cli="--n-break", ge=0)
-    n_form: int = P(2, "Bonds formed (max)", cli="--n-form", ge=0)
-    max_products: int = P(50, "Proposals per species", "Fewest bond changes first.", cli="--max-products", ge=1)
+    n_break: int = P(2, "Bonds broken (max)", cli="--n-break", ge=0, requires="generator=bond-rules")
+    n_form: int = P(2, "Bonds formed (max)", cli="--n-form", ge=0, requires="generator=bond-rules")
+    msreact_mode: Literal["all", "fragments", "isomers"] = P(
+        "all", "Products", "fragments: dissociated products only (e.g. to read as precursors, backwards); "
+        "isomers: non-dissociated only; all: both.", kind="custom", requires="generator=crest-msreact")
+    msreact_nbonds: int = P(3, "Bias bonds up to (bonds apart)", "msreact's repulsive potential acts on atom pairs "
+                            "up to this many bonds apart (CREST default 3).", kind="custom", ge=1,
+                            requires="generator=crest-msreact", advanced=True, group="CREST msreact")
+    msreact_nshifts: int = P(0, "Random-shift optimizations", "Extra optimizations from randomly shifted atoms, for "
+                             "more products (slower).", kind="custom", ge=0, requires="generator=crest-msreact",
+                             advanced=True, group="CREST msreact")
+    max_products: int = P(50, "Proposals per species", "Bond rules: fewest bond changes first. CREST msreact: "
+                          "lowest GFN2-xTB energy first.", cli="--max-products", ge=1)
     energy_window: float = P(60.0, "Expand species within (kcal/mol)", "Only species this close to the seed "
                              "are expanded in the next round.", cli="--energy-window", requires="steer=auto|window")
     explore_within: Optional[float] = P(
@@ -350,11 +363,13 @@ class ExpandParams(Params):
         "Explore; the rest stay in the result, to add by hand. Empty: the 'Expand species within' window (every "
         "species when growing by flux).", ge=0, group="Explore")
     form_distance: float = P(4.0, "Form bonds within (Å)", "Raise it to also close rings between atoms that "
-                             "start far apart.", cli="--form-distance", gt=0, advanced=True, group="Rules")
+                             "start far apart.", cli="--form-distance", gt=0, advanced=True, group="Rules",
+                             requires="generator=bond-rules")
     allow_radicals: bool = P(False, "Allow radicals and carbenes", cli="--allow-radicals", kind="toggle",
-                             advanced=True, group="Rules")
+                             advanced=True, group="Rules", requires="generator=bond-rules")
     allow_zwitterions: bool = P(False, "Allow charge-separated products", "Needed for e.g. isocyanides and CO.",
-                                cli="--allow-zwitterions", kind="switch", advanced=True, group="Rules")
+                                cli="--allow-zwitterions", kind="switch", advanced=True, group="Rules",
+                                requires="generator=bond-rules")
     validate_minima_with_hessian: bool = P(
         True, "Validate species with Hessian", "Every new species must have no imaginary frequency; one that "
         "stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped if that fails.",
@@ -465,6 +480,15 @@ class Operation:
     # unavailable instead of failing when run.
     cli_path: tuple = ()
     cli_extra_flags: tuple = ()
+    # target "job": write into this job's own output folder instead of the
+    # source's (for follow-ups that may run many times side by side).
+    own_output: bool = False
+    # Several operations shown as one card with a method switch (e.g. the
+    # ways of exploring a reaction network). Each method: {label, summary,
+    # fixed: params it sets (hidden in the form), programs: executables it
+    # needs on PATH}.
+    family: Optional[dict] = None
+    methods: tuple = ()
 
     def cli_problem(self) -> Optional[str]:
         if not self.cli_path:
@@ -503,12 +527,28 @@ class Operation:
             "source_ops": list(self.source_ops),
             "needs_route_ts": self.needs_route_ts,
             "schema": self.params_model.model_json_schema() if self.params_model else None,
+            "family": self.family,
+            "methods": [_method_view(m) for m in self.methods],
         }
 
     def parse_params(self, raw: Optional[dict]) -> Params:
         if self.params_model is None:
             return Params()
         return self.params_model.model_validate(raw or {})
+
+
+def _method_view(m: dict) -> dict:
+    import shutil
+
+    missing = [prog for prog in m.get("programs", ()) if shutil.which(prog) is None]
+    return {"label": m["label"], "summary": m.get("summary", ""), "fixed": m.get("fixed", {}), "rank": m.get("rank", 0),
+            "available": not missing,
+            "reason": f"needs {' and '.join(missing)} on the server's PATH ({m['install']})" if missing else ""}
+
+
+NETWORK = {"key": "network", "title": "Reaction network expansion",
+           "summary": "Explore the reactions and minima around a structure. Pick a method; every species found "
+                      "joins Explore, joined to the one it came from."}
 
 
 def _build_ts(ctx: JobContext, p: TsParams) -> list[str]:
@@ -661,6 +701,16 @@ def _build_channels_more(ctx: JobContext, p: ChannelsMoreParams) -> list[str]:
 def _build_tsopt(ctx: JobContext, p: TsOptParams) -> list[str]:
     guess = ctx.snapshot_structure(ctx.structures[0], "guess")
     return ["ts", "--guess", str(guess), *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+def _build_expand(ctx: JobContext, p: ExpandParams) -> list[str]:
+    argv = _build_discovery("expand")(ctx, p)
+    if p.generator == "crest-msreact":
+        out = argv.index("--output")
+        argv[out:out] = ["--generator", "crest-msreact", "--generator-option", f"mode={p.msreact_mode}",
+                         "--generator-option", f"nbonds={p.msreact_nbonds}",
+                         "--generator-option", f"nshifts={p.msreact_nshifts}"]
+    return argv
 
 
 def _build_discovery(command: str):
@@ -892,17 +942,16 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "hessian-sample", "Hessian sampling", "Displace along every normal mode and re-optimize to find "
         "nearby minima. (`mepd discovery hessian-sample`)",
         "structure", EXPLORE, HessianSampleParams, _build_discovery("hessian-sample"),
-        produces=["nearby minima"]),
+        produces=["nearby minima"], family=NETWORK, methods=({
+            "label": "Hessian sampling", "rank": 2, "summary": "Displace along every normal mode and re-optimize: the minima "
+            "one vibration away (conformers, nearby isomers)."},)),
     Operation(
         "hessian-global", "Hessian basin hopping", "Repeated Hessian sampling with Metropolis acceptance: "
         "a global search over minima reachable from the seed. (`mepd discovery hessian-global`)",
         "structure", EXPLORE, HessianGlobalParams, _build_discovery("hessian-global"),
-        produces=["accepted minima"]),
-    Operation(
-        "nanoreactor", "Nanoreactor", "Reactive MD / CREST msreact products around a structure.",
-        "structure", EXPLORE, available=False,
-        unavailable_reason="The engine can generate nanoreactor candidates "
-        "(QCComputeEngine.compute_nanoreactor_candidates), but mepd has no CLI command for it yet."),
+        produces=["accepted minima"], family=NETWORK, methods=({
+            "label": "Basin hopping", "rank": 3, "summary": "Repeated Hessian sampling with Metropolis acceptance: a global "
+            "search over the minima reachable from the seed."},)),
     Operation(
         "conformers", "Conformers", "Sample this molecule's conformers with RDKit or CREST and minimize them; "
         "they are added to the node, and its lowest-energy conformer represents it. (`mepd conformers`)",
@@ -913,9 +962,19 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "graph-enumeration", "Reaction network expansion", "Propose products by breaking and forming up to two "
         "bonds on the molecular graph, keep those with a valid Lewis structure, optimize them, and grow the network "
         "from the species the kinetics reach. (`mepd discovery expand`)",
-        "structure", EXPLORE, ExpandParams, _build_discovery("expand"),
+        "structure", EXPLORE, ExpandParams, _build_expand,
         produces=["product species", "proposed reactions", "network edges (with path search)"],
-        cli_path=("discovery", "expand"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output")),
+        cli_path=("discovery", "expand"),
+        cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output", "--generator", "--generator-option"),
+        family=NETWORK, methods=(
+            {"label": "Bond rules", "rank": 0, "fixed": {"generator": "bond-rules"},
+             "summary": "Break and form up to n bonds on the molecular graph, keep products with a valid Lewis "
+                        "structure, optimize them, and grow from the species the kinetics reach."},
+            {"label": "CREST msreact", "rank": 1, "fixed": {"generator": "crest-msreact"}, "programs": ("crest", "xtb"),
+             "install": "conda install -c conda-forge crest xtb",
+             "summary": "CREST's fragment generator (msreact): biased GFN2-xTB optimizations find the fragments and "
+                        "isomers the molecule can reach, e.g. likely precursors (read backwards) or nearby products. "
+                        "They are re-optimized at your level of theory and grown like any other species."})),
     Operation(
         "network-splits", "All-pairs network", "Run recursive path searches between every pair of the "
         "selected minima and assemble a reaction network. (`mepd network-splits`)",

@@ -6,20 +6,25 @@ order -- and network_expansion does the rest the same way for all of them:
 Lewis/charge/spin check, a 3D guess for each product, optimization, the
 live view, and path searches between the species found.
 
-    bond-rules  mepd's reimplementation of the break/form enumeration of
-                ZStruct (Zimmerman 2013) and YARP (Zhao & Savoie 2021);
-                see network_expansion.enumerate_bond_changes and REFERENCES
+    bond-rules    mepd's reimplementation of the break/form enumeration of
+                  ZStruct (Zimmerman 2013) and YARP (Zhao & Savoie 2021);
+                  see network_expansion.enumerate_bond_changes and REFERENCES
+    crest-msreact CREST's msreact fragment generator (fragments and isomers
+                  from biased GFN2-xTB optimizations); see crest_msreact
 
 Anything else plugs in by import path ("package.module:function", returning
 product Structures in the same atom order); see network_expansion.
 
 To add a generator: write `propose(symbols, coords_angstrom, edges, *, ...)`
-returning (proposals, stats) like `_bond_rules`, and register a `Generator`
+returning (proposals, stats) like `_bond_rules` (kind "bonds"), or
+`propose(structure, *, max_products, options)` returning product Structures
+in the species' atom order (kind "structures"), and register a `Generator`
 in GENERATORS.
 """
 from __future__ import annotations
 
 import importlib.util
+import shutil
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -34,13 +39,19 @@ class Generator:
     install: str = ""
     references: dict = field(default_factory=dict)
     options: dict = field(default_factory=dict)   # generator-specific options and their defaults
+    kind: str = "bonds"        # "bonds": (broken, formed) proposals; "structures": product geometries
+    programs: tuple = ()       # executables that must be on PATH
 
     def available(self) -> bool:
-        return not self.package or importlib.util.find_spec(self.package) is not None
+        return (not self.package or importlib.util.find_spec(self.package) is not None) \
+            and all(shutil.which(p) for p in self.programs)
 
     def check(self) -> None:
-        if not self.available():
+        if self.package and importlib.util.find_spec(self.package) is None:
             raise ImportError(f"The {self.label} generator needs the {self.package!r} package: {self.install}")
+        missing = [p for p in self.programs if shutil.which(p) is None]
+        if missing:
+            raise RuntimeError(f"The {self.label} generator needs {', '.join(missing)} on PATH: {self.install}")
 
 
 def _bond_rules(symbols, coords, edges, *, charge, multiplicity, n_break, n_form, form_distance, max_products,
@@ -55,11 +66,33 @@ def _bond_rules(symbols, coords, edges, *, charge, multiplicity, n_break, n_form
         allow_zwitterions=allow_zwitterions, source=source)
 
 
+def _crest_msreact(structure, *, max_products, options):
+    from mepd.discovery.crest_msreact import msreact_products
+
+    known = {"mode", "nbonds", "nshifts", "nshifts2"}
+    unknown = set(options) - known
+    if unknown:
+        raise ValueError(f"crest-msreact options are {', '.join(sorted(known))} (got {', '.join(sorted(unknown))}).")
+    return msreact_products(structure, max_products=max_products, **options)
+
+
 GENERATORS: dict[str, Generator] = {
     "bond-rules": Generator(
         "bond-rules", "Bond rules (mepd)",
         "Every combination of up to n breaks and m formations between nearby atoms, kept if coordination "
         "and a Lewis structure allow it.", _bond_rules),
+    "crest-msreact": Generator(
+        "crest-msreact", "CREST msreact (fragments and isomers)",
+        "CREST's mass-spectrometry fragment generator: repulsive potentials on bonds, GFN2-xTB optimizations, "
+        "the distinct fragments and isomers kept. Likely fragments (precursors, read backwards) and nearby "
+        "isomers, without enumerating bond changes.", _crest_msreact, kind="structures", programs=("crest", "xtb"),
+        install="conda install -c conda-forge crest xtb (or the release binaries of crest-lab/crest and grimme-lab/xtb)",
+        options={"mode": "all", "nbonds": 3, "nshifts": 0, "nshifts2": 0},
+        references={"crest-msreact": {
+            "method": "CREST msreact: automated fragment generation from biased GFN2-xTB optimizations",
+            "cite": ["P. Pracht, S. Grimme, C. Bannwarth, F. Bohle, S. Ehlert, G. Feldmann, J. Gorges, M. Müller, "
+                     "T. Neudecker, C. Plett, S. Spicher, P. Steinbach, P. A. Wesołowski, F. Zeller, J. Chem. Phys. "
+                     "160, 114110 (2024), doi:10.1063/5.0197592"]}}),
 }
 
 

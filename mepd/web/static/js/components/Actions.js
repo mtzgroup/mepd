@@ -119,7 +119,14 @@ function ProfilePicker({ value, onChange }) {
     </div>`;
 }
 
-function OperationCard({ op, sel, fit, open, onToggle }) {
+// The schema without the fields a method fixes (they are not the user's to set there).
+function withoutFields(schema, keys) {
+  if (!schema || !keys.length) return schema;
+  const properties = Object.fromEntries(Object.entries(schema.properties || {}).filter(([k]) => !keys.includes(k)));
+  return { ...schema, properties };
+}
+
+function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = false }) {
   const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) }));
   // Default to the session's level-of-theory profile, so a calculation runs
   // on the surface its structures were minimized on.
@@ -127,7 +134,7 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState(null);
 
-  useEffect(() => { setPreview(null); }, [sel, values, profile]);
+  useEffect(() => { setPreview(null); }, [sel, values, profile, JSON.stringify(fixed)]);
 
   // Drop remembered keys the schema no longer has.
   const clean = (v) => Object.fromEntries(Object.entries(v).filter(([k]) => k in (op.schema?.properties || {})));
@@ -138,15 +145,16 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
   const [confs, setConfs] = useState(() => ({ ...edgePicks }));
   useEffect(() => { setConfs({ ...edgePicks }); }, [sel.edges.join(','), sel.structures.join(','), JSON.stringify(edgePicks)]);
   const showConfs = ends && ends.some((r) => (r?.conformers || []).length > 1);
+  const params = () => ({ ...clean(values), ...(fixed || {}) });
   const body = (dry) => ({
     op: op.key, structures: sel.structures, edges: sel.edges,
-    params: clean(values), profile, dry_run: dry,
+    params: params(), profile, dry_run: dry,
     ...(showConfs ? { conformers: Object.fromEntries(ends.map((r) => [r.id, confs[r.id] || null])) } : {}),
   });
 
   const run = async () => {
     setBusy(true);
-    prefs.set(`params:${op.key}`, clean(values));
+    prefs.set(`params:${op.key}`, clean(values));   // (a method's fixed params are not remembered as choices)
     prefs.set('profile', profile);
     const jobs = await attempt(() => api.post('/api/jobs', body(false)),
       (js) => (js.length === 1 ? `Queued: ${js[0].title}` : `Queued ${js.length} jobs`));
@@ -196,18 +204,12 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
       <p class="small muted">${op.unavailable_reason}</p>
     </div>`;
   }
-  return html`
-    <div class=${`op-card ${open ? 'open' : ''}`}>
-      <button type="button" class="op-head" onClick=${onToggle} aria-expanded=${open}>
-        <span class="op-text">
-          <span class="op-title">${op.title}</span>
-          <span class="op-summary">${op.summary.replace(/\s*\(`[^`]*`\)\s*$/, '')}</span>
-        </span>
-        <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
-      </button>
-      ${open && html`
+  const formSchema = withoutFields(op.schema, Object.keys(fixed || {}));
+  // The form sees the fixed values too, so fields that depend on them show or hide.
+  const formValues = { ...values, ...(fixed || {}) };
+  const opBody = html`
         <div class="op-body">
-          <${ParamForm} schema=${op.schema} values=${values} onChange=${setValues} />
+          <${ParamForm} schema=${formSchema} values=${formValues} onChange=${(v) => setValues(Object.fromEntries(Object.entries(v).filter(([k]) => !(k in (fixed || {})))))} />
           <${ProfilePicker} value=${profile} onChange=${setProfile} />
           ${showConfs && html`<${EndpointConformers} ends=${ends} value=${confs} onChange=${setConfs} />`}
           ${fit.note && html`<p class="small muted">${fit.note}</p>`}
@@ -220,7 +222,49 @@ function OperationCard({ op, sel, fit, open, onToggle }) {
             <button class="btn-link small" onClick=${showCommand}>Show command</button>
           </div>
           ${preview && html`<pre class="cmd-preview">${preview.join('\n\n')}</pre>`}
-        </div>`}
+        </div>`;
+  if (embedded) return opBody;
+  return html`
+    <div class=${`op-card ${open ? 'open' : ''}`}>
+      <button type="button" class="op-head" onClick=${onToggle} aria-expanded=${open}>
+        <span class="op-text">
+          <span class="op-title">${op.title}</span>
+          <span class="op-summary">${op.summary.replace(/\s*\(`[^`]*`\)\s*$/, '')}</span>
+        </span>
+        <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
+      </button>
+      ${open && opBody}
+    </div>`;
+}
+
+// Several operations as one card: a method switch, then the chosen
+// method's form (e.g. the ways of exploring a reaction network).
+function FamilyCard({ family, methods, sel, open, onToggle }) {
+  const [pick, setPick] = useState(() => {
+    const saved = prefs.get(`family:${family.key}`, null);
+    return methods.some((m) => m.id === saved) ? saved : (methods.find((m) => m.available) || methods[0]).id;
+  });
+  const m = methods.find((x) => x.id === pick) || methods[0];
+  const choose = (id) => { setPick(id); prefs.set(`family:${family.key}`, id); };
+  return html`
+    <div class=${`op-card family ${open ? 'open' : ''}`}>
+      <button type="button" class="op-head" onClick=${onToggle} aria-expanded=${open}>
+        <span class="op-text">
+          <span class="op-title">${family.title}</span>
+          <span class="op-summary">${methods.map((x) => x.label).join(' · ')}</span>
+        </span>
+        <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
+      </button>
+      ${open && html`<div class="family-body">
+        <div class="method-switch" role="tablist">
+          ${methods.map((x) => html`<button role="tab" aria-selected=${x.id === m.id} class=${`method ${x.id === m.id ? 'on' : ''} ${x.available ? '' : 'off'}`}
+            title=${x.available ? x.summary : x.reason} onClick=${() => choose(x.id)}>${x.label}</button>`)}
+        </div>
+        <p class="small method-summary">${m.summary}</p>
+        ${!m.available ? html`<p class="warn-box small">Not available here: ${m.reason}.</p>`
+          : m.fit.disabled ? html`<p class="small why-disabled">${m.fit.disabled}</p>`
+            : html`<${OperationCard} key=${m.id} op=${m.op} sel=${sel} fit=${m.fit} open=${true} embedded fixed=${m.fixed} />`}
+      </div>`}
     </div>`;
 }
 
@@ -237,14 +281,30 @@ export function ActionPanel({ sel }) {
   const fits = all.filter((x) => x.op.available);
   const later = all.filter((x) => !x.op.available);
   const byCat = {};
-  for (const x of fits) (byCat[x.op.category] ||= []).push(x);
+  // Operations of one family (e.g. network exploration) become one card, in its first member's place.
+  const families = {};
+  for (const x of fits) {
+    const fam = x.op.family;
+    if (!fam) { (byCat[x.op.category] ||= []).push(x); continue; }
+    if (!families[fam.key]) {
+      families[fam.key] = { family: fam, methods: [] };
+      (byCat[x.op.category] ||= []).push({ familyKey: fam.key });
+    }
+    for (const [i, meth] of (x.op.methods?.length ? x.op.methods : [{ label: x.op.title, summary: x.op.summary, fixed: {}, available: true }]).entries()) {
+      families[fam.key].methods.push({ ...meth, id: `${x.op.key}:${i}`, op: x.op, fit: x.fit });
+    }
+  }
+  Object.values(families).forEach((f) => f.methods.sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0)));
   return html`
     <section class="actions">
       ${Object.entries(byCat).map(([cat, items]) => html`
         <div class="action-group">
           <h3 class="section-title">${cat}</h3>
-          ${items.map(({ op, fit }) => html`<${OperationCard} key=${op.key} op=${op} sel=${sel} fit=${fit}
-              open=${openKey === op.key} onToggle=${() => setOpenKey(openKey === op.key ? null : op.key)} />`)}
+          ${items.map(({ op, fit, familyKey }) => (familyKey
+            ? html`<${FamilyCard} key=${familyKey} family=${families[familyKey].family} methods=${families[familyKey].methods} sel=${sel}
+                open=${openKey === familyKey} onToggle=${() => setOpenKey(openKey === familyKey ? null : familyKey)} />`
+            : html`<${OperationCard} key=${op.key} op=${op} sel=${sel} fit=${fit}
+                open=${openKey === op.key} onToggle=${() => setOpenKey(openKey === op.key ? null : op.key)} />`))}
         </div>`)}
       ${later.length > 0 && html`<p class="small muted later">Not available yet: ${later.map(({ op }, i) =>
         html`${i ? ', ' : ''}<span title=${op.unavailable_reason}>${op.title}</span>`)}.</p>`}

@@ -924,3 +924,11 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .graph-view-panel .gv-sep { border-top: 1px solid var(--border); margin: 8px 0; }
 .graph-view-panel p { margin: 4px 0; }
 .pg .graph-view-panel { top: 72px; }
+.family-body { padding: 0 12px 10px; }
+.method-switch { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 6px; }
+.method-switch .method { font: inherit; font-size: 12.5px; padding: 4px 10px; border-radius: 14px; border: 1px solid var(--border-strong);
+  background: var(--panel); color: var(--text); cursor: pointer; }
+.method-switch .method.on { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.method-switch .method.off { opacity: .55; }
+.method-summary { margin: 2px 0 8px; color: var(--muted); }
+.family-body .op-body { padding: 0; }
