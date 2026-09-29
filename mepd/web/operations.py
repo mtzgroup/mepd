@@ -546,6 +546,10 @@ def _method_view(m: dict) -> dict:
             "reason": f"needs {' and '.join(missing)} on the server's PATH ({m['install']})" if missing else ""}
 
 
+TS_FAMILY = {"key": "ts", "title": "Transition state",
+             "summary": "Find the transition state(s) between two structures: from these endpoints only, or "
+                        "sampling their conformers and atom mappings for every distinct channel."}
+
 NETWORK = {"key": "network", "title": "Reaction network expansion",
            "summary": "Explore the reactions and minima around a structure. Pick a method; every species found "
                       "joins Explore, joined to the one it came from."}
@@ -910,14 +914,23 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "ts", "Transition state", "Find the minimum-energy path and its transition state(s) between "
         "two structures, optionally refined by TS optimization and IRC. (`mepd run`)",
         "pair", PAIR, TsParams, _build_ts, min_structures=2,
-        produces=["transition states", "IRC endpoints", "intermediates"]),
+        produces=["transition states", "IRC endpoints", "intermediates"], family=TS_FAMILY, methods=({
+            "label": "These endpoints", "rank": 0,
+            "summary": "One path search between these two structures (the chosen conformers): its TS(s), "
+                       "optimized and followed by IRC. Quick. Sample more paths from the result later if you want "
+                       "other conformers or atom mappings."},)),
     Operation(
         "channels", "Reaction channels", "Sample reactant/product conformers and atom mappings, search "
         "every distinct mechanism, and classify the TSs into direct, multi-step and off-target "
         "channels. (`mepd channels`)",
         "pair", PAIR, ChannelsParams, _build_channels, min_structures=2,
         produces=["transition states per channel", "conformers", "off-target products"],
-        cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output", "--start-pool", "--end-pool")),
+        cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output", "--start-pool", "--end-pool"),
+        family=TS_FAMILY, methods=({
+            "label": "Sample conformers and mappings", "rank": 1,
+            "summary": "Reaction channels: sample both ends' conformers and the atom mappings, search every "
+                       "distinct mechanism, and sort the TSs into direct, multi-step and off-target channels. "
+                       "Slower; finds the lowest channel rather than the nearest one."},)),
     Operation(
         "optimize", "Optimize geometry", "Minimize the selected structures at the chosen profile's level of "
         "theory, replacing their geometry and energy in place. (`mepd optimize`)",

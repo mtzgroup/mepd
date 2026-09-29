@@ -56,3 +56,11 @@ def test_the_network_card_offers_four_methods_and_msreact_builds_its_command():
     assert argv[i + 1] == "crest-msreact" and "mode=isomers" in argv and "nshifts=2" in argv
     assert "--n-break" not in argv and argv[-2:] == ["--output", "/out"]
     assert "--generator" not in op.build(Ctx(), op.parse_params({}))   # bond rules: the CLI default
+
+
+def test_ts_and_channels_are_one_card():
+    """A TS from these endpoints and a sampled reaction-channels search are
+    the two methods of one "Transition state" card."""
+    ts, ch = OPERATIONS["ts"], OPERATIONS["channels"]
+    assert ts.family == ch.family and ts.family["title"] == "Transition state"
+    assert [m["label"] for m in ts.methods + ch.methods] == ["These endpoints", "Sample conformers and mappings"]

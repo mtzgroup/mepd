@@ -99,6 +99,10 @@ They are never referenced to the search's own starting geometry.
 **Log warnings.** Problems mepd only reports on stdout (for example, an IRC that failed while the TS
 was kept, or an NEB that never converged) are shown above the results.
 
+### Transition states: one card
+
+*Transition state* has two methods: **These endpoints** (one path search between the two structures, `mepd run`), or **Sample conformers and mappings** (reaction channels, `mepd channels`). Quick start has the same choice as a checkbox. A finished TS search offers **Sample more paths**: a reaction-channels run on the same two structures, conformers and level of theory; the edge keeps the lowest barrier found by either.
+
 ### Reaction SMILES
 
 `reactants>>products` (or `reactants>agents>products`; agents are dropped) gives both ends of a reaction with their atoms matched (`mepd/reaction_smiles.py`). Map numbers in the SMILES are used when every heavy atom has one. Otherwise SLAPMapper maps it, and hydrogens (and ties between mappings) go to the smallest endpoint RMSD. That is fast, not exhaustive; a path search with atom mapping on still weighs the other mappings.

@@ -35,8 +35,7 @@ function EndpointInput({ label, value, onChange, placeholder }) {
 }
 
 const QUICK_MODES = [
-  { key: 'ts', title: 'Transition state', desc: 'MEP + TS optimization + IRC between two structures', pair: true },
-  { key: 'channels', title: 'Reaction channels', desc: 'Sample conformers and mappings, find every distinct channel', pair: true },
+  { key: 'ts', title: 'Transition state', desc: 'MEP + TS optimization + IRC between two structures; optionally sample conformers and mappings', pair: true },
   { key: 'hessian-sample', title: 'Explore nearby minima', desc: 'Hessian normal-mode sampling around one structure', pair: false },
 ];
 
@@ -49,8 +48,11 @@ function QuickStart({ onClose }) {
   const [mult, setMult] = useState('');
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState('');
-  const m = QUICK_MODES.find((x) => x.key === mode);
-  const op = operations.find((o) => o.key === mode);
+  // One "Transition state" mode: these endpoints (ts), or sampling conformers and mappings (channels).
+  const [sample, setSample] = useState(() => prefs.get('quickSample', false));
+  const m = QUICK_MODES.find((x) => x.key === mode) || QUICK_MODES[0];
+  const opKey = mode === 'ts' && sample ? 'channels' : m.key;
+  const op = operations.find((o) => o.key === opKey);
   // "reactants>>products" in the first box gives both ends (atoms mapped).
   const isRxn = (t) => { const x = t.trim().split(/\s/)[0] || ''; return (x.match(/>/g) || []).length === 2; };
   const rxn = m.pair && isRxn(a);
@@ -108,6 +110,9 @@ function QuickStart({ onClose }) {
         ${rxn && html`<p class="small muted rxn-note">Both ends come from this reaction SMILES, with their atoms matched (from the map numbers
           if it has them, else SLAPMapper and the closest match in 3D).</p>`}
       </div>
+      ${mode === 'ts' && html`<label class="small quick-sample" title="Reaction channels: sample both ends' conformers and the atom mappings, search every distinct mechanism, keep the lowest channel. Slower. You can also sample more paths later, from a finished TS search.">
+        <input type="checkbox" checked=${sample} onChange=${(e) => { setSample(e.target.checked); prefs.set('quickSample', e.target.checked); }} />
+        Sample conformers and atom mappings (reaction channels)</label>`}
       <div class="add-row">
         <input type="number" class="tiny" placeholder="charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} />
         <input type="number" class="tiny" placeholder="mult." min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} />
@@ -115,7 +120,7 @@ function QuickStart({ onClose }) {
       </div>
       <div class="modal-foot">
         <button class="btn" onClick=${onClose}>Cancel</button>
-        <button class="btn primary" disabled=${!ready || busy || !op} onClick=${go}>${busy ? (phase || 'Setting up…') : `Run ${m.title.toLowerCase()}`}</button>
+        <button class="btn primary" disabled=${!ready || busy || !op} onClick=${go}>${busy ? (phase || 'Setting up…') : (opKey === 'channels' ? 'Run reaction channels' : `Run ${m.title.toLowerCase()}`)}</button>
       </div>
     <//>`;
 }

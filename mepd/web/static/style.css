@@ -932,3 +932,4 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .method-switch .method.off { opacity: .55; }
 .method-summary { margin: 2px 0 8px; color: var(--muted); }
 .family-body .op-body { padding: 0; }
+.quick-sample { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; }

@@ -457,6 +457,7 @@ function ResultPanel({ job }) {
         </details>`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}
+      ${job.op === 'ts' && html`<${TsFollowUps} job=${job} />`}
       <div class="result-body">
         <div class="entries-col">
           ${pickGroup && html`<${BulkBar} group=${pickGroup} picked=${picked} inGraph=${inGraph} busy=${adding}
@@ -588,6 +589,58 @@ function ChannelsFollowUps({ job }) {
       <${FollowUpCard} op=${op} job=${job} runs=${runs.filter((r) => r.op === op.key)}
         initial=${{ pairs_per_mechanism: cap * 2 }}
         note=${`So far: the best ${cap} conformer pair${cap === 1 ? '' : 's'} per mechanism. Pairs already searched are skipped, and the result and path map then cover all of them.`} />
+    </section>`;
+}
+
+// A finished single-pair TS search: sample more paths for the same pair --
+// a Reaction channels run on the same two structures (and conformers), at
+// the same level of theory.
+function TsFollowUps({ job }) {
+  const operations = useStore((s) => s.operations);
+  const op = operations.find((o) => o.key === 'channels' && o.available);
+  const sameKey = (j) => j.op === 'channels' && j.created > job.created
+    && [...(j.targets?.structures || [])].sort().join() === [...job.targets.structures].sort().join();
+  const runsKey = useStore((s) => Object.values(s.jobs).filter(sameKey).map((j) => `${j.id}:${j.status}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter(sameKey).sort((a, b) => b.created - a.created), [runsKey]);
+  const [open, setOpen] = useState(false);
+  const [values, setValues] = useState(() => (op ? clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get('params:channels', {}) }) : {}));
+  const [busy, setBusy] = useState(false);
+  if (!op || job.status !== 'done' || job.external || job.targets.structures.length !== 2) return null;
+  const last = runs[0];
+  const active = last && ['queued', 'running'].includes(last.status);
+  const conformers = Object.fromEntries(job.targets.structures.map((sid, i) => [sid, job.target_conformers?.[i] || null]));
+  const run = async () => {
+    setBusy(true);
+    prefs.set('params:channels', values);
+    const out = await attempt(() => api.post('/api/jobs', {
+      op: 'channels', structures: job.targets.structures, edges: job.targets.edges || [], params: values,
+      profile: job.profile, conformers }), (js) => `Queued: ${js[0].title}`);
+    setBusy(false);
+    if (out?.length) openJob(out[0].id);
+  };
+  return html`
+    <section class="followups">
+      <h3 class="section-title">Next steps</h3>
+      <div class=${`op-card ${open ? 'open' : ''}`}>
+        <button type="button" class="op-head" onClick=${() => setOpen(!open)} aria-expanded=${open}>
+          <span class="op-text">
+            <span class="op-title">Sample more paths
+              ${last && html` <span class=${`pill ${last.status}`}>${STATUS_LABEL[last.status]}</span>`}</span>
+            <span class="op-summary">This search used one conformer of each end and one atom mapping. Sample both ends' conformers and
+              the atom mappings, search every distinct mechanism, and keep the lowest channel (Reaction channels).</span>
+          </span>
+          <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
+        </button>
+        ${open && html`<div class="op-body">
+          <${ParamForm} schema=${op.schema} values=${values} onChange=${setValues} />
+          <div class="op-run">
+            <button class="btn primary" disabled=${busy || active} onClick=${run}>
+              ${active ? 'Running…' : busy ? 'Queuing…' : last ? 'Sample again' : 'Sample more paths'}</button>
+            ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id); }}>open that run</a>`}
+            <span class="small muted">Same two structures and level of theory; the edge in Explore keeps the lowest barrier found.</span>
+          </div>
+        </div>`}
+      </div>
     </section>`;
 }
 
