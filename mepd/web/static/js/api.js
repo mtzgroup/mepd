@@ -14,6 +14,13 @@ async function request(method, url, body, { raw = false } = {}) {
     let detail = res.statusText;
     try { const j = await res.json(); detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); }
     catch { /* not json */ }
+    // Every 404 the server means to send names what is missing; a bare "Not
+    // Found" is FastAPI's answer for a route it doesn't have -- this page's
+    // code is newer than the running server (updated on disk, not restarted).
+    if (res.status === 404 && detail === 'Not Found' && url.startsWith('/api/')) {
+      throw new Error('The mepd web server is running older code than this page, so it does not have this '
+        + 'feature yet. Restart it (Ctrl-C in its terminal, then run `mepd web` again) and reload the page.');
+    }
     throw new Error(detail || `HTTP ${res.status}`);
   }
   if (raw) return res;

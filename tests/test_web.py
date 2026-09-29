@@ -1155,3 +1155,13 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
     assert job["live_nodes"]["3"] == seed["id"] and len(snap["structures"][seed["id"]]["conformers"]) == 2
     # The seed is represented by its lower-energy conformer.
     assert snap["structures"][seed["id"]]["energy"] == -3.0
+
+
+def test_only_an_unknown_route_answers_a_bare_not_found(client):
+    """The page reads a bare "Not Found" as a server older than itself (a
+    route it doesn't have yet): every 404 the server means must say what is
+    missing instead."""
+    assert client.get("/api/no-such-route").json()["detail"] == "Not Found"
+    for url in ("/api/jobs/j_nope/channels-map", "/api/jobs/j_nope/live/x", "/api/jobs/j_nope/files/x"):
+        r = client.get(url)
+        assert r.status_code in (400, 404) and r.json()["detail"] != "Not Found", url

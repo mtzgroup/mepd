@@ -1017,11 +1017,13 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         """One live stream in full (a finished minimization's whole replay,
         which the progress updates leave out to stay small)."""
         J().get(jid)
+        # (Every deliberate 404 says what is missing: a bare "Not Found" then
+        # means only an unknown route -- a server older than the page.)
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", stream):
-            raise HTTPException(404)
+            raise HTTPException(404, f"no live stream {stream!r}")
         fp = J().job_dir(jid) / "live" / f"{stream}.json"
         if not fp.is_file():
-            raise HTTPException(404)
+            raise HTTPException(404, f"no live stream {stream!r} for this job")
         return _reduce_chain_payload(json.loads(fp.read_text()), full=True)
 
     @app.get("/api/jobs/{jid}/log", response_class=PlainTextResponse)
@@ -1068,7 +1070,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         out = Path(J().get(jid)["output_dir"]).resolve()
         fp = (out / rel).resolve()
         if out not in fp.parents or not fp.is_file():
-            raise HTTPException(404)
+            raise HTTPException(404, f"no file {rel!r} in this job's output")
         return FileResponse(fp)
 
     def _import_picks(job: dict, group: dict, entry: dict, picks: list[int], connect: bool) -> dict:
