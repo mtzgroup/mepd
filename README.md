@@ -22,6 +22,10 @@ uv sync
 uv run pytest
 ```
 
+Every optional feature at once: `uv sync --all-extras --no-extra orb --no-extra mace`.
+Plain `--all-extras` fails, because the `mlip` extra (FAIR-Chem) can't share an environment
+with `orb` or `mace`. To use those, give each its own environment (see `docs/mlip.md`).
+
 ## Quick Start
 
 ```python
