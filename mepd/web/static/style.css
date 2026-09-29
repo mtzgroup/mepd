@@ -299,6 +299,8 @@ input.editable:focus { border-color: var(--accent); background: var(--panel); }
 .job-head-main { flex: 1; min-width: 0; }
 .job-head-main h2 { font-size: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 4px; }
 .cmd-line { margin: 0 24px 8px; }
+.run-picker { margin: 0 24px 8px; }
+.run-picker .pill { font-size: 11px; padding: 0 5px; }
 .cmd-line summary { cursor: pointer; font-size: 13px; color: var(--muted); width: max-content; }
 .cmd-line summary:hover { color: var(--accent); }
 .cmd-body { display: flex; align-items: flex-start; gap: 6px; background: var(--panel-2); border-radius: var(--radius); padding: 6px 8px; margin-top: 6px; }

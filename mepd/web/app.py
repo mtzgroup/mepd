@@ -133,6 +133,7 @@ class JobIn(BaseModel):
     label: str = ""
     dry_run: bool = False
     source_job: Optional[str] = None  # follow-up operations: the job they build on
+    extends: Optional[str] = None     # Sample more paths from a TS search: the page it adds to
     # {structure id: conformer id} to use instead of the lowest; None = the lowest
     # (the run form sends every endpoint, None for the ones left on 'lowest').
     conformers: Optional[dict[str, Optional[str]]] = None
@@ -247,6 +248,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     bus = Broadcaster()
     parse_result = ResultParser()
 
+    async def page_result(manager: JobManager, job: dict) -> dict:
+        """A job's result as its page shows it: a TS search or channels run
+        with Sample more paths runs includes theirs."""
+        view = manager.result_view(job) if manager.page_job(job) is job else job
+        return await parse_result(view, manager.job_dir(job["id"]))
+
     def on_finished(manager: JobManager, job: dict) -> None:
         # Parse results off the event loop, then attach the headline/barrier
         # to the job record so list views and edge badges need no extra fetch.
@@ -277,13 +284,23 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 job["summary"] = {"headline": f"result not readable: {type(exc).__name__}: {exc}",
                                   "barrier_kcal": None, "counts": {}}
             manager._update(job)
+            page = manager.page_job(job)
+            if page is not job and page.get("id") != job.get("source_job"):
+                # Sample more paths from a TS search: its page now shows these paths too.
+                (manager.job_dir(page["id"]) / "result.json").unlink(missing_ok=True)
+                try:
+                    page["summary"] = summarize(await page_result(manager, page))
+                except Exception:
+                    pass
+                page["result_rev"] = int(page.get("result_rev") or 0) + 1
+                manager._update(page)
             source = manager.jobs.get(job.get("source_job") or "")
             if source is not None:
                 # A follow-up (e.g. vri-check) changed the source job's result:
                 # re-read it, and let every open view of it refresh.
                 (manager.job_dir(source["id"]) / "result.json").unlink(missing_ok=True)
                 try:
-                    source["summary"] = summarize(await parse_result(source, manager.job_dir(source["id"])))
+                    source["summary"] = summarize(await page_result(manager, source))
                 except Exception:
                     pass
                 source["result_rev"] = int(source.get("result_rev") or 0) + 1
@@ -302,7 +319,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             async def redo() -> None:
                 for job in stale:
                     try:
-                        job["summary"] = summarize(await parse_result(job, manager.job_dir(job["id"])))
+                        job["summary"] = summarize(await page_result(manager, job))
                         manager._update(job)
                     except Exception:
                         continue
@@ -1123,7 +1140,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         # It only snapshots files and builds argv, so it is quick.
         created = J().submit(body.op, structure_ids=body.structures, edge_ids=body.edges,
                              params=body.params, profile=body.profile, label=body.label,
-                             dry_run=body.dry_run, source_job_id=body.source_job, conformers=body.conformers)
+                             dry_run=body.dry_run, source_job_id=body.source_job, conformers=body.conformers,
+                             extends_job_id=body.extends)
         if body.op == "optimize" and not body.dry_run:
             W().set_status(body.structures, "optimizing")
             publish_ws()
@@ -1139,15 +1157,22 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
         if mode not in ("bonds", "distance", "irc"):
             raise HTTPException(400, "mode is 'bonds', 'distance' or 'irc'")
-        job = J().get(jid)
-        # A "Sample more paths" follow-up shares its source's folder: one map for the run and all of them.
-        base = J().get(job["source_job"]) if job.get("op") == "channels-more" and job.get("source_job") in J().jobs else job
-        family = [base] + sorted((j for j in J().jobs.values()
-                                  if j.get("op") == "channels-more" and j.get("source_job") == base["id"]),
-                                 key=lambda j: j["created"])
+        # Sample more paths runs add to their page's run: one map for all of them.
+        family = J().family(J().get(jid))
+        base = family[0]
         jdirs = [J().job_dir(j["id"]) for j in family]
-        jdir, out = jdirs[0], Path(base["output_dir"])
+        view = J().result_view(base)
+        jdir, out = jdirs[0], Path((view.get("extension") or view)["output_dir"])
         running = any(j["status"] == "running" for j in family)
+        search = None
+        if base["op"] == "ts" and out != Path(base["output_dir"]):
+            # The first search's TSs, as its merged result classified them.
+            kind = {"channel": "direct", "alternate": "multi-step"}
+            res = await page_result(J(), base)
+            kinds = {e["id"].removeprefix("first_").removesuffix("_irc"): kind.get(g["kind"], "other")
+                     for g in res["groups"] if g["kind"] in ("channel", "alternate", "offtarget")
+                     for e in g["entries"] if e["id"].startswith("first_")}
+            search = (Path(base["output_dir"]), kinds)
 
         def signature():
             files = [f for d in jdirs for f in (d / "live").glob("*.json")] + list((out / "ts").glob("ts_pair_*"))
@@ -1161,20 +1186,24 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         hit = _channels_map_cache.get(key)
         if hit and hit[0] == sig:
             return hit[1]
-        result = await run_in_threadpool(channels_map, jdirs, mode, 64, running, out, ts)
+        result = await run_in_threadpool(channels_map, jdirs, mode, 64, running, out, ts, search)
         _channels_map_cache[key] = (sig, result)
         if len(_channels_map_cache) > 32:
             _channels_map_cache.pop(next(iter(_channels_map_cache)))
         return result
 
     def _tree_family(jid: str):
-        """(job dirs, output dir, running) of a job and the follow-ups that share its folder."""
+        """(job dirs, output dirs, running) of a job and the follow-ups that share its folder
+        or its page (Sample more paths)."""
         job = J().get(jid)
-        base = J().get(job["source_job"]) if job.get("source_job") in J().jobs and \
-            J().jobs[job["source_job"]].get("output_dir") == job.get("output_dir") else job
-        family = [base] + sorted((j for j in J().jobs.values() if j.get("source_job") == base["id"]
-                                  and j.get("output_dir") == base.get("output_dir")), key=lambda j: j["created"])
-        return ([J().job_dir(j["id"]) for j in family], Path(base["output_dir"]),
+        family = J().family(job)
+        if len(family) == 1:
+            base = J().get(job["source_job"]) if job.get("source_job") in J().jobs and \
+                J().jobs[job["source_job"]].get("output_dir") == job.get("output_dir") else job
+            family = [base] + sorted((j for j in J().jobs.values() if j.get("source_job") == base["id"]
+                                      and j.get("output_dir") == base.get("output_dir")), key=lambda j: j["created"])
+        outs = list(dict.fromkeys(Path(j["output_dir"]) for j in family))
+        return ([J().job_dir(j["id"]) for j in family], outs,
                 any(j["status"] == "running" for j in family))
 
     def _stream(tid: str) -> str:
@@ -1267,8 +1296,11 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         # means only an unknown route -- a server older than the page.)
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", stream):
             raise HTTPException(404, f"no live stream {stream!r}")
-        fp = J().job_dir(jid) / "live" / f"{stream}.json"
-        if not fp.is_file():
+        # On a page with Sample more paths runs, any of them (the newest first).
+        job = J().get(jid)
+        runs = reversed(J().family(job)) if J().page_job(job) is job else [job]
+        fp = next((f for f in (J().job_dir(j["id"]) / "live" / f"{stream}.json" for j in runs) if f.is_file()), None)
+        if fp is None:
             raise HTTPException(404, f"no live stream {stream!r} for this job")
         return _reduce_chain_payload(json.loads(fp.read_text()), full=True)
 
@@ -1288,8 +1320,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
     @app.get("/api/jobs/{jid}/result")
     async def job_result(jid: str):
-        job = J().get(jid)
-        return await parse_result(job, J().job_dir(jid))
+        return await page_result(J(), J().get(jid))
 
     @app.post("/api/jobs/{jid}/cancel")
     async def cancel(jid: str):
@@ -1368,7 +1399,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         """Pull structures out of a result into the Graph, optionally
         connecting them with an edge that remembers where it came from."""
         job = J().get(jid)
-        result = await parse_result(job, J().job_dir(jid))
+        result = await page_result(J(), job)
         try:
             group, entry = find_entry(result, body.entry)
         except KeyError:
@@ -1394,7 +1425,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         """Bulk "Add to Graph": the structure of each chosen entry -- its only
         frame, or the TS of a path -- in one request and one update."""
         job = J().get(jid)
-        result = await parse_result(job, J().job_dir(jid))
+        result = await page_result(J(), job)
         chosen = []
         for eid in dict.fromkeys(body.entries):
             try:

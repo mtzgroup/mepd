@@ -117,14 +117,14 @@ function Surface({ map, pairColor, selected, onSelect, hover, setHover }) {
       <text x="14" y=${(T + H - B) / 2} transform=${`rotate(-90 14 ${(T + H - B) / 2})`} text-anchor="middle">${map.axes.y}</text>
       ${hover?.ts && html`<g style="pointer-events:none">
         <text x=${Math.min(sx(hover.ts.q[0]) + 12, W - 330)} y=${Math.max(sy(hover.ts.q[1]) - 34, 24)} class="cmap-tip">
-          TS ${hover.ts.pair.replace(/_/g, ' ')}: ${hover.ts.e.toFixed(1)} kcal/mol · ${hover.ts.kind === 'direct' ? `direct channel${hover.ts.group ? ` (${hover.ts.group.replace('_', ' ')})` : ''}` : hover.ts.kind === 'multi-step' ? 'step of a multi-step channel' : 'IRC does not connect the ends'}</text>
+          TS ${pairName(hover.ts.pair)}: ${hover.ts.e.toFixed(1)} kcal/mol · ${hover.ts.kind === 'direct' ? `direct channel${hover.ts.group ? ` (${hover.ts.group.replace('_', ' ')})` : ''}` : hover.ts.kind === 'multi-step' ? 'step of a multi-step channel' : 'IRC does not connect the ends'}</text>
         ${hover.ts.closest && html`<text x=${Math.min(sx(hover.ts.q[0]) + 12, W - 330)} y=${Math.max(sy(hover.ts.q[1]) - 34, 24) + 15} class="cmap-tip">
           closest image: ${hover.ts.closest.rmsd.toFixed(2)} Å RMSD (image ${hover.ts.closest.image + 1}, ${hover.ts.closest.monitor})</text>`}
       </g>`}
       ${hover && !hover.ts && html`<g style="pointer-events:none">
         <circle cx=${sx(hover.q[0])} cy=${sy(hover.q[1])} r="7" fill="none" stroke="#ffd23f" stroke-width="3" />
         <text x=${Math.min(sx(hover.q[0]) + 10, W - 170)} y=${Math.max(sy(hover.q[1]) - 10, 24)} class="cmap-tip">
-          ${hover.p.pair.replace(/_/g, ' ')} · ${hover.p.monitor} · image ${hover.k + 1}: ${hover.q[2] == null ? '—' : `${hover.q[2].toFixed(1)} kcal/mol`}</text>
+          ${pairName(hover.p.pair)} · ${hover.p.monitor} · image ${hover.k + 1}: ${hover.q[2] == null ? '—' : `${hover.q[2].toFixed(1)} kcal/mol`}</text>
       </g>`}
     </svg>
     <div class="cmap-legend small">
@@ -149,7 +149,7 @@ function PathDetail({ job, path, pairColor, marks = [] }) {
   }, [path.id, path.points.length]);
   const top = Math.max(...path.points.map((q) => q[2] ?? -1e9));
   return html`<div class="cmap-detail">
-    <h4><span class="cmap-swatch" style=${`background:${pairColor(path.pair)}`}></span>${path.pair.replace(/_/g, ' ')} · ${path.monitor}${path.active ? ' · relaxing now' : ''}</h4>
+    <h4><span class="cmap-swatch" style=${`background:${pairColor(path.pair)}`}></span>${pairName(path.pair)} · ${path.monitor}${path.active ? ' · relaxing now' : ''}</h4>
     ${path.bonds && html`<p class="small">${path.bonds.kind === 'break-form'
       ? html`x: breaks <b>${path.bonds.x.join(', ') || '—'}</b> · y: forms <b>${path.bonds.y.join(', ') || '—'}</b>`
       : html`x: ${path.bonds.kind} <b>${path.bonds.x.join(', ')}</b> · y: ${path.bonds.kind} <b>${path.bonds.y.join(', ') || '—'}</b>`}</p>`}
@@ -163,6 +163,9 @@ function PathDetail({ job, path, pairColor, marks = [] }) {
       <div class="small muted">image ${Math.min(k, frames.length - 1) + 1} of ${frames.length}${path.points[k]?.[2] != null ? ` · ${path.points[k][2].toFixed(1)} kcal/mol` : ''}</div>`}
   </div>`;
 }
+
+// 'main' is the TS search that Sample more paths runs were added to.
+const pairName = (pair) => (pair === 'main' ? 'first search' : pair.replace(/_/g, ' '));
 
 export function ChannelsMap({ job }) {
   const [mode, setModeState] = useState(() => prefs.get('channelsMapMode', 'bonds'));
@@ -207,7 +210,7 @@ export function ChannelsMap({ job }) {
       </div>
       ${mode === 'irc' && choices.length > 0 && html`<label class="small">IRC of
         <select value=${map?.irc?.ts || ''} onChange=${(e) => setIrcTs(e.target.value)}>
-          ${choices.map((c) => html`<option value=${c.label}>${c.pair.replace(/_/g, ' ')} · ${c.e.toFixed(1)} kcal/mol · ${c.kind === 'direct' ? 'direct channel' : c.kind === 'multi-step' ? 'multi-step' : 'unconnected'}</option>`)}
+          ${choices.map((c) => html`<option value=${c.label}>${pairName(c.pair)} · ${c.e.toFixed(1)} kcal/mol · ${c.kind === 'direct' ? 'direct channel' : c.kind === 'multi-step' ? 'multi-step' : 'unconnected'}</option>`)}
         </select></label>`}
       <span class="small muted">${map ? `${map.paths.length} path${map.paths.length === 1 ? '' : 's'} · ${pairs.length} pair${pairs.length === 1 ? '' : 's'}` : ''}${job.status === 'running' ? ' · updating live' : ''}</span>
     </div>
@@ -226,7 +229,7 @@ export function ChannelsMap({ job }) {
       <${Surface} map=${map} pairColor=${pairColor} selected=${selected} onSelect=${setSelected} hover=${hover} setHover=${setHover} />
       <div class="cmap-side">
         <ul class="cmap-pairs small">${map.paths.map((p) => html`<li class=${p.id === selected ? 'on' : ''} onClick=${() => setSelected(p.id === selected ? null : p.id)}>
-          <span class="cmap-swatch" style=${`background:${pairColor(p.pair)}`}></span>${p.pair.replace(/_/g, ' ')} <span class="muted">· ${p.monitor}</span>${p.active ? html` <span class="badge">relaxing</span>` : p.verdict === 'split' ? html` <span class="muted">· split</span>` : p.verdict === 'elementary' ? html` <span class="muted">· elementary</span>` : p.verdict === 'unresolved' ? html` <span class="muted">· unresolved</span>` : ''}</li>`)}</ul>
+          <span class="cmap-swatch" style=${`background:${pairColor(p.pair)}`}></span>${pairName(p.pair)} <span class="muted">· ${p.monitor}</span>${p.active ? html` <span class="badge">relaxing</span>` : p.verdict === 'split' ? html` <span class="muted">· split</span>` : p.verdict === 'elementary' ? html` <span class="muted">· elementary</span>` : p.verdict === 'unresolved' ? html` <span class="muted">· unresolved</span>` : ''}</li>`)}</ul>
         ${sel ? html`<${PathDetail} job=${job} path=${sel} pairColor=${pairColor} marks=${map.ts || []} />` : html`<p class="small muted">Click a path to see its bonds and step through its images.</p>`}
       </div>
     </div>`}

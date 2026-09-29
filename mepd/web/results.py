@@ -221,9 +221,12 @@ def _tree_leaf_chains(tree_dir: Path, charge: int, multiplicity: int) -> list[tu
 
 # ------------------------------------------------------------ collectors
 
-def collect_ts(out: Path, charge: int, multiplicity: int) -> dict:
+def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[float] = None,
+               _extra: Optional[dict] = None) -> dict:
     """`mepd run` output: mep_output.xyz, tree/, ts[_leaf_k].xyz (+ _irc),
-    network_completion/ + network.json."""
+    network_completion/ + network.json. `floor_hint`: a lower reactant
+    energy found elsewhere (runs shown together share one floor); `_extra`
+    gets the floor and the route (for collect_ts_extended)."""
     warnings: list[str] = []
     mep = _load_chain(out / "mep_output.xyz", charge, multiplicity)
     ts_items = [(label, ts, _oriented(irc, mep[0], mep[-1]) if mep is not None else irc)
@@ -238,7 +241,7 @@ def collect_ts(out: Path, charge: int, multiplicity: int) -> dict:
         for end in (irc[0], irc[-1]):
             if reactant is not None and _same_connectivity(end, reactant):
                 floor_candidates.append(_node_energy(end))
-    floor = _min(floor_candidates)
+    floor = _min(floor_candidates + [floor_hint])
 
     groups = []
     if mep is not None:
@@ -257,6 +260,8 @@ def collect_ts(out: Path, charge: int, multiplicity: int) -> dict:
 
     ts_entries, off_route, irc_entries = [], [], []
     route = _verify_route(reactant, mep[-1] if mep is not None else None, ts_items, floor)
+    if _extra is not None:
+        _extra.update(floor=floor, route=route)
     for info in route["items"]:
         label, ts_node, irc, barrier = info["label"], info["ts"], info["irc"], info["barrier"]
         entry = _entry(label, label, [ts_node], floor, barrier=barrier, note=info["note"])
@@ -488,7 +493,9 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
                    ts_entries[0]["barrier_kcal"] if len(ts_entries) == 1 else None)
 
 
-def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
+def collect_channels(out: Path, charge: int, multiplicity: int, floor_hint: Optional[float] = None,
+                     _extra: Optional[dict] = None) -> dict:
+    """`floor_hint`, `_extra`: as for collect_ts."""
     warnings: list[str] = []
     stats = _read_json(out / "stats.json") or {}
     start_pool = _load_chain(out / "conformers" / "start.xyz", charge, multiplicity)
@@ -543,7 +550,7 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
         for end in (irc[0], irc[-1]):
             if _same_connectivity(end, ref_start):
                 floor_candidates.append(_node_energy(end))
-    floor = _min(floor_candidates)
+    floor = _min(floor_candidates + [floor_hint])
 
     def to_entries(items: list[dict], prefix: str) -> list[dict]:
         entries = []
@@ -564,6 +571,8 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
 
     channels = [i for i in loaded if i["kind"] == "channel"]
     offtarget = [i for i in loaded if i["kind"] == "offtarget"]
+    if _extra is not None:
+        _extra.update(floor=floor, channels=channels)
     channel_entries = to_entries(channels, "channel_")
     offtarget_entries = to_entries(offtarget, "offtarget_")
     alt_entries = []
@@ -641,6 +650,85 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
     if lowest:
         result["route_ts"] = _route_ts(lowest[0]["title"], lowest[0]["ts"], lowest[0]["barrier"])
     return result
+
+
+def collect_ts_extended(ts_out: Path, channels_out: Path, charge: int, multiplicity: int) -> dict:
+    """A TS search and the Sample more paths runs added to it (a channels
+    folder of its own) as one result: the channels result, with the first
+    search's TSs among its channels (or noted on the channel it also found)
+    and its path, all on one barrier floor (the lowest reactant energy
+    either found)."""
+    from mepd.cli_channels import _same_ts
+    from mepd.inputs import ChainInputs
+
+    def read(hint=None):
+        ts_x, ch_x = {}, {}
+        ts = collect_ts(ts_out, charge, multiplicity, floor_hint=hint, _extra=ts_x)
+        ch = collect_channels(channels_out, charge, multiplicity, floor_hint=hint, _extra=ch_x) \
+            if channels_out.is_dir() else _result("No paths yet", [], [])
+        return ts, ts_x, ch, ch_x
+
+    ts, ts_x, ch, ch_x = read()
+    shared = _min([ts_x.get("floor"), ch_x.get("floor")])
+    if shared is not None and (ts_x.get("floor") != shared or ch_x.get("floor") != shared):
+        ts, ts_x, ch, ch_x = read(shared)
+
+    groups = {g["kind"]: g for g in ch["groups"]}
+    sampled = any(k in groups for k in ("channel", "alternate", "offtarget"))
+    ts_entry = {e["id"]: e for g in ts["groups"] for e in g["entries"]}
+    tag = "First search"
+
+    def first(entry: dict, label: str) -> dict:
+        return {**entry, "id": f"first_{entry['id']}", "label": f"{tag} · {label}"}
+
+    def add(kind: str, title: str, entries: list, at: Optional[int] = None) -> None:
+        if not entries:
+            return
+        if kind not in groups:
+            groups[kind] = {"title": title, "kind": kind, "entries": []}
+            ch["groups"].insert(len(ch["groups"]) if at is None else at, groups[kind])
+        groups[kind]["entries"] += entries
+
+    cutoffs = ChainInputs()
+    channel_nodes = list(zip(groups.get("channel", {}).get("entries", []), ch_x.get("channels", [])))
+    route = ts_x.get("route") or {"items": [], "n_steps": 0}
+    on_route = [i for i in route["items"] if i["on_route"]]
+    direct, steps, other = [], [], []
+    for info in route["items"]:
+        label = info["label"]
+        same = next((e for e, c in channel_nodes if _same_ts(info["ts"], c["ts"], cutoffs.node_rms_thre,
+                                                              cutoffs.node_ene_thre)), None)
+        if info["on_route"] and same is not None:
+            same["note"] += f"{' · ' if same['note'] else ''}also the first search's TS"
+            continue
+        entry = first(ts_entry.get(f"{label}_irc") or ts_entry[label], label)
+        (direct if info["on_route"] and len(on_route) == 1 else steps if info["on_route"] else other).append(entry)
+    add("channel", "Direct channels (start → end in one step)", direct, 0)
+    add("alternate", "Multi-step channels", steps)
+    add("offtarget", "Off-target exits (lead elsewhere)", other)
+    paths = [first(e, "path" if e["id"] == "mep" else e["label"]) for g in ts["groups"] if g["kind"] == "path"
+             for e in g["entries"]]
+    add("path", "First search: path", paths)
+    add("ts", "All TS searches", [first(ts_entry[i["label"]], i["label"]) for i in route["items"]])
+
+    chans = groups.get("channel", {}).get("entries", [])
+    best = _min(e["barrier_kcal"] for e in chans)
+    if not sampled:
+        # Nothing classified yet (or at all): the first search's answer stands.
+        ch["headline"], ch["barrier_kcal"] = ts["headline"], ts["barrier_kcal"]
+        ch["barrier_verified"], ch["route_ts"] = ts.get("barrier_verified", True), ts.get("route_ts")
+        ch["warnings"] = ts["warnings"] + ch["warnings"]
+    elif chans:
+        ch["headline"] = f"{len(chans)} direct channel(s)" + (f" · lowest ΔE‡ {best:.1f} kcal/mol" if best is not None else "")
+        ch["barrier_kcal"], ch["barrier_verified"] = best, True
+        lowest = next(e for e in chans if e["barrier_kcal"] == best) if best is not None else None
+        if lowest is not None and lowest["id"].startswith("first_"):
+            ch["route_ts"] = ts.get("route_ts")
+    b = ts["barrier_kcal"]
+    ch["summary"].insert(0, {"label": tag, "value": None if b is None else
+                             f"ΔE‡ {b:.1f} kcal/mol" + ("" if ts.get("barrier_verified") else ", not IRC-verified")})
+    ch["summary"] = [x for x in ch["summary"] if x["value"] not in (None, "")]
+    return ch
 
 
 def _validation_note(v: Optional[dict]) -> str:
@@ -1004,7 +1092,13 @@ def collect(job: dict, job_dir: Optional[Path] = None) -> dict:
     fn = COLLECTORS.get(job["op"])
     if fn is None:
         return _result(f"No result reader for {job['op']}", [], [])
-    result = fn(out, int(job.get("charge") or 0), int(job.get("multiplicity") or 1))
+    ext = job.get("extension")
+    if job["op"] == "ts" and ext and Path(ext["output_dir"]) != out:
+        # Sample more paths runs from this search: one result for all of them.
+        result = collect_ts_extended(out, Path(ext["output_dir"]), int(job.get("charge") or 0),
+                                     int(job.get("multiplicity") or 1))
+    else:
+        result = fn(out, int(job.get("charge") or 0), int(job.get("multiplicity") or 1))
     if not job.get("external"):
         result["warnings"] += _log_warnings(out.parent / "stdout.log")
     _flag_negative_barriers(result)
@@ -1078,11 +1172,14 @@ def collect_cached(job: dict, job_dir: Path) -> dict:
     """Finished jobs are parsed once and cached; running jobs are parsed
     fresh (their output grows), so partial results are always current."""
     cache = job_dir / "result.json"
-    terminal = job["status"] in ("done", "failed", "cancelled", "interrupted")
+    ext = job.get("extension")
+    terminal = job["status"] in ("done", "failed", "cancelled", "interrupted") and (not ext or ext["status"] == "done")
+    # A page with Sample more paths runs: stale once any of them finishes.
+    stamp = [job.get("finished"), ext["finished"]] if ext else job.get("finished")
     if terminal and cache.exists():
         try:
             cached = json.loads(cache.read_text())
-            if cached.get("_finished") == job.get("finished") and cached.get("_version") == RESULT_VERSION:
+            if cached.get("_finished") == stamp and cached.get("_version") == RESULT_VERSION:
                 return cached
         except Exception:
             pass
@@ -1092,7 +1189,7 @@ def collect_cached(job: dict, job_dir: Path) -> dict:
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "route_ts.xyz").write_text(route_ts["xyz"])
     if terminal:
-        result["_finished"] = job.get("finished")
+        result["_finished"] = stamp
         result["_version"] = RESULT_VERSION
         job_dir.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(result))

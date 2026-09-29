@@ -86,14 +86,16 @@ def _final_dir(out: Path, stream: str) -> Path:
     return out / "tree" if stream == "main" else out / "pairs" / stream / "tree"
 
 
-def find_trees(job_dirs: list[Path], out: Path) -> dict[str, dict]:
-    """stream -> {final: dir|None, live: dir|None}."""
+def find_trees(job_dirs: list[Path], out: Path | list[Path]) -> dict[str, dict]:
+    """stream -> {final: dir|None, live: dir|None}. `out`: the output
+    folder, or several (a TS search and the channels runs added to it)."""
     found: dict[str, dict] = {}
-    if (out / "tree" / "adj_matrix.txt").exists():
-        found.setdefault("main", {})["final"] = out / "tree"
-    for d in sorted((out / "pairs").glob("pair_*/tree")) if (out / "pairs").is_dir() else []:
-        if (d / "adj_matrix.txt").exists():
-            found.setdefault(d.parent.name, {})["final"] = d
+    for out in out if isinstance(out, (list, tuple)) else [out]:
+        if (out / "tree" / "adj_matrix.txt").exists():
+            found.setdefault("main", {})["final"] = out / "tree"
+        for d in sorted((out / "pairs").glob("pair_*/tree")) if (out / "pairs").is_dir() else []:
+            if (d / "adj_matrix.txt").exists():
+                found.setdefault(d.parent.name, {})["final"] = d
     for jd in job_dirs:
         for d in sorted((jd / "live" / "trees").glob("*")) if (jd / "live" / "trees").is_dir() else []:
             if (d / "nodes.jsonl").exists():
@@ -210,6 +212,8 @@ def list_trees(job_dirs: list[Path], out: Path, job_running: bool) -> list[dict]
             counts[n["outcome"]] = counts.get(n["outcome"], 0) + 1
         items.append({"id": stream, "label": _label(stream), "live": tree["live"], "running": tree["running"],
                       "n_nodes": len(tree["nodes"]), "counts": counts})
+    if len(items) > 1 and items[0]["id"] == "main":
+        items[0]["label"] = "First search"   # a TS search with channels runs added to it
     return items
 
 

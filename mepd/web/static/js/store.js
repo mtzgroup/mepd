@@ -114,8 +114,27 @@ export function toast(message, kind = 'info', ms = 4500, action = null) {
 }
 
 // ---- navigation ---------------------------------------------------------
-export function openJob(jobId) {
-  set({ view: { tab: 'job', jobId } });
+// "Sample more paths" runs add to the run they start from and show on its
+// page (mepd/web/jobs.py: JobManager.page_job).
+function extendsJob(j) { return j?.extends || (j?.op === 'channels-more' ? j.source_job : null); }
+export function pageJobId(id) {
+  let j = state.jobs[id];
+  const seen = new Set([id]);
+  for (let up = extendsJob(j); j && up && state.jobs[up] && !seen.has(up); up = extendsJob(j)) {
+    seen.add(up);
+    j = state.jobs[up];
+  }
+  return j ? j.id : id;
+}
+// The page's runs, oldest (the page's own) first.
+export function familyOf(jobs, id) {
+  const base = pageJobId(id);
+  return Object.values(jobs).filter((j) => j.id === base || pageJobId(j.id) === base).sort((a, b) => a.created - b.created);
+}
+// `tab`: open the page on that tab, showing that run (a Sample more paths run's log).
+export function openJob(jobId, tab = null) {
+  const page = pageJobId(jobId);
+  set({ view: { tab: 'job', jobId: page, run: page !== jobId ? jobId : null, jobTab: tab } });
 }
 // Leaving the Profiles tab with unsaved edits would silently drop them
 // (jobs copy the profile *file*), so ask first.

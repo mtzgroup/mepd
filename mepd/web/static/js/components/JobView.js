@@ -2,7 +2,7 @@
 // output (partial results work too), the raw log, and its files.
 import { Component, html, useEffect, useMemo, useRef, useState } from '../lib.js';
 import { api, attempt, refreshState } from '../api.js';
-import { openJob, prefs, select, set, state, toast, update, useStore } from '../store.js';
+import { familyOf, openJob, pageJobId, prefs, select, set, state, toast, update, useStore } from '../store.js';
 import { STATUS_LABEL, copy, downloadText, entryToXyz, fmtDuration, fmtKcal, jobElapsed, safeName, structureName, tsFrameIndex } from '../util.js';
 import { EnergyPlot } from './EnergyPlot.js';
 import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
@@ -545,7 +545,7 @@ function FollowUpCard({ op, job, runs, done, initial = {}, note = null }) {
         <div class="op-run">
           <button class="btn primary" disabled=${busy || active} onClick=${run}>
             ${active ? 'Running…' : busy ? 'Queuing…' : (last || done) ? 'Run again' : 'Run'}</button>
-          ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id); }}>its log</a>`}
+          ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id, 'log'); }}>its log</a>`}
           <span class="small muted">Runs at this job's level of theory; results appear on this page.</span>
         </div>
       </div>`}
@@ -594,29 +594,32 @@ function ChannelsFollowUps({ job }) {
 
 // A finished single-pair TS search: sample more paths for the same pair --
 // a Reaction channels run on the same two structures (and conformers), at
-// the same level of theory.
+// the same level of theory, whose paths join this page's. Once there is
+// one, sampling more extends that run (more conformer pairs per mechanism).
 function TsFollowUps({ job }) {
   const operations = useStore((s) => s.operations);
   const op = operations.find((o) => o.key === 'channels' && o.available);
-  const sameKey = (j) => j.op === 'channels' && j.created > job.created
-    && [...(j.targets?.structures || [])].sort().join() === [...job.targets.structures].sort().join();
-  const runsKey = useStore((s) => Object.values(s.jobs).filter(sameKey).map((j) => `${j.id}:${j.status}`).sort().join('|'));
-  const runs = useMemo(() => Object.values(state.jobs).filter(sameKey).sort((a, b) => b.created - a.created), [runsKey]);
+  const runsKey = useStore((s) => Object.values(s.jobs).filter((j) => j.extends === job.id)
+    .map((j) => `${j.id}:${j.status}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.extends === job.id)
+    .sort((a, b) => b.created - a.created), [runsKey]);
   const [open, setOpen] = useState(false);
   const [values, setValues] = useState(() => (op ? clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get('params:channels', {}) }) : {}));
   const [busy, setBusy] = useState(false);
   if (!op || job.status !== 'done' || job.external || job.targets.structures.length !== 2) return null;
   const last = runs[0];
   const active = last && ['queued', 'running'].includes(last.status);
+  const finished = runs.find((r) => r.status === 'done');
+  if (finished && !active) return html`<${ChannelsFollowUps} job=${finished} />`;
   const conformers = Object.fromEntries(job.targets.structures.map((sid, i) => [sid, job.target_conformers?.[i] || null]));
   const run = async () => {
     setBusy(true);
     prefs.set('params:channels', values);
     const out = await attempt(() => api.post('/api/jobs', {
       op: 'channels', structures: job.targets.structures, edges: job.targets.edges || [], params: values,
-      profile: job.profile, conformers }), (js) => `Queued: ${js[0].title}`);
+      profile: job.profile, conformers, extends: job.id }), (js) => `Queued: ${js[0].title}`);
     setBusy(false);
-    if (out?.length) openJob(out[0].id);
+    if (out?.length) { setOpen(false); openJob(out[0].id, 'live'); }
   };
   return html`
     <section class="followups">
@@ -636,8 +639,8 @@ function TsFollowUps({ job }) {
           <div class="op-run">
             <button class="btn primary" disabled=${busy || active} onClick=${run}>
               ${active ? 'Running…' : busy ? 'Queuing…' : last ? 'Sample again' : 'Sample more paths'}</button>
-            ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id); }}>open that run</a>`}
-            <span class="small muted">Same two structures and level of theory; the edge in Explore keeps the lowest barrier found.</span>
+            ${last && html`<a href="#" class="small" onClick=${(e) => { e.preventDefault(); openJob(last.id, 'log'); }}>its log</a>`}
+            <span class="small muted">Same two structures and level of theory; results appear on this page.</span>
           </div>
         </div>`}
       </div>
@@ -708,11 +711,22 @@ function FilesPanel({ job }) {
 }
 
 // ------------------------------------------------------------ view
-export function JobView({ jobId }) {
+export function JobView({ jobId: openedId }) {
+  // Sample more paths runs show on the page of the run they add to: one
+  // result, map and tree for all of them; Live, Log and Files per run.
+  const jobId = useStore(() => pageJobId(openedId));
   const job = useStore((s) => s.jobs[jobId]);
+  const familyKey = useStore((s) => familyOf(s.jobs, jobId)
+    .map((j) => `${j.id}:${j.status}:${j.finished || 0}:${j.result_rev || 0}`).join('|'));
+  const family = useMemo(() => familyOf(state.jobs, jobId), [familyKey]);
+  const askedRun = useStore((s) => s.view.run);
+  const askedTab = useStore((s) => s.view.jobTab);
   const [tab, setTab] = useState(null);
-  useTick(1000, job?.status === 'running');
-  useEffect(() => { setTab(null); }, [jobId]);
+  const [runId, setRunId] = useState(null);
+  const active = [...family].reverse().find((j) => ['queued', 'running'].includes(j.status));
+  const run = family.find((j) => j.id === runId) || active || family[family.length - 1] || job;
+  useTick(1000, run?.status === 'running');
+  useEffect(() => { setTab(askedTab || null); setRunId(askedRun || null); }, [jobId, askedRun, askedTab]);
   // Opened before this page heard about the job (just queued): look it up
   // once before calling it gone.
   const [lookedUp, setLookedUp] = useState(false);
@@ -724,9 +738,14 @@ export function JobView({ jobId }) {
   if (!job) {
     return html`<div class="empty-hint"><p>${lookedUp ? 'This calculation no longer exists.' : 'Loading this calculation…'}</p></div>`;
   }
+  // What the family-wide views see: running while any run is.
+  const page = family.length > 1 ? { ...job, status: active ? 'running' : job.status,
+    finished: Math.max(...family.map((j) => j.finished || 0)),
+    result_rev: family.reduce((n, j) => n + (j.result_rev || 0), 0) } : job;
   const hasOutput = job.status !== 'queued';
-  const current = tab || (['done'].includes(job.status) || job.external ? 'result' : job.status === 'failed' ? 'log' : 'live');
+  const current = tab || (['done'].includes(run.status) || job.external ? 'result' : run.status === 'failed' ? 'log' : 'live');
   const targets = job.targets.structures.map((id) => ({ id, label: structureName(id) }));
+  const runLabel = (j, i) => (i === 0 ? (job.op === 'ts' ? 'First search' : 'First run') : `More paths ${i}`);
   return html`
     <div class="job-view">
       <div class="view-head">
@@ -734,40 +753,44 @@ export function JobView({ jobId }) {
         <div class="job-head-main">
           <h2>${job.title}</h2>
           <div class="small muted">
-            <span class=${`pill ${job.status}`}>${STATUS_LABEL[job.status]}</span>
-            ${job.external ? ' · existing output, read in place' : job.started && html` · ${fmtDuration(jobElapsed(job))}`}
+            <span class=${`pill ${page.status}`}>${STATUS_LABEL[page.status]}</span>
+            ${job.external ? ' · existing output, read in place' : run.started && html` · ${fmtDuration(jobElapsed(run))}`}
             ${job.profile && html` · profile <b>${job.profile}</b>`}
             ${targets.length > 0 && html` · ${targets.map((t, i) => html`${i ? (job.op === 'ts' || job.op === 'channels' ? ' → ' : ', ') : ''}<a href="#"
               onClick=${(e) => { e.preventDefault(); select({ structures: [t.id] }); set({ view: { tab: 'graph', jobId } }); }}>${t.label}</a>`)}`}
           </div>
         </div>
-        <${JobControls} job=${job} />
+        <${JobControls} job=${run} />
       </div>
+      ${family.length > 1 && html`<div class="segmented run-picker" title="Live, Log, Files and Command show this run; the other tabs cover all of them">
+        ${family.map((j, i) => html`<button class=${j.id === run.id ? 'on' : ''} onClick=${() => setRunId(j.id)}>
+          ${runLabel(j, i)}${j.status !== 'done' ? html` <span class=${`pill ${j.status}`}>${STATUS_LABEL[j.status]}</span>` : ''}</button>`)}
+      </div>`}
       <details class="cmd-line">
         <summary>Command</summary>
         <div class="cmd-body" title="Exactly what ran; paste into a shell to reproduce">
-          <code>${job.command}</code>
-          <button class="btn-icon" onClick=${() => copy(job.command)} title="Copy">⧉</button>
+          <code>${run.command}</code>
+          <button class="btn-icon" onClick=${() => copy(run.command)} title="Copy">⧉</button>
         </div>
       </details>
-      ${job.status === 'failed' && job.error && html`<pre class="error-box">${job.error}</pre>`}
+      ${run.status === 'failed' && run.error && html`<pre class="error-box">${run.error}</pre>`}
       ${Object.keys(job.live_skipped || {}).length > 0 && html`<p class="level-note small">
         ${Object.keys(job.live_skipped).length} species more than ${job.params?.explore_within ?? job.params?.energy_window} kcal/mol above the seed
         were not added to Explore (the threshold under Explore in this calculation's settings). They are in the results, to add by hand.</p>`}
-      ${['cancelled', 'interrupted'].includes(job.status) && html`<p class="warn-box small">${job.error} ${!job.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${job.id}/retry`))}>Resume</button>`}</p>`}
+      ${['cancelled', 'interrupted'].includes(run.status) && html`<p class="warn-box small">${run.error} ${!run.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${run.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
-        ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && ['channels', 'channels-more'].includes(job.op) && ['map', 'Path map'],
+        ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && family.some((j) => ['channels', 'channels-more'].includes(j.op)) && ['map', 'Path map'],
           ['ts', 'channels', 'channels-more', 'network-splits'].includes(job.op) && ['tree', 'Optimization tree'],
           !job.external && ['log', 'Log'], ['files', 'Files']].filter(Boolean)
           .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live'} onClick=${() => setTab(k)}>${l}</button>`)}
       </div>
       <div class="tab-body">
-        ${current === 'result' && html`<${ResultPanel} job=${job} />`}
-        ${current === 'live' && html`<${LivePanel} job=${job} />`}
-        ${current === 'map' && html`<${ChannelsMap} job=${job} />`}
-        ${current === 'tree' && html`<${OptTree} job=${job} />`}
-        ${current === 'log' && html`<${LogPanel} job=${job} />`}
-        ${current === 'files' && html`<${FilesPanel} job=${job} />`}
+        ${current === 'result' && html`<${ResultPanel} job=${page} />`}
+        ${current === 'live' && html`<${LivePanel} key=${run.id} job=${run} />`}
+        ${current === 'map' && html`<${ChannelsMap} job=${page} />`}
+        ${current === 'tree' && html`<${OptTree} job=${page} />`}
+        ${current === 'log' && html`<${LogPanel} key=${run.id} job=${run} />`}
+        ${current === 'files' && html`<${FilesPanel} key=${run.id} job=${run} />`}
       </div>
     </div>`;
 }

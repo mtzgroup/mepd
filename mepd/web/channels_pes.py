@@ -285,11 +285,34 @@ def _optimized_ts(output_dir: Optional[Path]) -> list[dict]:
     return found
 
 
+def _search_ts(output_dir: Path, kinds: dict) -> list[dict]:
+    """The TSs of a `mepd ts` search (ts_leaf_<k>.xyz, its live stream is
+    'main'), for a map that shows the channels runs added to it. `kinds`:
+    label -> direct / multi-step / other, as its result classified them."""
+    found = []
+    for fp in sorted(Path(output_dir).glob("ts*.xyz")):
+        if fp.stem.endswith("_irc"):
+            continue
+        try:
+            text = fp.read_text()
+            xyz = "\n".join(text.splitlines()[:int(text.split()[0]) + 2]) + "\n"
+            energy = float(fp.with_suffix(".energies").read_text().split()[0])
+        except Exception:
+            continue
+        irc = fp.with_name("irc.xyz" if fp.stem == "ts" else f"{fp.stem}_irc.xyz")
+        found.append({"label": fp.stem, "stream": "main", "xyz": xyz, "energy": energy,
+                      "kind": kinds.get(fp.stem, "other"), "group": "", "irc": str(irc) if irc.exists() else None})
+    return found
+
+
 def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bool = True,
-                 output_dir: Optional[Path] = None, ts: Optional[str] = None) -> dict:
+                 output_dir: Optional[Path] = None, ts: Optional[str] = None,
+                 search: Optional[tuple[Path, dict]] = None) -> dict:
     """The map for the web UI: {mode, axes, x, y, E (grid, None = blank),
     paths: [{id, pair, monitor, points: [[x, y, kcal]], active}],
-    ts: [{label, pair, q, e, kind, closest}], reference, warnings}."""
+    ts: [{label, pair, q, e, kind, closest}], reference, warnings}.
+    `search`: (output folder, TS kinds) of the TS search a channels run
+    was sampled from, whose TSs join the map (see _search_ts)."""
     paths = _paths(job_dir)
     warnings = []
     if not paths:
@@ -308,7 +331,7 @@ def channels_map(job_dir: Path, mode: str = "bonds", grid: int = 64, running: bo
         if p["stream"] not in roots or p["monitor"] in ("branch-0", "main"):
             roots[p["stream"]] = p
     placed = []
-    all_ts = _optimized_ts(output_dir)
+    all_ts = _optimized_ts(output_dir) + (_search_ts(*search) if search else [])
     irc_choices = [{"label": t["label"], "pair": t["stream"], "kind": t["kind"], "group": t["group"],
                     "e": round((t["energy"] - e_ref) * H2K, 2)} for t in all_ts if t["irc"]]
     irc_line, chosen_ts = None, None

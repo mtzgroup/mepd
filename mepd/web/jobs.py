@@ -34,6 +34,13 @@ from mepd.web.workspace import Workspace, WorkspaceError, _atomic_write, new_id,
 TERMINAL = {"done", "failed", "cancelled", "interrupted"}
 
 
+def extends(job: dict) -> Optional[str]:
+    """The job a Sample more paths run adds to (its result shows there)."""
+    if job.get("extends"):
+        return job["extends"]
+    return job.get("source_job") if job.get("op") == "channels-more" else None
+
+
 def _bump_rev(job: dict) -> None:
     """Every change to a job record gets a larger `rev`, so a browser that
     receives two copies out of order (a live event and a full-state reload
@@ -221,6 +228,44 @@ class JobManager:
     def list(self) -> list[dict]:
         return sorted(self.jobs.values(), key=lambda j: j["created"], reverse=True)
 
+    # ----------------------------------------------------------- families
+    # "Sample more paths" runs extend the result they start from: a
+    # channels run on a TS search's pair (`extends`), a channels-more run in
+    # its channels run's folder. They all show on one page, the first run's.
+    def page_job(self, job: dict) -> dict:
+        """The job whose page shows `job` (itself, unless it extends one)."""
+        seen = {job["id"]}
+        while (up := extends(job)) in self.jobs and up not in seen:
+            seen.add(up)
+            job = self.jobs[up]
+        return job
+
+    def family(self, job: dict) -> list[dict]:
+        """The page job and every run extending it, oldest first."""
+        base = self.page_job(job)
+        return sorted((j for j in self.jobs.values() if j is base or self.page_job(j) is base),
+                      key=lambda j: j["created"])
+
+    def result_view(self, job: dict) -> dict:
+        """The record the page's result is read from: the page job, plus
+        (`extension`) the channels folder its Sample more paths runs share.
+        Its status is the family's: running while any of them runs."""
+        family = self.family(job)
+        base = family[0]
+        runs = [j for j in family if j is not base]
+        if not runs:
+            return base
+        chans = [j for j in runs if j["op"] == "channels"]
+        # The newest that finished (a cancelled retry must not hide it), else the newest.
+        chans = [j for j in chans if j["status"] == "done"] or chans
+        folder = chans[-1]["output_dir"] if chans else base["output_dir"]
+        sharing = [j for j in family if j["output_dir"] == folder]
+        active = [j for j in family if j["status"] in ("queued", "running")]
+        return {**base, "extension": {
+            "output_dir": folder, "charge": sharing[-1].get("charge"), "multiplicity": sharing[-1].get("multiplicity"),
+            "status": "running" if active else "done",
+            "finished": None if active else max((j.get("finished") or 0) for j in family)}}
+
     # ------------------------------------------------------------- submit
     def _resolve_targets(self, op, structure_ids: list[str], edge_ids: list[str]) -> list[tuple[list[str], list[str]]]:
         """(structure ids, edge ids) per job to create."""
@@ -249,17 +294,25 @@ class JobManager:
     def submit(self, op_key: str, *, structure_ids: list[str], edge_ids: list[str],
                params: Optional[dict], profile: Optional[str], label: str = "",
                dry_run: bool = False, source_job_id: Optional[str] = None,
-               conformers=None) -> list[dict]:
+               conformers=None, extends_job_id: Optional[str] = None) -> list[dict]:
         """Create one job per target set. `dry_run` validates and returns
         the would-be records (with their `command`) without keeping anything.
         A follow-up operation (target "job") works on `source_job_id`'s
         finished output, in that job's output folder, at its level of theory.
         `conformers`: which conformer of each structure to use -- a list in
         target order, or {structure id: conformer id}; otherwise an edge's
-        chosen conformers, otherwise each node's lowest-energy one."""
+        chosen conformers, otherwise each node's lowest-energy one.
+        `extends_job_id`: a finished TS search whose page this channels run
+        (Sample more paths) adds its paths to."""
         op = get_operation(op_key)
         parsed = op.parse_params(params)
         source = None
+        if extends_job_id:
+            base = self.get(extends_job_id)
+            if op.key != "channels" or base["op"] != "ts":
+                raise WorkspaceError("only a Reaction channels run can add paths to a Transition state search")
+            if sorted(structure_ids) != sorted(base["targets"]["structures"]):
+                raise WorkspaceError("Sample more paths runs on the same two structures as the search it extends")
         if op.target == "job":
             source = self.get(source_job_id or "")
             if source["op"] not in op.source_ops:
@@ -346,6 +399,7 @@ class JobManager:
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
                     "output_dir": source["output_dir"] if source is not None else str(jdir / "output"),
                     "external": False, "source_job": source["id"] if source is not None else None,
+                    "extends": extends_job_id or None,
                     "error": None, "last_line": "", "summary": None,
                 })
         except Exception:
