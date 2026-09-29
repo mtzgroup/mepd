@@ -53,6 +53,46 @@ def new_pair(text: str) -> dict:
     }
 
 
+def pair_from_xyz(frames: list[str], charge: int = 0) -> dict:
+    """{reactant, product, amap, mapping} from two xyz structures, the
+    reactant first -- the xyz counterpart of a reaction SMILES. Atom i of
+    the product is atom i of the reactant: taken from the order the two
+    list their atoms when that agrees, otherwise matched by SLAPMapper
+    (and the product renumbered to follow the reactant)."""
+    import numpy as np
+    from qcdata import Structure
+
+    from mepd.web import chem
+
+    if len(frames) != 2:
+        raise WorkspaceError(f"a reaction needs two structures (reactant, product), got {len(frames)}")
+    start, end = (chem.structures_from_xyz_text(f)[0] for f in frames)
+    sym_s, sym_e = list(start.symbols), list(end.symbols)
+    if sorted(sym_s) != sorted(sym_e):
+        from collections import Counter
+
+        def formula(sym):
+            return "".join(f"{el}{k if k > 1 else ''}" for el, k in sorted(Counter(sym).items()))
+        raise WorkspaceError(f"the reactant ({formula(sym_s)}) and the product ({formula(sym_e)}) must have the "
+                             "same atoms")
+    source, product_xyz = "xyz-order", frames[1]
+    if sym_s != sym_e:
+        from mepd.atom_mapping import suggest_atom_mapping
+
+        am = suggest_atom_mapping(start, end)
+        if am is None or len(am.mapping) != len(sym_s):
+            raise WorkspaceError("the two structures list their atoms in different orders, and SLAPMapper found "
+                                 "no match between them: give them in the same atom order")
+        geom = np.asarray(end.geometry)[[am.mapping[i] for i in range(len(sym_s))]]
+        product_xyz = Structure(symbols=sym_s, geometry=geom, charge=end.charge,
+                                multiplicity=end.multiplicity).to_xyz()
+        source = "SLAPMapper"
+    r_info, r_warn = design.from_xyz(frames[0], charge)
+    p_info, p_warn = design.from_xyz(product_xyz, charge)
+    return {"reactant": {**r_info, "warnings": r_warn}, "product": {**p_info, "warnings": p_warn},
+            "amap": list(range(len(sym_s))), "mapping": {"source": source}}
+
+
 def _tagged(molblock: str, numbers: dict[int, int]):
     from rdkit import Chem
 

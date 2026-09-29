@@ -130,26 +130,44 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
   return html`<div class=${`design-canvas ${clickable ? 'picking' : ''}`} ref=${host}></div>`;
 }
 
+// How many structures an xyz text holds (frames with an atom-count line;
+// bare "El x y z" lines count as one).
+export function countXyzFrames(text) {
+  const lines = (text || '').replace(/\r/g, '').split('\n');
+  let i = 0, n = 0;
+  while (i < lines.length) {
+    const t = lines[i].trim();
+    if (!t) { i += 1; continue; }
+    if (/^\d+$/.test(t)) { n += 1; i += parseInt(t, 10) + 2; continue; }
+    return n || 1;
+  }
+  return n;
+}
+
 // An xyz from a file (button or drag-and-drop) or pasted text. Calls
-// onXyz(text, name) once the file is read.
-function XyzInput({ onXyz, compact = false }) {
+// onXyz(text, name) once read; with `multiple`, several files arrive as one
+// multi-frame text, in the order given.
+function XyzInput({ onXyz, compact = false, multiple = false }) {
   const [over, setOver] = useState(false);
   const [paste, setPaste] = useState(false);
   const [text, setText] = useState('');
   const file = useRef(null);
-  const read = (f) => {
-    if (!f) return;
-    if (f.size > 5e6) { toast('That file is too large for an xyz (over 5 MB)', 'error'); return; }
-    f.text().then((t) => onXyz(t, f.name.replace(/\.[^.]+$/, '')));
+  const read = (list) => {
+    const files = [...(list || [])].slice(0, multiple ? undefined : 1);
+    if (!files.length) return;
+    if (files.some((f) => f.size > 5e6)) { toast('That file is too large for an xyz (over 5 MB)', 'error'); return; }
+    Promise.all(files.map((f) => f.text())).then((texts) => onXyz(
+      texts.map((t) => t.replace(/\s+$/, '')).join('\n') + '\n',
+      files.map((f) => f.name.replace(/\.[^.]+$/, '')).join(' → ')));
   };
   return html`<div class=${`xyz-drop ${over ? 'over' : ''} ${compact ? 'compact' : ''}`}
     onDragOver=${(e) => { e.preventDefault(); setOver(true); }} onDragLeave=${() => setOver(false)}
-    onDrop=${(e) => { e.preventDefault(); setOver(false); read(e.dataTransfer.files?.[0]); }}>
-    <input type="file" accept=".xyz,.txt,text/plain" ref=${file} style="display:none"
-      onChange=${(e) => { read(e.target.files?.[0]); e.target.value = ''; }} />
+    onDrop=${(e) => { e.preventDefault(); setOver(false); read(e.dataTransfer.files); }}>
+    <input type="file" accept=".xyz,.txt,text/plain" ref=${file} style="display:none" multiple=${multiple}
+      onChange=${(e) => { read(e.target.files); e.target.value = ''; }} />
     <div class="row">
       <button class="btn" onClick=${() => file.current?.click()}>Upload .xyz</button>
-      <span class="small muted">or drop a file here · <a href="#" onClick=${(e) => { e.preventDefault(); setPaste(!paste); }}>${paste ? 'hide' : 'paste text'}</a></span>
+      <span class="small muted">or drop ${multiple ? 'one or two files' : 'a file'} here · <a href="#" onClick=${(e) => { e.preventDefault(); setPaste(!paste); }}>${paste ? 'hide' : 'paste text'}</a></span>
     </div>
     ${paste && html`<div>
       <textarea class="xyz-paste mono" rows=${compact ? 4 : 6} placeholder=${'3\nwater\nO 0.000 0.000 0.117\nH 0.000 0.757 -0.470\nH 0.000 -0.757 -0.470'}
@@ -162,6 +180,7 @@ function XyzInput({ onXyz, compact = false }) {
 function Start({ structures }) {
   const [smiles, setSmiles] = useState('');
   const [xyzCharge, setXyzCharge] = useState(0);
+  const [many, setMany] = useState(null);   // {xyz, n}: more structures than Design takes
   const [xyzMult, setXyzMult] = useState(1);
   const [sid, setSid] = useState('');
   const [cid, setCid] = useState('');
@@ -174,8 +193,22 @@ function Start({ structures }) {
       <button class="btn primary" disabled=${!smiles.trim()} onClick=${() => attempt(() => api.post('/api/design/new', { smiles }))}>Build</button></div></label>
     <p class="small muted start-note">A reaction SMILES (reactants>>products, atom map numbers optional) opens the reactant and the
       product side by side: an edit on one is made on the matching atom of the other, so you can vary a reaction and compare barriers.</p>
-    <div class="field"><span class="field-label">From an XYZ file</span>
-      <${XyzInput} onXyz=${(xyz, name) => attempt(() => api.post('/api/design/new', { xyz, name, charge: xyzCharge, multiplicity: xyzMult }))} />
+    <div class="field"><span class="field-label">From XYZ: one structure, or two for a reaction</span>
+      <${XyzInput} multiple=${true} onXyz=${(xyz, name) => {
+        const n = countXyzFrames(xyz);
+        if (n > 2) { setMany({ xyz, n }); return; }
+        setMany(null);
+        attempt(() => api.post('/api/design/new', { xyz, name, charge: xyzCharge, multiplicity: xyzMult }));
+      }} />
+      <p class="small muted start-note">Two structures (two files, or two frames in one) open as a reaction: the first is the
+        reactant, the second the product, with the same atoms, matched in the order they are listed (or by SLAPMapper).</p>
+      ${many && html`<div class="warn-box small">
+        <p>${many.n} structures: Design opens one, or two as a reaction. To build a network from many, add them in Explore.</p>
+        <button class="btn small primary" onClick=${async () => {
+          const added = await attempt(() => api.post('/api/structures', { text: many.xyz, charge: xyzCharge, multiplicity: xyzMult,
+            optimize: prefs.get('optimizeOnAdd', true) }), (a) => `Added ${a.length} structure(s) to Explore`);
+          if (added) { setMany(null); select({ structures: [...new Set(added.map((a) => a.id))] }); openTab('graph'); }
+        }}>Add all ${many.n} to Explore</button></div>`}
       <div class="row small xyz-cm">
         <label>charge <input type="number" value=${xyzCharge} onChange=${(e) => setXyzCharge(parseInt(e.target.value, 10) || 0)} /></label>
         <label>multiplicity <input type="number" min="1" value=${xyzMult} onChange=${(e) => setXyzMult(Math.max(1, parseInt(e.target.value, 10) || 1))} /></label>
@@ -523,7 +556,8 @@ export function DesignView() {
           ${rx && html`<div class="rxn-box small">
             ${!rx.balanced && html`<p class="warn-box small">The two sides no longer have the same atoms (an edit was made on one side only).
               Make them match (or undo) before searching.</p>`}
-            <p class="muted">Atoms matched ${rx.mapping?.source === 'given' ? 'from the map numbers in your reaction SMILES' : 'by SLAPMapper'}; new atoms
+            <p class="muted">Atoms matched ${rx.mapping?.source === 'given' ? 'from the map numbers in your reaction SMILES'
+              : rx.mapping?.source === 'xyz-order' ? 'in the order the two xyz list them' : 'by SLAPMapper'}; new atoms
               by their neighbours and the closest fit in 3D (endpoint RMSD). Fast, not exhaustive: the path search checks other mappings with atom mapping on.</p>
           </div>`}
           <dl class="props">

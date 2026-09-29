@@ -746,6 +746,27 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                                 reaction=_reaction_part(pair["product"], pair["amap"], pair["mapping"]))
             publish_ws()
             return out
+        if body.xyz and not body.smiles:
+            from mepd.web import chem
+
+            try:
+                frames = [s.to_xyz() for s in chem.structures_from_xyz_text(body.xyz)]
+            except Exception:
+                frames = [body.xyz]   # bare "El x y z" lines, or malformed: the single-structure path says why
+            if len(frames) > 2:
+                raise WorkspaceError(f"that xyz holds {len(frames)} structures: Design opens one, or two as a "
+                                     "reaction (reactant, then product). Add many at once in Explore (+ Add).")
+            if len(frames) == 2:
+                from mepd.web import design_reaction
+
+                if body.multiplicity is not None and body.multiplicity < 1:
+                    raise WorkspaceError("multiplicity must be at least 1")
+                pair = design_reaction.pair_from_xyz(frames, body.charge or 0)
+                out = _store_design(pair["reactant"], name=body.name or "reaction", source={"kind": "reaction-xyz"},
+                                    keep={}, charge=body.charge, multiplicity=body.multiplicity,
+                                    reaction=_reaction_part(pair["product"], pair["amap"], pair["mapping"]))
+                publish_ws()
+                return out
         if body.smiles:
             info, source = design.from_smiles(body.smiles), {"kind": "smiles", "input": body.smiles.strip()}
             name = body.name or body.smiles.strip()
