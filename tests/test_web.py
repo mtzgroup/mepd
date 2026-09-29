@@ -1157,6 +1157,44 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
     assert snap["structures"][seed["id"]]["energy"] == -3.0
 
 
+def test_expansion_species_above_the_threshold_stay_out_of_explore(tmp_path):
+    """Species more than the job's threshold above the seed are not added
+    to Explore; one found from a left-out species is placed from the nearest
+    shown ancestor, with no edge (its reaction starts at a species not shown)."""
+    from mepd.web import chem
+    from mepd.web.jobs import JobManager, explore_limit
+    from mepd.web.workspace import Workspace
+
+    class Bus:
+        def publish(self, event, data):
+            pass
+
+    assert explore_limit({"params": {"energy_window": 25.0}}) == 25.0                   # 1 round: grown by window
+    assert explore_limit({"params": {"energy_window": 25.0, "rounds": 3}}) is None      # by flux: everything
+    assert explore_limit({"params": {"energy_window": 25.0, "rounds": 3, "explore_within": 10}}) == 10.0
+
+    ws = Workspace(tmp_path / "ws")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ, 0, 1)
+    seed = ws.add_structure(water, name="seed", origin={"kind": "smiles"})
+    jobs = JobManager(ws, Bus())
+    job = {"id": "j_keep", "op": "graph-enumeration", "targets": {"structures": [seed["id"]], "edges": []},
+           "charge": 0, "multiplicity": 1, "level": None, "params": {"energy_window": 20.0}}
+    live = jobs.job_dir("j_keep") / "live"
+    live.mkdir(parents=True)
+    events = [
+        {"event": "species", "index": 1, "parent": 0, "xyz": WATER_BENT_XYZ, "energy_hartree": -1.0, "rel_energy_kcal": 45.0},
+        {"event": "species", "index": 2, "parent": 1, "xyz": HCN_XYZ, "energy_hartree": -2.0, "rel_energy_kcal": 5.0},
+        {"event": "reaction", "source": 0, "target": 1, "caption": ""},
+        {"event": "step", "a": 0, "b": 1, "barrier_kcal": 60.0},
+    ]
+    (live / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    jobs._adopt_live_events(job)
+    snap = ws.snapshot()
+    assert len(snap["structures"]) == 2 and not snap["edges"]
+    kept = snap["structures"][job["live_nodes"]["2"]]
+    assert kept["origin"]["parent"] == seed["id"] and job["live_skipped"] == {"1": "0"}
+
+
 def test_only_an_unknown_route_answers_a_bare_not_found(client):
     """The page reads a bare "Not Found" as a server older than itself (a
     route it doesn't have yet): every 404 the server means must say what is

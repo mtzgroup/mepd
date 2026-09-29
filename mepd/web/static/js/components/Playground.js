@@ -138,6 +138,7 @@ function Dock() {
         <${Pill} icon="plus" label="Add structures" active=${panel === 'add'} onClick=${() => toggle('add')} />
         <${Pill} icon="arrange" label="Arrange" onClick=${() => graph('arrange')} />
         <${Pill} icon="fit" label="Fit" onClick=${() => graph('fit')} />
+        <${Pill} icon="fit" label="View" title="Filter what the graph shows, and fold branches away" onClick=${() => graph('view')} />
       </div>
       <div class="pg-dock-group center">
         <button class="pg-pill" onClick=${() => openTab('jobs')} title="All calculations">

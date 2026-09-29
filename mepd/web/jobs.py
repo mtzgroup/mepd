@@ -107,6 +107,21 @@ def _tail_lines(fp: Path, n: int = 1, max_bytes: int = 8192) -> list[str]:
 _DECORATION = set("│┃|╭╮╰╯┌┐└┘├┤┬┴┼─━═╇╈╉╊┡┩┣┫┳┻╋ -_=+*·.:")
 
 
+def explore_limit(job: dict) -> Optional[float]:
+    """How far above the seed (kcal/mol) a network expansion's species may
+    be to become Explore nodes: the job's `explore_within`, else its
+    expansion window (when it grows by window), else no limit."""
+    p = job.get("params") or {}
+    if p.get("explore_within") is not None:
+        return float(p["explore_within"])
+    rounds = int(p.get("rounds") or 1)
+    steer = p.get("steer") or "auto"
+    by_window = steer == "window" or (steer == "auto" and rounds <= 1)
+    if by_window and p.get("energy_window") is not None:
+        return float(p["energy_window"])
+    return None
+
+
 class JobManager:
     def __init__(self, ws: Workspace, broadcaster: Broadcaster, *, max_concurrent: int = 2,
                  on_finished: Optional[Callable[[dict], Any]] = None,
@@ -553,6 +568,10 @@ class JobManager:
 
         seeds = job.get("targets", {}).get("structures") or []
         nodes = dict(job.get("live_nodes") or {})
+        # Species left out of Explore (above the job's threshold): index ->
+        # parent index, so their descendants can still be placed.
+        skipped = dict(job.get("live_skipped") or {})
+        limit = explore_limit(job)
         if seeds:
             nodes.setdefault("0", seeds[0])
         known = self.ws.snapshot()["structures"]
@@ -563,9 +582,21 @@ class JobManager:
             except ValueError:
                 continue
             if ev.get("event") == "species":
-                parent = nodes.get(str(ev.get("parent")))
-                if str(ev["index"]) in nodes or parent not in known:
-                    continue    # already added, or its parent was deleted
+                if str(ev["index"]) in nodes or str(ev["index"]) in skipped:
+                    continue    # already handled
+                rel = ev.get("rel_energy_kcal")
+                if limit is not None and rel is not None and rel > limit:
+                    skipped[str(ev["index"])] = str(ev.get("parent"))
+                    changed = True
+                    continue
+                # Found from a species left out: grow it from the nearest one shown, with no edge
+                # (the reaction it came from starts at a species that is not in Explore).
+                via, hops = str(ev.get("parent")), 0
+                while via in skipped and hops < 1000:
+                    via, hops = skipped[via], hops + 1
+                parent = nodes.get(via)
+                if parent not in known:
+                    continue    # its parent was deleted
                 (s,) = chem.structures_from_xyz_text(ev["xyz"], job.get("charge"), job.get("multiplicity"))
                 smiles = chem.perceive_smiles(s) or ev.get("smiles") or None
                 validation = ev.get("validation")
@@ -579,6 +610,9 @@ class JobManager:
                             "label": f"Minimum {ev['index']}", "frame": 0, "parent": parent, "live": True})
                 known = self.ws.snapshot()["structures"]
                 nodes[str(ev["index"])] = rec["id"]
+                if hops:
+                    changed = True
+                    continue
                 a, b = parent, rec["id"]
             elif ev.get("event") == "step":
                 changed |= self._adopt_step(job, ev, nodes, known)
@@ -600,6 +634,7 @@ class JobManager:
             changed = True
         job["live_offset"] = done + end
         job["live_nodes"] = nodes
+        job["live_skipped"] = skipped
         self._write(job)
         if changed:
             self.bus.publish("workspace", self.ws.snapshot())

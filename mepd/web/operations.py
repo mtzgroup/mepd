@@ -345,6 +345,10 @@ class ExpandParams(Params):
     max_products: int = P(50, "Proposals per species", "Fewest bond changes first.", cli="--max-products", ge=1)
     energy_window: float = P(60.0, "Expand species within (kcal/mol)", "Only species this close to the seed "
                              "are expanded in the next round.", cli="--energy-window", requires="steer=auto|window")
+    explore_within: Optional[float] = P(
+        None, "Add to Explore within (kcal/mol)", "Only species at most this far above the seed become nodes in "
+        "Explore; the rest stay in the result, to add by hand. Empty: the 'Expand species within' window (every "
+        "species when growing by flux).", ge=0, group="Explore")
     form_distance: float = P(4.0, "Form bonds within (Å)", "Raise it to also close rings between atoms that "
                              "start far apart.", cli="--form-distance", gt=0, advanced=True, group="Rules")
     allow_radicals: bool = P(False, "Allow radicals and carbenes", cli="--allow-radicals", kind="toggle",

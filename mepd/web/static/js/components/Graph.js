@@ -37,6 +37,11 @@ function stylesheet() {
     { selector: 'edge[status = "queued"]', style: { 'line-color': css('--warn'), 'target-arrow-color': css('--warn') } },
     { selector: 'edge[status = "failed"]', style: { 'line-color': css('--danger'), 'target-arrow-color': css('--danger') } },
     { selector: 'edge:selected', style: { width: 5, 'underlay-color': css('--accent'), 'underlay-opacity': 0.25, 'underlay-padding': 5 } },
+    // View filters (see applyView).
+    { selector: '.vhidden', style: { display: 'none' } },
+    { selector: '.dim', style: { opacity: 0.16 } },
+    { selector: 'node.collapsed', style: { 'border-width': 3, 'border-style': 'double', 'border-color': css('--accent'),
+      'font-weight': 600 } },
   ];
 }
 
@@ -97,6 +102,119 @@ function spawnSpot(c, parent, taken) {
   return { x: p.x + 190 * Math.cos(base), y: p.y + 190 * Math.sin(base) + 40 * taken.length };
 }
 
+const HARTREE_KCAL = 627.509;
+const VIEW_DEFAULT = { q: '', only: false, maxRel: null, hideProposed: false, hideFailed: false, hideTS: false, focusHops: 0 };
+
+function nodeLabel(s) {
+  const nConf = (s.conformers || []).length;
+  return nConf > 1 ? `${s.name} · ${nConf} conf.` : s.name;
+}
+
+// structure id -> ids of the structures found from it (origin.parent), e.g.
+// a network expansion's species.
+function childrenOf(structures) {
+  const kids = {};
+  for (const s of Object.values(structures)) {
+    const p = s.origin?.parent;
+    if (p && p !== s.id && structures[p]) (kids[p] ||= []).push(s.id);
+  }
+  return kids;
+}
+
+// Which structures and edges the view shows. Returns {hide, dim, folded}:
+// sets of ids, and collapsed node -> how many structures it folds away.
+// Selected structures always stay visible.
+function computeView(workspace, view, collapsed, selected, focusIds, cyc) {
+  const { structures, edges } = workspace;
+  const kids = childrenOf(structures);
+  const hide = new Set(), dim = new Set(), folded = {};
+  for (const cid of collapsed) {
+    if (!structures[cid] || hide.has(cid)) continue;
+    const stack = [...(kids[cid] || [])];
+    let n = 0;
+    while (stack.length) {
+      const x = stack.pop();
+      if (x === cid || hide.has(x)) continue;
+      hide.add(x); n += 1;
+      stack.push(...(kids[x] || []));
+    }
+    if (n) folded[cid] = n;
+  }
+  // Energy above the lowest isomer (same formula, charge, spin and level of theory).
+  const low = {};
+  const isoKey = (s) => `${s.formula}|${s.charge}|${s.multiplicity}|${s.level?.key || ''}`;
+  for (const s of Object.values(structures)) {
+    if (s.energy == null || s.role === 'ts') continue;
+    const k = isoKey(s);
+    if (low[k] == null || s.energy < low[k]) low[k] = s.energy;
+  }
+  const q = view.q.trim().toLowerCase();
+  for (const s of Object.values(structures)) {
+    if (selected.has(s.id)) continue;
+    if (view.hideTS && s.role === 'ts') hide.add(s.id);
+    if (view.maxRel != null && s.energy != null && s.role !== 'ts' && low[isoKey(s)] != null
+        && (s.energy - low[isoKey(s)]) * HARTREE_KCAL > view.maxRel) hide.add(s.id);
+    if (q && ![s.name, s.smiles, s.formula].some((t) => (t || '').toLowerCase().includes(q))) (view.only ? hide : dim).add(s.id);
+  }
+  if (focusIds && focusIds.length && view.focusHops > 0 && cyc) {
+    let near = cyc.collection();
+    focusIds.forEach((id) => { near = near.union(cyc.getElementById(id)); });
+    for (let k = 0; k < view.focusHops; k += 1) near = near.union(near.closedNeighborhood('node'));
+    const keep = new Set(near.map((n) => n.id()));
+    for (const id of Object.keys(structures)) if (!keep.has(id)) hide.add(id);
+  }
+  for (const s of Object.values(structures)) if (selected.has(s.id)) hide.delete(s.id);
+  for (const e of Object.values(edges)) {
+    const st = edgeStatus(e, state.jobs).status;
+    if (view.hideProposed && e.origin?.proposed && !['done', 'running', 'queued'].includes(st)) hide.add(e.id);
+    if (view.hideFailed && st === 'failed') hide.add(e.id);
+    if (dim.has(e.source) && dim.has(e.target)) dim.add(e.id);
+  }
+  return { hide, dim, folded, kids };
+}
+
+function ViewPanel({ view, setView, collapsed, setCollapsed, kids, shown, total, onClose, focusCount }) {
+  const up = (patch) => setView({ ...view, ...patch });
+  const roots = Object.keys(kids);
+  const active = JSON.stringify(view) !== JSON.stringify(VIEW_DEFAULT) || collapsed.length;
+  return html`<div class="graph-view-panel" onClick=${(e) => e.stopPropagation()}>
+    <div class="gv-head"><b>View</b> <span class="small muted">showing ${shown} of ${total} structures</span>
+      <button class="btn-icon" onClick=${onClose} title="Close">✕</button></div>
+    <label class="gv-row"><input type="search" placeholder="Find by name, SMILES or formula" value=${view.q}
+      onInput=${(e) => up({ q: e.target.value })} /></label>
+    <label class="gv-row small"><input type="checkbox" checked=${view.only} onChange=${(e) => up({ only: e.target.checked })} />
+      only matches (else the rest is faded)</label>
+    <div class="gv-row small">
+      <span>Hide minima more than</span>
+      <input type="number" class="tiny" min="0" step="5" placeholder="—" value=${view.maxRel ?? ''}
+        onInput=${(e) => up({ maxRel: e.target.value === '' ? null : Math.max(0, +e.target.value) })} />
+      <span>kcal/mol above the lowest isomer</span>
+    </div>
+    <label class="gv-row small"><input type="checkbox" checked=${view.hideProposed} onChange=${(e) => up({ hideProposed: e.target.checked })} />
+      hide proposed reactions not searched yet</label>
+    <label class="gv-row small"><input type="checkbox" checked=${view.hideFailed} onChange=${(e) => up({ hideFailed: e.target.checked })} />
+      hide failed searches</label>
+    <label class="gv-row small"><input type="checkbox" checked=${view.hideTS} onChange=${(e) => up({ hideTS: e.target.checked })} />
+      hide transition-state structures</label>
+    <div class="gv-row small">
+      <span>Only the selection and</span>
+      <select value=${view.focusHops} onChange=${(e) => up({ focusHops: +e.target.value })}>
+        <option value="0">everything</option><option value="1">its neighbours</option>
+        <option value="2">2 steps out</option><option value="3">3 steps out</option>
+      </select>
+      ${view.focusHops > 0 && !focusCount && html`<span class="muted">(select structures first)</span>`}
+    </div>
+    <div class="gv-sep"></div>
+    <p class="small muted">Double-click a structure to fold away everything found from it (e.g. an expansion's species);
+      double-click again to unfold. Folded structures have a double border and a +N count.</p>
+    <div class="gv-row">
+      <button class="btn small" disabled=${!roots.length} onClick=${() => setCollapsed([...new Set([...collapsed, ...roots])])}>Fold all</button>
+      <button class="btn small" disabled=${!collapsed.length} onClick=${() => setCollapsed([])}>Unfold all</button>
+      <button class="btn small" disabled=${!active} onClick=${() => { setView({ ...VIEW_DEFAULT }); setCollapsed([]); }}>Reset view</button>
+    </div>
+  </div>`;
+}
+
 function edgeLabel(e, st) {
   const parts = [];
   if (st.barrier != null) parts.push(`${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`);
@@ -124,6 +242,17 @@ export function Graph() {
   const connectMode = useStore((s) => s.connectMode);
   const howToHidden = useStore((s) => s.howToHidden);
   const [drag, setDrag] = useState(false);
+  const [view, setViewState] = useState(() => ({ ...VIEW_DEFAULT, ...prefs.get('graphView', {}) }));
+  const [collapsed, setCollapsedState] = useState(() => prefs.get('graphCollapsed', []));
+  const [panel, setPanel] = useState(false);
+  const setPanelRef = useRef(setPanel);
+  const [counts, setCounts] = useState({ shown: 0, total: 0, kids: {} });
+  const setView = (v) => { setViewState(v); prefs.set('graphView', v); };
+  const setCollapsed = (l) => { setCollapsedState(l); prefs.set('graphCollapsed', l); };
+  const collapsedRef = useRef(collapsed);
+  collapsedRef.current = collapsed;
+  const setCollapsedRef = useRef(setCollapsed);
+  setCollapsedRef.current = setCollapsed;
 
   const savePositions = (c) => {
     const pos = {};
@@ -167,6 +296,13 @@ export function Graph() {
       if (evt.target.isNode()) select({ structures: [id] }, additive);
       else select({ edges: [id] }, additive);
     });
+    c.on('dbltap', 'node', (evt) => {
+      const id = evt.target.id();
+      const kids = childrenOf(state.workspace.structures);
+      const cur = collapsedRef.current;
+      if (cur.includes(id)) setCollapsedRef.current(cur.filter((x) => x !== id));
+      else if (kids[id]?.length) setCollapsedRef.current([...cur, id]);
+    });
     c.on('boxend', () => {
       // Box selection: take whatever cytoscape selected, in any order.
       setTimeout(() => {
@@ -208,8 +344,7 @@ export function Graph() {
       for (const s of Object.values(structures)) {
         ids.add(s.id);
         const img = depictUrl(s.smiles, 200, 150);
-        const nConf = (s.conformers || []).length;
-        const data = { id: s.id, label: nConf > 1 ? `${s.name} · ${nConf} conf.` : s.name, img: img || '', noimg: !img };
+        const data = { id: s.id, label: nodeLabel(s), img: img || '', noimg: !img };
         const el = c.getElementById(s.id);
         if (el.nonempty()) {
           if (el.data('label') !== data.label || el.data('img') !== data.img) el.data(data);
@@ -328,6 +463,32 @@ export function Graph() {
     if (!connectMode && cy.current) { connectFrom.current = null; cy.current.nodes().removeClass('connect-source'); }
   }, [connectMode]);
 
+  // --- the view: filters and folded branches
+  const focusKey = view.focusHops > 0 ? selection.structures.join(',') : '';
+  useEffect(() => {
+    const c = cy.current;
+    if (!c) return;
+    const sel = new Set(selection.structures);
+    const { hide, dim, folded, kids } = computeView(workspace, view, collapsed, sel,
+      view.focusHops > 0 ? selection.structures : null, c);
+    c.batch(() => {
+      c.elements().forEach((el) => {
+        const id = el.id();
+        el.toggleClass('vhidden', hide.has(id));
+        el.toggleClass('dim', !hide.has(id) && dim.has(id));
+        if (el.isNode()) {
+          const s = workspace.structures[id];
+          if (!s) return;
+          el.toggleClass('collapsed', !!folded[id]);
+          const label = nodeLabel(s) + (folded[id] ? `  ▸ +${folded[id]}` : '');
+          if (el.data('label') !== label) el.data('label', label);
+        }
+      });
+    });
+    const total = Object.keys(workspace.structures).length;
+    setCounts({ shown: total - [...hide].filter((id) => workspace.structures[id]).length, total, kids });
+  }, [workspace, statusKey, view, collapsed, focusKey]);
+
   const layout = () => {
     const c = cy.current;
     if (!c) return;
@@ -337,7 +498,7 @@ export function Graph() {
     }
     pendingArrange.current = false;
     arranging.current = true;
-    c.layout({
+    c.elements().filter((el) => !el.hasClass('vhidden')).layout({
       name: 'cose', animate: true, animationDuration: 400, fit: false, randomize: false,
       nodeDimensionsIncludeLabels: true, nodeRepulsion: () => 400000, nodeOverlap: 40,
       idealEdgeLength: () => 180, componentSpacing: 120, padding: 40,
@@ -360,7 +521,8 @@ export function Graph() {
       const d = typeof e.detail === 'string' ? { cmd: e.detail } : (e.detail || {});
       if (d.cmd === 'arrange') arrangeRef.current();
       else if (d.cmd === 'fit') (d.margins ? fitInto(c, d.margins) : fitCapped(c));
-      else if (d.cmd === 'select-all') select({ structures: Object.keys(state.workspace.structures) });
+      else if (d.cmd === 'select-all') select({ structures: c.nodes().filter((n) => !n.hasClass('vhidden')).map((n) => n.id()) });
+      else if (d.cmd === 'view') setPanelRef.current((x) => !x);
       else if (d.cmd === 'restyle') c.style(stylesheet());          // colours come from CSS variables
       else if (d.cmd === 'center' && d.id) {
         const el = c.getElementById(d.id);
@@ -384,8 +546,10 @@ export function Graph() {
           ${connectMode ? 'Connecting… Esc to stop' : '＋ Connect'}</button>
         <button class="btn small ghost" onClick=${layout} title="Auto-arrange the graph">Arrange</button>
         <button class="btn small ghost" onClick=${() => fitCapped(cy.current)} title="Fit everything in view">Fit</button>
-        <button class="btn small ghost" onClick=${() => select({ structures: Object.keys(state.workspace.structures) })}
-          title="Select every structure (then delete, download, or run one calculation on all)">Select all</button>
+        <button class="btn small ghost" onClick=${() => select({ structures: cy.current.nodes().filter((n) => !n.hasClass('vhidden')).map((n) => n.id()) })}
+          title="Select every structure shown (then delete, download, or run one calculation on all)">Select all</button>
+        <button class=${`btn small ${panel ? 'primary' : 'ghost'}`} onClick=${() => setPanel(!panel)}
+          title="Filter what the graph shows, and fold branches away">View${counts.shown < counts.total ? ` · ${counts.shown}/${counts.total}` : ''}</button>
         ${howToHidden && html`<button class="btn small ghost" title="Show 'How it works'" aria-label="How it works"
           onClick=${() => { prefs.set('hideHowTo', false); set({ howToHidden: false }); }}>?</button>`}
         ${nSelected > 0 && html`<button class="btn small ghost danger-text" onClick=${deleteSelection}
@@ -397,6 +561,8 @@ export function Graph() {
         <span><i class="lg done"></i>ΔE‡, kcal/mol</span>
         <span><i class="lg failed"></i>failed</span>
       </div>`}
+      ${panel && html`<${ViewPanel} view=${view} setView=${setView} collapsed=${collapsed} setCollapsed=${setCollapsed}
+        kids=${counts.kids} shown=${counts.shown} total=${counts.total} onClose=${() => setPanel(false)} focusCount=${selection.structures.length} />`}
       ${connectMode && html`<div class="graph-hint">Click the <b>start</b> structure, then the <b>end</b> structure.</div>`}
       ${empty && html`<div class="graph-empty">
         <h3>Your reaction graph</h3>

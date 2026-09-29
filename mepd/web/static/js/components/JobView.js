@@ -698,6 +698,9 @@ export function JobView({ jobId }) {
         </div>
       </details>
       ${job.status === 'failed' && job.error && html`<pre class="error-box">${job.error}</pre>`}
+      ${Object.keys(job.live_skipped || {}).length > 0 && html`<p class="level-note small">
+        ${Object.keys(job.live_skipped).length} species more than ${job.params?.explore_within ?? job.params?.energy_window} kcal/mol above the seed
+        were not added to Explore (the threshold under Explore in this calculation's settings). They are in the results, to add by hand.</p>`}
       ${['cancelled', 'interrupted'].includes(job.status) && html`<p class="warn-box small">${job.error} ${!job.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${job.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
         ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && ['channels', 'channels-more'].includes(job.op) && ['map', 'Path map'],
