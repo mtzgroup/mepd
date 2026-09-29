@@ -169,3 +169,18 @@ def test_design_minimize_skips_the_hessian_check_unless_asked(client):
         (job,) = client.post("/api/jobs", json={"op": "design-optimize", "dry_run": True,
                                                "params": {"validate_minima_with_hessian": flag}}).json()
         assert ("--validate-minima-with-hessian" in job["argv"]) == flag
+
+
+def test_a_bond_beyond_an_atoms_valence_says_why_instead_of_crashing(client):
+    """Bonding AlCl3 to an alkene carbon was a 500 "Internal Server Error"
+    (the valence message itself raised under RDKit 2026.03), so the click
+    seemed to do nothing. It is a 400 that names the atom and the way out."""
+    assert client.post("/api/design/new", json={"smiles": "C1=CCCCC1.[Cl][Al]([Cl])[Cl]"}).status_code == 200
+    r = client.post("/api/design/edit", json={"op": {"op": "bond", "a": 7, "b": 0, "order": 1}})
+    assert r.status_code == 400, r.text
+    assert "Al8 would have 4 bonds" in r.json()["detail"] and "Charge" in r.json()["detail"]
+    # Following the hint: Al- first, then the bond forms.
+    assert client.post("/api/design/edit", json={"op": {"op": "charge", "atom": 7, "delta": -1}}).status_code == 200
+    r = client.post("/api/design/edit", json={"op": {"op": "bond", "a": 7, "b": 0, "order": 1}})
+    assert r.status_code == 200, r.text
+    assert "[Al-]" in r.json()["smiles"]

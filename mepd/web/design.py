@@ -124,8 +124,12 @@ def _valence_message(mol, exc) -> str:
         try:
             atom.UpdatePropertyCache(strict=True)
         except Exception:
-            return (f"{atom.GetSymbol()}{atom.GetIdx() + 1} would have {int(atom.GetExplicitValence())} bonds "
-                    f"(charge {atom.GetFormalCharge():+d}), more than it can take")
+            # Counted from the bonds: after a failed strict update RDKit
+            # (2026.03) refuses to report the valence it just rejected.
+            n = sum(b.GetBondTypeAsDouble() for b in atom.GetBonds()) + atom.GetNumExplicitHs()
+            return (f"{atom.GetSymbol()}{atom.GetIdx() + 1} would have {n:g} bonds "
+                    f"(charge {atom.GetFormalCharge():+d}), more than it can take -- if it should carry a "
+                    f"formal charge (e.g. -1 on Al or B in a Lewis-acid adduct), set it with Charge first")
     return text.split("\n")[0]
 
 
