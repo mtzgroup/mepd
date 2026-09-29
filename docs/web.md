@@ -99,6 +99,18 @@ They are never referenced to the search's own starting geometry.
 **Log warnings.** Problems mepd only reports on stdout (for example, an IRC that failed while the TS
 was kept, or an NEB that never converged) are shown above the results.
 
+### Reaction SMILES
+
+`reactants>>products` (or `reactants>agents>products`; agents are dropped) gives both ends of a reaction with their atoms matched (`mepd/reaction_smiles.py`). Map numbers in the SMILES are used when every heavy atom has one. Otherwise SLAPMapper maps it, and hydrogens (and ties between mappings) go to the smallest endpoint RMSD. That is fast, not exhaustive; a path search with atom mapping on still weighs the other mappings.
+
+- **Explore › + Add, and Quick start:** adds both ends and the edge between them, pinned to the conformers built for this reaction.
+- **Design:** opens the reactant and the product side by side. With *Edit both* on (the default), an edit on one is made on the matching atom of the other, e.g. to swap a substituent on both ends and compare barriers. *Search TS* / *Reaction channels* add both ends and their edge, then run the search. `mepd/web/design_reaction.py` carries the atom match through edits: atoms an edit does not touch keep it; new atoms are matched by element, bonded neighbours and the closest fit in 3D.
+- **CLI:** `mepd run --reaction '...'` and `mepd channels --reaction '...'`.
+
+### Design
+
+Build or edit a structure in 3D: from SMILES, a reaction SMILES (above), an XYZ file (upload, drop or paste, with its charge), or a graph node. *Add molecule* places a preset, any SMILES, or an uploaded XYZ (kept rigid, as in the file) next to the atom you click.
+
 ### Sessions, cleanup, downloads
 
 - **Sessions.** A session is a workspace directory.
@@ -116,6 +128,9 @@ was kept, or an NEB that never converged) are shown above the results.
 
 - **Queue.** At most `--max-jobs` jobs run at once. The rest wait, first in, first out.
 - **Live tab.** Shows the latest status line and the path's energy profile as it optimizes, plus per-branch mini-plots for MSMEP. For `channels` it also shows the stats.json counters.
+- **Optimization tree tab** (`ts`, `channels`, `network-splits`). Shows every MSMEP path search as a tree: why each node split (the criterion) or stopped (elementary, unresolved and why, failed with its error and traceback, skipped). Pick a node to see its optimization step by step: all steps' energy profiles overlaid, a step scrubber with play, the barrier, how far the path moved and the gradient at the highest image per step, and the 3D geometry of any image.
+  - While a search runs, MSMEP records each node as it starts and finishes (`mepd/tree_log.py`, into `<job>/live/trees/<stream>/`). So a running search, or one that crashed or was cancelled before writing its tree, can be inspected too; the node that never finished is marked *interrupted*.
+  - Finished trees also write `tree.json` next to `adj_matrix.txt`. Older runs without it get outcomes inferred from their files.
 - **Cancel** kills the job's whole process group, which includes `--workers` children and CREST.
 - **Resume / Rerun** runs the same command into the same output folder. `channels`, `ts` and `network-splits` skip what is already on disk.
 - **Server restart.** Queued jobs stay queued. Running jobs are marked *interrupted* and can be resumed.

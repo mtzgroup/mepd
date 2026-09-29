@@ -23,6 +23,7 @@ from mepd.neb import NEB, NoneConvergedException
 from mepd.nodes.nodehelpers import is_identical
 
 from mepd.TreeNode import TreeNode
+from mepd import tree_log
 from mepd.errors import (
     ElectronicStructureError,
     extract_electronic_structure_error_details,
@@ -711,6 +712,7 @@ class MSMEP:
         attempted_pairs_payload: list[dict[str, Any]] | None = None,
         tree_depth: int = 0,
         max_depth: int | None = None,
+        parent_index: int | None = None,
     ) -> TreeNode:
         """Will take a chain as an input and run NEB minimizations until it exits out.
         NEB can exit due to the chain being converged, the chain needing to be split,
@@ -731,9 +733,11 @@ class MSMEP:
         if attempted_pairs_payload is not None:
             self._set_attempted_pairs_payload(attempted_pairs_payload)
         max_depth = self._resolve_recursive_split_max_depth(max_depth)
+        tree_log.started(tree_node_index, parent_index, tree_depth, input_chain)
         history, sequence_of_chains = self._guarded_step(
             input_chain, tree_node_index, tree_depth=tree_depth, max_depth=max_depth
         )
+        tree_log.finished(tree_node_index, history, len(sequence_of_chains))
 
         new_tree_node_index = tree_node_index + 1
         for i, chain_frag in enumerate(sequence_of_chains, start=1):
@@ -744,9 +748,11 @@ class MSMEP:
                     tree_node_index=new_tree_node_index,
                     tree_depth=tree_depth + 1,
                     max_depth=max_depth,
+                    parent_index=tree_node_index,
                 )
             except Exception as child_exc:
                 out_history = self._branch_failed(new_tree_node_index, child_exc, chain_frag)
+                tree_log.finished(new_tree_node_index, out_history, 0)
             history.children.append(out_history)
             new_tree_node_index = out_history.max_index + 1
         return history
@@ -902,6 +908,7 @@ class MSMEP:
         if not chain_trajectory:
             return history_node, []
         set_monitor_verdict("split")
+        history_node.split_criterion = elem_step_results.splitting_criterion
         self._say(
             f"Splitting chains based on: {elem_step_results.splitting_criterion}",
             snapshot=True,
@@ -958,6 +965,7 @@ class MSMEP:
 
         progress_printer = get_progress_printer()
         progress_printer.clear_path_so_far()
+        tree_log.started(tree_node_index, None, 0, input_chain)
         with progress_monitor(f"branch-{int(tree_node_index)}"):
             root_history, root_children = self._guarded_step(
                 input_chain=input_chain,
@@ -965,6 +973,7 @@ class MSMEP:
                 tree_depth=0,
                 max_depth=resolved_max_depth,
             )
+        tree_log.finished(tree_node_index, root_history, len(root_children))
         if not root_children:
             root_history.parallel_failures = []
             return root_history
@@ -1020,16 +1029,19 @@ class MSMEP:
             for child_position, child_chain in enumerate(child_fragments):
                 child_index = next_tree_index
                 next_tree_index += 1
+                tree_log.started(child_index, int(parent_node.index), child_depth, child_chain)
                 if resolved_max_depth is not None and child_depth > resolved_max_depth:
                     parent_node.children[child_position] = _empty_leaf(
                         child_index, status="max_depth_reached"
                     )
+                    tree_log.finished(child_index, parent_node.children[child_position], 0)
                     continue
                 worker_payload = copy.deepcopy(self._get_attempted_pairs_payload())
                 if self._skip_chain_due_to_attempted_history(child_chain):
                     parent_node.children[child_position] = _empty_leaf(
                         child_index, status="attempted_elsewhere"
                     )
+                    tree_log.finished(child_index, parent_node.children[child_position], 0)
                     continue
                 attempt_payload = self._record_attempted_pair(child_chain)
                 progress_printer.mark_monitor_active(f"branch-{child_index}")
@@ -1092,6 +1104,7 @@ class MSMEP:
                         )
                         child_children = []
                     job.parent.children[job.position] = child_history
+                    tree_log.finished(job.index, child_history, len(child_children))
                     leaf_status = str(getattr(child_history, "leaf_status", "") or "")
                     is_elem_step = (
                         not child_children

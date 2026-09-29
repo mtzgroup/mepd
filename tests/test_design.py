@@ -184,3 +184,67 @@ def test_a_bond_beyond_an_atoms_valence_says_why_instead_of_crashing(client):
     r = client.post("/api/design/edit", json={"op": {"op": "bond", "a": 7, "b": 0, "order": 1}})
     assert r.status_code == 200, r.text
     assert "[Al-]" in r.json()["smiles"]
+
+
+def test_xyz_files_start_a_design_and_can_be_placed_as_they_are(client):
+    import numpy as np
+
+    water = "3\nwater\nO 0.000 0.000 0.117\nH 0.000 0.757 -0.470\nH 0.000 -0.757 -0.470\n"
+    new = client.post("/api/design/new", json={"xyz": water, "name": "water"}).json()
+    assert new["smiles"] == "O" and new["name"] == "water" and new["charge"] == 0
+    # Bare "El x y z" lines (no header) and a charge for the bond orders.
+    hydroxide = client.post("/api/design/new", json={"xyz": "O 0 0 0\nH 0 0 0.97\n", "charge": -1}).json()
+    assert hydroxide["smiles"] == "[OH-]" and hydroxide["charge"] == -1
+    assert client.post("/api/design/new", json={"xyz": "2\n\nO 0 0 0\n"}).status_code == 400
+
+    # An uploaded structure placed next to an atom keeps its own geometry
+    # (no force-field relaxation), and brings the charge it was given.
+    client.post("/api/design/new", json={"smiles": "CC=O"})
+    bent = "3\n\nO 0 0 0\nH 0.96 0 0\nH -0.2 0.94 0\n"          # a deliberately odd H-O-H angle
+    placed = client.post("/api/design/edit", json={"op": {"op": "place", "atom": 2, "xyz": bent, "charge": 0}}).json()
+    assert placed["smiles"] == "CC=O.O" and placed["charge"] == 0
+    pos = d.read(placed["molblock"]).GetConformer().GetPositions()[-3:]
+    ref = np.array([[0, 0, 0], [0.96, 0, 0], [-0.2, 0.94, 0]])
+    dist = lambda x: np.linalg.norm(x[:, None] - x[None], axis=-1)
+    assert np.allclose(dist(pos), dist(ref), atol=1e-3)
+    ion = client.post("/api/design/edit", json={"op": {"op": "place", "atom": 2, "xyz": "1\n\nNa 0 0 0\n", "charge": 1}}).json()
+    assert ion["charge"] == 1
+
+
+def test_a_reaction_design_edits_both_sides_and_keeps_their_atoms_matched(client):
+    new = client.post("/api/design/new", json={"smiles": "CC(=O)C>>CC(O)=C"}).json()
+    rx = new["reaction"]
+    assert new["smiles"] == "CC(C)=O" and rx["product"]["smiles"] == "C=C(C)O" and rx["amap"] == list(range(10))
+    assert rx["balanced"] and rx["mapping"]["source"] == "slapmapper"
+    # Swap a methyl H on the reactant for a phenyl: the product gets it too, on the matching carbon.
+    mol = d.read(new["molblock"])
+    h = next(a.GetIdx() for a in mol.GetAtomWithIdx(0).GetNeighbors() if a.GetAtomicNum() == 1)
+    out = client.post("/api/design/edit", json={"op": {"op": "group", "atom": h, "group": "phenyl"}, "side": "reactant"}).json()
+    assert out["smiles"] == "CC(=O)Cc1ccccc1" and out["reaction"]["product"]["smiles"] in ("C=C(O)Cc1ccccc1", "OC(=C)Cc1ccccc1")
+    assert out["reaction"]["balanced"] and sorted(out["reaction"]["amap"]) == list(range(out["natoms"]))
+    # Matched atoms are the same element, and the ring sits on the same carbon on both sides.
+    r, p = d.read(out["molblock"]), d.read(out["reaction"]["product"]["molblock"])
+    amap = out["reaction"]["amap"]
+    assert all(r.GetAtomWithIdx(i).GetSymbol() == p.GetAtomWithIdx(j).GetSymbol() for i, j in enumerate(amap))
+    for b in r.GetBonds():
+        i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        if r.GetAtomWithIdx(i).GetIsAromatic() and r.GetAtomWithIdx(j).GetIsAromatic():
+            assert p.GetBondBetweenAtoms(amap[i], amap[j]) is not None
+    # One side alone: no longer balanced, so it can't go to the graph.
+    ph = next(a.GetIdx() for a in p.GetAtoms() if a.GetAtomicNum() == 1)
+    lone = client.post("/api/design/edit", json={"op": {"op": "element", "atom": ph, "element": "Cl"}, "side": "product",
+                                                 "linked": False}).json()
+    assert lone["reaction"]["balanced"] is False
+    assert client.post("/api/design/to-graph").status_code == 400
+    # Undo restores both sides.
+    back = client.put("/api/design", json={"molblock": out["molblock"], "reaction": {
+        "product_molblock": out["reaction"]["product"]["molblock"], "amap": amap}}).json()
+    assert back["reaction"]["balanced"]
+    added = client.post("/api/design/to-graph").json()
+    ws = client.get("/api/state").json()["workspace"]
+    edge = ws["edges"][added["edge"]]
+    assert edge["source"] == added["reactant"]["id"] and len(edge["conformers"]) == 2
+    (job,) = client.post("/api/jobs", json={"op": "ts", "edges": [added["edge"]], "dry_run": True, "profile": "default"}).json()
+    assert job["op"] == "ts"
+    assert client.post("/api/design/minimize", json={}).status_code == 400
+    assert client.get("/api/design/xyz?side=product").text.startswith(str(out["natoms"]))

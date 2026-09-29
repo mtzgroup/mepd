@@ -1165,3 +1165,14 @@ def test_only_an_unknown_route_answers_a_bare_not_found(client):
     for url in ("/api/jobs/j_nope/channels-map", "/api/jobs/j_nope/live/x", "/api/jobs/j_nope/files/x"):
         r = client.get(url)
         assert r.status_code in (400, 404) and r.json()["detail"] != "Not Found", url
+
+
+def test_a_reaction_smiles_adds_both_ends_and_their_edge(client):
+    added = client.post("/api/structures", json={"text": "CC(=O)C>>CC(O)=C keto-enol", "optimize": False}).json()
+    assert len(added) == 2 and added[1]["edge"]
+    ws = client.get("/api/state").json()["workspace"]
+    edge = ws["edges"][added[1]["edge"]]
+    assert (edge["source"], edge["target"]) == (added[0]["id"], added[1]["id"]) and edge["label"] == "keto-enol"
+    assert edge["origin"]["kind"] == "reaction" and set(edge["conformers"]) == {added[0]["id"], added[1]["id"]}
+    bad = client.post("/api/structures", json={"text": "CC>>CCC", "optimize": False})
+    assert bad.status_code == 400 and "not balanced" in bad.json()["detail"]

@@ -66,6 +66,7 @@ The public CLI exposes path minimization and NEB refinement commands:
 
 ```bash
 mepd run --start start.xyz --end end.xyz --inputs inputs.toml
+mepd channels --reaction "CC(=O)C>>CC(O)=C" --inputs inputs.toml   # both ends as one reaction SMILES
 mepd run-refine examples/oxycope.xyz -i expensive.toml -ci cheap.toml --mode neb
 mepd refine previous_result.xyz --inputs expensive.toml --mode neb
 mepd init --output inputs.toml

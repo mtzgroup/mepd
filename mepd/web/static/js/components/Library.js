@@ -14,6 +14,8 @@ function addedSummary(list) {
   if (fresh) parts.push(`Added ${fresh} structure${fresh === 1 ? '' : 's'}`);
   if (conf.length) parts.push(`${conf.length} new conformer${conf.length === 1 ? '' : 's'} of ${[...new Set(conf.map((a) => a.name))].join(', ')}`);
   if (dup) parts.push(`${dup} already in the graph`);
+  const edges = list.filter((a) => a.edge).length;
+  if (edges) parts.push(`${edges} reaction edge${edges === 1 ? '' : 's'}`);
   return parts.join(' · ') || 'Nothing new';
 }
 
@@ -37,6 +39,7 @@ export function AddBox({ onDone }) {
   const level = useStore((s) => s.levels[s.levelProfile ?? '']);
   const isXyz = /^\s*\d+\s*\n/.test(text);
   const n = isXyz ? null : text.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length;
+  const rxns = !isXyz && text.split('\n').some((l) => ((l.trim().split(/\s/)[0] || '').match(/>/g) || []).length === 2);
 
   const add = async () => {
     if (!text.trim()) return;
@@ -54,14 +57,14 @@ export function AddBox({ onDone }) {
   return html`
     <div class="add-box">
       <textarea rows="3" value=${text} spellcheck="false"
-        placeholder=${'SMILES, one per line (a name may follow a space),\nor pasted XYZ. You can also drop .xyz / .smi files.'}
+        placeholder=${'SMILES, one per line (a name may follow a space); a reaction\nSMILES (reactants>>products) adds both ends and their edge;\nor pasted XYZ. You can also drop .xyz / .smi files.'}
         onInput=${(e) => setText(e.target.value)}
         onKeyDown=${(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) add(); }} />
       <div class="add-row">
         <input type="number" class="tiny" placeholder="Charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} title="Charge (default: from SMILES / xyz)" />
         <input type="number" class="tiny" placeholder="Mult." min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} title="Spin multiplicity (default: from SMILES / xyz)" />
         <button class="btn primary" disabled=${busy || !text.trim()} onClick=${add}>
-          ${busy ? 'Embedding…' : isXyz ? 'Add XYZ' : n > 1 ? `Add ${n}` : 'Add'}
+          ${busy ? 'Embedding…' : isXyz ? 'Add XYZ' : rxns && n === 1 ? 'Add reaction' : n > 1 ? `Add ${n}` : 'Add'}
         </button>
       </div>
       <label class="small opt-toggle" title="Minimize at the workspace level of theory so every structure in the graph lives on the same potential energy surface">

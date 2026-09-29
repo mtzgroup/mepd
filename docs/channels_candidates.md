@@ -12,6 +12,13 @@ Default command:
 mepd channels --start <R> --end <P> -i inputs.toml --workers N
 ```
 
+`--start`/`--end` take xyz files or SMILES. Both can instead be given as one
+reaction SMILES, `--reaction "C=CCOC=C>>C=CCCC=O"` (agents in
+`reactants>agents>products` are ignored). Its atom map numbers are used when
+every heavy atom has one; otherwise SLAPMapper maps it, and hydrogens (and
+ties between mappings) go to the smallest endpoint RMSD. `--atom-mapping`
+still weighs the alternatives, as for any other input.
+
 The defaults are: `--atom-mapping` on, `--backend rdkit`, `--n-conformers 0`
 (no cap), `--n-embed 0` (automatic), `--max-pairs 0` (no cap),
 `--pairs-per-mechanism 3`, `--rmsd-cutoff 0.5` bohr. Every run writes

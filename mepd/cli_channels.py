@@ -32,7 +32,9 @@ from mepd.cli_common import (
     _echo_run_inputs_summary,
     _fork_map,
     _geometry_optimizer_keywords,
+    _check_endpoint_options,
     _load_structure_from_smiles_or_xyz,
+    _reaction_endpoints,
     _minimize_endpoints,
     _open_run_inputs,
     _optimize_ts_and_irc,
@@ -697,8 +699,16 @@ def _discover_channels(
 
 
 def channels(
-    start: str = typer.Option(..., "--start", help="Path to the reactant-endpoint xyz file, or a SMILES string."),
-    end: str = typer.Option(..., "--end", help="Path to the product-endpoint xyz file, or a SMILES string."),
+    start: Optional[str] = typer.Option(
+        None, "--start", help="Path to the reactant-endpoint xyz file, or a SMILES string (or use --reaction)."),
+    end: Optional[str] = typer.Option(
+        None, "--end", help="Path to the product-endpoint xyz file, or a SMILES string (or use --reaction)."),
+    reaction: Optional[str] = typer.Option(
+        None, "--reaction",
+        help="Both endpoints as one reaction SMILES, 'reactants>>products' (agents, as in "
+        "'reactants>agents>products', are ignored). Atom map numbers ([CH3:1]...) are used when every "
+        "heavy atom has one; otherwise SLAPMapper maps the reaction. Instead of --start/--end.",
+    ),
     method: str = typer.Option(
         "conformers", "--method",
         help="Seed-generation strategy for perturbing the search to surface "
@@ -977,6 +987,8 @@ def channels(
     channel, and lands in <output>/offtarget-exit-channels/. Everything
     completed is also combined into one byproduct network at
     <output>/network.json."""
+    reaction = reaction if isinstance(reaction, str) else None   # called as a plain function
+    _check_endpoint_options(start, end, reaction)
     if method != "conformers":
         raise typer.BadParameter(f"Unknown --method '{method}'. Known: 'conformers'.")
     if backend not in ("rdkit", "crest"):
@@ -1033,11 +1045,14 @@ def channels(
     run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     _echo_run_inputs_summary(run_inputs)
 
-    start_is_smiles = not Path(start).exists()
-    end_is_smiles = not Path(end).exists()
-
-    start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
-    end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
+    if reaction is not None:
+        start_structure, end_structure = _reaction_endpoints(reaction, charge, multiplicity)
+        start_is_smiles = end_is_smiles = True
+    else:
+        start_is_smiles = not Path(start).exists()
+        end_is_smiles = not Path(end).exists()
+        start_structure = _load_structure_from_smiles_or_xyz(start, charge, multiplicity)
+        end_structure = _load_structure_from_smiles_or_xyz(end, charge, multiplicity)
     start_node = StructureNode(structure=start_structure)
     end_node = StructureNode(structure=end_structure)
 

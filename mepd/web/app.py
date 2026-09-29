@@ -9,6 +9,7 @@ refetches /api/state.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import multiprocessing
 import os
@@ -28,6 +29,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
+
+from mepd.reaction_smiles import ReactionSmilesError, is_reaction_smiles, reaction_structures
 
 from mepd.web import chem
 from mepd.web.jobs import Broadcaster, JobManager, _reduce_chain_payload
@@ -70,6 +73,8 @@ class DesignNew(BaseModel):
     smiles: Optional[str] = None
     xyz: Optional[str] = None
     name: Optional[str] = None
+    charge: Optional[int] = None          # of an xyz (bond orders are assigned for this total charge)
+    multiplicity: Optional[int] = None
 
 
 class DesignLoad(BaseModel):
@@ -79,13 +84,27 @@ class DesignLoad(BaseModel):
 
 class DesignEdit(BaseModel):
     op: dict
+    side: Literal["reactant", "product"] = "reactant"   # reaction mode: which molecule was clicked
+    linked: bool = True                                 # reaction mode: repeat the edit on the other side
+
+
+class DesignReactionPut(BaseModel):
+    product_molblock: str
+    amap: list[int]
 
 
 class DesignPut(BaseModel):
     molblock: Optional[str] = None
+    reaction: Optional[DesignReactionPut] = None        # reaction mode undo/redo: the product side too
     name: Optional[str] = None
     charge: Optional[int] = None
     multiplicity: Optional[int] = None
+
+
+class DesignSearch(BaseModel):
+    op: Literal["ts", "channels"] = "ts"
+    profile: Optional[str] = None
+    params: Optional[dict] = None
 
 
 class DesignMinimize(BaseModel):
@@ -504,6 +523,18 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             for line in lines:
                 # "SMILES name" per line, like a .smi file
                 smi, _, line_name = line.partition(" ")
+                if is_reaction_smiles(smi):
+                    # Both ends, atoms in the same order, joined by an edge.
+                    try:
+                        start, end, pair = reaction_structures(smi, charge, mult)
+                    except ReactionSmilesError as exc:
+                        raise WorkspaceError(str(exc)) from None
+                    rs, ps = smi.partition(">")[0], smi.rpartition(">")[2]
+                    origin = {"kind": "reaction", "input": smi, "mapping": pair.source, "mapped": pair.mapped_smiles}
+                    todo.append((start, {"name": rs, "origin": origin, "smiles": rs, "_edge": "start",
+                                         "_label": line_name.strip() or name or ""}))
+                    todo.append((end, {"name": ps, "origin": origin, "smiles": ps, "_edge": "end"}))
+                    continue
                 try:
                     s = chem.structure_from_smiles(smi, charge, mult)
                 except Exception as exc:
@@ -512,11 +543,28 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                                  "origin": {"kind": "smiles", "input": smi}, "smiles": smi}))
         if demo is not None:
             demo.check_structures(len(W().snapshot()["structures"]), [len(s.symbols) for s, _ in todo])
-        out = []
+        out, start, label = [], None, ""
         for s, kw in todo:
+            role = kw.pop("_edge", None)
+            label = kw.pop("_label", label)
             added = W().add_or_merge(s, **kw)
             out.append({**added["rec"], "merged": added["merged"], "duplicate": added["duplicate"],
                         "added_conformer": added["conformer"]})
+            if role == "start":
+                start = added
+            elif role == "end" and start is not None:
+                ws = W()
+                if start["rec"]["id"] != added["rec"]["id"]:
+                    edge = ws.add_edge(start["rec"]["id"], added["rec"]["id"], label=label,
+                                       origin={"kind": "reaction", "input": kw.get("origin", {}).get("input")})
+                    # The conformers built for this reaction, whose atoms line up
+                    # (not an older conformer these geometries turned out to repeat).
+                    if start["conformer"] and added["conformer"] and not start["duplicate"] and not added["duplicate"]:
+                        with contextlib.suppress(Exception):
+                            ws.update_edge(edge["id"], conformers={start["rec"]["id"]: start["conformer"],
+                                                                    added["rec"]["id"]: added["conformer"]})
+                    out[-1]["edge"] = edge["id"]
+                start = None
         return out
 
     def queue_optimization(sids: list[str], conformers: Optional[list] = None) -> list[dict]:
@@ -612,12 +660,19 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return (W().conformer_path(sid, conformer) if conformer else W().structure_path(sid)).read_text()
 
     # ------------------------------------------------------------ design
-    def _store_design(info: dict, *, name=None, source=None, charge=None, multiplicity=None, keep=None) -> dict:
+    def _store_design(info: dict, *, name=None, source=None, charge=None, multiplicity=None, keep=None,
+                      reaction=None) -> dict:
         """Save a molecule as the design. An edit clears the energy/level (it
         is no longer the minimized geometry) and keeps name/source/overrides."""
         old = keep or {}
-        if name is None and old.get("name") in (None, old.get("smiles"), (old.get("source") or {}).get("input")):
-            name = info.get("smiles") or old.get("name")   # an automatic name follows the molecule
+        new_rx = reaction if reaction is not None else old.get("reaction")
+
+        def auto_name(smiles, rx):
+            return f"{smiles}>>{rx['product'].get('smiles')}" if rx and smiles else smiles
+
+        if name is None and old.get("name") in (None, old.get("smiles"), (old.get("source") or {}).get("input"),
+                                                auto_name(old.get("smiles"), old.get("reaction"))):
+            name = auto_name(info.get("smiles"), new_rx) or old.get("name")   # an automatic name follows the molecule
         design = {
             "molblock": info["molblock"], "smiles": info.get("smiles"), "formula": info.get("formula"),
             "natoms": info.get("natoms"),
@@ -634,7 +689,21 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         design["charge"] = info["charge"] + design["charge_offset"]
         design["multiplicity"] = max(1, info["multiplicity"] + design["multiplicity_offset"])
         design["coverage"] = _coverage_warnings(info["molblock"])
+        rx = reaction if reaction is not None else old.get("reaction")
+        if rx:
+            # Reaction mode: the product shares the charge offset and spin.
+            prod = rx["product"]
+            rx = {**rx, "product": {**prod, "charge": prod["formal_charge"] + design["charge_offset"]}}
+            rx["balanced"] = rx.get("balanced", True)
+            design["coverage"] = sorted(set(design["coverage"]) | set(_coverage_warnings(prod["molblock"])))
+        design["reaction"] = rx or None
         return W().set_design(design)
+
+    def _reaction_part(info: dict, amap: list, mapping=None, balanced=True, note=None) -> dict:
+        prod = {k: info.get(k) for k in ("molblock", "smiles", "formula", "natoms")}
+        prod["formal_charge"] = info["charge"]
+        prod["warnings"] = info.get("warnings", [])
+        return {"product": prod, "amap": list(amap), "mapping": mapping, "balanced": balanced, "note": note}
 
     def _level_text() -> Optional[str]:
         ws = W()
@@ -668,16 +737,29 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def design_new(body: DesignNew):
         from mepd.web import design
 
+        if body.smiles and is_reaction_smiles(body.smiles.strip()):
+            from mepd.web import design_reaction
+
+            pair = design_reaction.new_pair(body.smiles.strip())
+            out = _store_design(pair["reactant"], name=body.name or body.smiles.strip(),
+                                source={"kind": "reaction", "input": body.smiles.strip()}, keep={},
+                                reaction=_reaction_part(pair["product"], pair["amap"], pair["mapping"]))
+            publish_ws()
+            return out
         if body.smiles:
             info, source = design.from_smiles(body.smiles), {"kind": "smiles", "input": body.smiles.strip()}
             name = body.name or body.smiles.strip()
         elif body.xyz:
-            info, warnings = design.from_xyz(body.xyz)
+            info, warnings = design.from_xyz(body.xyz, body.charge or 0)
             info["warnings"] = warnings
             source, name = {"kind": "xyz"}, body.name or "design"
         else:
             raise WorkspaceError("give a SMILES or an xyz")
-        out = _store_design(info, name=name, source=source, keep={})
+        if body.multiplicity is not None and body.multiplicity < 1:
+            raise WorkspaceError("multiplicity must be at least 1")
+        out = _store_design(info, name=name, source=source, keep={},
+                            charge=body.charge if body.xyz else None,
+                            multiplicity=body.multiplicity if body.xyz else None)
         publish_ws()
         return out
 
@@ -703,7 +785,25 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import design
 
         d = _current_design()
-        out = _store_design(design.edit(d["molblock"], body.op), keep=d)
+        if d.get("reaction"):
+            from mepd.web import design_reaction
+
+            rx = d["reaction"]
+            res = design_reaction.linked_edit(d["molblock"], rx["product"]["molblock"], rx["amap"], body.side,
+                                              body.op, body.linked)
+            part = _reaction_part(res["product"], res["amap"], rx.get("mapping"), res["balanced"], res["note"])
+            out = _store_design(res["reactant"], keep=d, reaction=part)
+            publish_ws()
+            return {**out, "changed": res["changed"].get("reactant", []),
+                    "changed_product": res["changed"].get("product", []), "note": res["note"]}
+        info = design.edit(d["molblock"], body.op)
+        charge = None
+        if body.op.get("op") == "place" and body.op.get("xyz") and body.op.get("charge") is not None:
+            # A placed xyz brings the charge it was given, whatever formal
+            # charges its bonds could be assigned.
+            count = max(1, min(int(body.op.get("count", 1)), 30))
+            charge = int(d["charge"]) + int(body.op["charge"]) * count
+        out = _store_design(info, keep=d, charge=charge)
         publish_ws()
         return out
 
@@ -712,7 +812,13 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import design
 
         d = _current_design()
-        out = _store_design(design.clean(d["molblock"]), keep=d)
+        rx = d.get("reaction")
+        if rx:
+            p = design.clean(rx["product"]["molblock"])   # same atoms, new coordinates: the map holds
+            out = _store_design(design.clean(d["molblock"]), keep=d,
+                                reaction={**rx, **_reaction_part(p, rx["amap"], rx.get("mapping"), rx.get("balanced", True))})
+        else:
+            out = _store_design(design.clean(d["molblock"]), keep=d)
         publish_ws()
         return out
 
@@ -726,7 +832,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         info = design.describe(design.read(body.molblock or d["molblock"]), sanitized=False)
         if body.multiplicity is not None and body.multiplicity < 1:
             raise WorkspaceError("multiplicity must be at least 1")
-        out = _store_design(info, name=body.name, keep=d, charge=body.charge, multiplicity=body.multiplicity)
+        reaction = None
+        if body.reaction is not None and d.get("reaction"):
+            rx = d["reaction"]
+            p = design.describe(design.read(body.reaction.product_molblock), sanitized=False)
+            ok = -1 not in body.reaction.amap and sorted(body.reaction.amap) == list(range(p["natoms"]))
+            reaction = _reaction_part(p, body.reaction.amap, rx.get("mapping"), ok and p["natoms"] == info["natoms"])
+        out = _store_design(info, name=body.name, keep=d, charge=body.charge, multiplicity=body.multiplicity,
+                            reaction=reaction)
         if body.molblock is None and d.get("energy") is not None and body.charge is None and body.multiplicity is None:
             out = W().set_design({**out, "energy": d["energy"], "level": d["level"]})   # a rename keeps the energy
         publish_ws()
@@ -739,15 +852,29 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return {"ok": True}
 
     @app.get("/api/design/xyz", response_class=PlainTextResponse)
-    def design_xyz():
+    def design_xyz(side: str = "reactant"):
         from mepd.web import design
 
         d = _current_design()
+        if side == "product":
+            if not d.get("reaction"):
+                raise HTTPException(404, "this design is one molecule, not a reaction")
+            return design.to_xyz(_product_in_reactant_order(d), d["charge"], d["multiplicity"])
         return design.to_xyz(d["molblock"], d["charge"], d["multiplicity"])
+
+    def _product_in_reactant_order(d: dict) -> str:
+        """The product molblock with its atoms in the reactant's order."""
+        from rdkit import Chem
+
+        from mepd.web import design, design_reaction
+
+        order = design_reaction.product_order(d["reaction"]["amap"])
+        return Chem.MolToMolBlock(Chem.RenumberAtoms(design.read(d["reaction"]["product"]["molblock"]), order))
 
     @app.post("/api/design/minimize")
     async def design_minimize(body: DesignMinimize):
-        _current_design()
+        if _current_design().get("reaction"):
+            raise WorkspaceError("a reaction design is minimized when its path search starts: use Search TS")
         params = {"validate_minima_with_hessian": W().validate_minima, **(body.params or {})}
         created = J().submit("design-optimize", structure_ids=[], edge_ids=[], params=params,
                              profile=body.profile if body.profile is not None else W().level_profile)
@@ -769,7 +896,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
     @app.post("/api/design/tsopt")
     async def design_tsopt(body: DesignMinimize):
-        _current_design()
+        if _current_design().get("reaction"):
+            raise WorkspaceError("Optimize as TS takes one structure (a TS guess), not a reaction")
         return J().submit("design-tsopt", structure_ids=[], edge_ids=[], params={"irc": True, **(body.params or {})},
                           profile=body.profile if body.profile is not None else W().level_profile)
 
@@ -810,6 +938,10 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import design
 
         d = _current_design()
+        if d.get("reaction"):
+            out = _reaction_to_graph(d)
+            publish_ws()
+            return out
         (s,) = chem.structures_from_xyz_text(design.to_xyz(d["molblock"], d["charge"], d["multiplicity"]),
                                               d["charge"], d["multiplicity"])
         ts = d.get("role") == "ts"   # a converged TS stays a saddle point (never merged, never minimized)
@@ -823,6 +955,46 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         publish_ws()
         return {**added["rec"], "merged": added["merged"], "duplicate": added["duplicate"],
                 "added_conformer": added["conformer"]}
+
+    def _reaction_to_graph(d: dict) -> dict:
+        """Both ends of a reaction design (the product's atoms in the
+        reactant's order), joined by an edge that uses these conformers."""
+        from mepd.web import design
+
+        rx = d["reaction"]
+        if not rx.get("balanced", True):
+            raise WorkspaceError("the reactant and the product no longer have the same atoms (an edit was made on one "
+                                 "side only): make them match before adding the reaction")
+        ends = []
+        for mb, smiles in ((d["molblock"], d.get("smiles")), (_product_in_reactant_order(d), rx["product"].get("smiles"))):
+            (s,) = chem.structures_from_xyz_text(design.to_xyz(mb, d["charge"], d["multiplicity"]),
+                                                  d["charge"], d["multiplicity"])
+            ends.append(W().add_or_merge(s, name=smiles, smiles=None, role="minimum",
+                                         origin={"kind": "design", "label": "Design (reaction)", "source": d.get("source")}))
+        (a, b), ws = ends, W()
+        if a["rec"]["id"] == b["rec"]["id"]:
+            raise WorkspaceError("both sides are the same molecule, so there is no reaction to search")
+        edge = ws.add_edge(a["rec"]["id"], b["rec"]["id"], label=d.get("name") or "",
+                           origin={"kind": "reaction", "input": (d.get("source") or {}).get("input")})
+        ws.update_edge(edge["id"], conformers={a["rec"]["id"]: a["conformer"], b["rec"]["id"]: b["conformer"]})
+        return {"reactant": a["rec"], "product": b["rec"], "edge": edge["id"],
+                "new": [x["rec"]["id"] for x in ends if not x["merged"]]}
+
+    @app.post("/api/design/search")
+    async def design_search(body: DesignSearch):
+        """Reaction mode: add both ends and their edge, then run a TS search
+        (or a channels run) on it at the workspace level."""
+        d = _current_design()
+        if not d.get("reaction"):
+            raise WorkspaceError("Search needs a reaction design (start one from a reaction SMILES)")
+        out = await run_in_threadpool(_reaction_to_graph, d)
+        publish_ws()
+        ws = W()
+        # The edge carries these conformers, so the search starts from exactly this pair.
+        created = await run_in_threadpool(
+            J().submit, body.op, structure_ids=[], edge_ids=[out["edge"]], params=body.params or {},
+            profile=body.profile if body.profile is not None else ws.level_profile)
+        return {**out, "jobs": created}
 
     @app.delete("/api/structures/{sid}/conformers/{cid}")
     def delete_conformer(sid: str, cid: str):
@@ -973,6 +1145,59 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if len(_channels_map_cache) > 32:
             _channels_map_cache.pop(next(iter(_channels_map_cache)))
         return result
+
+    def _tree_family(jid: str):
+        """(job dirs, output dir, running) of a job and the follow-ups that share its folder."""
+        job = J().get(jid)
+        base = J().get(job["source_job"]) if job.get("source_job") in J().jobs and \
+            J().jobs[job["source_job"]].get("output_dir") == job.get("output_dir") else job
+        family = [base] + sorted((j for j in J().jobs.values() if j.get("source_job") == base["id"]
+                                  and j.get("output_dir") == base.get("output_dir")), key=lambda j: j["created"])
+        return ([J().job_dir(j["id"]) for j in family], Path(base["output_dir"]),
+                any(j["status"] == "running" for j in family))
+
+    def _stream(tid: str) -> str:
+        from mepd.web.opt_tree import STREAM
+
+        if not STREAM.match(tid) or tid in (".", ".."):
+            raise HTTPException(400, "bad tree id")
+        return tid
+
+    @app.get("/api/jobs/{jid}/trees")
+    async def job_trees(jid: str):
+        """The MSMEP split trees in a job (one per path search), finished or live."""
+        from mepd.web.opt_tree import list_trees
+
+        dirs, out, running = _tree_family(jid)
+        return await run_in_threadpool(list_trees, dirs, out, running)
+
+    @app.get("/api/jobs/{jid}/trees/{tid}")
+    async def job_tree(jid: str, tid: str):
+        from mepd.web.opt_tree import load_tree
+
+        dirs, out, running = _tree_family(jid)
+        try:
+            return await run_in_threadpool(load_tree, dirs, out, _stream(tid), running)
+        except KeyError:
+            raise HTTPException(404, f"no optimization tree '{tid}' in this job")
+
+    @app.get("/api/jobs/{jid}/trees/{tid}/nodes/{key}")
+    async def job_tree_node(jid: str, tid: str, key: int, step: Optional[int] = None):
+        """One node's optimization, step by step (geometries of one step)."""
+        from mepd.web.opt_tree import node_detail, running_node
+
+        dirs, out, running = _tree_family(jid)
+        try:
+            detail = await run_in_threadpool(node_detail, dirs, out, _stream(tid), key, running, step)
+        except KeyError:
+            raise HTTPException(404, f"no optimization tree '{tid}' in this job")
+        if running:
+            for d in dirs:
+                live = await run_in_threadpool(running_node, d, tid, key)
+                if live:
+                    detail["live"] = live
+                    break
+        return detail
 
     @app.get("/api/jobs/{jid}/vri-viewer", response_class=HTMLResponse)
     def vri_viewer(jid: str):

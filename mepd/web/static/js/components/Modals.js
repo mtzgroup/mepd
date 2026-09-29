@@ -22,14 +22,14 @@ function Modal({ title, children, onClose }) {
     </div>`;
 }
 
-function EndpointInput({ label, value, onChange }) {
+function EndpointInput({ label, value, onChange, placeholder }) {
   const [drag, setDrag] = useState(false);
   return html`
     <label class=${`endpoint ${drag ? 'drag' : ''}`}
       onDragOver=${(e) => { e.preventDefault(); setDrag(true); }} onDragLeave=${() => setDrag(false)}
       onDrop=${async (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files[0]; if (f) onChange(await readFileText(f)); }}>
       <span class="field-label">${label}</span>
-      <textarea rows="3" spellcheck="false" value=${value} placeholder="SMILES, pasted XYZ, or drop an .xyz file"
+      <textarea rows="3" spellcheck="false" value=${value} placeholder=${placeholder || 'SMILES, pasted XYZ, or drop an .xyz file'}
         onInput=${(e) => onChange(e.target.value)} />
     </label>`;
 }
@@ -51,15 +51,18 @@ function QuickStart({ onClose }) {
   const [phase, setPhase] = useState('');
   const m = QUICK_MODES.find((x) => x.key === mode);
   const op = operations.find((o) => o.key === mode);
-  const ready = a.trim() && (!m.pair || b.trim());
+  // "reactants>>products" in the first box gives both ends (atoms mapped).
+  const isRxn = (t) => { const x = t.trim().split(/\s/)[0] || ''; return (x.match(/>/g) || []).length === 2; };
+  const rxn = m.pair && isRxn(a);
+  const ready = a.trim() && (!m.pair || rxn || b.trim());
 
   const go = async () => {
     setBusy(true);
     const opts = { charge: charge === '' ? null : +charge, multiplicity: mult === '' ? null : +mult };
     const out = await attempt(async () => {
-      const [sa] = await api.post('/api/structures', { text: a, ...opts, optimize: true });
-      const ids = [sa.id];
-      if (m.pair) { const [sb] = await api.post('/api/structures', { text: b, ...opts, optimize: true }); ids.push(sb.id); }
+      const added = await api.post('/api/structures', { text: a, ...opts, optimize: true });
+      const ids = rxn ? added.slice(0, 2).map((x) => x.id) : [added[0].id];
+      if (m.pair && !rxn) { const [sb] = await api.post('/api/structures', { text: b, ...opts, optimize: true }); ids.push(sb.id); }
       // Every calculation starts from minima at the workspace level: wait for
       // the minimizations, and stop with an explanation if one of them turned
       // the input into something else.
@@ -99,8 +102,11 @@ function QuickStart({ onClose }) {
           <strong>${x.title}</strong><span class="small muted">${x.desc}</span></button>`)}
       </div>
       <div class=${m.pair ? 'endpoint-pair' : ''}>
-        <${EndpointInput} label=${m.pair ? 'Start (reactant)' : 'Structure'} value=${a} onChange=${setA} />
-        ${m.pair && html`<${EndpointInput} label="End (product)" value=${b} onChange=${setB} />`}
+        <${EndpointInput} label=${m.pair ? (rxn ? 'Reaction SMILES' : 'Start (reactant), or a reaction SMILES') : 'Structure'} value=${a} onChange=${setA}
+          placeholder=${m.pair ? 'SMILES, reactants>>products, pasted XYZ, or drop an .xyz file' : undefined} />
+        ${m.pair && !rxn && html`<${EndpointInput} label="End (product)" value=${b} onChange=${setB} />`}
+        ${rxn && html`<p class="small muted rxn-note">Both ends come from this reaction SMILES, with their atoms matched (from the map numbers
+          if it has them, else SLAPMapper and the closest match in 3D).</p>`}
       </div>
       <div class="add-row">
         <input type="number" class="tiny" placeholder="charge" value=${charge} onInput=${(e) => setCharge(e.target.value)} />

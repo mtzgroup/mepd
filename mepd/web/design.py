@@ -18,7 +18,8 @@ Edits (see `edit`):
                                       (a named one, or any SMILES with [*] where it attaches)
   charge    {atom, delta}             change an atom's formal charge by +-1
   hydrogens {}                        re-add hydrogens everywhere from valences
-  place     {atom, species | smiles,  put whole molecules/ions (water, Li+, Mg2+, BF3, any SMILES) next to
+  place     {atom, species | smiles | put whole molecules/ions (water, Li+, Mg2+, BF3, any SMILES, an xyz
+             xyz (+charge),           structure placed rigidly as given) next to
              count}
                                       `atom`, not bonded: count waters make a small solvation shell
 """
@@ -184,12 +185,40 @@ def from_xyz(xyz: str, charge: int = 0) -> tuple[dict, list[str]]:
     """A molblock from a graph structure's xyz: bond orders from the
     geometry (xyz2mol) when they can be assigned, otherwise connectivity
     only (e.g. a transition state), with a warning."""
+    mol, warnings = mol_from_xyz(xyz, charge)
+    return describe(mol, sanitized=not warnings), warnings
+
+
+def _xyz_block(xyz: str) -> str:
+    """Tolerate what people paste or upload: a missing atom-count/comment
+    header (bare "El x y z" lines) and trailing frames (only the first is
+    used)."""
+    lines = [ln for ln in xyz.replace("\r", "").split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        raise WorkspaceError("the xyz is empty")
+    head = lines[0].split()
+    if len(head) == 1 and head[0].isdigit():
+        n = int(head[0])
+        body = lines[2:2 + n]
+    else:
+        body = [ln for ln in lines if len(ln.split()) >= 4]
+        n = len(body)
+    if n == 0 or len([ln for ln in body if ln.strip()]) < n:
+        raise WorkspaceError("could not read the xyz: expected an atom count, a comment line, then one "
+                             "'element x y z' line per atom")
+    return f"{n}\n\n" + "\n".join(" ".join(ln.split()[:4]) for ln in body) + "\n"
+
+
+def mol_from_xyz(xyz: str, charge: int = 0):
     Chem = _chem()
     from rdkit.Chem import rdDetermineBonds
 
+    xyz = _xyz_block(xyz)
     mol = Chem.MolFromXYZBlock(xyz)
     if mol is None:
-        raise WorkspaceError("could not read the structure's xyz")
+        raise WorkspaceError("could not read the xyz (check the element symbols)")
     warnings = []
     try:
         trial = Chem.Mol(mol)
@@ -205,7 +234,7 @@ def from_xyz(xyz: str, charge: int = 0) -> tuple[dict, list[str]]:
                         "edits that re-add hydrogens use them.")
     for a in mol.GetAtoms():
         a.SetNoImplicit(True)
-    return describe(mol, sanitized=not warnings), warnings
+    return mol, warnings
 
 
 # ------------------------------------------------------------------ geometry helpers
@@ -592,7 +621,14 @@ def _edit_place(mol, op):
 
     idx = int(op["atom"])
     count = max(1, min(int(op.get("count", 1)), 30))
-    if op.get("smiles"):
+    xyz_frag = None
+    if op.get("xyz"):
+        # A structure of its own (e.g. an uploaded catalyst): its geometry is
+        # kept as given (placed rigidly, never force-field relaxed), with the
+        # file's first atom as the contact atom.
+        xyz_frag, frag_warnings = mol_from_xyz(str(op["xyz"]), int(op.get("charge") or 0))
+        smiles, contact = None, None
+    elif op.get("smiles"):
         smiles = str(op["smiles"]).strip()
         contact = None
     else:
@@ -600,7 +636,7 @@ def _edit_place(mol, op):
         if name not in SPECIES:
             raise WorkspaceError(f"unknown species {name!r}")
         smiles, contact = SPECIES[name]
-    parsed = Chem.MolFromSmiles(smiles)
+    parsed = xyz_frag if xyz_frag is not None else Chem.MolFromSmiles(smiles)
     if parsed is None:
         raise WorkspaceError(f"could not read the SMILES {smiles!r}")
     if contact is None:
@@ -614,8 +650,10 @@ def _edit_place(mol, op):
         contact = r + (0.25 if (first.GetFormalCharge() or metal) else 1.2)
     if mol.GetAtomWithIdx(idx).GetAtomicNum() == 1:
         contact -= 0.9   # clicked a hydrogen: an H-bond / contact to the H itself, not to its heavy atom
-    frag = Chem.AddHs(parsed)
-    if frag.GetNumAtoms() > 1:
+    frag = parsed if xyz_frag is not None else Chem.AddHs(parsed)
+    if xyz_frag is not None:
+        fpos0 = _positions(frag)
+    elif frag.GetNumAtoms() > 1:
         if AllChem.EmbedMolecule(frag, randomSeed=11) != 0:
             AllChem.EmbedMolecule(frag, randomSeed=11, useRandomCoords=True)
         try:
@@ -665,7 +703,9 @@ def _edit_place(mol, op):
     m = rw.GetMol()
     m.UpdatePropertyCache(strict=False)
     warnings = []
-    if len(placed) > 1:
+    if xyz_frag is not None:
+        warnings += frag_warnings
+    elif len(placed) > 1:
         warnings.append(_relax(m, placed, steps=300))
     return m, placed, warnings
 

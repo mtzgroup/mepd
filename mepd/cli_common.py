@@ -138,6 +138,39 @@ def _open_run_inputs(inputs: Optional[Path]) -> RunInputs:
         raise typer.BadParameter(f"Could not load '{inputs}': {type(exc).__name__}: {exc}")
 
 
+def _check_endpoint_options(start: Optional[str], end: Optional[str], reaction: Optional[str]) -> None:
+    """Either --start and --end, or --reaction -- never both, never neither."""
+    if reaction is not None and (start is not None or end is not None):
+        raise typer.BadParameter("Give either --reaction or --start/--end, not both.")
+    if reaction is None and (start is None or end is None):
+        raise typer.BadParameter(
+            "Give both --start and --end (xyz files or SMILES), or one --reaction "
+            "'reactants>>products' reaction SMILES."
+        )
+
+
+def _reaction_endpoints(
+    reaction: str, charge: Optional[int], multiplicity: Optional[int]
+) -> tuple[Structure, Structure]:
+    """Both endpoints of a --reaction SMILES, embedded with one shared atom
+    order (see mepd/reaction_smiles.py)."""
+    from mepd.reaction_smiles import ReactionSmilesError, reaction_structures
+
+    try:
+        start_structure, end_structure, pair = reaction_structures(reaction, charge, multiplicity)
+    except (ReactionSmilesError, ValueError) as exc:
+        raise typer.BadParameter(f"--reaction {reaction!r}: {exc}")
+    if pair.source == "given":
+        typer.echo("--reaction: atom mapping from the map numbers in the reaction SMILES "
+                   "(hydrogens by smallest endpoint RMSD).")
+    else:
+        typer.echo(f"--reaction: atom mapping by SLAPMapper ({pair.n_candidates} candidate(s), chosen by smallest "
+                   f"endpoint RMSD, {pair.rmsd:.2f} A): {pair.mapped_smiles}")
+    for note in pair.notes:
+        typer.echo(f"  {note}")
+    return start_structure, end_structure
+
+
 def _load_structure_from_smiles_or_xyz(
     value: str, charge: Optional[int], multiplicity: Optional[int]
 ) -> Structure:

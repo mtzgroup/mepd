@@ -113,6 +113,11 @@ class TreeNode:
             for k, piece in enumerate(getattr(node, "rejected_chains", None) or []):
                 piece.write_to_disk(fp=folder_name / f"node_{i}_rejected_{k}.xyz", write_qcio=write_qcio)
 
+        # What each node did and why (read by `mepd web`'s optimization tree).
+        from mepd.tree_log import write_tree_json
+
+        write_tree_json(self, folder_name)
+
     def draw(self):
         foo = self.adj_matrix - np.identity(len(self.adj_matrix))
         g = nx.from_numpy_array(foo)

@@ -33,7 +33,9 @@ from mepd.cli_common import (
     _echo_run_inputs_summary,
     _geometry_optimizer_keywords,
     _load_endpoint,
+    _check_endpoint_options,
     _load_structure_from_smiles_or_xyz,
+    _reaction_endpoints,
     _minimize_endpoints,
     _open_run_inputs,
     _optimize_ts_and_irc,
@@ -198,8 +200,16 @@ def _run_network_completion(
 
 @app.command("run")
 def run(
-    start: str = typer.Option(..., "--start", help="Path to the start-structure xyz file, or a SMILES string."),
-    end: str = typer.Option(..., "--end", help="Path to the end-structure xyz file, or a SMILES string."),
+    start: Optional[str] = typer.Option(
+        None, "--start", help="Path to the start-structure xyz file, or a SMILES string (or use --reaction)."),
+    end: Optional[str] = typer.Option(
+        None, "--end", help="Path to the end-structure xyz file, or a SMILES string (or use --reaction)."),
+    reaction: Optional[str] = typer.Option(
+        None, "--reaction",
+        help="Both endpoints as one reaction SMILES, 'reactants>>products' (agents, as in "
+        "'reactants>agents>products', are ignored). Atom map numbers ([CH3:1]...) are used when every "
+        "heavy atom has one; otherwise SLAPMapper maps the reaction. Instead of --start/--end.",
+    ),
     inputs: Optional[Path] = typer.Option(
         None, "--inputs", "-i", exists=True,
         help="Path to a RunInputs TOML file. Uses built-in defaults if omitted.",
@@ -350,6 +360,8 @@ def run(
     from mepd.nodes.node import StructureNode
     import mepd.chainhelpers as ch
 
+    reaction = reaction if isinstance(reaction, str) else None   # called as a plain function
+    _check_endpoint_options(start, end, reaction)
     if recursive and parallel:
         raise typer.BadParameter(
             "--parallel cannot be combined with --recursive. Use one mode."
@@ -383,11 +395,16 @@ def run(
     run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     _echo_run_inputs_summary(run_inputs)
 
-    start_is_smiles = not Path(start).exists()
-    end_is_smiles = not Path(end).exists()
-    both_smiles_pair = start_is_smiles and end_is_smiles
+    # A --reaction pair is embedded from SMILES too, but is already one
+    # consistently indexed pair (the --atom-mapping check below still weighs
+    # other mappings, as for xyz endpoints).
+    start_is_smiles = reaction is not None or not Path(start).exists()
+    end_is_smiles = reaction is not None or not Path(end).exists()
+    both_smiles_pair = reaction is None and start_is_smiles and end_is_smiles
 
-    if both_smiles_pair:
+    if reaction is not None:
+        start_structure, end_structure = _reaction_endpoints(reaction, charge, multiplicity)
+    elif both_smiles_pair:
         typer.echo(
             "--start/--end are both SMILES strings; computing a SLAPMapper "
             "atom-to-atom mapping to build a consistently-indexed structure pair..."

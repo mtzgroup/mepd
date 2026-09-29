@@ -105,6 +105,7 @@ def _call_run(**overrides):
     kwargs = dict(
         start=None,
         end=None,
+        reaction=None,
         inputs=None,
         charge=None,
         multiplicity=None,

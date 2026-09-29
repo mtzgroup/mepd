@@ -59,6 +59,7 @@ def _call_channels(**overrides):
     kwargs = dict(
         start=None,
         end=None,
+        reaction=None,
         method="conformers",
         inputs=None,
         charge=0,

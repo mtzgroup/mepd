@@ -9,6 +9,7 @@ import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
 import { JobControls, useTick } from './Jobs.js';
 import { NetworkLive } from './NetworkLive.js';
 import { ChannelsMap } from './ChannelsMap.js';
+import { OptTree } from './OptTree.js';
 import { Viewer3D } from './Viewer3D.js';
 
 // ------------------------------------------------------------ live
@@ -700,6 +701,7 @@ export function JobView({ jobId }) {
       ${['cancelled', 'interrupted'].includes(job.status) && html`<p class="warn-box small">${job.error} ${!job.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${job.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
         ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && ['channels', 'channels-more'].includes(job.op) && ['map', 'Path map'],
+          ['ts', 'channels', 'channels-more', 'network-splits'].includes(job.op) && ['tree', 'Optimization tree'],
           !job.external && ['log', 'Log'], ['files', 'Files']].filter(Boolean)
           .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live'} onClick=${() => setTab(k)}>${l}</button>`)}
       </div>
@@ -707,6 +709,7 @@ export function JobView({ jobId }) {
         ${current === 'result' && html`<${ResultPanel} job=${job} />`}
         ${current === 'live' && html`<${LivePanel} job=${job} />`}
         ${current === 'map' && html`<${ChannelsMap} job=${job} />`}
+        ${current === 'tree' && html`<${OptTree} job=${job} />`}
         ${current === 'log' && html`<${LogPanel} job=${job} />`}
         ${current === 'files' && html`<${FilesPanel} job=${job} />`}
       </div>

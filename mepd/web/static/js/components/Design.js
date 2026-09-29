@@ -130,17 +130,57 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
   return html`<div class=${`design-canvas ${clickable ? 'picking' : ''}`} ref=${host}></div>`;
 }
 
+// An xyz from a file (button or drag-and-drop) or pasted text. Calls
+// onXyz(text, name) once the file is read.
+function XyzInput({ onXyz, compact = false }) {
+  const [over, setOver] = useState(false);
+  const [paste, setPaste] = useState(false);
+  const [text, setText] = useState('');
+  const file = useRef(null);
+  const read = (f) => {
+    if (!f) return;
+    if (f.size > 5e6) { toast('That file is too large for an xyz (over 5 MB)', 'error'); return; }
+    f.text().then((t) => onXyz(t, f.name.replace(/\.[^.]+$/, '')));
+  };
+  return html`<div class=${`xyz-drop ${over ? 'over' : ''} ${compact ? 'compact' : ''}`}
+    onDragOver=${(e) => { e.preventDefault(); setOver(true); }} onDragLeave=${() => setOver(false)}
+    onDrop=${(e) => { e.preventDefault(); setOver(false); read(e.dataTransfer.files?.[0]); }}>
+    <input type="file" accept=".xyz,.txt,text/plain" ref=${file} style="display:none"
+      onChange=${(e) => { read(e.target.files?.[0]); e.target.value = ''; }} />
+    <div class="row">
+      <button class="btn" onClick=${() => file.current?.click()}>Upload .xyz</button>
+      <span class="small muted">or drop a file here · <a href="#" onClick=${(e) => { e.preventDefault(); setPaste(!paste); }}>${paste ? 'hide' : 'paste text'}</a></span>
+    </div>
+    ${paste && html`<div>
+      <textarea class="xyz-paste mono" rows=${compact ? 4 : 6} placeholder=${'3\nwater\nO 0.000 0.000 0.117\nH 0.000 0.757 -0.470\nH 0.000 -0.757 -0.470'}
+        value=${text} onInput=${(e) => setText(e.target.value)} />
+      <button class="btn small" disabled=${!text.trim()} onClick=${() => onXyz(text, 'pasted')}>Use this xyz</button>
+    </div>`}
+  </div>`;
+}
+
 function Start({ structures }) {
   const [smiles, setSmiles] = useState('');
+  const [xyzCharge, setXyzCharge] = useState(0);
+  const [xyzMult, setXyzMult] = useState(1);
   const [sid, setSid] = useState('');
   const [cid, setCid] = useState('');
   const rec = structures[sid];
   const list = Object.values(structures).sort((a, b) => b.created - a.created);
   return html`<div class="design-start">
-    <label class="field"><span class="field-label">From SMILES</span>
-      <div class="row"><input value=${smiles} placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O" onInput=${(e) => setSmiles(e.target.value)}
+    <label class="field"><span class="field-label">From SMILES or a reaction SMILES</span>
+      <div class="row"><input value=${smiles} placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O, or a reaction: CC(=O)C>>CC(O)=C" onInput=${(e) => setSmiles(e.target.value)}
         onKeyDown=${(e) => e.key === 'Enter' && smiles.trim() && attempt(() => api.post('/api/design/new', { smiles }))} />
       <button class="btn primary" disabled=${!smiles.trim()} onClick=${() => attempt(() => api.post('/api/design/new', { smiles }))}>Build</button></div></label>
+    <p class="small muted start-note">A reaction SMILES (reactants>>products, atom map numbers optional) opens the reactant and the
+      product side by side: an edit on one is made on the matching atom of the other, so you can vary a reaction and compare barriers.</p>
+    <div class="field"><span class="field-label">From an XYZ file</span>
+      <${XyzInput} onXyz=${(xyz, name) => attempt(() => api.post('/api/design/new', { xyz, name, charge: xyzCharge, multiplicity: xyzMult }))} />
+      <div class="row small xyz-cm">
+        <label>charge <input type="number" value=${xyzCharge} onChange=${(e) => setXyzCharge(parseInt(e.target.value, 10) || 0)} /></label>
+        <label>multiplicity <input type="number" min="1" value=${xyzMult} onChange=${(e) => setXyzMult(Math.max(1, parseInt(e.target.value, 10) || 1))} /></label>
+        <span class="muted">Set these before loading: bond orders are read from the geometry for this charge.</span>
+      </div></div>
     <label class="field"><span class="field-label">From the graph</span>
       <div class="row"><select value=${sid} onChange=${(e) => { setSid(e.target.value); setCid(''); }}>
         <option value="">Choose a structure…</option>
@@ -169,11 +209,16 @@ export function DesignView() {
   const [placeWhat, setPlaceWhat] = useState('water');
   const [placeCount, setPlaceCount] = useState(1);
   const [placeSmiles, setPlaceSmiles] = useState('');
+  const [placeXyz, setPlaceXyz] = useState(null);   // {xyz, name, natoms, charge}
   const [groupSmiles, setGroupSmiles] = useState('');
   const [hessian, setHessian] = useState(() => prefs.get('designHessian', false));
   const [cov, setCov] = useState({ method: '', elements: null });
   const [picked, setPicked] = useState([]);
+  const [pickSide, setPickSide] = useState('reactant');   // reaction mode: which molecule `picked` is on
   const [changed, setChanged] = useState([]);
+  const [changedP, setChangedP] = useState([]);
+  const [linked, setLinked] = useState(() => prefs.get('designLinked', true));
+  const rx = design?.reaction || null;
   const [labels, setLabels] = useState(false);
   const [busy, setBusy] = useState(false);
   const [info, setInfo] = useState('');
@@ -198,6 +243,12 @@ export function DesignView() {
   // back (the store's copy follows over the event stream, a moment later).
   const current = useRef(design?.molblock);
   useEffect(() => { current.current = design?.molblock; }, [design?.molblock]);
+  const currentP = useRef(rx?.product?.molblock);
+  useEffect(() => { currentP.current = rx?.product?.molblock; }, [rx?.product?.molblock]);
+  const amapRef = useRef(rx?.amap);
+  useEffect(() => { amapRef.current = rx?.amap; }, [rx?.amap]);
+  // What undo restores: the molecule, and in reaction mode the product and the atom match too.
+  const snapshot = () => ({ mb: current.current, pmb: currentP.current, amap: amapRef.current });
   const busyRef = useRef(false);
   const queue = useRef([]);            // edits clicked while another was being applied
   const pumpRef = useRef(() => {});
@@ -207,7 +258,7 @@ export function DesignView() {
     if (busyRef.current) return null;
     busyRef.current = true;
     setBusy(true);
-    const before = current.current;
+    const before = snapshot();
     const out = await attempt(fn);
     busyRef.current = false;
     setBusy(false);
@@ -215,13 +266,18 @@ export function DesignView() {
     setTimeout(() => pumpRef.current(), 0);
     if (out && out.molblock !== undefined) {
       current.current = out.molblock;
-      if (record && before && before !== out.molblock) {
+      currentP.current = out.reaction?.product?.molblock;
+      amapRef.current = out.reaction?.amap;
+      if (record && before.mb && (before.mb !== out.molblock || before.pmb !== currentP.current)) {
         history.current.undo.push(before);
         history.current.redo = [];
         bump((x) => x + 1);
       }
       setChanged(out.changed || []);
+      setChangedP(out.changed_product || []);
       (out.warnings || []).forEach((w) => toast(w, 'info', 7000));
+      (out.reaction?.product?.warnings || []).forEach((w) => toast(`Product: ${w}`, 'info', 7000));
+      if (out.note) toast(out.note, 'info', 6000);
     }
     return out;
   };
@@ -238,7 +294,7 @@ export function DesignView() {
   // An edit that renumbered them (a deleted heavy atom shifts the rest)
   // would make it act on other atoms, so it is skipped.
   const stillValid = (item) => {
-    const now = atomsOf(current.current);
+    const now = atomsOf(item.side === 'product' ? currentP.current : current.current);
     if (!now || !item.atoms) return false;
     return item.indices.every((i) => {
       const a = now[i], b = item.atoms[i];
@@ -246,7 +302,7 @@ export function DesignView() {
     });
   };
   const runEdit = async (item) => {
-    const out = await apply(() => api.post('/api/design/edit', { op: item.op }));
+    const out = await apply(() => api.post('/api/design/edit', { op: item.op, side: item.side, linked }));
     item.done?.();
     return out;
   };
@@ -265,8 +321,8 @@ export function DesignView() {
     }
   };
   pumpRef.current = pump;
-  const edit = (op, done) => {
-    const item = { op, done, atoms: atomsOf(current.current),
+  const edit = (op, done, side = 'reactant') => {
+    const item = { op, done, side, atoms: atomsOf(side === 'product' ? currentP.current : current.current),
       indices: ['atom', 'a', 'b'].filter((k) => op[k] != null).map((k) => op[k]) };
     if (busyRef.current) {
       queue.current.push(item);
@@ -276,41 +332,54 @@ export function DesignView() {
     return runEdit(item);
   };
 
-  const onAtom = (idx) => {
+  const onAtom = (idx, side = 'reactant') => {
     if (running) { toast('Wait for the minimization to finish (or stop it) before editing', 'info'); return; }
-    if (tool === 'view') { setPicked([idx]); setInfo(`Atom ${idx + 1}`); return; }
-    if (tool === 'element') edit({ op: 'element', atom: idx, element });
-    else if (tool === 'add') edit({ op: 'add', atom: idx, element });
-    else if (tool === 'group') edit(groupSmiles.trim() ? { op: 'group', atom: idx, smiles: groupSmiles.trim() } : { op: 'group', atom: idx, group });
-    else if (tool === 'place') edit(placeSmiles.trim() ? { op: 'place', atom: idx, smiles: placeSmiles.trim(), count: placeCount }
+    const e = (op, done) => edit(op, done, side);
+    if (tool === 'view') { setPickSide(side); setPicked([idx]); setInfo(`${rx ? `${side === 'product' ? 'Product' : 'Reactant'} a` : 'A'}tom ${idx + 1}`); return; }
+    if (tool === 'element') e({ op: 'element', atom: idx, element });
+    else if (tool === 'add') e({ op: 'add', atom: idx, element });
+    else if (tool === 'group') e(groupSmiles.trim() ? { op: 'group', atom: idx, smiles: groupSmiles.trim() } : { op: 'group', atom: idx, group });
+    else if (tool === 'place') e(placeXyz ? { op: 'place', atom: idx, xyz: placeXyz.xyz, charge: placeXyz.charge, count: placeCount }
+      : placeSmiles.trim() ? { op: 'place', atom: idx, smiles: placeSmiles.trim(), count: placeCount }
       : { op: 'place', atom: idx, species: placeWhat, count: placeCount });
-    else if (tool === 'delete') edit({ op: 'delete', atom: idx });
-    else if (tool === 'charge') edit({ op: 'charge', atom: idx, delta: order === 0 ? -1 : 1 });
+    else if (tool === 'delete') e({ op: 'delete', atom: idx });
+    else if (tool === 'charge') e({ op: 'charge', atom: idx, delta: order === 0 ? -1 : 1 });
     else if (tool === 'bond') {
       // A new pair unless exactly its first atom is picked (a pair being applied stays lit).
-      if (picked.length !== 1 || picked[0] === idx) { setPicked([idx]); return; }
+      // Both atoms of a bond are on the same molecule.
+      if (side !== pickSide || picked.length !== 1 || picked[0] === idx) { setPickSide(side); setPicked([idx]); return; }
       const a = picked[0];
       const pair = `${a},${idx}`;
       setPicked([a, idx]);   // both stay lit until the edit is back
-      edit({ op: 'bond', a, b: idx, order }, () => setPicked((p) => (p.join(',') === pair ? [] : p)));
+      e({ op: 'bond', a, b: idx, order }, () => setPicked((p) => (p.join(',') === pair ? [] : p)));
     }
   };
+  // Reaction mode: an atom picked on one side lights its match on the other.
+  const counterpart = (idxs, from) => {
+    const amap = rx?.amap || [];
+    if (from === 'reactant') return idxs.map((i) => amap[i]).filter((j) => j != null && j >= 0);
+    return idxs.map((j) => amap.indexOf(j)).filter((i) => i >= 0);
+  };
+  const pickedR = !rx || pickSide === 'reactant' ? picked : counterpart(picked, 'product');
+  const pickedP = rx ? (pickSide === 'product' ? picked : counterpart(picked, 'reactant')) : [];
 
+  const restore = (snap) => api.put('/api/design', snap.pmb && rx
+    ? { molblock: snap.mb, reaction: { product_molblock: snap.pmb, amap: snap.amap } } : { molblock: snap.mb });
   const undo = () => {
     const h = history.current;
     const prev = h.undo.pop();
     if (!prev) return;
-    h.redo.push(design.molblock);
+    h.redo.push(snapshot());
     bump((x) => x + 1);
-    apply(() => api.put('/api/design', { molblock: prev }), { record: false });
+    apply(() => restore(prev), { record: false });
   };
   const redo = () => {
     const h = history.current;
     const next = h.redo.pop();
     if (!next) return;
-    h.undo.push(design.molblock);
+    h.undo.push(snapshot());
     bump((x) => x + 1);
-    apply(() => api.put('/api/design', { molblock: next }), { record: false });
+    apply(() => restore(next), { record: false });
   };
   useEffect(() => {
     const onKey = (e) => {
@@ -324,6 +393,11 @@ export function DesignView() {
   const toGraph = async () => {
     const rec = await attempt(() => api.post('/api/design/to-graph'));
     if (!rec) return;
+    if (rec.edge) {
+      toast(`Added the reactant, the product and their edge to Explore${rec.new.length < 2 ? ' (as conformers of nodes already there)' : ''}`, 'ok', 6000,
+        { label: 'Show', run: () => { select({ structures: [rec.reactant.id, rec.product.id] }); openTab('graph'); } });
+      return;
+    }
     toast(rec.duplicate ? `${rec.name} already has this geometry` : rec.merged
       ? `Added as a new conformer of ${rec.name}` : `Added ${rec.name} to the graph`, 'ok', 6000,
     { label: 'Show', run: () => { select({ structures: [rec.id] }); openTab('graph'); } });
@@ -338,6 +412,13 @@ export function DesignView() {
     const ids = [out.ts?.id, ...(out.added || []).map((r) => r.id), ...(out.reused || []).map((r) => r.id)].filter(Boolean);
     toast(`Added the TS${out.edge ? ' and its IRC ends, joined by an edge' : ''} to the graph`, 'ok', 7000,
       { label: 'Show', run: () => { select({ structures: ids }); openTab('graph'); } });
+  };
+  const search = async (op) => {
+    const out = await attempt(() => api.post('/api/design/search', { op, profile: levelProfile ?? null }));
+    if (out?.jobs?.length) {
+      toast(`${op === 'ts' ? 'TS search' : 'Reaction channels'} started at ${level?.label ?? 'the workspace level'} (ends are minimized first)`, 'ok', 7000,
+        { label: 'Open', run: () => openJob(out.jobs[0].id) });
+    }
   };
   const minimize = async () => {
     const created = await attempt(() => api.post('/api/design/minimize', {
@@ -372,13 +453,28 @@ export function DesignView() {
             <button class=${`el ${order === 0 ? 'on' : ''}`} onClick=${() => setOrder(0)}>−</button>
           </div>`}
           ${tool === 'place' && html`<div>
-            <${Steps} steps=${[`Choose what to add (now ${placeSmiles.trim() || placeWhat}${placeCount > 1 ? ` ×${placeCount}` : ''}), or type any SMILES.`,
-              'Click the atom in the 3D view it should go next to: it lands in the free space beside that atom, not bonded (click a hydrogen to H-bond to it).']} />
-            <input class="smiles-in" placeholder="any molecule or ion, as SMILES (e.g. [Pd], [Cl-], O=C=O)" value=${placeSmiles}
-              onInput=${(e) => setPlaceSmiles(e.target.value)} />
-            <div class="palette groups">
-              ${species.map((g) => html`<button class=${`el wide ${!placeSmiles.trim() && placeWhat === g ? 'on' : ''}`} onClick=${() => { setPlaceWhat(g); setPlaceSmiles(''); }}>${g}</button>`)}
-            </div>
+            <${Steps} steps=${[`Choose what to add (now ${placeXyz ? placeXyz.name : placeSmiles.trim() || placeWhat}${placeCount > 1 ? ` ×${placeCount}` : ''}): a preset, any SMILES, or an xyz file.`,
+              placeXyz ? 'Click the atom in the 3D view it should go next to: the file\'s first atom goes beside that atom, the structure kept exactly as in the file.'
+                : 'Click the atom in the 3D view it should go next to: it lands in the free space beside that atom, not bonded (click a hydrogen to H-bond to it).']} />
+            ${placeXyz ? html`<div class="xyz-chosen">
+                <span><b>${placeXyz.name}</b> <span class="muted small">${placeXyz.natoms} atoms, from xyz</span></span>
+                <label class="small">charge <input type="number" value=${placeXyz.charge}
+                  onChange=${(e) => setPlaceXyz({ ...placeXyz, charge: parseInt(e.target.value, 10) || 0 })} /></label>
+                <button class="btn-icon" title="Use a preset or SMILES instead" onClick=${() => setPlaceXyz(null)}>✕</button>
+              </div>`
+              : html`<div>
+                <input class="smiles-in" placeholder="any molecule or ion, as SMILES (e.g. [Pd], [Cl-], O=C=O)" value=${placeSmiles}
+                  onInput=${(e) => setPlaceSmiles(e.target.value)} />
+                <div class="palette groups">
+                  ${species.map((g) => html`<button class=${`el wide ${!placeSmiles.trim() && placeWhat === g ? 'on' : ''}`} onClick=${() => { setPlaceWhat(g); setPlaceSmiles(''); }}>${g}</button>`)}
+                </div>
+                <${XyzInput} compact onXyz=${(xyz, name) => {
+                  const n = parseInt(xyz.trimStart().split('\n', 1)[0], 10);
+                  const natoms = n > 0 ? n : xyz.split('\n').filter((l) => l.trim().split(/\s+/).length >= 4).length;
+                  if (!natoms) { toast('No atoms found in that xyz', 'error'); return; }
+                  setPlaceXyz({ xyz, name, natoms, charge: 0 });
+                }} />
+              </div>`}
             <label class="small place-count">how many <input type="number" min="1" max="30" value=${placeCount}
               onChange=${(e) => setPlaceCount(Math.max(1, Math.min(30, +e.target.value || 1)))} /></label>
           </div>`}
@@ -392,7 +488,16 @@ export function DesignView() {
           </div>`}
         </div>
         <div class="design-stage">
-          <${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} clickable=${tool !== 'view'} />
+          ${rx ? html`<div class="design-pair">
+              ${[['reactant', 'Reactant', design.molblock, design.smiles, pickedR, changed], ['product', 'Product', rx.product.molblock, rx.product.smiles, pickedP, changedP]]
+                .map(([side, label, mb, smi, pk, ch]) => html`<div class=${`design-side-pane ${pickSide === side && picked.length ? 'active' : ''}`}>
+                  <div class="pane-head"><b>${label}</b> <span class="mono small">${smi || ''}</span></div>
+                  <${Canvas} molblock=${mb} liveXyz=${null} picked=${pk} changed=${ch} onAtom=${(i) => onAtom(i, side)} labels=${labels} clickable=${tool !== 'view'} />
+                </div>`)}
+              <div class="pair-link"><button class=${`btn small ${linked ? 'on' : ''}`} title=${linked ? 'Edits are made on both molecules (on the matching atom). Click to edit one side alone.' : 'Edits change only the molecule you click. Click to edit both.'}
+                onClick=${() => { setLinked(!linked); prefs.set('designLinked', !linked); }}>${linked ? '⇄ Edit both' : '→ One side'}</button></div>
+            </div>`
+          : html`<${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} clickable=${tool !== 'view'} />`}
           <div class="design-hint small">${running ? html`${running.op === 'design-tsopt' ? 'Optimizing as a TS (then IRC)' : 'Minimizing'} at ${level?.label ?? 'the workspace level'}… <a href="#" onClick=${(e) => { e.preventDefault(); openJob(running.id); }}>details</a>`
             : busy ? `Applying the edit…${queued ? ` (${queued} more queued)` : ''}`
               : tool === 'bond' && picked.length === 1 ? `Atom ${picked[0] + 1} picked: click the second atom.` : toolHelp}</div>
@@ -402,21 +507,27 @@ export function DesignView() {
             <button class="btn small" disabled=${busy || running} onClick=${() => apply(() => api.post('/api/design/edit', { op: { op: 'hydrogens' } }))} title="Re-add hydrogens everywhere from valences">Fix H</button>
             <button class="btn small" disabled=${busy || running} onClick=${() => apply(() => api.post('/api/design/clean'))}
               title="Quick force-field cleanup (MMFF94, else UFF). Moves every atom: not for a transition state.">Clean (MMFF)</button>
-            <button class="btn small" disabled=${busy || running} onClick=${tsopt}
+            ${!rx && html`<button class="btn small" disabled=${busy || running} onClick=${tsopt}
               title=${`Treat this structure as a TS guess: saddle optimization at ${level?.label ?? 'the workspace level'}, then an IRC. If it doesn't converge, the design goes back to what you submitted.`}>Optimize as TS</button>
             <button class="btn small primary" disabled=${busy || running} onClick=${minimize}
               title=${`Minimize at ${level?.label ?? 'the workspace level'} (mepd optimize); the result replaces the design`}>Minimize</button>
             <label class="small" title="After minimizing, check for imaginary frequencies (and try to push off a saddle). Slow for large or floppy structures, e.g. with explicit solvent or ions, which rarely pass a strict check.">
-              <input type="checkbox" checked=${hessian} onChange=${(e) => { setHessian(e.target.checked); prefs.set('designHessian', e.target.checked); }} /> Hessian check</label>
+              <input type="checkbox" checked=${hessian} onChange=${(e) => { setHessian(e.target.checked); prefs.set('designHessian', e.target.checked); }} /> Hessian check</label>`}
             <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom numbers</label>
           </div>
         </div>
         <aside class="design-side">
           <input class="title-input" value=${design.name || ''} placeholder="Name"
             onChange=${(e) => attempt(() => api.put('/api/design', { name: e.target.value }))} />
-          ${design.smiles && html`<div class="smiles">${design.smiles}</div>`}
+          ${design.smiles && html`<div class="smiles">${design.smiles}${rx ? html` >> ${rx.product.smiles}` : ''}</div>`}
+          ${rx && html`<div class="rxn-box small">
+            ${!rx.balanced && html`<p class="warn-box small">The two sides no longer have the same atoms (an edit was made on one side only).
+              Make them match (or undo) before searching.</p>`}
+            <p class="muted">Atoms matched ${rx.mapping?.source === 'given' ? 'from the map numbers in your reaction SMILES' : 'by SLAPMapper'}; new atoms
+              by their neighbours and the closest fit in 3D (endpoint RMSD). Fast, not exhaustive: the path search checks other mappings with atom mapping on.</p>
+          </div>`}
           <dl class="props">
-            <dt>Formula</dt><dd>${design.formula} (${design.natoms} atoms)</dd>
+            <dt>Formula</dt><dd>${design.formula} (${design.natoms} atoms)${rx && rx.product.formula !== design.formula ? html` · product ${rx.product.formula}` : ''}</dd>
             <dt>Charge</dt><dd><input type="number" class="tiny" value=${design.charge}
               onChange=${(e) => attempt(() => api.put('/api/design', { charge: +e.target.value }))} />
               <span class="small muted">${design.charge_offset ? ` formal charges ${design.charge - design.charge_offset >= 0 ? '+' : ''}${design.charge - design.charge_offset}, ${design.charge_offset > 0 ? '+' : ''}${design.charge_offset} set by hand` : ' from formal charges'}</span></dd>
@@ -441,8 +552,13 @@ export function DesignView() {
           ${(design.warnings || []).map((w) => html`<p class="level-note small">${w}</p>`)}
           ${info && tool === 'view' && html`<p class="small muted">${info}</p>`}
           <div class="design-actions">
-            <button class="btn primary" onClick=${toGraph} disabled=${busy || running}>Add to Explore</button>
-            <a class="btn" href="/api/design/xyz" download=${`${design.name || 'design'}.xyz`}>Download xyz</a>
+            ${rx && html`<button class="btn primary" onClick=${() => search('ts')} disabled=${busy || !rx.balanced}
+              title=${`Add both ends and their edge to Explore, then find the TS between them at ${level?.label ?? 'the workspace level'}`}>Search TS</button>
+              <button class="btn" onClick=${() => search('channels')} disabled=${busy || !rx.balanced}
+                title="Sample conformers and atom mappings of both ends and find every distinct channel">Reaction channels</button>`}
+            <button class=${`btn ${rx ? '' : 'primary'}`} onClick=${toGraph} disabled=${busy || running || (rx && !rx.balanced)}>Add to Explore</button>
+            <a class="btn" href="/api/design/xyz" download=${`${design.name || 'design'}${rx ? '_reactant' : ''}.xyz`}>Download xyz${rx ? ' (reactant)' : ''}</a>
+            ${rx && html`<a class="btn" href="/api/design/xyz?side=product" download=${`${design.name || 'design'}_product.xyz`}>Download xyz (product)</a>`}
             <button class="btn-link small" onClick=${() => { if (confirm('Start a new design? The current one is not kept (add it to the graph first if you want it).')) attempt(() => api.del('/api/design')); }}>New design…</button>
           </div>
           <details class="advanced"><summary>Load another</summary><${Start} structures=${structures} /></details>
