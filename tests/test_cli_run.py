@@ -721,7 +721,7 @@ def test_atom_mapping_keeps_identity_even_when_mapping_only_slightly_worse(monke
         result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
 
     out = capsys.readouterr().out
-    assert "keeping --end's original atom ordering" in out
+    assert "Keeping the end's current atom numbering" in out
     assert np.allclose(np.asarray(result.geometry), np.asarray(end.geometry))
 
 
@@ -738,7 +738,7 @@ def test_atom_mapping_reindexes_when_mapping_scores_better(monkeypatch, capsys):
         result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
 
     out = capsys.readouterr().out
-    assert "reindexing --end's atoms" in out
+    assert "Renumbering the end's atoms" in out
     assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
 
 
@@ -950,7 +950,7 @@ def test_cli_run_atom_mapping_reorders_end_to_match_mapping(tmp_path, monkeypatc
         )
 
     out = capsys.readouterr().out
-    assert "reindexing --end's atoms" in out
+    assert "Renumbering the end's atoms" in out
     assert list(captured["result"].symbols) == ["C", "C", "C", "H", "H", "H", "H", "H", "H"]
     assert np.allclose(
         np.asarray(captured["result"].geometry),

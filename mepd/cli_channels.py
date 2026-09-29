@@ -44,11 +44,16 @@ from mepd.inputs import NetworkInputs, RunInputs
 
 
 def _describe_mechanism(key: str) -> str:
-    """'break C27-C29,C28-O20 | form C27-C28' -> 'break C27-C29 and C28-O20, form C27-C28'."""
+    """'break C27-C29,C28-O20 | form C27-C28' -> 'break C27-C29 and C28-O20, form C27-C28';
+    symmetry-equivalent bonds (the same name) are counted: 'form 2 x C10-C12'."""
     parts = []
     for side in key.split("|"):
         verb, _, bonds = side.strip().partition(" ")
-        names = [b for b in bonds.split(",") if b and b != "none"]
+        counts: dict[str, int] = {}
+        for b in bonds.split(","):
+            if b and b != "none":
+                counts[b] = counts.get(b, 0) + 1
+        names = [f"{k} x {b}" if k > 1 else b for b, k in counts.items()]
         if names:
             parts.append(f"{verb} " + (" and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else names[0]))
     return ", ".join(parts) or "no bond changes"

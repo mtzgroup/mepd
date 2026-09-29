@@ -806,6 +806,11 @@ class MSMEP:
         from where it stopped with the elementary-step checks (the early
         stop) off, and the leaf keeps `status` to say why it was not split."""
         pmi = self.inputs.path_min_inputs
+        if not getattr(pmi, "converge_unsplit_paths", True):
+            # (Tests on toy potentials that only check the tree's shape.)
+            history_node.leaf_status = status
+            set_monitor_verdict("unresolved")
+            return history_node
         trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
         start = trajectory[-1] if trajectory and len(trajectory[-1]) >= 2 else input_chain
         self._say("Optimizing this path to convergence as a single step instead.", snapshot=True)

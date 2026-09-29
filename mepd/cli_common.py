@@ -452,9 +452,9 @@ def _check_endpoint_atom_mapping(
 
     metric = run_inputs.atom_mapping_inputs.metric
     typer.echo(
-        f"--atom-mapping: found {len(candidates) - 1} distinct candidate mapping(s) "
-        f"(of up to {n_candidates} considered). Selecting among 'identity' (don't "
-        f"reindex) and the candidates by --atom-mapping-metric={metric}..."
+        f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
+        f"current numbering with {len(candidates) - 1} other(s) found by SLAPMapper, by {metric} "
+        f"(lower is better)..."
     )
 
     debug_dump_dir = Path(output) / "realign_debug" if debug_dump and output is not None else None
@@ -475,14 +475,22 @@ def _check_endpoint_atom_mapping(
         )
         return end_structure
 
-    for candidate in candidates:
-        marker = "  <- selected" if candidate.label == result.winner.label else ""
-        typer.echo(f"  {candidate.label}: {metric}={result.scores[candidate.label]:.4f}{marker}")
+    # The best numbering and the current one, not every candidate (there can be hundreds).
+    scores = result.scores
+    ranked = sorted((c.label for c in candidates if c.label in scores), key=lambda k: scores[k])
+    shown = [result.winner.label] + (["identity"] if result.winner.label != "identity" and "identity" in scores else [])
+    for label in shown:
+        role = "chosen" if label == result.winner.label else "current"
+        name = "current numbering" if label == "identity" else label
+        typer.echo(f"  {role + ':':<10}{name:<20}{metric} = {scores[label]:.4f}")
+    rest = [k for k in ranked if k not in shown]
+    if rest:
+        typer.echo(f"  ({len(rest)} other(s), {metric} {scores[rest[0]]:.4f} to {scores[rest[-1]]:.4f})")
 
     if result.winner.label == "identity":
-        typer.echo("--atom-mapping: keeping --end's original atom ordering.")
+        typer.echo("Keeping the end's current atom numbering: no other fits clearly better.")
     else:
-        typer.echo(f"--atom-mapping: reindexing --end's atoms per '{result.winner.label}'.")
+        typer.echo(f"Renumbering the end's atoms ({result.winner.label}) so they match the start's.")
 
     return result.winner.end_structure
 

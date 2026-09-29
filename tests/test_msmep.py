@@ -233,6 +233,9 @@ def _flower_split_msmep():
     })
     run_inputs = RunInputs(path_min_inputs=neb_inputs.__dict__, chain_inputs=chain_inputs.__dict__)
     run_inputs.path_min_inputs.recursive_split_max_depth = 2
+    # These tests check the split tree's shape; converging each leaf that is
+    # not split (the depth limit, cycles) would only slow them down.
+    run_inputs.path_min_inputs.converge_unsplit_paths = False
     run_inputs.engine = FlowerPotential()
     run_inputs.optimizer = ConjugateGradient(timestep=0.1)
     return MSMEP(run_inputs), chain
@@ -377,10 +380,12 @@ def _cycling_msmep(monkeypatch):
 
     msmep, chain = _flower_split_msmep()
     msmep.inputs.path_min_inputs.recursive_split_max_depth = None
+    msmep.inputs.path_min_inputs.converge_unsplit_paths = True   # the behaviour under test
     calls = []
 
     def fake_minimize(self, input_chain):
-        calls.append(1)
+        # Each call records whether its elementary-step checks (the early stop) were on.
+        calls.append(bool(getattr(self.inputs.path_min_inputs, "do_elem_step_checks", True)))
         assert len(calls) < 20, "cycle not detected"
         return (NS(chain_trajectory=[input_chain], optimized=input_chain, converged=True),
                 NS(is_elem_step=False, new_structures=[input_chain[5]], splitting_criterion="minima",
@@ -403,9 +408,13 @@ def test_recursive_split_stops_at_a_cycle_and_keeps_a_continuous_path(monkeypatc
     msmep, chain, calls = _cycling_msmep(monkeypatch)
     history = msmep.run_recursive_minimize(chain)
     # default recursive_cycle_revisits = 5: the root, then five revisits of
-    # the same pair; the fifth is kept as the cycle leaf
-    assert len(calls) == 6
-    assert len(_leaves_with_status(history, "cycle")) == 1
+    # the same pair; the fifth is kept as the cycle leaf -- first optimized
+    # to convergence as one step, with the early stop off (the 7th call)
+    assert len(calls) == 7
+    assert calls[:6] == [True] * 6 and calls[6] is False
+    assert msmep.inputs.path_min_inputs.do_elem_step_checks is True      # restored
+    (leaf,) = _leaves_with_status(history, "cycle")
+    assert leaf.converged_unsplit
     out = history.output_chain
     assert np.allclose(out[0].coords, chain[0].coords) and np.allclose(out[-1].coords, chain[-1].coords)
 
@@ -414,7 +423,8 @@ def test_parallel_recursive_split_stops_at_a_cycle(monkeypatch):
     msmep, chain, calls = _cycling_msmep(monkeypatch)
     msmep.inputs.path_min_inputs.recursive_cycle_revisits = 1
     history = msmep.run_parallel_recursive_minimize(chain, max_workers=2)
-    assert len(calls) == 2  # cut at the first revisit
+    assert len(calls) == 3  # cut at the first revisit, then that path optimized to convergence
+    assert calls[-1] is False
     assert len(_leaves_with_status(history, "cycle")) == 1
 
 
