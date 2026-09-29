@@ -83,6 +83,20 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     return () => { ro.disconnect(); viewer.current?.clear(); viewer.current = null; };
   }, []);
 
+  // Styles only: the picked atom(s) and what the last edit touched. Cheap,
+  // so a pick shows at once however big the molecule is.
+  const highlight = useRef(() => {});
+  highlight.current = () => {
+    const v = viewer.current;
+    if (!v || !v.getModel()) return;
+    v.setStyle({}, { stick: { radius: 0.14 }, sphere: { scale: 0.26 } });
+    if (!liveXyz) {
+      if (picked.length) v.addStyle({ index: picked }, { sphere: { scale: 0.42, color: '#e0a100', opacity: 0.85 } });
+      if (changed.length) v.addStyle({ index: changed }, { sphere: { scale: 0.34, color: '#3aa76d', opacity: 0.75 } });
+    }
+    v.render();
+  };
+
   useEffect(() => {
     const v = viewer.current;
     if (!v) return;
@@ -93,11 +107,7 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     const data = liveXyz || molblock;
     if (!data) { v.render(); return; }
     const model = v.addModel(data, liveXyz ? 'xyz' : 'sdf');
-    v.setStyle({}, { stick: { radius: 0.14 }, sphere: { scale: 0.26 } });
     if (!liveXyz) {
-      // The picked atom(s) and what the last edit touched.
-      if (picked.length) v.addStyle({ index: picked }, { sphere: { scale: 0.42, color: '#e0a100', opacity: 0.85 } });
-      if (changed.length) v.addStyle({ index: changed }, { sphere: { scale: 0.34, color: '#3aa76d', opacity: 0.75 } });
       model.setClickable({}, true, (atom) => clickRef.current(atom.index));
       model.setHoverable({}, true,
         (atom) => { if (!atom.label) atom.label = v.addLabel(`${atom.elem}${atom.index + 1}`, { position: atom, fontSize: 11, backgroundOpacity: 0.6, inFront: true }); },
@@ -112,8 +122,10 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     // removed atoms: frame the whole molecule again.
     if (last.current.n === n) v.setView(view); else v.zoomTo();
     last.current.n = n;
-    v.render();
-  }, [molblock, liveXyz, picked.join(','), changed.join(','), labels]);
+    highlight.current();   // styles + render
+  }, [molblock, liveXyz, labels]);
+
+  useEffect(() => { highlight.current(); }, [picked.join(','), changed.join(',')]);
 
   return html`<div class=${`design-canvas ${clickable ? 'picking' : ''}`} ref=${host}></div>`;
 }
@@ -182,13 +194,27 @@ export function DesignView() {
   const frames = stream?.geometry?.frames || [];
   const liveXyz = running && frames.length ? frames[frames.length - 1] : null;
 
+  // The molecule edits apply to: the last edit's result as soon as it is
+  // back (the store's copy follows over the event stream, a moment later).
+  const current = useRef(design?.molblock);
+  useEffect(() => { current.current = design?.molblock; }, [design?.molblock]);
+  const busyRef = useRef(false);
+  const queue = useRef([]);            // edits clicked while another was being applied
+  const pumpRef = useRef(() => {});
+  const [queued, setQueued] = useState(0);
+
   const apply = async (fn, { record = true } = {}) => {
-    if (busy) return null;
+    if (busyRef.current) return null;
+    busyRef.current = true;
     setBusy(true);
-    const before = design?.molblock;
+    const before = current.current;
     const out = await attempt(fn);
+    busyRef.current = false;
     setBusy(false);
+    // After this edit's own follow-up (its caller's `done`), start the next queued one.
+    setTimeout(() => pumpRef.current(), 0);
     if (out && out.molblock !== undefined) {
+      current.current = out.molblock;
       if (record && before && before !== out.molblock) {
         history.current.undo.push(before);
         history.current.redo = [];
@@ -199,7 +225,56 @@ export function DesignView() {
     }
     return out;
   };
-  const edit = (op) => apply(() => api.post('/api/design/edit', { op }));
+  // The molecule's atoms, in order: [element, x, y, z] (V2000 molblock).
+  const atomsOf = (mb) => {
+    const lines = (mb || '').split('\n');
+    const n = parseInt((lines[3] || '').slice(0, 3), 10);
+    if (!Number.isFinite(n)) return null;
+    return lines.slice(4, 4 + n).map((l) => { const f = l.trim().split(/\s+/); return [f[3], +f[0], +f[1], +f[2]]; });
+  };
+  // An edit refers to atoms by index. Queued behind another edit it runs
+  // only if those indices still hold the same atoms: same element, within
+  // 0.5 Å of where they were (edits relax only nearby atoms, a little).
+  // An edit that renumbered them (a deleted heavy atom shifts the rest)
+  // would make it act on other atoms, so it is skipped.
+  const stillValid = (item) => {
+    const now = atomsOf(current.current);
+    if (!now || !item.atoms) return false;
+    return item.indices.every((i) => {
+      const a = now[i], b = item.atoms[i];
+      return a && b && a[0] === b[0] && Math.hypot(a[1] - b[1], a[2] - b[2], a[3] - b[3]) < 0.5;
+    });
+  };
+  const runEdit = async (item) => {
+    const out = await apply(() => api.post('/api/design/edit', { op: item.op }));
+    item.done?.();
+    return out;
+  };
+  // The queued edits, one after another, once nothing is being applied
+  // (whatever started the last one: a click, Clean, Fix H, undo, ...).
+  const pump = async () => {
+    while (!busyRef.current && queue.current.length) {
+      const next = queue.current.shift();
+      setQueued(queue.current.length);
+      if (!stillValid(next)) {
+        next.done?.();
+        toast('Skipped an edit clicked while the previous one was applying: that edit changed the atoms. Pick them again.', 'info', 6000);
+        continue;
+      }
+      await runEdit(next);
+    }
+  };
+  pumpRef.current = pump;
+  const edit = (op, done) => {
+    const item = { op, done, atoms: atomsOf(current.current),
+      indices: ['atom', 'a', 'b'].filter((k) => op[k] != null).map((k) => op[k]) };
+    if (busyRef.current) {
+      queue.current.push(item);
+      setQueued(queue.current.length);
+      return null;
+    }
+    return runEdit(item);
+  };
 
   const onAtom = (idx) => {
     if (running) { toast('Wait for the minimization to finish (or stop it) before editing', 'info'); return; }
@@ -212,10 +287,12 @@ export function DesignView() {
     else if (tool === 'delete') edit({ op: 'delete', atom: idx });
     else if (tool === 'charge') edit({ op: 'charge', atom: idx, delta: order === 0 ? -1 : 1 });
     else if (tool === 'bond') {
-      if (!picked.length || picked[0] === idx) { setPicked([idx]); return; }
+      // A new pair unless exactly its first atom is picked (a pair being applied stays lit).
+      if (picked.length !== 1 || picked[0] === idx) { setPicked([idx]); return; }
       const a = picked[0];
-      setPicked([]);
-      edit({ op: 'bond', a, b: idx, order });
+      const pair = `${a},${idx}`;
+      setPicked([a, idx]);   // both stay lit until the edit is back
+      edit({ op: 'bond', a, b: idx, order }, () => setPicked((p) => (p.join(',') === pair ? [] : p)));
     }
   };
 
@@ -317,7 +394,8 @@ export function DesignView() {
         <div class="design-stage">
           <${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} clickable=${tool !== 'view'} />
           <div class="design-hint small">${running ? html`${running.op === 'design-tsopt' ? 'Optimizing as a TS (then IRC)' : 'Minimizing'} at ${level?.label ?? 'the workspace level'}… <a href="#" onClick=${(e) => { e.preventDefault(); openJob(running.id); }}>details</a>`
-            : busy ? 'Working…' : tool === 'bond' && picked.length ? `Atom ${picked[0] + 1} picked: click the second atom.` : toolHelp}</div>
+            : busy ? `Applying the edit…${queued ? ` (${queued} more queued)` : ''}`
+              : tool === 'bond' && picked.length === 1 ? `Atom ${picked[0] + 1} picked: click the second atom.` : toolHelp}</div>
           <div class="design-bar">
             <button class="btn small" disabled=${!history.current.undo.length || busy} onClick=${undo} title="Undo (Ctrl+Z)">Undo</button>
             <button class="btn small" disabled=${!history.current.redo.length || busy} onClick=${redo} title="Redo (Ctrl+Shift+Z)">Redo</button>
