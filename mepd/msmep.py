@@ -1278,7 +1278,7 @@ class MSMEP:
                 "\nWarning! A chain did not converge.\
                         Returning an unoptimized chain..."
             )
-            out_chain = n.chain_trajectory[-1]
+            out_chain = self._last_or_initial_chain(n, interpolation)
             if self.inputs.path_min_inputs.do_elem_step_checks:
                 elem_step_results = check_if_elem_step(
                     out_chain,
@@ -1296,6 +1296,12 @@ class MSMEP:
                 )
 
         except ElectronicStructureError as e:
+            if not getattr(n, "chain_trajectory", None):
+                # Failed before its first step (e.g. GSM's seed energies): no
+                # path to return. The caller's guard (_guarded_step) records
+                # a failed branch with this error and the path it was given,
+                # rather than a raw interpolation being taken for a step.
+                raise
             setattr(n, "converged", False)
             setattr(n, "failure_reason", "electronic_structure_error")
             setattr(n, "failure_exception", e)
@@ -1336,6 +1342,16 @@ class MSMEP:
                 stop_status()
 
         return n, elem_step_results
+
+    @staticmethod
+    def _last_or_initial_chain(n, initial_chain: Chain) -> Chain:
+        """The path a failed minimizer got to -- or, when it failed before
+        its first step (e.g. GSM's seed energies raised), the path it was
+        given, recorded as its trajectory so the failed branch still has a
+        path to report and write (node_<i>_failed.xyz)."""
+        if not n.chain_trajectory:
+            n.chain_trajectory.append(initial_chain)
+        return n.chain_trajectory[-1]
 
     def _make_chain_frag(self, chain: Chain, geom_pair, ind_pair):
         start_ind, end_ind = ind_pair
