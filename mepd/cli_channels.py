@@ -43,6 +43,17 @@ from mepd.cli_common import (
 from mepd.inputs import NetworkInputs, RunInputs
 
 
+def _describe_mechanism(key: str) -> str:
+    """'break C27-C29,C28-O20 | form C27-C28' -> 'break C27-C29 and C28-O20, form C27-C28'."""
+    parts = []
+    for side in key.split("|"):
+        verb, _, bonds = side.strip().partition(" ")
+        names = [b for b in bonds.split(",") if b and b != "none"]
+        if names:
+            parts.append(f"{verb} " + (" and ".join([", ".join(names[:-1]), names[-1]]) if len(names) > 1 else names[0]))
+    return ", ".join(parts) or "no bond changes"
+
+
 def _expand_pairs_by_mechanism(
     structures: list,
     candidates: list[tuple[int, int]],
@@ -84,8 +95,9 @@ def _expand_pairs_by_mechanism(
     metric = run_inputs.atom_mapping_inputs.metric
     budget = run_inputs.atom_mapping_inputs.n_candidates
     typer.echo(
-        f"--atom-mapping: finding every mechanism for {len(candidates)} conformer "
-        f"pair(s) (best symmetry variant per mechanism by {metric})..."
+        f"Finding the mechanisms of the {len(candidates)} pair(s): every way the reactant's atoms can "
+        f"become the product's, grouped by which bonds break and form (per mechanism, the atom "
+        f"numbering that fits best by {metric} is used)..."
     )
 
     def _one(pair):
@@ -162,14 +174,14 @@ def _expand_pairs_by_mechanism(
                    f"{len(rows) - reused} are new.")
 
     counts = {key: sum(1 for r in rows if r["key"] == key) for key in keys}
-    typer.echo(f"--atom-mapping: {len(keys)} mechanism(s) across the pairs:")
-    for key in keys:
-        typer.echo(f"    {counts[key]:>4} path search(es)  {key}")
+    typer.echo(f"{len(keys)} mechanism(s) (atoms are named by element and symmetry class, not by number):")
+    for k, key in enumerate(keys, start=1):
+        typer.echo(f"  {k}. {_describe_mechanism(key)}: {counts[key]} path search(es)")
     typer.echo(
-        f"--atom-mapping: {len(candidates)} conformer pair(s) -> {len(new_candidates)} "
-        f"path search(es)"
-        + (f" (best {pairs_per_mechanism} pair(s) per mechanism)" if pairs_per_mechanism > 0 else "")
-        + (f"; {n_failed} enumeration(s) failed." if n_failed else ".")
+        f"Path searches: {len(new_candidates)} of the {len(candidates)} pair(s)"
+        + (f" -- the {pairs_per_mechanism} best-matching per mechanism (--pairs-per-mechanism)"
+           if pairs_per_mechanism > 0 else "")
+        + (f"; mapping failed for {n_failed} pair(s)." if n_failed else ".")
     )
 
     if output is not None:
@@ -943,10 +955,10 @@ def channels(
     direct_only: Optional[bool] = typer.Option(
         None, "--direct-only/--allow-multistep",
         help="--direct-only: focus compute on the queried pair. When a path search splits, only the pieces "
-        "between queried species (the start or end, in any conformer or stereo variant) are run; legs through other species "
-        "are not. E.g. A->B splitting into A->C, C->D, D->A', A'->B runs only A'->B. Multistep mechanisms "
-        "through intermediates are therefore not characterized. Default: the profile's "
-        "path_min_inputs.direct_only, else every piece is followed.",
+        "with at least one end at a queried species (the start or end, in any conformer or stereo variant) "
+        "are run; a leg between two other species is not. E.g. A->B splitting into A->C, C->D, D->A', A'->B "
+        "runs A->C, D->A' and A'->B, not C->D. Default: the profile's path_min_inputs.direct_only, else "
+        "every piece is followed.",
     ),
     validate_minima_with_hessian: bool = typer.Option(
         True, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
@@ -1138,7 +1150,7 @@ def channels(
     if len(reused) == 2:
         start_confs, end_confs = reused["start"], reused["end"]
     else:
-        typer.echo(f"Generating seed pairs (--method {method})...")
+        typer.echo(f"Sampling conformers ({conformer_inputs.backend})...")
         if not reused:
             start_confs, end_confs = generate_seed_pairs(
                 method, start_node, end_node, conformer_inputs=conformer_inputs,
@@ -1152,16 +1164,15 @@ def channels(
                                           stats["conformers"].setdefault(label, {}))
             start_confs = reused.get("start", sampled)
             end_confs = reused.get("end", sampled)
-        typer.echo(
-            f"  -> {len(start_confs)} start-endpoint seed(s), "
-            f"{len(end_confs)} end-endpoint seed(s)."
-        )
+        typer.echo(f"  {len(start_confs)} reactant and {len(end_confs)} product conformer(s).")
 
     pools = {"start": start_confs, "end": end_confs}
     for label in ("start", "end"):
         side = stats["conformers"].setdefault(label, {})
         if minimize_ends and label not in reused:
-            typer.echo(f"Minimizing {label}-endpoint conformers...")
+            side_name = "reactant" if label == "start" else "product"
+            typer.echo(f"Minimizing the {len(pools[label])} {side_name} conformer(s) at the profile's "
+                       "level of theory...")
             t0 = time.perf_counter()
             pools[label] = _minimize_conformer_pool(pools[label], label, run_inputs)
             side["minimize_seconds"] = round(time.perf_counter() - t0, 3)
@@ -1174,8 +1185,8 @@ def channels(
             dropped = side["n_minimized"] - len(pools[label])
             if dropped:
                 typer.echo(
-                    f"  {dropped} {label} conformer(s) minimized into an "
-                    f"already-kept minimum (snap-RMSD < {rmsd_cutoff}); dropped."
+                    f"  Dropped {dropped}: relaxed into the same minimum as a kept one "
+                    f"(RMSD < {rmsd_cutoff} bohr)."
                 )
             # A loosely bound complex's conformers differ mostly in how far
             # apart the molecules sit; compare molecule by molecule instead.
@@ -1186,10 +1197,11 @@ def channels(
             side["n_complex_degenerate_merged"] = before - len(pools[label])
             if side["n_complex_degenerate_merged"]:
                 typer.echo(
-                    f"  {side['n_complex_degenerate_merged']} {label} conformer(s) of the "
-                    f"complex match a kept one fragment by fragment within "
-                    f"{complex_energy_tol} kcal/mol; dropped."
+                    f"  Dropped {side['n_complex_degenerate_merged']}: the same molecules as a kept one, "
+                    f"only placed differently (each molecule matches, energy within "
+                    f"{complex_energy_tol} kcal/mol)."
                 )
+            typer.echo(f"  Kept {len(pools[label])}.")
 
     # Each side's final pool before mirror images are merged (a merge drops
     # conformers from one side only, depending on the other side): what a
@@ -1218,9 +1230,9 @@ def channels(
     n_mirrors = len(pools[mirror_side]) - len(merged[mirror_side])
     if n_mirrors:
         typer.echo(
-            f"  {n_mirrors} {mirror_side} conformer(s) are mirror images of another "
-            f"(achiral molecule); merged, {len(pools['start']) * len(pools['end'])} "
-            f"-> {n_if[mirror_side]} pairs."
+            f"Merged {n_mirrors} {'reactant' if mirror_side == 'start' else 'product'} conformer(s) that are "
+            f"mirror images of kept ones (the molecule is achiral, so their paths would be mirror images too): "
+            f"{len(pools['start']) * len(pools['end'])} -> {n_if[mirror_side]} pairs."
         )
         pools[mirror_side] = merged[mirror_side]
     for label in pools:
@@ -1257,8 +1269,8 @@ def channels(
 
     if max_pairs and len(candidates) > max_pairs:
         typer.echo(
-            f"{len(candidates)} candidate reactant x product conformer pairs found "
-            f"({n_start} x {len(end_confs)}), capping at --max-pairs={max_pairs}."
+            f"Pairs: {n_start} reactant x {len(end_confs)} product conformers = {len(candidates)}; "
+            f"keeping the first {max_pairs} (capping at --max-pairs={max_pairs})."
         )
         candidates = candidates[:max_pairs]
     stats["n_pairs"] = len(candidates)
@@ -1341,8 +1353,8 @@ def channels(
     if not tree_dirs:
         if (stats.get("direct_only") or {}).get("pairs_not_characterized"):
             # Expected with --direct-only, not a failure: every search needed an intermediate.
-            typer.echo("No direct channel: every pair's path goes through species other than the start and "
-                       "end, and --direct-only does not run those legs. Rerun without it to characterize them.")
+            typer.echo("No channel: every pair's legs run between species other than the start and end, and "
+                       "--direct-only does not run those. Rerun without it to characterize them.")
             return
         typer.echo("No pairs completed successfully; nothing to build a network from.")
         raise typer.Exit(code=1)

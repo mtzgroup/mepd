@@ -422,8 +422,8 @@ def _check_endpoint_atom_mapping(
 
     if atom_map.is_identity:
         typer.echo(
-            "--start/--end atom-mapping check: SLAPMapper's suggested mapping "
-            "agrees with the existing atom ordering; no reindexing needed."
+            "Atom mapping: the start's and end's atoms are already numbered the same way "
+            "(checked with SLAPMapper), so nothing is renumbered."
         )
         return end_structure
 
@@ -537,7 +537,7 @@ def _completed_tree_dirs(completion_dir: Path) -> list[Path]:
     rejected = [t for t in trees if _uncharacterized_by_direct_only(t)]
     if rejected:
         typer.echo(
-            f"{len(rejected)} pair(s) have no path between the queried species and were not characterized "
+            f"{len(rejected)} pair(s) had every leg between other species and were not characterized "
             "(--direct-only): " + ", ".join(t.parent.name for t in sorted(rejected))
         )
     trees = [t for t in trees if t not in rejected]
@@ -711,7 +711,7 @@ def _run_msmep_pairs(
             typer.echo(f"Skipping pair ({i}, {j}): --search-budget reached before it started.")
             return
         pair_dir.mkdir(parents=True, exist_ok=True)
-        typer.echo(f"Running NEB/MSMEP for pair ({i}, {j})...")
+        typer.echo(f"Starting pair_{i}_{j} ({run_inputs.path_min_method} path search)...")
         # MSMEP's "endpoints already attempted elsewhere" dedup (meant to stop
         # redundant re-splitting of the same species discovered mid-recursion
         # within ONE pair's own tree) stores its cache directly on this shared
@@ -751,7 +751,8 @@ def _run_msmep_pairs(
             _progress.end_live_stream(stream_status)
 
     if workers > 1 and len(todo) > 1:
-        typer.echo(f"Running {len(todo)} pair(s) across {min(workers, len(todo))} worker process(es).")
+        typer.echo(f"Running {len(todo)} path search(es), {min(workers, len(todo))} at a time "
+                   f"({min(workers, len(todo))} worker process(es)).")
     _fork_map(_one, todo, workers)
 
 

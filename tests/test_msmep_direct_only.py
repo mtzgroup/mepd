@@ -1,5 +1,6 @@
-"""path_min_inputs.direct_only: pieces of a split that reach species other
-than the queried endpoints are not run; pieces between queried species are."""
+"""path_min_inputs.direct_only: a piece of a split runs if at least one of
+its ends is a queried species (any conformer or stereo variant); a piece
+between two other species is not run."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -41,15 +42,24 @@ def _run(monkeypatch, direct_only: bool, pieces, root=None):
     return msmep.run_recursive_minimize(root, max_depth=1)
 
 
-def test_a_split_with_no_piece_between_queried_species_ends_the_branch(monkeypatch, tmp_path):
+def test_a_split_whose_pieces_all_avoid_the_queried_species_ends_the_branch(monkeypatch, tmp_path):
     c = _other_species()
-    tree = _run(monkeypatch, True, lambda: [_chain_from(_topology_structure("a"), c),
-                                             _chain_from(c, _topology_structure("b"))])
+    d = Structure(geometry=np.array([[0.0, 0.0, 0.0], [4.5, 0.0, 0.0], [9.0, 0.0, 0.0]]),  # all apart
+                  symbols=["C", "O", "H"], charge=0, multiplicity=1)
+    tree = _run(monkeypatch, True, lambda: [_chain_from(c, d)])
     assert tree.leaf_status == "offtarget_split_rejected"
     assert tree.children == [] and tree.data is None       # nothing left to TS-optimize
     tree.write_to_disk(tmp_path / "tree")
     assert (tmp_path / "tree" / "node_0_rejected.xyz").exists()
     assert not (tmp_path / "tree" / "node_0.xyz").exists()
+
+
+def test_legs_with_one_queried_end_run(monkeypatch):
+    c = _other_species()
+    tree = _run(monkeypatch, True, lambda: [_chain_from(_topology_structure("a"), c),
+                                             _chain_from(c, _topology_structure("b"))])
+    assert getattr(tree, "leaf_status", None) != "offtarget_split_rejected"
+    assert len(tree.children) == 2 and not getattr(tree, "rejected_chains", None)
 
 
 def test_splits_through_conformers_of_the_queried_endpoints_are_kept(monkeypatch):
@@ -77,12 +87,16 @@ def test_deeper_splits_are_judged_against_the_root_query():
     kept, off = msmep._split_pieces_on_target(child, [child])
     assert kept == [child] and off == []
     via_c = _chain_from(a.structure, c.structure)
-    kept, off = msmep._split_pieces_on_target(child, [via_c, child])
-    assert kept == [child] and len(off) == 1
+    d = Structure(geometry=np.array([[0.0, 0.0, 0.0], [4.5, 0.0, 0.0], [9.0, 0.0, 0.0]]),
+                  symbols=["C", "O", "H"], charge=0, multiplicity=1)
+    c_to_d = _chain_from(c.structure, d)
+    kept, off = msmep._split_pieces_on_target(child, [via_c, c_to_d, child])
+    assert kept == [via_c, child] and len(off) == 2   # only the leg between two other species is dropped
 
 
-def test_only_the_legs_between_queried_species_run(monkeypatch, tmp_path):
-    """A -> B splitting into A -> C, C -> D, D -> A', A' -> B runs only A' -> B."""
+def test_only_the_leg_between_two_other_species_is_dropped(monkeypatch, tmp_path):
+    """A -> B splitting into A -> C, C -> D, D -> A', A' -> B runs A -> C,
+    D -> A' and A' -> B; only C -> D is not run."""
     a, b = _topology_structure("a"), _topology_structure("b")
     a_conf = _topology_structure("a", offset=0.05)
     c = _other_species()
@@ -90,15 +104,15 @@ def test_only_the_legs_between_queried_species_run(monkeypatch, tmp_path):
                   symbols=["C", "O", "H"], charge=0, multiplicity=1)
     legs = lambda: [_chain_from(a, c), _chain_from(c, d), _chain_from(d, a_conf), _chain_from(a_conf, b)]
     tree = _run(monkeypatch, True, legs)
-    assert len(tree.children) == 1
-    kept = tree.children[0].data.chain_trajectory[-1]
-    assert np.allclose(kept[0].coords, StructureNode(structure=a_conf).coords)
-    assert len(tree.rejected_chains) == 3
+    assert len(tree.children) == 3
+    starts = [np.asarray(ch.data.chain_trajectory[-1][0].coords) for ch in tree.children]
+    expected = [StructureNode(structure=s).coords for s in (a, d, a_conf)]
+    assert all(np.allclose(x, y) for x, y in zip(starts, expected))
+    assert len(tree.rejected_chains) == 1
     record = TreeNode(data=None, children=[], index=0)   # the fake search data can't be written
     record.rejected_chains = tree.rejected_chains
     record.write_to_disk(tmp_path / "tree")
-    assert sorted(p.name for p in (tmp_path / "tree").glob("node_0_rejected_*.xyz")) == [
-        "node_0_rejected_0.xyz", "node_0_rejected_1.xyz", "node_0_rejected_2.xyz"]
+    assert sorted(p.name for p in (tmp_path / "tree").glob("node_0_rejected_*.xyz")) == ["node_0_rejected_0.xyz"]
 
 
 def _fake_tree(root, adj, files):
@@ -161,4 +175,7 @@ def test_legs_to_a_stereo_variant_of_an_endpoint_still_run():
     root_b = Chain.model_validate({"nodes": [trans, cis], "parameters": ChainInputs()})
     to_other = Chain.model_validate({"nodes": [trans, other], "parameters": ChainInputs()})
     kept, off = msmep._split_pieces_on_target(root_b, [to_other])
-    assert kept == [] and len(off) == 1
+    assert kept == [to_other] and off == []           # one queried end is enough
+    between_others = Chain.model_validate({"nodes": [other, node("C=C(C)C")], "parameters": ChainInputs()})
+    kept, off = msmep._split_pieces_on_target(root_b, [between_others])
+    assert kept == [] and len(off) == 2

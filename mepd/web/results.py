@@ -629,8 +629,8 @@ def collect_channels(out: Path, charge: int, multiplicity: int) -> dict:
         {"label": "Mechanisms", "value": stats.get("n_mechanisms")},
         {"label": "Path searches", "value": stats.get("n_path_searches")},
         {"label": "Direct only", "value": (
-            f"{stats['direct_only']['legs_not_run']} legs through other species not run, "
-            f"{stats['direct_only']['pairs_not_characterized']} pairs with no direct path"
+            f"{stats['direct_only']['legs_not_run']} legs between other species not run, "
+            f"{stats['direct_only']['pairs_not_characterized']} pairs with nothing left to search"
             if stats.get("direct_only") else None)},
         {"label": "Distinct mechanisms", "value": ", ".join(sorted({m["mechanism"] for m in mechanisms if m.get("mechanism")})) or None},
         {"label": "Wall time", "value": f"{stats['total_seconds']:.0f} s" if stats.get("total_seconds") else None},

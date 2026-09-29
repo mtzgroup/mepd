@@ -210,11 +210,11 @@ class NEBInputs:
         cuts no reaction's lowest channel (4% of searches avoided; at 4,
         rxn_747's only channel sat below a cut).
     `direct_only`: during recursive autosplitting, run only the pieces of a
-        split whose two ends are both queried species (the root search's
-        endpoints, in any conformer or stereo variant); pieces reaching any other species are
-        not run. A -> B splitting into A -> C, C -> D, D -> A', A' -> B runs
-        only A' -> B. So no compute goes to intermediates, and multistep
-        routes through them are not characterized. Default False.
+        split with at least one end at a queried species (the root search's
+        endpoints, in any conformer or stereo variant); a piece between two
+        other species is not run. A -> B splitting into A -> C, C -> D,
+        D -> A', A' -> B runs A -> C, D -> A' and A' -> B, not C -> D.
+        Default False.
     """
 
     climb: bool = True

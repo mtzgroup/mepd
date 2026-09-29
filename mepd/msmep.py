@@ -542,13 +542,14 @@ class MSMEP:
             child_chain._split_ancestors = list(ancestors)
 
     def _split_pieces_on_target(self, input_chain: Chain, pieces: list[Chain]) -> tuple[list[Chain], list[str]]:
-        """With path_min_inputs.direct_only: (the pieces of a split whose two
-        ends are both queried species -- the root search's endpoints, in any
-        conformer or stereo variant -- and labels of the other species the
-        rest reach).
+        """With path_min_inputs.direct_only: (the pieces of a split with at
+        least one end at a queried species -- the root search's endpoints, in
+        any conformer or stereo variant -- and labels of the other species
+        the dropped pieces reach).
 
-        A -> B splitting into A -> C, C -> D, D -> A', A' -> B keeps only
-        A' -> B: the legs through C and D are not run. With the option off,
+        A -> B splitting into A -> C, C -> D, D -> A', A' -> B keeps A -> C,
+        D -> A' and A' -> B, and drops C -> D: only a leg between two other
+        species is not run. With the option off,
         or when molecular graphs are disabled (species can't be told apart),
         every piece is kept."""
         if not getattr(self.inputs.path_min_inputs, "direct_only", False):
@@ -573,7 +574,7 @@ class MSMEP:
         for piece in pieces:
             ends = [piece[0], piece[-1]]
             flags = [queried(n) for n in ends]
-            if None in flags or all(flags):
+            if None in flags or any(flags):
                 kept.append(piece)
                 variants = [n for n in ends if flags[0] is not None and stereo_variant(n)]
                 if variants:
@@ -795,6 +796,32 @@ class MSMEP:
                       snapshot=True, warn=True)
         return _failed_leaf(index, status="path_minimization_error", exc=exc, chain=chain)
 
+    def _keep_unsplit(self, history_node: TreeNode, root_neb_obj, input_chain: Chain,
+                      attempt_payload, status: str) -> TreeNode:
+        """A path that is not elementary but will not be split (a cycle, the
+        same-pair split limit, the depth limit) is kept as one step -- and
+        first optimized to convergence: the path minimizer stopped early
+        when it saw the path was not elementary, so the path it left is only
+        partly relaxed, and the TS search would start from it. It continues
+        from where it stopped with the elementary-step checks (the early
+        stop) off, and the leaf keeps `status` to say why it was not split."""
+        pmi = self.inputs.path_min_inputs
+        trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
+        start = trajectory[-1] if trajectory and len(trajectory[-1]) >= 2 else input_chain
+        self._say("Optimizing this path to convergence as a single step instead.", snapshot=True)
+        before = getattr(pmi, "do_elem_step_checks", True)
+        try:
+            pmi.do_elem_step_checks = False
+            neb_obj, elem_step_results = self.run_minimize_chain(input_chain=start)
+        finally:
+            pmi.do_elem_step_checks = before
+        self._mark_attempted_pair_result(attempt_payload, neb_obj, elem_step_results)
+        history_node.data = neb_obj
+        history_node.leaf_status = status
+        history_node.converged_unsplit = True
+        set_monitor_verdict("elementary")
+        return history_node
+
     def _run_recursive_step(
         self,
         input_chain: Chain,
@@ -872,14 +899,12 @@ class MSMEP:
                 self._same_pair_split_limit_message(same_pair_split_count),
                 snapshot=True, warn=True,
             )
-            history_node.leaf_status = "same_pair_split_limit_reached"
-            set_monitor_verdict("unresolved")
-            return history_node, []
+            return self._keep_unsplit(history_node, root_neb_obj, input_chain, attempt_payload,
+                                      "same_pair_split_limit_reached"), []
 
         if resolved_max_depth is not None and tree_depth >= resolved_max_depth:
-            history_node.leaf_status = "max_depth_reached"
-            set_monitor_verdict("unresolved")
-            return history_node, []
+            return self._keep_unsplit(history_node, root_neb_obj, input_chain, attempt_payload,
+                                      "max_depth_reached"), []
 
         deadline = getattr(self.inputs.path_min_inputs, "recursive_split_deadline", None)
         if deadline is not None and time.time() > deadline:
@@ -897,12 +922,10 @@ class MSMEP:
             # unresolved rather than split again.
             self._say(
                 f"Endpoint pair revisited {self._resolve_cycle_revisits()}+ times on this branch "
-                "(a cycle); keeping this path as an unresolved leaf instead of splitting it again.",
+                "(a cycle); not splitting it again.",
                 snapshot=True, warn=True,
             )
-            history_node.leaf_status = "cycle"
-            set_monitor_verdict("unresolved")
-            return history_node, []
+            return self._keep_unsplit(history_node, root_neb_obj, input_chain, attempt_payload, "cycle"), []
 
         chain_trajectory = getattr(root_neb_obj, "chain_trajectory", None) or []
         if not chain_trajectory:
@@ -920,13 +943,13 @@ class MSMEP:
         )
         kept, offtarget = self._split_pieces_on_target(input_chain, sequence_of_chains)
         if len(kept) < len(sequence_of_chains):
-            # direct_only: no compute on legs through intermediates. Legs
-            # between queried species (e.g. A' -> B) still run.
+            # direct_only: no compute on legs between two other species
+            # (e.g. C -> D); legs touching a queried species still run.
             dropped = len(sequence_of_chains) - len(kept)
             self._say(
                 f"direct_only: not running {dropped} of {len(sequence_of_chains)} pieces of this split "
-                f"(they reach {', '.join(offtarget)}, not the queried endpoints)"
-                + (f"; running the {len(kept)} between queried species." if kept else "."),
+                f"(both ends are other species: {', '.join(offtarget)})"
+                + (f"; running the {len(kept)} that touch a queried species." if kept else "."),
                 snapshot=True, warn=True,
             )
             history_node.rejected_chains = [p.copy() for p in sequence_of_chains if p not in kept]
@@ -1109,7 +1132,9 @@ class MSMEP:
                     is_elem_step = (
                         not child_children
                         and bool(getattr(child_history, "data", None))
-                        and leaf_status not in {"max_depth_reached", "same_pair_split_limit_reached", "cycle", "time_budget"}
+                        and (bool(getattr(child_history, "converged_unsplit", False))
+                             or leaf_status not in {"max_depth_reached", "same_pair_split_limit_reached", "cycle",
+                                                    "time_budget"})
                     )
                     self._mark_attempted_pair_result(
                         job.attempt_payload,
