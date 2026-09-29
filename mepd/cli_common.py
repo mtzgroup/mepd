@@ -468,13 +468,15 @@ def _tree_leaves(tree_dir: Path) -> tuple[set[int], set[int]]:
 
 
 def _uncharacterized_by_direct_only(tree_dir: Path) -> bool:
-    """A pair tree in which --direct-only left nothing to search: every
-    branch was a leg through other species."""
+    """A pair tree in which --direct-only left nothing searched: some legs
+    were dropped (whole branches, or pieces of a split) and no leaf with a
+    search of its own remains."""
     try:
         searched, rejected = _tree_leaves(tree_dir)
     except Exception:
         return False
-    return bool(rejected) and not searched
+    dropped = bool(rejected) or any(tree_dir.glob("node_*_rejected_*.xyz"))
+    return dropped and not searched
 
 
 def direct_only_counts(pairs_dir: Path) -> dict:

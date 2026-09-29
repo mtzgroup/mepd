@@ -1332,19 +1332,24 @@ def channels(
         typer.echo("No pairs completed successfully; nothing to build a network from.")
         raise typer.Exit(code=1)
 
+    # network.json is a by-product: TS optimization and classification read
+    # the pair trees themselves, so a network that can't be built (e.g. no
+    # elementary leaf left once --direct-only dropped legs) is reported,
+    # not fatal.
     builder = NetworkBuilder(data_dir=output, network_inputs=NetworkInputs())
     try:
         pot = builder.create_rxn_network_from_paths(tree_dirs)
     except Exception as exc:
-        typer.echo(f"Network construction failed: {type(exc).__name__}: {exc}")
-        raise typer.Exit(code=1)
-
-    network_path = output / "network.json"
-    pot.write_to_disk(network_path)
-    typer.echo(
-        f"Wrote network to {network_path} "
-        f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
-    )
+        typer.echo(f"WARNING: network construction failed ({type(exc).__name__}: {exc}); "
+                   "continuing with TS optimization and classification.")
+        stats["network_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        network_path = output / "network.json"
+        pot.write_to_disk(network_path)
+        typer.echo(
+            f"Wrote network to {network_path} "
+            f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
+        )
 
     t0 = time.perf_counter()
     mismatch_warnings = _discover_channels(
