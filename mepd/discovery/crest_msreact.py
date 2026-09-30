@@ -79,6 +79,19 @@ def _run_with_progress(argv: list[str], cwd: Path, env: dict, timeout: float) ->
     return proc.returncode, b"".join(chunks).decode(errors="replace")
 
 
+def _say_none_kept(structure) -> None:
+    """Why CREST returned no products (a structure of several molecules:
+    msreact fragments one molecule, and keeps nothing for a cluster)."""
+    from mepd.conformers import fragments
+    from mepd.progress import update_status
+
+    n = len(fragments(structure))
+    why = (f": this structure is {n} separate molecules, and msreact only fragments a single molecule "
+           "(use Bond rules for reactions between molecules)" if n > 1 else "")
+    message = f"CREST MSReact kept no products{why}."
+    update_status(message)
+
+
 def msreact_products(structure, *, max_products: int = 50, mode: str = "all", nbonds: int = 3, nshifts: int = 0,
                      nshifts2: int = 0, timeout: float = 3600.0, keep_dir=None) -> list:
     """Product Structures (the input's atom order, charge and spin) of
@@ -117,6 +130,11 @@ def msreact_products(structure, *, max_products: int = 50, mode: str = "all", nb
         returncode, log = _run_with_progress(argv, work, env, timeout)
         (work / "crest.log").write_text(log)
         out = work / "crest_msreact_products.xyz"
+        kept_none = returncode == 0 and ("No structure left" in log or not out.exists() or not out.read_text().strip())
+        if kept_none:
+            # CREST ran and kept nothing: no products for this species, not a failure.
+            _say_none_kept(structure)
+            return []
         if returncode != 0 or not out.exists():
             tail = "\n".join(log.strip().splitlines()[-8:])
             raise RuntimeError(f"crest --msreact failed (exit {returncode}):\n{tail}")

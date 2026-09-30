@@ -987,7 +987,8 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
              "install": "conda install -c conda-forge crest xtb",
              "summary": "CREST's fragment generator (msreact): biased GFN2-xTB optimizations find the fragments and "
                         "isomers the molecule can reach, e.g. likely precursors (read backwards) or nearby products. "
-                        "They are re-optimized at your level of theory and grown like any other species."})),
+                        "They are re-optimized at your level of theory and grown like any other species. One molecule at a "
+                        "time: a cluster of several gets no products."})),
     Operation(
         "network-splits", "All-pairs network", "Run recursive path searches between every pair of the "
         "selected minima and assemble a reaction network. (`mepd network-splits`)",
