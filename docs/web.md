@@ -113,7 +113,9 @@ was kept, or an NEB that never converged) are shown above the results.
 
 ### Design
 
-Build or edit a structure in 3D: from SMILES, a reaction SMILES (above), an XYZ file (upload, drop or paste, with its charge), or a graph node. *Add molecule* places a preset, any SMILES, or an uploaded XYZ (kept rigid, as in the file) next to the atom you click.
+Build or edit a structure in 3D: from scratch (click empty space to drop an atom, with its hydrogens; click a hydrogen to grow a new atom in its place), from SMILES, a reaction SMILES (above), an XYZ file (upload, drop or paste, with its charge), or a graph node. *Add molecule* places a preset, any SMILES, or an uploaded XYZ (kept rigid, as in the file) next to the atom you click.
+
+A new, empty workspace opens on Design; an empty Explore points there too.
 
 ### Sessions, cleanup, downloads
 

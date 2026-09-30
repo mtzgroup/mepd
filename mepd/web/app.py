@@ -70,6 +70,7 @@ class StructurePatch(BaseModel):
 
 
 class DesignNew(BaseModel):
+    scratch: bool = False                 # an empty design, built atom by atom
     smiles: Optional[str] = None
     xyz: Optional[str] = None
     name: Optional[str] = None
@@ -738,10 +739,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         except Exception:
             return []
 
-    def _current_design() -> dict:
+    def _current_design(*, atoms: bool = False) -> dict:
         d = W().design
         if not d:
-            raise WorkspaceError("there is no design yet: start one from SMILES or load a structure from the graph")
+            raise WorkspaceError("there is no design yet: start one from scratch, from SMILES, or from the graph")
+        if atoms and not d.get("natoms"):
+            raise WorkspaceError("the design has no atoms yet: click in the 3D view to drop the first one")
         return d
 
     @app.get("/api/design/groups")
@@ -754,6 +757,11 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def design_new(body: DesignNew):
         from mepd.web import design
 
+        if body.scratch:
+            out = _store_design(design.empty(), name=body.name or "New molecule", source={"kind": "scratch"},
+                                keep={}, charge=body.charge, multiplicity=body.multiplicity)
+            publish_ws()
+            return out
         if body.smiles and is_reaction_smiles(body.smiles.strip()):
             from mepd.web import design_reaction
 
@@ -849,7 +857,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def design_clean():
         from mepd.web import design
 
-        d = _current_design()
+        d = _current_design(atoms=True)
         rx = d.get("reaction")
         if rx:
             p = design.clean(rx["product"]["molblock"])   # same atoms, new coordinates: the map holds
@@ -911,7 +919,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
     @app.post("/api/design/minimize")
     async def design_minimize(body: DesignMinimize):
-        if _current_design().get("reaction"):
+        if _current_design(atoms=True).get("reaction"):
             raise WorkspaceError("a reaction design is minimized when its path search starts: use Search TS")
         params = {"validate_minima_with_hessian": W().validate_minima, **(body.params or {})}
         created = J().submit("design-optimize", structure_ids=[], edge_ids=[], params=params,
@@ -934,7 +942,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
     @app.post("/api/design/tsopt")
     async def design_tsopt(body: DesignMinimize):
-        if _current_design().get("reaction"):
+        if _current_design(atoms=True).get("reaction"):
             raise WorkspaceError("Optimize as TS takes one structure (a TS guess), not a reaction")
         return J().submit("design-tsopt", structure_ids=[], edge_ids=[], params={"irc": True, **(body.params or {})},
                           profile=body.profile if body.profile is not None else W().level_profile)
@@ -975,7 +983,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         one more conformer of it)."""
         from mepd.web import design
 
-        d = _current_design()
+        d = _current_design(atoms=True)
         if d.get("reaction"):
             out = _reaction_to_graph(d)
             publish_ws()
@@ -1022,7 +1030,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     async def design_search(body: DesignSearch):
         """Reaction mode: add both ends and their edge, then run a TS search
         (or a channels run) on it at the workspace level."""
-        d = _current_design()
+        d = _current_design(atoms=True)
         if not d.get("reaction"):
             raise WorkspaceError("Search needs a reaction design (start one from a reaction SMILES)")
         out = await run_in_threadpool(_reaction_to_graph, d)

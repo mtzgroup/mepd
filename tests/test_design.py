@@ -248,3 +248,19 @@ def test_a_reaction_design_edits_both_sides_and_keeps_their_atoms_matched(client
     assert job["op"] == "ts"
     assert client.post("/api/design/minimize", json={}).status_code == 400
     assert client.get("/api/design/xyz?side=product").text.startswith(str(out["natoms"]))
+
+
+def test_a_molecule_built_from_scratch(client):
+    """No SMILES or xyz: start empty, drop atoms in space, grow them by clicking hydrogens."""
+    new = client.post("/api/design/new", json={"scratch": True}).json()
+    assert new["natoms"] == 0 and new["name"] == "New molecule"
+    assert client.post("/api/design/to-graph").status_code == 400          # nothing to add yet
+    c = client.post("/api/design/edit", json={"op": {"op": "drop", "element": "C", "xyz": [0, 0, 0]}}).json()
+    assert c["smiles"] == "C" and c["natoms"] == 5
+    h = next(a.GetIdx() for a in d.read(c["molblock"]).GetAtoms() if a.GetSymbol() == "H")
+    cc = client.post("/api/design/edit", json={"op": {"op": "add", "atom": h, "element": "C"}}).json()
+    assert cc["smiles"] == "CC"                                             # the new atom took that H's place
+    ion = client.post("/api/design/edit", json={"op": {"op": "drop", "element": "Na", "xyz": [5, 0, 0],
+                                                        "hydrogens": False}}).json()
+    assert ion["smiles"] == "CC.[Na]"
+    assert client.post("/api/design/to-graph").status_code == 200

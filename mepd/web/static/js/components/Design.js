@@ -54,7 +54,7 @@ function Steps({ steps }) {
 const TOOLS = [
   ['view', 'View', 'Rotate and zoom; click an atom to see what it is.'],
   ['element', 'Element', 'Click an atom to turn it into the chosen element (hydrogens are re-added to fit).'],
-  ['add', 'Add atom', 'Click an atom to bond a new atom of the chosen element to it (it takes a hydrogen\'s place).'],
+  ['add', 'Add atom', 'Click an atom to bond a new atom of the chosen element to it (it takes a hydrogen\'s place), click a hydrogen to replace it, or click empty space to drop a new atom there.'],
   ['place', 'Add molecule', 'Click an atom to put whole molecules or ions next to it, not bonded: a metal ion or Lewis acid to coordinate it, or several waters to solvate it.'],
   ['group', 'Swap group', 'Click a hydrogen, or the first atom of a terminal group (e.g. a methyl carbon), to replace it with the chosen group.'],
   ['bond', 'Bond', 'Click two atoms to give them the chosen bond order (or remove their bond).'],
@@ -67,12 +67,29 @@ function themeBackground() {
   return getComputedStyle(document.documentElement).getPropertyValue('--viewer-bg').trim() || '#ffffff';
 }
 
-function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable }) {
+// The model-space point (Angstrom) under a click on empty space: in the
+// plane through the molecule's centre (the origin when there are no atoms
+// yet), parallel to the screen.
+function pointUnder(v, evt) {
+  const atoms = v.getModel()?.selectedAtoms({}) || [];
+  const ref = atoms.length
+    ? { x: atoms.reduce((t, a) => t + a.x, 0) / atoms.length, y: atoms.reduce((t, a) => t + a.y, 0) / atoms.length,
+        z: atoms.reduce((t, a) => t + a.z, 0) / atoms.length }
+    : { x: 0, y: 0, z: 0 };
+  const at = v.modelToScreen(ref);   // page coordinates
+  const off = v.screenOffsetToModel(evt.pageX - at.x, evt.pageY - at.y);
+  return [ref.x + off.x, ref.y + off.y, ref.z + off.z];
+}
+
+function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable, onBackground = null }) {
   const host = useRef(null);
   const viewer = useRef(null);
   const last = useRef({ n: 0 });
   const clickRef = useRef(onAtom);
   clickRef.current = onAtom;
+  const bgRef = useRef(onBackground);
+  bgRef.current = onBackground;
+  const atomHit = useRef(0);
 
   useEffect(() => {
     if (!window.$3Dmol || !host.current) return undefined;
@@ -80,7 +97,21 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     host.current.viewer = viewer.current;   // lets UI tests find atoms on screen
     const ro = new ResizeObserver(() => { viewer.current?.resize(); viewer.current?.render(); });
     ro.observe(host.current);
-    return () => { ro.disconnect(); viewer.current?.clear(); viewer.current = null; };
+    // A click on empty space (not a drag to rotate, not on an atom) -> onBackground(point).
+    let down = null;
+    const onDown = (e) => { down = { x: e.clientX, y: e.clientY }; };
+    const onClick = (e) => {
+      const moved = down ? Math.hypot(e.clientX - down.x, e.clientY - down.y) : 99;
+      if (moved > 5 || Date.now() - atomHit.current < 250 || !bgRef.current || !viewer.current) return;
+      bgRef.current(pointUnder(viewer.current, e));
+    };
+    host.current.addEventListener('pointerdown', onDown);
+    host.current.addEventListener('click', onClick);
+    const el = host.current;
+    return () => {
+      ro.disconnect(); el.removeEventListener('pointerdown', onDown); el.removeEventListener('click', onClick);
+      viewer.current?.clear(); viewer.current = null;
+    };
   }, []);
 
   // Styles only: the picked atom(s) and what the last edit touched. Cheap,
@@ -105,10 +136,11 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     v.removeAllLabels();
     v.removeAllShapes();
     const data = liveXyz || molblock;
-    if (!data) { v.render(); return; }
+    const noAtoms = !liveXyz && /^\s*0\s/.test((data || '').split('\n')[3] || '');
+    if (!data || noAtoms) { last.current.n = 0; v.render(); return; }
     const model = v.addModel(data, liveXyz ? 'xyz' : 'sdf');
     if (!liveXyz) {
-      model.setClickable({}, true, (atom) => clickRef.current(atom.index));
+      model.setClickable({}, true, (atom) => { atomHit.current = Date.now(); clickRef.current(atom.index); });
       model.setHoverable({}, true,
         (atom) => { if (!atom.label) atom.label = v.addLabel(`${atom.elem}${atom.index + 1}`, { position: atom, fontSize: 11, backgroundOpacity: 0.6, inFront: true }); },
         (atom) => { if (atom.label) { v.removeLabel(atom.label); delete atom.label; } });
@@ -120,7 +152,10 @@ function Canvas({ molblock, liveXyz, picked, changed, onAtom, labels, clickable 
     const n = model.selectedAtoms({}).length;
     // Same atoms (a minimization, a bond order): keep the camera; new or
     // removed atoms: frame the whole molecule again.
-    if (last.current.n === n) v.setView(view); else v.zoomTo();
+    // The first atoms of a molecule built from scratch: keep the camera (so the next click
+    // lands where it looks like it will), just not zoomed in onto a single atom.
+    if (last.current.n === n || (last.current.n > 0 && last.current.n < 12)) v.setView(view);
+    else { v.zoomTo(); if (n < 6) v.zoom(0.6); }
     last.current.n = n;
     highlight.current();   // styles + render
   }, [molblock, liveXyz, labels]);
@@ -187,6 +222,15 @@ function Start({ structures }) {
   const rec = structures[sid];
   const list = Object.values(structures).sort((a, b) => b.created - a.created);
   return html`<div class="design-start">
+    <div class="scratch-start">
+      <div>
+        <b>Start from scratch</b>
+        <p class="small muted">Build it atom by atom in 3D: click anywhere to drop an atom (its hydrogens come with it), click a
+          hydrogen to grow a new atom in its place, change elements, set bonds and charges, add whole groups or molecules.</p>
+      </div>
+      <button class="btn primary" onClick=${() => attempt(() => api.post('/api/design/new', { scratch: true }))}>Start drawing</button>
+    </div>
+    <p class="small muted start-or">Or start from something you have:</p>
     <label class="field"><span class="field-label">From SMILES or a reaction SMILES</span>
       <div class="row"><input value=${smiles} placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O, or a reaction: CC(=O)C>>CC(O)=C" onInput=${(e) => setSmiles(e.target.value)}
         onKeyDown=${(e) => e.key === 'Enter' && smiles.trim() && attempt(() => api.post('/api/design/new', { smiles }))} />
@@ -235,6 +279,10 @@ export function DesignView() {
   const progress = useStore((s) => s.progress);
   const [tool, setTool] = useState(() => prefs.get('designTool', 'view'));
   const [element, setElement] = useState('C');
+  const [dropH, setDropH] = useState(() => prefs.get('designDropH', true));
+  // A design started from scratch opens on Add atom, ready for the first click.
+  const empty = design && !design.natoms;
+  useEffect(() => { if (empty && !['add', 'element'].includes(tool)) setTool('add'); }, [empty]);
   const [order, setOrder] = useState(2);
   const [group, setGroup] = useState('methyl');
   const [groups, setGroups] = useState([]);
@@ -365,6 +413,13 @@ export function DesignView() {
     return runEdit(item);
   };
 
+  // A click on empty space: drop a new atom there (Add atom / Element, or any tool on an empty canvas).
+  const onBackground = (xyz) => {
+    if (running) return;
+    if (!(['add', 'element'].includes(tool) || empty)) return;
+    if (rx) { toast('Drop new atoms in a single-molecule design; in a reaction, grow atoms from the ones you have', 'info'); return; }
+    edit({ op: 'drop', element, xyz, hydrogens: dropH });
+  };
   const onAtom = (idx, side = 'reactant') => {
     if (running) { toast('Wait for the minimization to finish (or stop it) before editing', 'info'); return; }
     const e = (op, done) => edit(op, done, side);
@@ -474,8 +529,12 @@ export function DesignView() {
           ${TOOLS.map(([k, label, help]) => html`<button class=${`tool ${tool === k ? 'on' : ''}`} title=${help} onClick=${() => setTool(k)}>${label}</button>`)}
           ${(tool === 'element' || tool === 'add') && html`<div>
             <${Steps} steps=${[`Pick the element (now ${element}).`, tool === 'add'
-              ? 'Click the atom in the 3D view to bond it to: it takes one of that atom\'s hydrogens, or points away from its neighbours.'
-              : 'Click the atom in the 3D view to change: its hydrogens are redone to fit.']} />
+              ? 'Click an atom to bond the new one to it (it takes one of its hydrogens), or click a hydrogen to put it in that hydrogen\'s place.'
+              : 'Click the atom in the 3D view to change: its hydrogens are redone to fit.',
+              'Click empty space to drop a new, unbonded atom there.']} />
+            <label class="small drop-h" title="A dropped atom comes with the hydrogens its valence wants (C becomes CH4); off: a bare atom or ion">
+              <input type="checkbox" checked=${dropH} onChange=${(e) => { setDropH(e.target.checked); prefs.set('designDropH', e.target.checked); }} />
+              dropped atoms get their hydrogens</label>
             <${ElementPicker} value=${element} onPick=${setElement} covered=${cov.elements} method=${cov.method} />
           </div>`}
           ${tool === 'bond' && html`<div class="palette">
@@ -530,7 +589,12 @@ export function DesignView() {
               <div class="pair-link"><button class=${`btn small ${linked ? 'on' : ''}`} title=${linked ? 'Edits are made on both molecules (on the matching atom). Click to edit one side alone.' : 'Edits change only the molecule you click. Click to edit both.'}
                 onClick=${() => { setLinked(!linked); prefs.set('designLinked', !linked); }}>${linked ? '⇄ Edit both' : '→ One side'}</button></div>
             </div>`
-          : html`<${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels} clickable=${tool !== 'view'} />`}
+          : html`<div class="design-single">
+              <${Canvas} molblock=${design.molblock} liveXyz=${liveXyz} picked=${picked} changed=${changed} onAtom=${onAtom} labels=${labels}
+                clickable=${tool !== 'view' || empty} onBackground=${onBackground} />
+              ${empty && html`<div class="design-empty-hint"><b>Click anywhere to place a ${element} atom.</b>
+                <span>Pick another element on the left. Then click a hydrogen to grow the next atom from it.</span></div>`}
+            </div>`}
           <div class="design-hint small">${running ? html`${running.op === 'design-tsopt' ? 'Optimizing as a TS (then IRC)' : 'Minimizing'} at ${level?.label ?? 'the workspace level'}… <a href="#" onClick=${(e) => { e.preventDefault(); openJob(running.id); }}>details</a>`
             : busy ? `Applying the edit…${queued ? ` (${queued} more queued)` : ''}`
               : tool === 'bond' && picked.length === 1 ? `Atom ${picked[0] + 1} picked: click the second atom.` : toolHelp}</div>

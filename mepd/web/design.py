@@ -18,6 +18,8 @@ Edits (see `edit`):
                                       (a named one, or any SMILES with [*] where it attaches)
   charge    {atom, delta}             change an atom's formal charge by +-1
   hydrogens {}                        re-add hydrogens everywhere from valences
+  drop      {element, xyz, hydrogens} a new, unbonded atom at a point (building from scratch); by default
+                                      with hydrogens to fill its valence
   place     {atom, species | smiles | put whole molecules/ions (water, Li+, Mg2+, BF3, any SMILES, an xyz
              xyz (+charge),           structure placed rigidly as given) next to
              count}
@@ -426,6 +428,10 @@ def _edit_add(mol, op):
     rw = Chem.RWMol(mol)
     pos = _positions(rw)
     hs = [n for n in _neighbors(rw, parent) if rw.GetAtomWithIdx(n).GetAtomicNum() == 1]
+    clicked = rw.GetAtomWithIdx(parent)
+    if clicked.GetAtomicNum() == 1 and clicked.GetDegree() == 1:
+        # A hydrogen was clicked: the new atom takes that hydrogen's place.
+        hs, parent = [parent], clicked.GetNeighbors()[0].GetIdx()
     if hs:   # take a hydrogen's place: along its bond
         h = hs[0]
         d = pos[h] - pos[parent]
@@ -441,6 +447,51 @@ def _edit_add(mol, op):
     m, new_h = _fix_hydrogens(rw.GetMol(), {new, parent})
     moving = new_h | {new}
     return m, moving, [_relax(m, moving)]
+
+
+def _edit_drop(mol, op):
+    """A new atom at a point in space (building from scratch, or a second
+    molecule next to the first), not bonded to anything; with `hydrogens`
+    (default) its valence is filled with hydrogens, e.g. C becomes CH4, so
+    Add atom / Element can grow it from there."""
+    Chem = _chem()
+    sym = str(op.get("element") or "C").strip()
+    try:
+        atom = Chem.Atom(sym)
+    except Exception:
+        raise WorkspaceError(f"unknown element {sym!r}") from None
+    xyz = np.asarray(op.get("xyz") if op.get("xyz") is not None else (0.0, 0.0, 0.0), dtype=float)
+    if xyz.shape != (3,) or not np.all(np.isfinite(xyz)):
+        raise WorkspaceError("a dropped atom needs a point, xyz = [x, y, z] in Angstrom")
+    rw = Chem.RWMol(mol)
+    if rw.GetNumConformers() == 0:
+        rw.AddConformer(Chem.Conformer(rw.GetNumAtoms()), assignId=True)
+    pos = _positions(rw) if rw.GetNumAtoms() else np.zeros((0, 3))
+    warnings = []
+    if len(pos) and np.linalg.norm(pos - xyz, axis=1).min() < 0.8:
+        warnings.append("The new atom sits almost on top of another one: drop it further away, or undo.")
+    atom.SetNoImplicit(True)
+    new = rw.AddAtom(atom)
+    _set_position(rw, new, xyz)
+    if not op.get("hydrogens", True):
+        m = rw.GetMol()
+        m.UpdatePropertyCache(strict=False)
+        return m, {new}, warnings
+    m, new_h = _fix_hydrogens(rw.GetMol(), {new})
+    moving = new_h
+    if new_h:
+        warnings.append(_relax(m, moving))
+    return m, moving | {new}, warnings
+
+
+def empty() -> dict:
+    """A design with no atoms yet, to build from scratch (Drop / Add atom)."""
+    Chem = _chem()
+    m = Chem.RWMol().GetMol()
+    m.AddConformer(Chem.Conformer(0), assignId=True)
+    out = describe(m, sanitized=False)
+    out["warnings"] = []
+    return out
 
 
 def _edit_delete(mol, op):
@@ -710,7 +761,7 @@ def _edit_place(mol, op):
     return m, placed, warnings
 
 
-_EDITS = {"place": _edit_place, "element": _edit_element, "add": _edit_add, "delete": _edit_delete, "bond": _edit_bond,
+_EDITS = {"drop": _edit_drop, "place": _edit_place, "element": _edit_element, "add": _edit_add, "delete": _edit_delete, "bond": _edit_bond,
           "group": _edit_group, "charge": _edit_charge, "hydrogens": _edit_hydrogens}
 
 

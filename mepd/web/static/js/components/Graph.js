@@ -3,7 +3,7 @@
 import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
-import { clearSelection, prefs, select, set, state, useStore } from '../store.js';
+import { clearSelection, openTab, prefs, select, set, state, useStore } from '../store.js';
 import { depictUrl, edgeStatus, edgeStatusKey, playgroundFitMargins } from '../util.js';
 import { uploadFiles } from './Library.js';
 
@@ -566,8 +566,10 @@ export function Graph() {
       ${connectMode && html`<div class="graph-hint">Click the <b>start</b> structure, then the <b>end</b> structure.</div>`}
       ${empty && html`<div class="graph-empty">
         <h3>Your reaction graph</h3>
-        <p>Structures you add appear here as nodes. Select two and run a calculation to connect them, or start with a transition-state search right away.</p>
-        <button class="btn primary" onClick=${() => set({ modal: { kind: 'quick' } })}>Find a transition state</button>
+        <p>Every molecule you make or add becomes a node here. Build one in Design (atom by atom, or from a SMILES,
+          a reaction or an XYZ), then explore its reactions, or connect two molecules to find the step between them.</p>
+        <button class="btn primary" onClick=${() => openTab('design')}>Design a molecule</button>
+        <p class="small muted">or <a href="#" onClick=${(e) => { e.preventDefault(); set({ modal: { kind: 'quick' } }); }}>connect two structures you already have</a></p>
       </div>`}
     </div>`;
 }

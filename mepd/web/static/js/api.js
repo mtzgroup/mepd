@@ -91,6 +91,14 @@ function newer(a, b) {
 
 function applyState(data) {
   update((s) => {
+    // First load of an empty workspace (nothing built, nothing run): start on Design.
+    if (!s.landed) {
+      s.landed = true;
+      const ws = data.workspace || {};
+      if (s.view.tab === 'graph' && !Object.keys(ws.structures || {}).length && !ws.design && !(data.jobs || []).length) {
+        s.view = { ...s.view, tab: 'design' };
+      }
+    }
     s.workspace = data.workspace;
     // A reload that was already in flight when a live update arrived must not
     // roll that job back (e.g. 'done' -> 'running'): keep the newer copy.
