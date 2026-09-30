@@ -263,48 +263,64 @@ def get_bond_list(
         image_indices_to_process = [0]  # Fallback for a single frame if selection logic fails
 
     # --- Identify Atom Pairs ---
-    # Initialize set of atom pairs, ensuring (i,j) with i < j for uniqueness.
-    rijset: Set[Tuple[int, int]] = set(tuple(sorted(p)) for p in enforce) if enforce else set()
+    # Pairs are collected in a boolean upper-triangular matrix (i < j) instead of a
+    # Python set; the resulting sorted list is identical.
+    ignore_list = list(ignore_atoms) if ignore_atoms is not None else []
+    ignored = np.zeros(num_atoms, dtype=bool)
+    if len(ignore_list) > 0:
+        ia_arr = np.asarray(ignore_list, dtype=np.int64)
+        ignored[ia_arr[(ia_arr >= 0) & (ia_arr < num_atoms)]] = True
+    pair_mask = np.zeros((num_atoms, num_atoms), dtype=bool)
+    enforced_set: Set[Tuple[int, int]] = set(tuple(sorted(p)) for p in enforce) if enforce else set()
+    for i, j in enforced_set:
+        pair_mask[i, j] = True
     last_snapshot_tree: Optional[KDTree] = None  # KDTree of the last processed snapshot (for min_neighbors)
+    eye = np.eye(num_atoms, dtype=bool)
 
     for image_idx in image_indices_to_process:
         current_geom_snapshot = geom_arr[image_idx]
         tree = KDTree(current_geom_snapshot) # For efficient distance queries
         last_snapshot_tree = tree
 
-        # 1. Add pairs within the primary distance `threshold`.
-        for i, j in tree.query_pairs(r=threshold):
-            if len(ignore_atoms) > 0 and (i in ignore_atoms and j in ignore_atoms):
-                continue # Skip adding pairs involving frozen atoms
-            rijset.add(tuple(sorted((i, j))))
+        # 1. Add pairs within the primary distance `threshold` (i < j), skipping
+        #    pairs whose atoms are both ignored.
+        close = tree.query_pairs(r=threshold, output_type='ndarray')
+        if close.size:
+            keep = ~(ignored[close[:, 0]] & ignored[close[:, 1]])
+            pair_mask[close[keep, 0], close[keep, 1]] = True
 
-        # 2. Add pairs based on neighbor-of-neighbor logic using a tighter `bond_threshold`.
-        #    If A is bonded to B, and C is bonded to D, this logic might consider A-C, A-D, B-C, B-D
-        #    or more commonly, if A-B and B-C are bonds, A-C (an angle) is considered.
-        #    Here, it adds pairs (ni, nj) where ni is a "bonded" neighbor of i, and nj is of j.
-        bonded_pairs_in_snapshot = list(tree.query_pairs(r=bond_threshold))
-        snapshot_neighbors_dict: Dict[int, Set[int]] = {atom_idx: {atom_idx} for atom_idx in range(num_atoms)}
-        for i, j in bonded_pairs_in_snapshot:
-            if len(ignore_atoms) > 0 and (i in ignore_atoms and j in ignore_atoms):
-                continue # Skip adding neighbors for bonded pairs if both atoms are frozen
-            snapshot_neighbors_dict[i].add(j)
-            snapshot_neighbors_dict[j].add(i)
+        # 2. Neighbor-of-neighbor logic with the tighter `bond_threshold`: for every
+        #    "bonded" pair (i, j) add all (ni, nj), ni a bonded neighbor of i (or i),
+        #    nj a bonded neighbor of j (or j), ni != nj.  Bonded pairs of two
+        #    ignored atoms do not make those atoms neighbors, but still seed pairs.
+        bonded = tree.query_pairs(r=bond_threshold, output_type='ndarray')
+        if bonded.size:
+            bi, bj = bonded[:, 0], bonded[:, 1]
+            nbr = eye.copy()  # nbr[a, b]: b is a neighbor of a (or a itself)
+            keep = ~(ignored[bi] & ignored[bj])
+            nbr[bi[keep], bj[keep]] = True
+            nbr[bj[keep], bi[keep]] = True
+            bond_mat = np.zeros((num_atoms, num_atoms), dtype=np.int64)
+            bond_mat[bi, bj] = 1
+            bond_mat[bj, bi] = 1
+            nbr_i = nbr.astype(np.int64)
+            reach = (nbr_i @ bond_mat @ nbr_i) > 0
+            reach &= ~eye
+            pair_mask |= np.triu(reach)
 
-        for i, j in bonded_pairs_in_snapshot:  # For each "bonded" pair (i,j)
-            for ni in snapshot_neighbors_dict.get(i, set()):  # For each neighbor of i (including i itself)
-                for nj in snapshot_neighbors_dict.get(j, set()):  # For each neighbor of j (including j itself)
-                    if ni != nj: # Ensure they are different atoms
-                        rijset.add(tuple(sorted((ni, nj))))
-
-    rijlist = sorted(list(rijset)) # Convert set to sorted list
+    ii, jj = np.nonzero(np.triu(pair_mask))
+    rijset: Set[Tuple[int, int]] = set(zip(ii.tolist(), jj.tolist()))
+    rijset |= enforced_set
+    rijlist = sorted(rijset) # Convert set to sorted list
 
     # --- Ensure Minimum Neighbors ---
     if min_neighbors > 0 and last_snapshot_tree is not None and num_frames > 0:
         # Count current neighbors for each atom from rijlist
         counts = np.zeros(num_atoms, dtype=int)
-        for i, j in rijlist:
-            counts[i] += 1
-            counts[j] += 1
+        if rijlist:
+            rij_arr = np.asarray(rijlist, dtype=np.int64)
+            counts += np.bincount(rij_arr[:, 0], minlength=num_atoms)
+            counts += np.bincount(rij_arr[:, 1], minlength=num_atoms)
 
         geom_of_last_snapshot = geom_arr[num_frames - 1] # Use the last geometry for adding missing neighbors
         additional_pairs_to_satisfy_min_neighbors: Set[Tuple[int,int]] = set()
@@ -340,7 +356,11 @@ def get_bond_list(
             # Get radii for each atom, using default if symbol not found
             atom_radii = np.array([ATOMIC_RADIUS.get(s.capitalize(), default_radius) for s in atoms])
             # Estimate re as sum of radii for each pair in rijlist
-            re_values = np.array([atom_radii[i] + atom_radii[j] for i, j in rijlist], dtype=float) if rijlist else np.array([], dtype=float)
+            if rijlist:
+                rij_arr = np.asarray(rijlist, dtype=np.int64)
+                re_values = atom_radii[rij_arr[:, 0]] + atom_radii[rij_arr[:, 1]]
+            else:
+                re_values = np.array([], dtype=float)
         else:
             logger.warning(
                 f"Atom list length ({len(atoms)}) does not match geometry atom count ({num_atoms}). "
@@ -392,15 +412,18 @@ def compute_rij(geom: np.ndarray, rij_list_np: np.ndarray) -> Tuple[np.ndarray, 
     diff_vectors = geom[atom_indices_i] - geom[atom_indices_j]
 
     # Calculate magnitudes of difference vectors (i.e., the distances rij)
-    rij_values = np.linalg.norm(diff_vectors, axis=1)
+    # (what np.linalg.norm(diff_vectors, axis=1) computes for real input)
+    rij_values = np.sqrt(np.add.reduce(diff_vectors * diff_vectors, axis=1))
 
     # Calculate unit vectors (gradients of distance w.r.t. Cartesian coordinates of atom i)
     # Handle potential division by zero for very close atoms using an epsilon.
     epsilon = COORD_UTILS_DEFAULTS.get("rij_norm_epsilon", 1e-9)
+    valid_dist_mask = rij_values > epsilon
+    if valid_dist_mask.all():  # the usual case: no masking needed
+        return rij_values, diff_vectors / rij_values[:, np.newaxis]
     grad_unit_vecs = np.zeros_like(diff_vectors) # Initialize as zeros
 
     # Create a mask for pairs where the distance is greater than epsilon
-    valid_dist_mask = rij_values > epsilon
     if np.any(valid_dist_mask):
         # For valid distances, compute unit vector: (R_i - R_j) / ||R_i - R_j||
         grad_unit_vecs[valid_dist_mask] = diff_vectors[valid_dist_mask] / rij_values[valid_dist_mask, np.newaxis]
@@ -444,111 +467,99 @@ def compute_wij(
               `natoms * 3`. Each row `k` contains the derivatives of `wij[k]`
               with respect to all Cartesian coordinates.
     """
-
     if geom.ndim != 2 or geom.shape[1] != 3:
         raise ValueError(f"Input geometry must be a 2D array of shape (natoms, 3). Got {geom.shape}")
 
     num_rij = rij_list_np.shape[0]  # Number of internal coordinates (pairs)
-    num_atoms = geom.shape[0]
-    num_cart_coords = num_atoms * 3 # Total number of Cartesian coordinates
+    num_cart_coords = geom.shape[0] * 3  # Total number of Cartesian coordinates
 
     if num_rij == 0:  # No internal coordinates to process
         return np.array([]), scipy.sparse.csr_matrix((0, num_cart_coords), dtype=float)
 
-    # 1. Calculate raw interatomic distances (rij) and their unit vector gradients (d(rij)/dR_i)
-    rij_values, grad_unit_vecs = compute_rij(geom, rij_list_np)
+    wij, vals = compute_wij_raw(geom, rij_list_np, scaler_func)
+    cols = pair_jacobian_columns(rij_list_np)
 
-    # 2. Apply the scaler function to get scaled internals (wij) and their derivatives w.r.t. rij (dw/drij)
-    wij, dw_drij = scaler_func(rij_values)
+    if np.all(rij_list_np[:, 0] < rij_list_np[:, 1]):
+        # Every row already has sorted, unique column indices (3i..3i+2 < 3j..3j+2),
+        # so this is exactly the canonical CSR that COO -> tocsr() would produce.
+        indptr = np.arange(0, 6 * num_rij + 1, 6, dtype=np.int32)
+        return wij, scipy.sparse.csr_matrix(
+            (vals.ravel(), cols.ravel(), indptr), shape=(num_rij, num_cart_coords))
 
-    # Optional: check for ignore_atoms in the scaler function call signature
-    # (the scaler itself shouldn't need ignore_atoms, but compute_wij will respect it
-    # when building the Jacobian). Accept ignore_atoms via kwargs if provided by caller.
-    ignore_atoms: Optional[Set[int]] = []
-    # If caller supplied ignore atoms via a closure attribute on scaler_func, try to read it.
-    # This is a non-intrusive way to pass ignore list without changing many call sites.
+    # General pair lists (i > j allowed): let scipy sort the columns.
+    coo_rows_np = np.repeat(np.arange(num_rij, dtype=np.int32), 6)
+    dwdR_flat_sparse = scipy.sparse.coo_matrix(
+        (vals.ravel(), (coo_rows_np, cols.ravel())),
+        shape=(num_rij, num_cart_coords),
+        dtype=float
+    ).tocsr()
+    return wij, dwdR_flat_sparse
+
+
+def pair_jacobian_columns(rij_list_np: np.ndarray) -> np.ndarray:
+    """Cartesian column indices of the six non-zeros of each d(wij)/dR row:
+    ``[3i, 3i+1, 3i+2, 3j, 3j+1, 3j+2]``, shape (n_pairs, 6), int32."""
+    ij3 = np.asarray(rij_list_np, dtype=np.int32) * 3
+    cols = np.empty((ij3.shape[0], 6), dtype=np.int32)
+    cols[:, 0:3] = ij3[:, 0:1] + np.arange(3, dtype=np.int32)
+    cols[:, 3:6] = ij3[:, 1:2] + np.arange(3, dtype=np.int32)
+    return cols
+
+
+def _scaler_ignore_atoms(scaler_func) -> Set[int]:
+    """Atoms whose Cartesian derivatives are dropped (``scaler_func.ignore_atoms``)."""
     if hasattr(scaler_func, "ignore_atoms"):
         try:
             ia = getattr(scaler_func, "ignore_atoms")
             if ia is not None:
-                ignore_atoms = set(int(x) for x in ia)
+                return set(int(x) for x in ia)
         except Exception:
-            ignore_atoms = []
+            pass
+    return set()
 
-    # --- Construct the Jacobian d(wij)/d(R) in COO sparse format ---
-    # The Jacobian has `num_rij` rows and `num_cart_coords` columns.
-    # Each internal coordinate `wij_k` (for pair (i,j)) depends on the Cartesian
-    # coordinates of atom i and atom j. So, each row of the Jacobian will have
-    # at most 6 non-zero elements (3 for atom i, 3 for atom j).
-    max_nnz = num_rij * 6  # Maximum number of non-zero elements in the Jacobian
 
-    # Row indices for COO format: each `wij_k` corresponds to `k`-th row, repeated 6 times for its 6 derivatives.
-    coo_rows_np = np.repeat(np.arange(num_rij, dtype=np.int32), 6)
+def compute_wij_raw(
+    geom: np.ndarray,
+    rij_list_np: np.ndarray,
+    scaler_func: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Like `compute_wij`, but returns the Jacobian as its dense per-pair blocks.
 
-    # Atom indices for each pair
-    atom_i_indices = rij_list_np[:, 0]  # First atom in each pair
-    atom_j_indices = rij_list_np[:, 1]  # Second atom in each pair
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - wij (np.ndarray): 1D array of scaled internal coordinates.
+            - vals (np.ndarray): shape (n_pairs, 6); row k holds d(wij[k])/dR at the
+              columns given by `pair_jacobian_columns` (x/y/z of atom i, then of
+              atom j).  Derivatives of atoms in ``scaler_func.ignore_atoms`` are 0.
+    """
+    num_rij = rij_list_np.shape[0]
+    if num_rij == 0:
+        return np.array([]), np.empty((0, 6), dtype=float)
 
-    # Column indices for COO format: map to Cartesian coordinates (atom_idx * 3 + coord_idx)
-    coo_cols_np = np.empty(max_nnz, dtype=np.int32)
-    coo_cols_np[0::6] = atom_i_indices * 3       # Atom i, X-coordinate column index
-    coo_cols_np[1::6] = atom_i_indices * 3 + 1   # Atom i, Y-coordinate column index
-    coo_cols_np[2::6] = atom_i_indices * 3 + 2   # Atom i, Z-coordinate column index
-    coo_cols_np[3::6] = atom_j_indices * 3       # Atom j, X-coordinate column index
-    coo_cols_np[4::6] = atom_j_indices * 3 + 1   # Atom j, Y-coordinate column index
-    coo_cols_np[5::6] = atom_j_indices * 3 + 2   # Atom j, Z-coordinate column index
+    # 1. Raw interatomic distances (rij) and their unit vector gradients (d(rij)/dR_i)
+    rij_values, grad_unit_vecs = compute_rij(geom, rij_list_np)
 
-    # Data for COO format: Jacobian elements d(wij_k)/d(R_alpha)
-    # This is calculated using the chain rule:
-    #   d(wij_k)/d(R_atom_p_coord_alpha) = (d(wij_k)/d(rij_k)) * (d(rij_k)/d(R_atom_p_coord_alpha))
-    # Where d(rij_k)/d(R_i_alpha) = grad_unit_vecs[k, alpha]
-    # And   d(rij_k)/d(R_j_alpha) = -grad_unit_vecs[k, alpha]
-    coo_data_np = np.empty(max_nnz, dtype=float)
-    # dw_drij is already a 1D array of shape (num_rij,)
+    # 2. Scaled internals (wij) and their derivatives w.r.t. rij (dw/drij)
+    wij, dw_drij = scaler_func(rij_values)
 
-    # Derivatives with respect to coordinates of atom i in each pair
-    coo_data_np[0::6] = dw_drij * grad_unit_vecs[:, 0]  # d(wij)/d(Rx_i)
-    coo_data_np[1::6] = dw_drij * grad_unit_vecs[:, 1]  # d(wij)/d(Ry_i)
-    coo_data_np[2::6] = dw_drij * grad_unit_vecs[:, 2]  # d(wij)/d(Rz_i)
+    # 3. Chain rule: d(wij)/dR_i = dw/drij * u_ij, d(wij)/dR_j = -dw/drij * u_ij
+    vals = np.empty((num_rij, 6), dtype=float)
+    dw_col = np.asarray(dw_drij)[:, np.newaxis]
+    vals[:, 0:3] = dw_col * grad_unit_vecs
+    vals[:, 3:6] = dw_col * (-grad_unit_vecs)
 
-    # Derivatives with respect to coordinates of atom j in each pair
-    coo_data_np[3::6] = dw_drij * (-grad_unit_vecs[:, 0]) # d(wij)/d(Rx_j)
-    coo_data_np[4::6] = dw_drij * (-grad_unit_vecs[:, 1]) # d(wij)/d(Ry_j)
-    coo_data_np[5::6] = dw_drij * (-grad_unit_vecs[:, 2]) # d(wij)/d(Rz_j)
-
-    # If there are ignored atoms, zero out the corresponding columns (their derivatives)
-    # so that they are not considered displaced. The atoms still influence others via rij.
+    # 4. Ignored atoms still take part in distances but get no derivatives.
+    ignore_atoms = _scaler_ignore_atoms(scaler_func)
     if len(ignore_atoms) > 0:
-        # Vectorized approach: compute the exact Cartesian column indices for all ignored atoms
-        # and mask the COO columns directly. This avoids creating a full-length boolean array
-        # and looping in Python per atom, which is slower for many ignored atoms.
-        try:
-            ia_arr = np.asarray(list(ignore_atoms), dtype=np.int32)
-        except Exception:
-            ia_arr = np.asarray(sorted(ignore_atoms), dtype=np.int32)
+        num_atoms = geom.shape[0]
+        ignored = np.zeros(num_atoms, dtype=bool)
+        ia_arr = np.asarray(sorted(ignore_atoms), dtype=np.int64)
+        ignored[ia_arr[(ia_arr >= 0) & (ia_arr < num_atoms)]] = True
+        vals[ignored[rij_list_np[:, 0]], 0:3] = 0.0
+        vals[ignored[rij_list_np[:, 1]], 3:6] = 0.0
 
-        # Keep only valid atom indices
-        if ia_arr.size:
-            valid_mask = (ia_arr >= 0) & (ia_arr < num_atoms)
-            ia_arr = ia_arr[valid_mask]
-        if ia_arr.size > 0:
-            # For each atom index a, the Cartesian columns are [3*a, 3*a+1, 3*a+2]
-            # Build a 1D array of these column indices for all ignored atoms.
-            cols = np.concatenate([ia_arr * 3, ia_arr * 3 + 1, ia_arr * 3 + 2])
-
-            # Mask positions in coo_cols_np that match any of these columns using np.isin
-            col_mask = np.isin(coo_cols_np, cols)
-            if np.any(col_mask):
-                coo_data_np[col_mask] = 0.0
-
-    # Create sparse matrix in COO format and convert to CSR for efficient arithmetic operations.
-    dwdR_flat_sparse = scipy.sparse.coo_matrix(
-        (coo_data_np, (coo_rows_np, coo_cols_np)),  # (data, (row_ind, col_ind))
-        shape=(num_rij, num_cart_coords),           # Shape of the Jacobian
-        dtype=float
-    ).tocsr()
-
-    return wij, dwdR_flat_sparse
+    return wij, vals
 
 
 # --- SCALER FUNCTIONS ---
@@ -583,6 +594,11 @@ def morse_scaler(
     """
 
     _eq_dist_arr = np.asarray(eq_distances, dtype=float) # Ensure re is a NumPy array
+    # r-independent pieces, computed once (same operations as inline, so same values)
+    _epsilon = COORD_UTILS_DEFAULTS.get("scaler_epsilon", 1e-12)
+    _re_safe = np.maximum(_eq_dist_arr, _epsilon)  # Equilibrium distances, floored by epsilon
+    _d_exp_factor = -alpha / _re_safe               # d/dr of alpha * (1 - r/re)
+    _neg_beta_re = -beta * _re_safe                 # numerator of d/dr (beta * re / r)
 
     def scaler(r_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -604,9 +620,8 @@ def morse_scaler(
              )
 
         # Ensure numerical stability by preventing division by zero or operations on very small numbers.
-        epsilon = COORD_UTILS_DEFAULTS.get("scaler_epsilon", 1e-12)
-        r_safe = np.maximum(r_values, epsilon)  # Current distances, floored by epsilon
-        re_safe = np.maximum(_eq_dist_arr, epsilon) # Equilibrium distances, floored by epsilon
+        r_safe = np.maximum(r_values, _epsilon)  # Current distances, floored by epsilon
+        re_safe = _re_safe
 
         ratio = r_safe / re_safe  # r/re
 
@@ -617,9 +632,9 @@ def morse_scaler(
 
         # Calculate derivative d(wij)/d(rij)
         # Derivative of exp(alpha * (1 - r/re)) w.r.t. r is exp(...) * (-alpha/re)
-        d_exp_term = exp_term_val * (-alpha / re_safe)
+        d_exp_term = exp_term_val * _d_exp_factor
         # Derivative of beta / (r/re) = beta * re / r w.r.t. r is -beta * re / r^2
-        d_inv_ratio_term = -beta * re_safe / (r_safe**2)
+        d_inv_ratio_term = _neg_beta_re / (r_safe**2)
         dw_drij = d_exp_term + d_inv_ratio_term
 
         return wij, dw_drij

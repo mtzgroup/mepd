@@ -11,12 +11,13 @@ chemical relevance of internal coordinates with the robustness of Cartesian opti
 
 import logging
 import numpy as np
-from scipy.optimize import least_squares  # For path optimization
+from ._fast_lsq import least_squares  # scipy's trf/lsmr least_squares, faster
 import scipy.sparse  # For efficient handling of Jacobian matrices
 from typing import List, Tuple, Callable, Union, Optional, Any
 
 # Local imports from the same package
-from .coord_utils import align_path, get_bond_list, morse_scaler, compute_wij
+from .coord_utils import (align_path, get_bond_list, morse_scaler, compute_wij_raw,
+                          pair_jacobian_columns)
 from .config import MAIN_DEFAULTS, COORD_UTILS_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,11 @@ class MorseGeodesic(object):
 
         # Number of defined internal coordinates (Rijs)
         self.nrij: int = len(rij_list_py)
+        # Cartesian columns of the 6 non-zeros of each d(w)/dR row, shared by all images.
+        self._pair_cols: np.ndarray = pair_jacobian_columns(self.rij_list_np)
+        # With i < j for every pair those columns are sorted, which the vectorized
+        # Jacobian assembly relies on.
+        self._pairs_sorted: bool = bool(np.all(self.rij_list_np[:, 0] < self.rij_list_np[:, 1]))
 
         # --- Scaler Function Setup ---
         # If `scaler` is a number, it's treated as Morse alpha
@@ -215,8 +221,10 @@ class MorseGeodesic(object):
 
         # Caches for scaled internal coordinates (w) and their Cartesian gradients (dwdR)
         # for each image on the main path. `None` indicates the value needs computation.
+        # dwdR[i] holds the per-pair derivative blocks from `compute_wij_raw`, shape
+        # (nrij, 6), at the columns `self._pair_cols` (see `_vals_to_csr`).
         self.w: List[Optional[np.ndarray]] = [None] * self.nimages
-        self.dwdR: List[Optional[scipy.sparse.csr_matrix]] = [
+        self.dwdR: List[Optional[np.ndarray]] = [
             None] * self.nimages
 
         num_midpoints = self.nimages - 1 if self.nimages > 0 else 0
@@ -224,7 +232,7 @@ class MorseGeodesic(object):
         # X_mid[i] is the geometric midpoint between path[i] and path[i+1].
         self.X_mid: List[Optional[np.ndarray]] = [None] * num_midpoints
         self.w_mid: List[Optional[np.ndarray]] = [None] * num_midpoints
-        self.dwdR_mid: List[Optional[scipy.sparse.csr_matrix]] = [
+        self.dwdR_mid: List[Optional[np.ndarray]] = [
             None] * num_midpoints
 
         # Current displacement vector (residuals for LS)
@@ -266,7 +274,7 @@ class MorseGeodesic(object):
         # Update for main path images
         for i in range(self.nimages):
             if self.w[i] is None or self.dwdR[i] is None:  # If not cached or invalidated
-                self.w[i], self.dwdR[i] = compute_wij(
+                self.w[i], self.dwdR[i] = compute_wij_raw(
                     self.path[i], self.rij_list_np, self.scaler_func
                 )
 
@@ -281,7 +289,7 @@ class MorseGeodesic(object):
                     # This state should not be reached if X_mid[i] is set above.
                     raise RuntimeError(
                         f"Midpoint X_mid[{i}] is None before compute_wij call in _update_intc.")
-                self.w_mid[i], self.dwdR_mid[i] = compute_wij(
+                self.w_mid[i], self.dwdR_mid[i] = compute_wij_raw(
                     # type: ignore
                     self.X_mid[i], self.rij_list_np, self.scaler_func
                 )
@@ -555,6 +563,11 @@ class MorseGeodesic(object):
             if dx_was_present_for_disps and abs(active_fric_coeff) > COO_NON_ZERO_EPSILON else 0
         total_rows_in_jacobian = num_rows_internal_disps + num_rows_friction_jac
 
+        if self._pairs_sorted:
+            return self._compute_disp_grad_vectorized(
+                slice_start, slice_end, active_fric_coeff, num_rows_friction_jac,
+                total_rows_in_jacobian)
+
         # Lists to store COO components for building the sparse Jacobian
         temp_coo_data_arrays: List[np.ndarray] = []
         temp_coo_rows_arrays: List[np.ndarray] = []
@@ -565,7 +578,7 @@ class MorseGeodesic(object):
         # `i_offset_in_segment` is its relative index within the varied segment (0 to `num_varied_images` - 1).
         for i_offset_in_segment, k_varied_path_idx in enumerate(range(slice_start, slice_end)):
             # Jacobian d(w[k_varied_path_idx]) / d(R[k_varied_path_idx])
-            dwdRk_varied_sparse = self.dwdR[k_varied_path_idx]
+            dwdRk_varied_sparse = self._vals_to_csr(self.dwdR[k_varied_path_idx])
             if dwdRk_varied_sparse is None:
                 raise ValueError(
                     f"Sparse dwdR cache miss for varied image {k_varied_path_idx}. Call _update_intc first.")
@@ -594,7 +607,7 @@ class MorseGeodesic(object):
 
                 if k_varied_path_idx == m_mid_path_idx or k_varied_path_idx == m_mid_path_idx + 1:
                     # Jacobian d(w_mid[m]) / d(X_mid[m])
-                    dwdR_mid_m_sparse = self.dwdR_mid[m_mid_path_idx]
+                    dwdR_mid_m_sparse = self._vals_to_csr(self.dwdR_mid[m_mid_path_idx])
                     if dwdR_mid_m_sparse is None:
                         raise ValueError(
                             f"Sparse dwdR_mid cache miss for midpoint {m_mid_path_idx}. Call _update_intc first.")
@@ -686,6 +699,118 @@ class MorseGeodesic(object):
             (final_coo_data, (final_coo_rows, final_coo_cols)),
             shape=(total_rows_in_jacobian, num_cart_coords_varied_segment)
         )
+
+    def _vals_to_csr(self, vals: Optional[np.ndarray]) -> Optional[scipy.sparse.csr_matrix]:
+        """Per-pair derivative blocks (nrij, 6) -> sparse d(w)/dR (nrij, 3*natoms)."""
+        if vals is None:
+            return None
+        rows = np.repeat(np.arange(self.nrij, dtype=np.int32), 6)
+        return scipy.sparse.coo_matrix(
+            (vals.ravel(), (rows, self._pair_cols.ravel())),
+            shape=(self.nrij, self.num_cart_coords)).tocsr()
+
+    def _friction_diagonal(self, num_varied_images: int, active_fric_coeff: float
+                           ) -> Tuple[np.ndarray, np.ndarray]:
+        """Diagonal of the friction block (zero for ignored atoms): (data, index)
+        of its entries with |value| > COO_NON_ZERO_EPSILON."""
+        n = num_varied_images * self.num_cart_coords
+        diag_indices = np.arange(n)
+        diag_data = np.full(n, active_fric_coeff, dtype=float)
+        ign_atoms = None
+        if hasattr(self.scaler_func, "ignore_atoms"):
+            try:
+                ign_atoms = set(int(x) for x in getattr(self.scaler_func, "ignore_atoms") or [])
+            except Exception:
+                ign_atoms = None
+        if ign_atoms:
+            ia_arr = np.fromiter(ign_atoms, dtype=np.int32)
+            ia_arr = ia_arr[(ia_arr >= 0) & (ia_arr < self.natoms)]
+            if ia_arr.size > 0:
+                image_offsets = np.arange(num_varied_images, dtype=np.int32)
+                cols = (image_offsets[:, None] * self.num_cart_coords)[..., None] + \
+                    (ia_arr[None, :, None] * 3) + np.array([0, 1, 2], dtype=np.int32)
+                mask = np.isin(diag_indices, cols.ravel())
+                if np.any(mask):
+                    diag_data[mask] = 0.0
+        significant_mask = np.abs(diag_data) > COO_NON_ZERO_EPSILON
+        return diag_data[significant_mask], diag_indices[significant_mask]
+
+    def _compute_disp_grad_vectorized(self, slice_start: int, slice_end: int,
+                                      active_fric_coeff: float, num_rows_friction_jac: int,
+                                      total_rows_in_jacobian: int) -> scipy.sparse.csr_matrix:
+        """
+        Same matrix as the block-by-block COO assembly in `_compute_disp_grad`, built
+        directly in canonical CSR form with numpy.
+
+        Row r of vec_l[m] (= w_mid[m] - w[m]) and of vec_r[m] (= w[m+1] - w_mid[m])
+        has non-zeros only in the columns of images m and m+1:
+            d vec_l[m] / dR_m     = 0.5 dwdR_mid[m] - dwdR[m]
+            d vec_l[m] / dR_m+1   = 0.5 dwdR_mid[m]
+            d vec_r[m] / dR_m     = -0.5 dwdR_mid[m]
+            d vec_r[m] / dR_m+1   = -0.5 dwdR_mid[m] + dwdR[m+1]
+        As in the COO assembly, each scaled term is dropped when its magnitude is
+        <= COO_NON_ZERO_EPSILON before the (at most two) terms are summed, so the
+        values -- and therefore everything downstream -- are bit-for-bit identical.
+        """
+        nr = self.nrij
+        n_mid = self.nimages - 1
+        n3 = self.num_cart_coords
+        eps = COO_NON_ZERO_EPSILON
+        num_varied_images = slice_end - slice_start
+
+        if any(v is None for v in self.dwdR) or any(v is None for v in self.dwdR_mid):
+            raise ValueError("dwdR cache miss in _compute_disp_grad. Call _update_intc first.")
+        W = np.stack(self.dwdR)            # (nimages, nr, 6)
+        Wm = np.stack(self.dwdR_mid)       # (n_mid, nr, 6)
+
+        def keep(v):
+            return np.where(np.abs(v) > eps, v, 0.0), np.abs(v) > eps
+
+        half, p_half = keep(Wm * 0.5)
+        mhalf, p_mhalf = keep(Wm * -0.5)
+        w_left, p_w_left = keep(W[:-1] * -1.0)    # -dwdR[m]   (vec_l, image m)
+        w_right, p_w_right = keep(W[1:] * 1.0)    # +dwdR[m+1] (vec_r, image m+1)
+
+        vals = np.empty((2, n_mid, nr, 12))
+        pres = np.empty((2, n_mid, nr, 12), dtype=bool)
+        vals[0, :, :, :6] = half + w_left
+        pres[0, :, :, :6] = p_half | p_w_left
+        vals[0, :, :, 6:] = half
+        pres[0, :, :, 6:] = p_half
+        vals[1, :, :, :6] = mhalf
+        pres[1, :, :, :6] = p_mhalf
+        vals[1, :, :, 6:] = mhalf + w_right
+        pres[1, :, :, 6:] = p_mhalf | p_w_right
+
+        m = np.arange(n_mid)
+        left_varied = (m >= slice_start) & (m < slice_end)
+        right_varied = (m + 1 >= slice_start) & (m + 1 < slice_end)
+        pres[:, ~left_varied, :, :6] = False
+        pres[:, ~right_varied, :, 6:] = False
+
+        cols = np.empty((n_mid, nr, 12), dtype=np.int64)
+        cols[:, :, :6] = ((m - slice_start) * n3)[:, None, None] + self._pair_cols[None]
+        cols[:, :, 6:] = ((m + 1 - slice_start) * n3)[:, None, None] + self._pair_cols[None]
+        cols = np.broadcast_to(cols, (2,) + cols.shape)
+
+        data = vals[pres]
+        indices = cols[pres]
+        counts = pres.reshape(2 * n_mid * nr, 12).sum(axis=1)
+
+        if num_rows_friction_jac > 0:
+            f_data, f_idx = self._friction_diagonal(num_varied_images, active_fric_coeff)
+            f_counts = np.zeros(num_rows_friction_jac, dtype=counts.dtype)
+            f_counts[f_idx] = 1
+            data = np.concatenate([data, f_data])
+            indices = np.concatenate([indices, f_idx])
+            counts = np.concatenate([counts, f_counts])
+
+        indptr = np.zeros(total_rows_in_jacobian + 1, dtype=np.int64)
+        np.cumsum(counts, out=indptr[1:])
+        index_dtype = np.int32 if max(indptr[-1], num_varied_images * n3) < 2**31 else np.int64
+        return scipy.sparse.csr_array(
+            (data, indices.astype(index_dtype), indptr.astype(index_dtype)),
+            shape=(total_rows_in_jacobian, num_varied_images * n3))
 
     def _ensure_state_updated(self,
                               X_flat_segment: Optional[np.ndarray],
@@ -978,8 +1103,8 @@ class MorseGeodesic(object):
                 "`self.current_grad` is None in `target_deriv` after state update attempt.")
 
         # Ensure the returned Jacobian is in CSC format, as preferred by some SciPy solvers
-        return self.current_grad if isinstance(self.current_grad, scipy.sparse.csc_matrix) \
-            else scipy.sparse.csc_matrix(self.current_grad)
+        return self.current_grad if scipy.sparse.issparse(self.current_grad) \
+            else scipy.sparse.csr_matrix(self.current_grad)
 
     def _smooth_scipy_least_squares(
         self,
@@ -1081,12 +1206,7 @@ class MorseGeodesic(object):
                 raise RuntimeError(
                     "Initial Jacobian (J0) is None before least_squares call.")
 
-            # Provide Jacobian sparsity pattern to the optimizer if available and non-empty
-            jac_sparsity_pattern = J0 if isinstance(
-                J0, scipy.sparse.spmatrix) and J0.size > 0 and J0.nnz > 0 else None
-            if jac_sparsity_pattern is not None and not isinstance(jac_sparsity_pattern, scipy.sparse.csc_matrix):
-                # Ensure CSC format for 'trf' method
-                jac_sparsity_pattern = jac_sparsity_pattern.tocsc()
+            # (least_squares ignores `jac_sparsity` for a callable Jacobian, so none is passed.)
 
             result = least_squares(
                 fun=self.target_func,          # Residuals function
@@ -1101,7 +1221,6 @@ class MorseGeodesic(object):
                 max_nfev=active_max_nfev,      # Max function evaluations
                 kwargs=kwargs_for_target_eval,  # Args for target_func/deriv
                 x_scale='jac',                 # Scale variables based on Jacobian columns
-                jac_sparsity=jac_sparsity_pattern,  # Provide sparsity pattern
                 # Solver for trust-region subproblems (good for sparse)
                 tr_solver='lsmr'
             )

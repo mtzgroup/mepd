@@ -13,13 +13,14 @@ This module provides functions to:
 
 import logging
 import numpy as np
-from scipy.optimize import least_squares
+from ._fast_lsq import least_squares
 import scipy.sparse
 from typing import Iterable, List, Tuple, Callable, Union, Optional, Set
 
 # Local imports from the same package
 from .morsegeodesic import MorseGeodesic
-from .coord_utils import get_bond_list, compute_wij, morse_scaler, align_geom, align_path
+from .coord_utils import (get_bond_list, compute_wij, compute_wij_raw, pair_jacobian_columns,
+                          morse_scaler, align_geom, align_path)
 from .config import INTERPOLATION_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,8 @@ class _MidpointFinder:
         friction_coeff = self._LS_FRICTION_FACTOR / np.sqrt(self.num_atoms if self.num_atoms > 0 else 1)
         initial_guess_flat_f64 = initial_guess_flat.astype(float, copy=False) # Ensure float64
 
+        num_cart_coords_total = initial_guess_flat_f64.size
+
         def _residuals(X_flat: np.ndarray) -> np.ndarray:
             """
             Residuals function for `scipy.optimize.least_squares`.
@@ -207,13 +210,18 @@ class _MidpointFinder:
                  return (X_flat - initial_guess_flat_f64) * friction_coeff
 
             # Calculate scaled internals for the current trial midpoint geometry
-            wx_curr, _ = compute_wij(current_geom, active_rij_list_np, self.scaler_func_for_ls) # type: ignore
+            wx_curr, _ = compute_wij_raw(current_geom, active_rij_list_np, self.scaler_func_for_ls) # type: ignore
             delta_w = wx_curr - self.avg_w_for_ls # type: ignore # Difference from target
             friction_res = (X_flat - initial_guess_flat_f64) * friction_coeff # Friction term
 
             return np.concatenate([delta_w, friction_res])
 
-        def _jacobian(X_flat: np.ndarray) -> scipy.sparse.csc_matrix:
+        pairs_sorted = False
+        if self.rij_list_for_ls_np is not None and self.rij_list_for_ls_np.size > 0 and num_cart_coords_total > 0:
+            pairs_sorted = bool(np.all(self.rij_list_for_ls_np[:, 0] < self.rij_list_for_ls_np[:, 1]))
+            pair_cols = pair_jacobian_columns(self.rij_list_for_ls_np)
+
+        def _jacobian(X_flat: np.ndarray) -> scipy.sparse.spmatrix:
             """
             Jacobian of the `_residuals` function with respect to `X_flat`.
             This is also composed of two parts:
@@ -228,6 +236,18 @@ class _MidpointFinder:
                 # Jacobian of the friction term only
                 return scipy.sparse.identity(num_cart_coords, dtype=float, format='csc') * friction_coeff \
                        if num_cart_coords > 0 else scipy.sparse.csc_matrix((0,0), dtype=float)
+
+            if pairs_sorted:
+                # [d(w)/dR ; friction * I] assembled directly as canonical CSR (the
+                # same matrix the vstack below produces, without the conversions).
+                _, vals = compute_wij_raw(current_geom, active_rij_list_np, self.scaler_func_for_ls)
+                nr = vals.shape[0]
+                data = np.concatenate([vals.ravel(), np.full(num_cart_coords, 1.0 * friction_coeff)])
+                indices = np.concatenate([pair_cols.ravel(), np.arange(num_cart_coords, dtype=np.int32)])
+                indptr = np.concatenate([np.arange(0, 6 * nr, 6, dtype=np.int32),
+                                         6 * nr + np.arange(0, num_cart_coords + 1, dtype=np.int32)])
+                return scipy.sparse.csr_array(
+                    (data, indices, indptr), shape=(nr + num_cart_coords, num_cart_coords))
 
             # Get Jacobian d(wx_curr)/dX_flat from compute_wij
             _, dwdR_flat_sparse = compute_wij(current_geom, active_rij_list_np, self.scaler_func_for_ls) # type: ignore
@@ -259,9 +279,8 @@ class _MidpointFinder:
 
         logger.debug('Starting LS minimization for midpoint (alpha_LS: %s, re=default).', self._MORSE_ALPHA_LS)
 
-        # Provide Jacobian sparsity pattern if available (can speed up optimization)
-        jac_at_x0 = _jacobian(initial_guess_flat_f64)
-        sparsity_pattern = jac_at_x0 if jac_at_x0.size > 0 and jac_at_x0.nnz > 0 else None
+        # (A `jac_sparsity` pattern used to be computed here from an extra Jacobian
+        # evaluation; least_squares ignores it when `jac` is callable.)
 
         result = least_squares(
             fun=_residuals,
@@ -271,7 +290,6 @@ class _MidpointFinder:
             loss='linear', # Standard least squares loss
             ftol=self.tol,
             gtol=self.tol,
-            jac_sparsity=sparsity_pattern
         )
         self.last_ls_nfev = result.nfev if hasattr(result, 'nfev') else 0
         return result.x  # Optimized Cartesian coordinates (flattened)
