@@ -86,7 +86,15 @@ def nanoreactor(
     compress: float = typer.Option(0.6, "--compress", help="Narrow radius as a fraction of the wide one."),
     period: float = typer.Option(1.0, "--period", help="Piston period (ps)."),
     duty: float = typer.Option(0.75, "--duty", help="Fraction of each period at the wide radius."),
-    md_method: str = typer.Option("gfn2", "--md-method", help="xtb Hamiltonian of the discovery MD: gfn2, gfn1, gxtb."),
+    md_method: str = typer.Option(
+        "auto", "--md-method",
+        help="What drives the discovery MD: gfn2, gfn1 or gxtb (xtb's own MD: fast), 'level': any mepd engine, "
+        "the level of theory of --md-inputs (default --inputs): MLIPs, ASE calculators, g-xTB, ...; or 'auto' "
+        "(default): gfn2 if xtb is installed, else gxtb if the g-xTB program is found (also from the profile's "
+        "g-xTB engine), else 'level'."),
+    md_inputs: Optional[Path] = typer.Option(
+        None, "--md-inputs", exists=True,
+        help="--md-method level: RunInputs TOML for the MD (e.g. an MLIP), when it should differ from --inputs."),
     step_fs: float = typer.Option(0.5, "--step", help="MD time step (fs)."),
     dump_fs: float = typer.Option(2.0, "--dump", help="Trajectory frame spacing (fs)."),
     electronic_temperature: float = typer.Option(
@@ -140,6 +148,17 @@ def nanoreactor(
     from mepd.discovery import nanoreactor as nr
 
     md_method = md_method.strip().lower()
+    # g-xTB's program may be known only to the profile (its engine's executable).
+    md_executable = None
+    if md_method in ("auto", "gxtb") and trajectory is None:
+        profile_engine = _open_run_inputs(md_inputs or inputs).engine
+        if md_method == "auto":
+            md_method, md_executable = nr.pick_md_method(profile_engine)
+            typer.echo(f"MD: {md_method} (automatic choice)")
+        else:
+            md_executable = nr.engine_gxtb_executable(profile_engine)
+    elif md_method == "auto":
+        md_method = "gfn2"
     settings = nr.ReactorSettings(temperature=temperature, time_ps=time_ps, step_fs=step_fs, dump_fs=dump_fs,
                                   radius=radius, compress=compress, period_ps=period, duty=duty, method=md_method,
                                   wall_force=wall_force, electronic_temperature=electronic_temperature, seed=seed)
@@ -179,7 +198,8 @@ def nanoreactor(
         if event == "md_relax":
             typer.echo(f"Relaxing the packed reactor ({payload['natoms']} atoms)...")
         elif event == "md_segment":
-            typer.echo(f"MD {payload['time_ps']:.2f} / {payload['total_ps']:.2f} ps (wall {payload['radius']:.1f} A)")
+            typer.echo(f"MD {payload['time_ps']:.2f} / {payload['total_ps']:.2f} ps (wall {payload['radius']:.1f} A"
+                       + (f", {payload['temperature']:.0f} K" if payload.get("temperature") else "") + ")")
         elif event == "refine_species":
             typer.echo(f"Optimizing species {payload['index'] + 1}/{payload['total']}: {payload['smiles']}")
         elif event == "refine_reaction":
@@ -213,11 +233,21 @@ def nanoreactor(
     typer.echo(f"Reactor: {len(symbols)} atoms, charge {total_charge}, multiplicity {mult}"
                + (f", wall {settings.radius:.1f} -> {settings.radius * compress:.1f} A" if trajectory is None else ""))
     if trajectory is None:
-        if nr.missing_programs(md_method):
-            raise typer.BadParameter("The nanoreactor MD needs xtb on PATH (conda install -c conda-forge xtb).")
+        if md_method != "level":
+            try:
+                nr._xtb_command(md_method, md_executable)
+            except RuntimeError as exc:
+                raise typer.BadParameter(f"{exc} Or use --md-method level (the MD on your profile's own calculator).")
         try:
-            traj = nr.run_reactor_md(symbols, coords, charge=total_charge, multiplicity=mult, settings=settings,
-                                     workdir=output / "md", on_event=say)
+            if md_method == "level":
+                md_run_inputs = _open_run_inputs(md_inputs or inputs)
+                typer.echo(f"MD engine: {type(md_run_inputs.engine).__name__} "
+                           f"({md_inputs or inputs or 'built-in defaults'})")
+                traj = nr.run_engine_md(symbols, coords, charge=total_charge, multiplicity=mult, settings=settings,
+                                        engine=md_run_inputs.engine, workdir=output / "md", on_event=say)
+            else:
+                traj = nr.run_reactor_md(symbols, coords, charge=total_charge, multiplicity=mult, settings=settings,
+                                         workdir=output / "md", executable=md_executable, on_event=say)
         except Exception as exc:
             typer.echo(f"The reactor MD failed: {type(exc).__name__}: {exc}")
             raise typer.Exit(code=1)
@@ -226,8 +256,18 @@ def nanoreactor(
 
     # --- events -> species and reactions -------------------------------------
     typer.echo("Finding reaction events in the trajectory...")
-    charges = ({"method": md_method, "electronic_temperature": electronic_temperature, "multiplicity": mult,
-                "workdir": str(output / "partial_charges")} if partial_charges and not nr.missing_programs(md_method)
+    # Partial charges only label the molecules (which charge each carries):
+    # an xtb single point does that whatever drove the MD, when xtb is there.
+    q_method, q_exe = (md_method, md_executable) if md_method != "level" else ("gfn2", None)
+    if md_method == "level" and nr.missing_programs("gfn2"):
+        q_method, q_exe = "gxtb", nr.engine_gxtb_executable(_open_run_inputs(inputs).engine)
+    try:
+        nr._xtb_command(q_method, q_exe)
+        q_ok = True
+    except RuntimeError:
+        q_ok = False
+    charges = ({"method": q_method, "executable": q_exe, "electronic_temperature": electronic_temperature,
+                "multiplicity": mult, "workdir": str(output / "partial_charges")} if partial_charges and q_ok
                else None)
     symbols, frames, hist, species, reactions, events = nr.analyze_trajectory(
         traj, total_charge=total_charge, detect=detect, dt_fs=dump_fs, max_instances=instances, charges=charges)

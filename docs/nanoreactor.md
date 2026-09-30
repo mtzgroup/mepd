@@ -20,6 +20,18 @@ runs the exploration on the big system and extracts each reaction event as a sma
    - `--etemp` 3000 K (Fermi smearing): without it, the closed-shell SCC stops converging once a bond
      breaks homolytically, the forces are wrong, and atoms fly off.
    - Resumable: finished segments are kept.
+   **Automatic** (`--md-method auto`, the default): GFN2-xTB MD if `xtb` is installed, else g-xTB's MD
+   (its program from `GXTB_EXECUTABLE`, PATH, or the profile's g-xTB engine), else the profile's own
+   engine as below. Nothing else needs installing.
+   **Any level of theory** (`--md-method level`; web: MD level › "Your level of theory"): the MD
+   runs on the engine of `--md-inputs` (default `--inputs`), which can be an MLIP (AIMNet2, MACE,
+   UMA...), an ASE calculator, g-xTB or a QCOP program. The MD is Langevin (BAOAB, friction
+   0.01/fs) with the same logfermi wall and piston schedule, and the packed reactor is first relaxed
+   by FIRE inside the wall. It writes the same files, so events, refinement, the live view and resume
+   work unchanged. One gradient per 0.5 fs step: fast for an in-process MLIP (AIMNet2 on CPU: 2 ps of
+   a 33-atom reactor in about 70 s), slow for calculators run as a separate program each step. The
+   species' charges still come from a GFN2-xTB single point when xtb is installed (a labeling hint
+   only); otherwise molecules are neutral where they can be.
 3. **Bond history.** Per frame, a bond forms below 1.15 × (r_i + r_j) and breaks above 1.45 × (Cordero
    radii). A hydrogen caught between two partners stays on the nearer one. A bond state shorter than
    `--min-lifetime` (20 fs) is vibration and is removed.

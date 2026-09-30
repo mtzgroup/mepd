@@ -88,7 +88,30 @@ COVALENT_RADII = {
     "K": 2.03, "Ca": 1.76, "Fe": 1.32, "Cu": 1.32, "Zn": 1.22, "Se": 1.20, "Br": 1.20, "I": 1.39,
 }
 
-MD_METHODS = ("gfn2", "gfn1", "gxtb")
+MD_METHODS = ("gfn2", "gfn1", "gxtb", "level")   # "level": any mepd engine (run_engine_md)
+
+
+def engine_gxtb_executable(engine) -> Optional[str]:
+    """The g-xTB executable a profile's g-xTB engine uses, if it is one."""
+    exe = getattr(engine, "executable", None)
+    if exe and type(engine).__name__ == "GXTBCalculator":
+        found = shutil.which(str(exe)) or (str(exe) if Path(str(exe)).exists() else None)
+        return found
+    return None
+
+
+def pick_md_method(engine=None) -> tuple[str, Optional[str]]:
+    """'auto': the fastest MD this machine can run -- xtb's GFN2 MD, else
+    g-xTB's MD (its executable from the environment or the profile's g-xTB
+    engine), else the profile's own engine. Returns (method, executable)."""
+    if not missing_programs("gfn2"):
+        return "gfn2", None
+    exe = engine_gxtb_executable(engine) if engine is not None else None
+    try:
+        _xtb_command("gxtb", exe)
+        return "gxtb", exe
+    except RuntimeError:
+        return "level", None
 
 
 @dataclass
@@ -231,6 +254,8 @@ def _xtb_argv(cmd: list[str], input_file: str, *args: str) -> list[str]:
 
 
 def missing_programs(method: str = "gfn2") -> list[str]:
+    if method == "level":   # a mepd engine: nothing extra to install
+        return []
     try:
         _xtb_command(method)
         return []
@@ -358,6 +383,165 @@ def run_reactor_md(symbols, coords_angstrom, *, charge: int, multiplicity: int, 
         if on_event is not None:
             on_event("md_segment", {"segment": k + 1, "segments": len(schedule), "time_ps": t_done,
                                     "radius": r, "total_ps": settings.time_ps})
+    traj = workdir / "trajectory.xyz"
+    with traj.open("w") as out:
+        for k in range(len(schedule)):
+            out.write((workdir / f"segment_{k:03d}.xyz").read_text())
+    return traj
+
+
+# ---------------------------------------------------------------------------
+# Discovery MD on any mepd engine (MLIPs, ASE calculators, g-xTB, ...)
+# ---------------------------------------------------------------------------
+
+# Unit conversions (atomic units for forces/energies, bohr and fs for motion).
+_ACC = 0.93766                 # (Eh/bohr)/amu -> bohr/fs^2
+_KIN = 1.066551                # amu bohr^2/fs^2 -> Eh
+_KB = 3.166811563e-6           # Eh/K
+
+
+def _masses(symbols) -> np.ndarray:
+    from rdkit import Chem
+
+    table = Chem.GetPeriodicTable()
+    return np.array([table.GetAtomicWeight(s) for s in symbols])
+
+
+def _wall(pos_bohr: np.ndarray, radius_bohr: float, force: float, beta: float = 1.0):
+    """xtb's logfermi wall, kT ln(1 + exp(beta (r - R))), with kT*beta =
+    `force` (Eh/bohr): (energy, gradient) per atom, around the origin."""
+    r = np.linalg.norm(pos_bohr, axis=1)
+    x = np.clip(beta * (r - radius_bohr), -50, 50)
+    kt = force / beta
+    energy = float(np.sum(kt * np.logaddexp(0.0, x)))
+    sig = 1.0 / (1.0 + np.exp(-x))
+    grad = (kt * beta * sig / np.maximum(r, 1e-9))[:, None] * pos_bohr
+    return energy, grad
+
+
+class _EngineForces:
+    """Energy and gradient of the reactor from a mepd engine, plus the wall."""
+
+    def __init__(self, engine, symbols, charge: int, multiplicity: int, wall_force_au: float):
+        self.engine, self.symbols = engine, list(symbols)
+        self.charge, self.multiplicity = int(charge), int(multiplicity)
+        self.wall_force = wall_force_au
+        self.calls = 0
+
+    def __call__(self, pos_bohr: np.ndarray, radius_bohr: float):
+        from qcdata import Structure
+
+        from mepd.nodes.node import StructureNode
+
+        node = StructureNode(structure=Structure(symbols=self.symbols, geometry=pos_bohr, charge=self.charge,
+                                                 multiplicity=self.multiplicity))
+        grad = np.asarray(self.engine.compute_gradients([node]))[0].reshape(-1, 3)
+        energy = float(node.energy) if node._cached_energy is not None else float("nan")
+        e_wall, g_wall = _wall(pos_bohr, radius_bohr, self.wall_force)
+        self.calls += 1
+        return energy + e_wall, grad + g_wall
+
+
+def _relax_in_wall(forces: _EngineForces, pos: np.ndarray, radius_bohr: float, masses: np.ndarray,
+                   steps: int = 300, fmax: float = 5e-3) -> np.ndarray:
+    """FIRE minimization inside the wall: takes the strain out of a packed
+    reactor (else it turns into heat and blows atoms out)."""
+    v = np.zeros_like(pos)
+    dt, alpha, n_pos = 0.5, 0.1, 0
+    for _ in range(steps):
+        _, g = forces(pos, radius_bohr)
+        f = -g
+        if np.max(np.linalg.norm(f, axis=1)) < fmax:
+            break
+        p = float(np.sum(f * v))
+        if p > 0:
+            fn = np.linalg.norm(f) or 1.0
+            v = (1 - alpha) * v + alpha * np.linalg.norm(v) * f / fn
+            n_pos += 1
+            if n_pos > 5:
+                dt, alpha = min(dt * 1.1, 2.0), alpha * 0.99
+        else:
+            v[:] = 0.0
+            dt, alpha, n_pos = dt * 0.5, 0.1, 0
+        v = v + dt * _ACC * f / masses[:, None]
+        step = dt * v
+        norm = np.linalg.norm(step, axis=1, keepdims=True)
+        pos = pos + np.where(norm > 0.2, step * 0.2 / np.maximum(norm, 1e-12), step)   # at most 0.2 bohr per atom
+    return pos
+
+
+def run_engine_md(symbols, coords_angstrom, *, charge: int, multiplicity: int, settings: ReactorSettings,
+                  engine, workdir: Path, on_event: OnEvent = None, friction_per_fs: float = 0.01) -> Path:
+    """The piston MD with gradients from any mepd engine (the level of
+    theory of a profile: an MLIP, an ASE calculator, g-xTB, ...). Langevin
+    dynamics (BAOAB), the same logfermi wall as the xtb path, and the same
+    files: segment_k.xyz per piston segment (with a restart), the running
+    segment in xtb.trj (so the live view sees it), trajectory.xyz at the
+    end. A finished segment is not rerun (resume)."""
+    settings.validate()
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    schedule = piston_schedule(settings)
+    (workdir / "schedule.json").write_text(json.dumps({"dump_fs": settings.dump_fs, "time_ps": settings.time_ps,
+                                                       "segments": [[d, r] for d, r in schedule],
+                                                       "engine": type(engine).__name__}))
+    masses = _masses(symbols)
+    wall_au = settings.wall_force / HARTREE_TO_KCAL_PER_MOL / ANGSTROM_TO_BOHR
+    forces = _EngineForces(engine, symbols, charge, multiplicity, wall_au)
+    kt = _KB * settings.temperature / _KIN               # amu bohr^2/fs^2
+    rng = np.random.default_rng(settings.seed)
+    dt = settings.step_fs
+    every = max(1, int(round(settings.dump_fs / dt)))
+    c1 = math.exp(-friction_per_fs * dt)
+    c2 = np.sqrt((1 - c1 * c1) * kt / masses)[:, None]
+
+    if (workdir / "reactor.xyz").exists():
+        _, x0, _ = read_xyz_frames(workdir / "reactor.xyz")
+        pos = x0[0] * ANGSTROM_TO_BOHR
+    else:
+        _write_xyz(workdir / "packed.xyz", symbols, coords_angstrom, "nanoreactor packed")
+        _emit(on_event, "md_relax", natoms=len(symbols))
+        pos = _relax_in_wall(forces, np.asarray(coords_angstrom) * ANGSTROM_TO_BOHR,
+                             settings.radius * ANGSTROM_TO_BOHR, masses)
+        _write_xyz(workdir / "reactor.xyz", symbols, pos / ANGSTROM_TO_BOHR, "nanoreactor relaxed")
+    vel = rng.normal(size=pos.shape) * np.sqrt(kt / masses)[:, None]
+    vel -= (masses[:, None] * vel).sum(axis=0) / masses.sum()      # no drift of the whole reactor
+
+    t_done, grad = 0.0, None
+    for k, (dur, r) in enumerate(schedule):
+        seg, restart = workdir / f"segment_{k:03d}.xyz", workdir / f"segment_{k:03d}.restart.npz"
+        if seg.exists() and restart.exists():
+            state = np.load(restart)
+            pos, vel, grad = state["pos"], state["vel"], None
+            t_done += dur
+            continue
+        radius_bohr = r * ANGSTROM_TO_BOHR
+        n_steps = max(1, int(round(dur * 1000.0 / dt)))
+        running = workdir / "xtb.trj"
+        running.unlink(missing_ok=True)
+        with running.open("w") as trj:
+            energy, grad = forces(pos, radius_bohr)
+            for step in range(1, n_steps + 1):
+                # BAOAB: half kick, half drift, thermostat, half drift, half kick
+                vel -= 0.5 * dt * _ACC * grad / masses[:, None]
+                pos = pos + 0.5 * dt * vel
+                vel = c1 * vel + c2 * rng.normal(size=vel.shape)
+                pos = pos + 0.5 * dt * vel
+                energy, grad = forces(pos, radius_bohr)
+                vel -= 0.5 * dt * _ACC * grad / masses[:, None]
+                if step % every == 0:
+                    xyz = pos / ANGSTROM_TO_BOHR
+                    trj.write(f"{len(symbols)}\n energy: {energy:.10f} \n")
+                    trj.write("".join(f"{s} {x:.8f} {y:.8f} {z:.8f}\n" for s, (x, y, z) in zip(symbols, xyz)))
+                    trj.flush()
+                if not np.all(np.isfinite(pos)):
+                    raise RuntimeError(f"the MD blew up in segment {k} (step {step}): non-finite positions")
+        np.savez(restart, pos=pos, vel=vel)
+        shutil.move(running, seg)
+        t_done += dur
+        temp = float(np.sum(masses[:, None] * vel ** 2) * _KIN / (3 * len(symbols) * _KB))
+        _emit(on_event, "md_segment", segment=k + 1, segments=len(schedule), time_ps=t_done, radius=r,
+              total_ps=settings.time_ps, temperature=temp)
     traj = workdir / "trajectory.xyz"
     with traj.open("w") as out:
         for k in range(len(schedule)):

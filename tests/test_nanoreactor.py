@@ -179,3 +179,69 @@ def test_why_a_reaction_has_no_ts_endpoints():
     assert nr._verdict("product", {(0, 1), (2, 3), (1, 2)}, {(0, 1), (2, 3)}, {(0, 2)}, 4)["code"] == "recombines"
     assert nr._verdict("reactant", {(0, 1)}, {(0, 1), (1, 2)}, {(0, 2)}, 3)["code"] == "falls_apart"
     assert nr._verdict("reactant", {(0, 2), (1, 2)}, {(0, 1), (1, 2)}, {(0, 1)}, 3)["code"] == "rearranges"
+
+
+def test_wall_gradient_matches_its_energy():
+    rng = np.random.default_rng(0)
+    pos = rng.normal(size=(5, 3)) * 6.0
+    e0, g = nr._wall(pos, 5.0, 0.02)
+    h = 1e-5
+    for a in range(5):
+        for k in range(3):
+            p = pos.copy(); p[a, k] += h
+            assert (nr._wall(p, 5.0, 0.02)[0] - e0) / h == pytest.approx(g[a, k], abs=1e-6)
+
+
+class _MorseEngine:
+    """A toy engine: Morse bonds between every pair of H atoms (all H2 molecules)."""
+
+    def compute_gradients(self, nodes):
+        out = []
+        for node in nodes:
+            x = np.asarray(node.structure.geometry).reshape(-1, 3)
+            d = x[:, None] - x[None]
+            r = np.linalg.norm(d, axis=2) + np.eye(len(x))
+            De, a, re = 0.17, 1.0, 1.4
+            ex = np.exp(-a * (r - re))
+            e = De * (1 - ex) ** 2 - De
+            np.fill_diagonal(e, 0.0)
+            dedr = 2 * De * a * ex * (1 - ex)
+            np.fill_diagonal(dedr, 0.0)
+            g = (dedr / r)[:, :, None] * d
+            node._cached_energy = float(e.sum() / 2)
+            out.append(g.sum(axis=1))
+        return np.array(out)
+
+
+def test_engine_md_runs_on_any_engine_and_writes_the_usual_files(tmp_path):
+    rng = np.random.default_rng(1)
+    symbols = ["H"] * 8
+    coords = np.vstack([np.array([[0, 0, 0], [0.74, 0, 0]]) + rng.uniform(-2.5, 2.5, 3) for _ in range(4)])
+    s = nr.ReactorSettings(temperature=1000.0, time_ps=0.2, radius=5.0, period_ps=0.1, duty=0.5, ramp_fs=20.0,
+                           method="level", dump_fs=2.0, step_fs=0.5)
+    seen = []
+    traj = nr.run_engine_md(symbols, coords, charge=0, multiplicity=1, settings=s, engine=_MorseEngine(),
+                            workdir=tmp_path / "md", on_event=lambda e, p: seen.append(p))
+    syms, frames, _ = nr.read_xyz_frames(traj)
+    assert syms == symbols and len(frames) == 100
+    assert np.max(np.linalg.norm(frames, axis=2)) < 5.0 + 1.5          # the wall holds
+    temps = [p["temperature"] for p in seen if "temperature" in p]
+    assert 300 < np.mean(temps) < 2500                                   # thermostatted near 1000 K
+    assert len(list((tmp_path / "md").glob("segment_*.xyz"))) == len(nr.piston_schedule(s))
+    # resume: nothing is rerun
+    seen.clear()
+    nr.run_engine_md(symbols, coords, charge=0, multiplicity=1, settings=s, engine=_MorseEngine(),
+                     workdir=tmp_path / "md", on_event=lambda e, p: seen.append(p))
+    assert not [p for p in seen if "temperature" in p]
+
+
+def test_automatic_md_choice_falls_back_to_gxtb_then_to_the_profile(monkeypatch):
+    monkeypatch.setattr(nr, "missing_programs", lambda m="gfn2": ["xtb"] if m != "level" else [])
+    monkeypatch.delenv("GXTB_EXECUTABLE", raising=False)
+    monkeypatch.setattr(nr.shutil, "which", lambda name: None)
+    monkeypatch.setattr(nr.Path, "home", lambda: nr.Path("/nonexistent"))
+
+    class GXTBCalculator:   # a profile's g-xTB engine, known by name
+        executable = __file__   # an existing path stands in for the program
+    assert nr.pick_md_method(GXTBCalculator()) == ("gxtb", __file__)
+    assert nr.pick_md_method(object()) == ("level", None)

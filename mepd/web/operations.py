@@ -738,10 +738,13 @@ class NanoreactorParams(Params):
     time_ps: float = P(20.0, "Simulated time (ps)", cli="--time", gt=0)
     compress: float = P(0.6, "Piston squeeze", "Narrow wall radius as a fraction of the wide one: smaller pushes "
                         "the molecules harder together.", cli="--compress", gt=0, le=1)
-    md_method: Literal["gfn2", "gfn1", "gxtb"] = P(
-        "gfn2", "MD level", "The fast xtb method that drives the discovery MD. Every species, reaction and TS is "
-        "then refined at your level of theory.", cli="--md-method",
-        labels={"gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB", "gxtb": "g-xTB (slower)"})
+    md_method: Literal["auto", "gfn2", "gfn1", "gxtb", "level"] = P(
+        "auto", "MD level", "What drives the discovery MD. Automatic: GFN2-xTB if xtb is installed, else g-xTB, "
+        "else your level of theory. The xtb methods run xtb's own MD (fast). 'Your level of "
+        "theory' runs it on the compute profile below, with any calculator (MLIPs, ASE, g-xTB...): as fast as that "
+        "calculator. Every species, reaction and TS is then refined at the profile's level.", cli="--md-method",
+        labels={"auto": "Automatic", "gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB", "gxtb": "g-xTB (slower)",
+                "level": "Your level of theory"})
     connect: bool = P(False, "Find each reaction's TS", "Path search, TS optimization and IRC on every reaction's "
                       "subsystem (only the molecules it needs). Or run a TS search later on any reaction you pick.",
                       cli="--connect", kind="toggle")
@@ -1075,7 +1078,7 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         produces=["species", "reactions with only the molecules they need", "TSs on those subsystems"],
         cli_path=("discovery", "nanoreactor"), cli_extra_flags=("--charge", "--inputs", "--output"),
         family=NETWORK, methods=({
-            "label": "Nanoreactor", "rank": -1, "programs": ("xtb",), "install": "conda install -c conda-forge xtb",
+            "label": "Nanoreactor", "rank": -1,
             "summary": "Hot, periodically squeezed molecular dynamics of the selected molecules (several copies, "
                        "solvent, partners): whatever reacts becomes a reaction dot with only the molecules it needs, "
                        "refined at your level of theory. Select several structures to put them in together."},)),
