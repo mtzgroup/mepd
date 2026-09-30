@@ -107,6 +107,7 @@ PY_HOME="$(readlink -f "$REPO/.venv/bin/python")"          # uv-managed interpre
 UV_PYTHONS="$(dirname "$(dirname "$(dirname "$PY_HOME")")")"   # ~/.local/share/uv/python
 OPT="$HOME/.local/opt"                                         # gxtb, gsm, gsm-blas
 CREST="$(readlink -f "$(command -v crest)")"
+XTB="$(readlink -f "$(command -v xtb)")"                       # plain xtb: CREST msreact, solvation
 GXTB="$(readlink -f "${GXTB_EXECUTABLE:-$OPT/gxtb-2.0.1/bin/xtb}")"
 GSM="$(readlink -f "${GSM_EXECUTABLE:-$OPT/gsm/bin/gsm}")"
 
@@ -137,6 +138,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --mount "type=bind,src=$UV_PYTHONS,dst=$UV_PYTHONS,readonly" \
   --mount "type=bind,src=$OPT,dst=$OPT,readonly" \
   --mount "type=bind,src=$CREST,dst=/opt/bin/crest,readonly" \
+  --mount "type=bind,src=$XTB,dst=/opt/bin/xtb,readonly" \
   --mount "type=bind,src=$DEMO_DATA,dst=/data" \
   -e HOME=/data/home -e MEPD_WEB_STATE_DIR=/data/state \
   -e PATH=/opt/bin:/usr/local/bin:/usr/bin:/bin \
