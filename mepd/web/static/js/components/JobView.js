@@ -10,6 +10,8 @@ import { JobControls, useTick } from './Jobs.js';
 import { NetworkLive } from './NetworkLive.js';
 import { ChannelsMap } from './ChannelsMap.js';
 import { OptTree } from './OptTree.js';
+import { ReactorLive } from './ReactorLive.js';
+import { ReactionTable } from './Reactions.js';
 import { Viewer3D } from './Viewer3D.js';
 
 // ------------------------------------------------------------ live
@@ -455,6 +457,7 @@ function ResultPanel({ job }) {
           <summary>${result.warnings.length} warning${result.warnings.length > 1 ? 's' : ''} reported by mepd — check before trusting every number</summary>
           <ul>${result.warnings.map((w) => html`<li class="mono">${w}</li>`)}</ul>
         </details>`}
+      ${result.nanoreactor && html`<${ReactionTable} job=${job} reactions=${result.nanoreactor.reactions} />`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}
       ${job.op === 'ts' && html`<${TsFollowUps} job=${job} />`}
@@ -743,7 +746,8 @@ export function JobView({ jobId: openedId }) {
     finished: Math.max(...family.map((j) => j.finished || 0)),
     result_rev: family.reduce((n, j) => n + (j.result_rev || 0), 0) } : job;
   const hasOutput = job.status !== 'queued';
-  const current = tab || (['done'].includes(run.status) || job.external ? 'result' : run.status === 'failed' ? 'log' : 'live');
+  const current = tab || (['done'].includes(run.status) || job.external ? 'result' : run.status === 'failed' ? 'log'
+    : job.op === 'nanoreactor' ? 'reactor' : 'live');
   const targets = job.targets.structures.map((id) => ({ id, label: structureName(id) }));
   const runLabel = (j, i) => (i === 0 ? (job.op === 'ts' ? 'First search' : 'First run') : `More paths ${i}`);
   return html`
@@ -779,14 +783,15 @@ export function JobView({ jobId: openedId }) {
         were not added to Explore (the threshold under Explore in this calculation's settings). They are in the results, to add by hand.</p>`}
       ${['cancelled', 'interrupted'].includes(run.status) && html`<p class="warn-box small">${run.error} ${!run.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${run.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
-        ${[['result', 'Results'], !job.external && ['live', 'Live'], !job.external && family.some((j) => ['channels', 'channels-more'].includes(j.op)) && ['map', 'Path map'],
+        ${[['result', 'Results'], job.op === 'nanoreactor' && ['reactor', 'Reactor'], !job.external && job.op !== 'nanoreactor' && ['live', 'Live'], !job.external && family.some((j) => ['channels', 'channels-more'].includes(j.op)) && ['map', 'Path map'],
           ['ts', 'channels', 'channels-more', 'network-splits'].includes(job.op) && ['tree', 'Optimization tree'],
           !job.external && ['log', 'Log'], ['files', 'Files']].filter(Boolean)
-          .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live'} onClick=${() => setTab(k)}>${l}</button>`)}
+          .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live' && k !== 'reactor'} onClick=${() => setTab(k)}>${l}</button>`)}
       </div>
       <div class="tab-body">
         ${current === 'result' && html`<${ResultPanel} job=${page} />`}
         ${current === 'live' && html`<${LivePanel} key=${run.id} job=${run} />`}
+        ${current === 'reactor' && html`<${ReactorLive} key=${run.id} job=${run} />`}
         ${current === 'map' && html`<${ChannelsMap} job=${page} />`}
         ${current === 'tree' && html`<${OptTree} job=${page} />`}
         ${current === 'log' && html`<${LogPanel} key=${run.id} job=${run} />`}

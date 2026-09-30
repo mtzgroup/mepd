@@ -604,6 +604,15 @@ class JobManager:
             self._adopt_live_events(job)
         except Exception:   # a bad line must never stop the progress feed
             log.exception("could not add live results of %s to the graph", job["id"])
+        if job.get("op") == "nanoreactor":
+            from mepd.web.nanoreactor import adopt_nanoreactor
+
+            try:
+                if adopt_nanoreactor(self.ws, job):
+                    self._write(job)
+                    self.bus.publish("workspace", self.ws.snapshot())
+            except Exception:
+                log.exception("could not add the nanoreactor network of %s to the graph", job["id"])
 
         for key, fp in (("chain", jdir / "chain.json"), ("stats", out / "stats.json")):
             m = _mtime(fp)

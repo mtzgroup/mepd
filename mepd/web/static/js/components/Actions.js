@@ -26,8 +26,16 @@ export function applicability(op, sel) {
   }
   if (op.target === 'job') return null;   // follow-ups live on their source job's result page
   if (op.target === 'set') {
-    if (nS >= op.min_structures && nE === 0) return { n: 1, what: `${nS} structures` };
-    return null;
+    if (!(nS >= op.min_structures && nE === 0)) return null;
+    const fit = { n: 1, what: `${nS} structures` };
+    if (op.same_atoms) {
+      const recs = sel.structures.map((id) => state.workspace.structures[id]).filter(Boolean);
+      const key = (r) => `${r.formula}|${r.charge}|${r.multiplicity}`;
+      if (new Set(recs.map(key)).size > 1) {
+        fit.disabled = 'Needs isomers: the selected structures differ in atoms, charge or spin. The Nanoreactor handles molecules with different atoms.';
+      }
+    }
+    return fit;
   }
   return null;
 }

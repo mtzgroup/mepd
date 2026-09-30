@@ -26,6 +26,7 @@ and edges, so exploration results grow the same graph the user draws.
 from __future__ import annotations
 
 import json
+from collections import Counter
 import os
 import secrets
 import shutil
@@ -210,6 +211,11 @@ class Workspace:
             self._data = {"version": 1, "structures": {}, "edges": {}, "positions": {}}
             self._save()
         self._data.setdefault("positions", {})
+        # Reactions with any number of reactants and products (a nanoreactor's
+        # events): drawn as a dot joined to its species. A reaction's
+        # optimized subsystem ends are hidden structures (role "complex")
+        # joined by an ordinary edge, so pair operations (TS search) run on it.
+        self._data.setdefault("reactions", {})
         self._data.setdefault("level_profile", None)
         # Hessian check applied when structures are optimized on entry.
         self._data.setdefault("validate_minima", True)
@@ -397,7 +403,7 @@ class Workspace:
             return None
         key = chem.canonical_key(smiles)
         for rec in self._data["structures"].values():
-            if (rec.get("role") != "ts" and rec.get("smiles") and rec["charge"] == charge
+            if (rec.get("role") not in ("ts", "complex") and rec.get("smiles") and rec["charge"] == charge
                     and rec["multiplicity"] == multiplicity and not rec.get("reacted")
                     and chem.canonical_key(rec["smiles"]) == key):
                 return rec
@@ -522,7 +528,7 @@ class Workspace:
         with self._lock:
             groups: dict[tuple, list[dict]] = {}
             for rec in sorted(self._data["structures"].values(), key=lambda r: r.get("created", 0)):
-                if rec.get("role") == "ts" or not rec.get("smiles") or rec.get("reacted"):
+                if rec.get("role") in ("ts", "complex") or not rec.get("smiles") or rec.get("reacted"):
                     continue
                 key = (chem.canonical_key(rec["smiles"]), rec["charge"], rec["multiplicity"])
                 groups.setdefault(key, []).append(rec)
@@ -568,16 +574,53 @@ class Workspace:
             self._save()
             return rec
 
-    def delete_structure(self, sid: str) -> None:
+    # ----------------------------------------------------------- reactions
+    def reaction(self, rid: str) -> dict:
+        try:
+            return self._data["reactions"][rid]
+        except KeyError:
+            raise WorkspaceError(f"unknown reaction {rid!r}") from None
+
+    def find_reaction(self, job: str, index: int) -> Optional[dict]:
+        for rec in self._data["reactions"].values():
+            o = rec.get("origin") or {}
+            if o.get("job") == job and o.get("index") == index:
+                return rec
+        return None
+
+    def put_reaction(self, *, reactants: list, products: list, origin: dict, **fields: Any) -> dict:
+        """Add a reaction, or update the one from the same job and index.
+        Reactants/products are structure ids, repeated for 2 A etc.; a
+        species on both sides is a shuttle."""
         with self._lock:
-            self.structure(sid)
-            del self._data["structures"][sid]
-            self._data["positions"].pop(sid, None)
-            for eid in [e for e, rec in self._data["edges"].items() if sid in (rec["source"], rec["target"])]:
-                del self._data["edges"][eid]
-            (self.structures_dir / f"{sid}.xyz").unlink(missing_ok=True)
-            shutil.rmtree(self.structures_dir / sid, ignore_errors=True)
+            for sid in [*reactants, *products]:
+                self.structure(sid)
+            rec = self.find_reaction(origin.get("job"), origin.get("index"))
+            if rec is None:
+                rid = new_id("r_")
+                rec = self._data["reactions"][rid] = {"id": rid, "created": time.time()}
+            both = Counter(reactants) & Counter(products)
+            rec.update(fields, reactants=list(reactants), products=list(products),
+                       shuttles=sorted(both.elements()), origin=origin)
             self._save()
+            return rec
+
+    def _drop_reactions(self, rids: set, gone_s: list, gone_e: set) -> None:
+        """Remove reactions and their hidden subsystem structures/edges (lock held)."""
+        for rid in rids:
+            rec = self._data["reactions"].pop(rid, None)
+            self._data["positions"].pop(rid, None)
+            if rec is None:
+                continue
+            for sid in rec.get("complexes") or []:
+                if sid in self._data["structures"] and sid not in gone_s:
+                    gone_s.append(sid)
+            if rec.get("edge"):
+                gone_e.add(rec["edge"])
+
+    def delete_structure(self, sid: str) -> None:
+        self.structure(sid)
+        self.delete_many([sid], [])
 
     # --------------------------------------------------------------- edges
     def edge(self, eid: str) -> dict:
@@ -638,17 +681,22 @@ class Workspace:
             return rec
 
     def delete_edge(self, eid: str) -> None:
-        with self._lock:
-            self.edge(eid)
-            del self._data["edges"][eid]
-            self._save()
+        self.edge(eid)
+        self.delete_many([], [eid])
 
-    def delete_many(self, structure_ids: list[str], edge_ids: list[str]) -> dict:
-        """Remove several structures (with their edges) and edges in one save."""
+    def delete_many(self, structure_ids: list[str], edge_ids: list[str],
+                    reaction_ids: Optional[list[str]] = None) -> dict:
+        """Remove several structures (with their edges and the reactions they
+        take part in), edges and reactions in one save."""
         with self._lock:
             edges = self._data["edges"]
             gone_s = [sid for sid in structure_ids if sid in self._data["structures"]]
             gone_e = {eid for eid in edge_ids if eid in edges}
+            gone_r = {rid for rid in reaction_ids or [] if rid in self._data["reactions"]}
+            gone_r |= {rid for rid, rec in self._data["reactions"].items()
+                       if set(gone_s) & set(rec["reactants"] + rec["products"] + (rec.get("complexes") or []))
+                       or (rec.get("edge") and rec["edge"] in gone_e)}
+            self._drop_reactions(gone_r, gone_s, gone_e)
             gone_e |= {eid for eid, rec in edges.items() if rec["source"] in gone_s or rec["target"] in gone_s}
             for eid in gone_e:
                 del edges[eid]
@@ -658,7 +706,7 @@ class Workspace:
                 (self.structures_dir / f"{sid}.xyz").unlink(missing_ok=True)
                 shutil.rmtree(self.structures_dir / sid, ignore_errors=True)
             self._save()
-        return {"structures": gone_s, "edges": sorted(gone_e)}
+        return {"structures": gone_s, "edges": sorted(gone_e), "reactions": sorted(gone_r)}
 
     def set_status(self, sids: list[str], status: str, error: Optional[str] = None) -> None:
         with self._lock:

@@ -52,6 +52,12 @@ export function edgeStatus(edge, jobs = state.jobs) {
   const unverified = done.filter((j) => j.summary.barrier_verified === false).map((j) => j.summary.barrier_kcal);
   const barrier = verified.length ? Math.min(...verified) : null;
   const barrierUnverified = !verified.length && unverified.length ? Math.min(...unverified) : null;
+  // The calculation that set the barrier shown (its page has the TS and IRC,
+  // and Sample more paths): the job with that value, else the edge's origin.
+  const shown = barrier ?? barrierUnverified;
+  const barrierJob = shown == null ? null
+    : (done.find((j) => j.summary.barrier_kcal === shown && (barrier == null) === (j.summary.barrier_verified === false))?.id
+      ?? (edge.origin?.barrier_kcal === shown ? edge.origin.job : null) ?? null);
   let status = 'idle';
   if (has('running')) status = 'running';
   else if (has('queued')) status = 'queued';
@@ -62,7 +68,12 @@ export function edgeStatus(edge, jobs = state.jobs) {
   // A negative barrier is a problem to see, not a small number: say why.
   const warning = edge.origin?.barrier_warning || done.map((j) => j.summary?.barrier_warning).find(Boolean)
     || (barrier != null && barrier < -0.1 ? `Negative barrier (${barrier.toFixed(1)} kcal/mol): the TS lies below an endpoint. With one level of theory, minimized endpoints and a dense enough path this cannot happen: check the endpoints' minimization and level, and the path's density.` : null);
-  return { status, barrier, barrierUnverified, count: related.length, warning };
+  return { status, barrier, barrierUnverified, barrierJob, count: related.length, warning };
+}
+
+// The reaction (nanoreactor) whose subsystem this edge joins, if any.
+export function reactionOfEdge(workspace, eid) {
+  return Object.values(workspace.reactions || {}).find((r) => r.edge === eid) || null;
 }
 
 // Latest status line: live progress if we have it, else what the record had.

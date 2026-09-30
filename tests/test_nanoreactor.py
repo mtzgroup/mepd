@@ -1,0 +1,181 @@
+"""Nanoreactor: event detection, subsystem extraction and the reaction
+network, on hand-built bond histories (no MD needed)."""
+import numpy as np
+import pytest
+
+from mepd.discovery import nanoreactor as nr
+
+# Two acetaldehydes, a shuttle water and a spectator water.
+#   CH3-CHO #1: C0 C1 O2 H3 H4 H5 (on C0) H6 (on C1)
+#   CH3-CHO #2: C7 C8 O9 H10 H11 H12 (on C7) H13 (on C8)
+#   water (shuttle): O14 H15 H16;  water (spectator): O17 H18 H19
+SYMBOLS = ["C", "C", "O", "H", "H", "H", "H"] * 2 + ["O", "H", "H"] * 2
+ACETALDEHYDE = [(0, 1), (1, 2), (0, 3), (0, 4), (0, 5), (1, 6)]
+INITIAL = ({tuple(b) for b in ACETALDEHYDE} | {(i + 7, j + 7) for i, j in ACETALDEHYDE}
+           | {(14, 15), (14, 16), (17, 18), (17, 19)})
+DT = 2.0
+
+
+def _sides(label):
+    left, right = label.split(" -> ")
+    return set(left.split(" + ")), set(right.split(" + "))
+
+
+def _history(changes, n_frames=600):
+    return nr.BondHistory(n_frames, set(INITIAL), sorted(changes))
+
+
+def test_denoise_drops_short_blips_and_keeps_real_changes():
+    s = [False] * 10 + [True] * 2 + [False] * 10 + [True] * 30
+    clean = nr._denoise(s, 5)
+    assert clean == [False] * 22 + [True] * 30
+    # a short state at the very end is not a new state yet
+    assert nr._denoise([True] * 20 + [False] * 3, 5) == [True] * 23
+
+
+def test_direct_and_shuttled_tautomerization_are_two_reactions():
+    changes = [
+        (100, 0, 3, False), (100, 2, 3, True),                           # direct: H3 from C0 to O2
+        (300, 7, 10, False), (302, 10, 14, True),                        # H10 to the water O14 ...
+        (320, 14, 15, False), (321, 9, 15, True),                        # ... and H15 on to O9
+    ]
+    hist = _history(changes)
+    det = nr.DetectSettings()
+    events = nr.detect_events(len(SYMBOLS), hist, det, DT)
+    assert len(events) == 2
+    direct, shuttled = events
+    assert direct.atoms == tuple(range(7))                               # only the molecule that reacts
+    assert shuttled.atoms == tuple(range(7, 17))                         # acetaldehyde + the shuttle water
+    assert not set(range(17, 20)) & set(shuttled.atoms)                  # the spectator is left out
+    assert shuttled.reactant_frame < 300 and shuttled.product_frame > 321
+
+    frames = np.zeros((hist.n_frames, len(SYMBOLS), 3))
+    species, reactions, records = nr.build_network(SYMBOLS, frames, hist, events, nr.Labeler(SYMBOLS),
+                                                   0, DT)
+    names = {s.id: s.smiles for s in species}
+    assert sorted(names.values()) == sorted(["CC=O", "O", "C=CO"])
+    by_label = {r.label: r for r in reactions}
+    assert set(by_label) == {"CC=O -> C=CO", "CC=O + O -> C=CO + O"}
+    shuttle = by_label["CC=O + O -> C=CO + O"]
+    assert [names[i] for i in shuttle.shuttles] == ["O"]
+    assert by_label["CC=O -> C=CO"].shuttles == []
+    water = next(s for s in species if s.smiles == "O")
+    assert water.initial == 2
+
+
+def test_collision_partner_and_concurrent_reaction_are_split_off():
+    # The direct tautomerization of #1 while its H3 briefly touches the
+    # spectator water (O17), and #2 loses H13 at the same time after also
+    # touching that water: two reactions, the water in neither.
+    changes = [(100, 0, 3, False), (101, 3, 17, True), (110, 3, 17, False), (111, 2, 3, True),
+               (105, 13, 17, True), (106, 8, 13, False), (120, 13, 17, False)]
+    hist = _history(changes)
+    events = nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT)
+    assert [e.atoms for e in events] == [tuple(range(7)), tuple(range(7, 14))]
+    _, reactions, _ = nr.build_network(SYMBOLS, np.zeros((600, 20, 3)), hist, events, nr.Labeler(SYMBOLS), 0, DT)
+    assert [r.shuttles for r in reactions] == [[], []]
+
+
+def test_reverse_event_counts_on_the_same_reaction():
+    changes = [(100, 0, 3, False), (100, 2, 3, True),                    # keto -> enol
+               (400, 2, 3, False), (400, 0, 3, True)]                    # and back
+    hist = _history(changes)
+    events = nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT)
+    _, reactions, _ = nr.build_network(SYMBOLS, np.zeros((600, 20, 3)), hist, events, nr.Labeler(SYMBOLS), 0, DT)
+    assert len(reactions) == 1
+    assert (reactions[0].count, reactions[0].reverse_count) == (1, 1)
+
+
+def test_collision_that_undoes_itself_is_not_a_reaction():
+    # A water H binds to the carbonyl O and leaves again within the merge window.
+    changes = [(200, 2, 18, True), (230, 2, 18, False)]
+    events = nr.detect_events(len(SYMBOLS), _history(changes), nr.DetectSettings(), DT)
+    assert events == []
+
+
+def test_degenerate_exchange_is_recorded_but_is_no_reaction():
+    # H swaps between the two waters: water + water -> water + water.
+    changes = [(200, 14, 15, False), (201, 17, 15, True), (210, 17, 18, False), (211, 14, 18, True)]
+    hist = _history(changes)
+    events = nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT)
+    assert len(events) == 1
+    _, reactions, records = nr.build_network(SYMBOLS, np.zeros((600, 20, 3)), hist, events,
+                                             nr.Labeler(SYMBOLS), 0, DT)
+    assert reactions == [] and records[0]["reaction"] is None
+
+
+def test_partial_charges_decide_ions():
+    # O14-H15 breaks: H atom + OH radical, unless the partial charges say
+    # it left as a proton.
+    changes = [(200, 14, 15, False)]
+    hist = _history(changes)
+    events = nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT)
+    frames = np.zeros((600, 20, 3))
+    _, rx, _ = nr.build_network(SYMBOLS, frames, hist, events, nr.Labeler(SYMBOLS), 0, DT)
+    assert _sides(rx[0].label) == ({"O"}, {"[H]", "[OH]"})
+    q = np.zeros(20)
+    q[15], q[[14, 16]] = 0.9, -0.45
+    _, rx, _ = nr.build_network(SYMBOLS, frames, hist, events, nr.Labeler(SYMBOLS), 0, DT,
+                                charges_at=lambda f: q if f > 200 else np.zeros(20))
+    assert _sides(rx[0].label) == ({"O"}, {"[H+]", "[OH-]"})
+
+
+def test_no_neutral_lewis_structure_gives_an_ion_pair():
+    # H15 from one water to the other: neutral H3O has no Lewis structure.
+    changes = [(200, 14, 15, False), (200, 17, 15, True)]
+    hist = _history(changes)
+    events = nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT)
+    _, rx, _ = nr.build_network(SYMBOLS, np.zeros((600, 20, 3)), hist, events, nr.Labeler(SYMBOLS), 0, DT)
+    assert rx[0].label == "2 O -> [OH-] + [OH3+]"
+
+
+def test_piston_schedule_closes_in_steps():
+    s = nr.ReactorSettings(radius=10.0, compress=0.5, period_ps=1.0, duty=0.75, time_ps=2.0, ramp_fs=100.0)
+    sched = nr.piston_schedule(s)
+    assert sum(d for d, _ in sched) == pytest.approx(2.0)
+    radii = [r for _, r in sched]
+    assert radii[:7] == pytest.approx([10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 5.0])
+
+
+def test_pack_reactor_grows_an_automatic_radius_until_the_molecules_fit():
+    """Two copies of a 13-atom molecule (6 C in a row, 5.3 Angstrom long): the
+    atom-count radius (5.4 Angstrom) cannot hold both, so it grows; a radius
+    given by hand is kept and refused instead."""
+    from qcdata import Structure
+
+    chain = [[1.3 * k - 3.25, 0.0, 0.0] for k in range(6)]
+    geom = chain + [[x, 1.0, 0.0] for x, _, _ in chain[:5]] + [[-3.25, -1.2, 0.0], [3.25, -1.2, 0.0]]
+    mol = Structure(symbols=["C"] * 6 + ["H"] * 5 + ["O"] * 2, geometry=np.array(geom) * nr.ANGSTROM_TO_BOHR)
+    symbols, xyz, radius, owner = nr.pack_reactor([mol, mol])
+    assert len(symbols) == 26 and radius > nr.auto_radius(26)
+    assert np.max(np.linalg.norm(xyz, axis=1)) < radius
+    with pytest.raises(RuntimeError, match="larger radius"):
+        nr.pack_reactor([mol, mol], nr.auto_radius(26))
+
+
+def test_pack_reactor_keeps_molecules_apart_and_inside():
+    from qcdata import Structure
+
+    water = Structure(symbols=["O", "H", "H"],
+                      geometry=np.array([[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]]) * nr.ANGSTROM_TO_BOHR)
+    symbols, xyz, radius, owner = nr.pack_reactor([water] * 8, seed=3)
+    assert len(symbols) == 24 and radius == pytest.approx(nr.auto_radius(24))
+    assert np.max(np.linalg.norm(xyz, axis=1)) < radius
+    for a in range(8):
+        for b in range(a + 1, 8):
+            ia = [k for k, o in enumerate(owner) if o == a]
+            ib = [k for k, o in enumerate(owner) if o == b]
+            assert np.min(np.linalg.norm(xyz[ia][:, None] - xyz[ib][None], axis=2)) >= 2.0
+
+
+def test_why_a_reaction_has_no_ts_endpoints():
+    # H2 -> 2 H: the product side (two H atoms) bonds back when optimized.
+    two_h, h2 = set(), {(0, 1)}
+    v = nr._verdict("product", h2, two_h, h2, 2)
+    assert v["code"] == "reverts" and not v["ts"]
+    v = nr._verdict("reactant", two_h, h2, two_h, 2)
+    assert v["code"] == "barrierless"
+    # Two radicals (atoms 0-1 and 2-3) that bond: recombines; a molecule that splits: falls apart.
+    assert nr._verdict("product", {(0, 1), (2, 3), (1, 2)}, {(0, 1), (2, 3)}, {(0, 2)}, 4)["code"] == "recombines"
+    assert nr._verdict("reactant", {(0, 1)}, {(0, 1), (1, 2)}, {(0, 2)}, 3)["code"] == "falls_apart"
+    assert nr._verdict("reactant", {(0, 2), (1, 2)}, {(0, 1), (1, 2)}, {(0, 1)}, 3)["code"] == "rearranges"

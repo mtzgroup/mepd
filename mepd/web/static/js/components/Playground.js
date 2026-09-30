@@ -17,6 +17,7 @@ import { AddBox, LevelBar } from './Library.js';
 import { ProfilesView } from './Profiles.js';
 import { ReferencesView } from './References.js';
 import { DesignView } from './Design.js';
+import { AnalyzeView } from './Analyze.js';
 
 // Small line icons (24px grid, stroke = currentColor).
 const ICONS = {
@@ -67,7 +68,7 @@ function TopLeft() {
 function Tabs() {
   const view = useStore((s) => s.view);
   const active = useStore((s) => Object.values(s.jobs).filter((j) => j.status === 'running' || j.status === 'queued').length);
-  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
+  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['analyze', 'Analyze'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
   return html`
     <nav class="pg-tabs" aria-label="Pages">
       ${tabs.map(([k, l]) => html`<button class=${view.tab === k || (k === 'jobs' && view.tab === 'job') ? 'on' : ''}
@@ -83,7 +84,7 @@ function TopRight() {
   const [open, setOpen] = useState(() => ({ level: false, structures: !window.matchMedia('(max-width: 720px)').matches }));
   const [q, setQ] = useState('');
   const toggle = (k) => setOpen({ ...open, [k]: !open[k] });
-  const all = Object.values(structures).sort((a, b) => b.created - a.created);
+  const all = Object.values(structures).filter((r) => r.role !== 'complex').sort((a, b) => b.created - a.created);
   const list = q ? all.filter((r) => `${r.name} ${r.smiles} ${r.formula}`.toLowerCase().includes(q.toLowerCase())) : all;
   const pick = (e, r) => {
     select({ structures: [r.id] }, e.shiftKey || e.metaKey || e.ctrlKey);
@@ -225,7 +226,8 @@ export function PlaygroundApp() {
     : view.tab === 'job' ? html`<${JobView} jobId=${view.jobId} />`
       : view.tab === 'profiles' ? html`<${ProfilesView} />`
         : view.tab === 'refs' ? html`<${ReferencesView} />`
-        : view.tab === 'design' ? html`<${DesignView} />` : null;
+        : view.tab === 'design' ? html`<${DesignView} />`
+        : view.tab === 'analyze' ? html`<${AnalyzeView} />` : null;
   return html`
     <div class=${`pg pg-${bg}`}>
       <div class="pg-canvas"><${Graph} /></div>
@@ -233,7 +235,7 @@ export function PlaygroundApp() {
       <${Tabs} />
       ${onGraph && html`<${TopRight} />`}
       ${onGraph && nSel > 0 && !panel && html`<div class="pg-sheet pg-inspector"><${Inspector} /></div>`}
-      ${page && html`<${Sheet} className="pg-page" label=${{ profiles: 'Settings', refs: 'References' }[view.tab] || 'Calculations'}
+      ${page && html`<${Sheet} className="pg-page" label=${{ profiles: 'Settings', refs: 'References', analyze: 'Analyze' }[view.tab] || 'Calculations'}
         onClose=${() => { clearSelection(); openTab('graph'); }}>${page}<//>`}
       ${panel === 'add' && html`<${Sheet} className="pg-add" title="Add structures" onClose=${() => set({ pgPanel: null })}>
         <${LevelBar} /><${AddBox} onDone=${() => set({ pgPanel: null })} /><//>`}

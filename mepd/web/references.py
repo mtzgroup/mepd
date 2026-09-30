@@ -135,4 +135,12 @@ def references() -> list[dict]:
         + [{"what": gen.label, "note": ref["method"], "cite": ref["cite"]}
            for gen in GENERATORS.values() for ref in gen.references.values()],
     }
-    return [_with_links(e) for e in [*_OTHER, expansion]]
+    from mepd.discovery.nanoreactor import REFERENCES as NANOREACTOR
+
+    nanoreactor = {
+        "feature": "Nanoreactor",
+        "where": "Reaction network expansion › Nanoreactor",
+        "items": [{"what": stage.replace("_", " ").capitalize(), "note": m["method"], "cite": m["cite"]}
+                  for stage, m in NANOREACTOR.items()],
+    }
+    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor]]

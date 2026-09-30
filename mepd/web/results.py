@@ -33,6 +33,8 @@ from mepd.web.workspace import HARTREE_TO_KCAL
 
 def detect_operation(path: Path) -> Optional[str]:
     if path.is_dir():
+        if (path / "network.json").exists() and (_read_json(path / "summary.json") or {}).get("kind") == "nanoreactor":
+            return "nanoreactor"
         if (path / "conformers").is_dir():
             return "channels"
         if (path / "summary.json").exists() and list(path.glob("opt_*.xyz")):
@@ -1059,7 +1061,105 @@ def collect_vri(out: Path, charge: int, multiplicity: int) -> dict:
     return result
 
 
+def _xyz_frames(texts: list, baseline: Optional[float]) -> list[dict]:
+    """Frames from xyz texts whose comment line may carry 'energy=<Eh>'
+    (the nanoreactor's files: each species has its own charge, so no Chain)."""
+    import re
+
+    out = []
+    for k, text in enumerate(texts):
+        lines = text.splitlines()
+        m = re.search(r"energy=(-?[0-9.]+)", lines[1] if len(lines) > 1 else "")
+        e = float(m.group(1)) if m else None
+        out.append({"xyz": text, "energy_hartree": e, "path_length": float(k),
+                    "energy_kcal": _clean((e - baseline) * HARTREE_TO_KCAL) if e is not None and baseline is not None
+                    else None})
+    return out
+
+
+def _read_text(fp) -> Optional[str]:
+    try:
+        return Path(fp).read_text()
+    except (OSError, TypeError):
+        return None
+
+
+def collect_nanoreactor(out: Path, charge: int, multiplicity: int) -> dict:
+    """Species (each on its own: energies of different molecules are not
+    compared), reactions (the optimized subsystem ends; energies from the
+    reactant side), and the TSs found on them."""
+    data = _read_json(out / "network.json")
+    if not data:
+        return _result("Reactor running…" if (out / "md").is_dir() else "No output yet", [], [])
+    species, reactions = data.get("species") or [], data.get("reactions") or []
+    names = {sp["id"]: sp["smiles"] for sp in species}
+    sp_entries = []
+    for sp in species:
+        text = _read_text(sp.get("file")) or _read_text(sp.get("md_file"))
+        if not text:
+            continue
+        note = f"charge {sp['charge']}, mult {sp['multiplicity']}; {sp['initial']} at start, seen {sp['count']}×"
+        if not sp.get("file"):
+            note += "; as cut from the MD (not optimized" + (f": {sp['note']}" if sp.get("note") else "") + ")"
+        sp_entries.append({"id": f"species_{sp['id']}", "label": sp["smiles"], "note": note, "barrier_kcal": None,
+                           "ts_index": None, "frames": _xyz_frames([text], None)})
+    rx_entries, ts_entries, irc_entries, warnings = [], [], [], []
+    for rx in reactions:
+        c = rx.get("complex") or {}
+        seen = f"seen {rx.get('count', 0)}×" + (f", reverse {rx['reverse_count']}×" if rx.get("reverse_count") else "")
+        shuttles = ", ".join(names.get(i, str(i)) for i in rx.get("shuttles") or [])
+        dE = rx.get("delta_e_kcal")
+        note = "; ".join(x for x in (seen, f"shuttle: {shuttles}" if shuttles else "",
+                                     f"ΔE {dE:+.1f} kcal/mol (separated)" if dE is not None else "") if x)
+        texts = [_read_text(c.get("reactant")), _read_text(c.get("product"))]
+        if all(texts):
+            frames = _xyz_frames(texts, c.get("reactant_energy"))
+            rx_entries.append({"id": f"reaction_{rx['id']}", "label": rx["label"], "note": note, "barrier_kcal": None,
+                               "ts_index": None, "frames": frames})
+        elif c.get("error"):
+            warnings.append(f"{rx['label']}: {c['error']}")
+        ts = rx.get("ts") or {}
+        files = ts.get("files") or {}
+        if ts.get("error"):
+            warnings.append(f"TS of {rx['label']}: {ts['error']}")
+        if files.get("ts"):
+            chain = _load_chain(Path(files["ts"]), c.get("charge", 0), c.get("multiplicity", 1))
+            if chain is not None:
+                floor = c.get("reactant_energy")
+                ts_entries.append(_entry(f"reaction_{rx['id']}_ts", rx["label"], [chain[0]], floor,
+                                         barrier=ts.get("barrier_kcal"), note=note))
+                irc = _load_chain(Path(files["irc"]), c.get("charge", 0), c.get("multiplicity", 1)) \
+                    if files.get("irc") else None
+                if irc is not None:
+                    irc_entries.append(_entry(f"reaction_{rx['id']}_irc", f"IRC: {rx['label']}", irc.nodes, floor,
+                                              barrier=ts.get("barrier_kcal"), note=note))
+    st = data.get("settings") or {}
+    n_ts = sum(1 for rx in reactions if (rx.get("ts") or {}).get("barrier_kcal") is not None)
+    ps = (data.get("n_frames") or 0) * (data.get("frame_fs") or 0) / 1000 or st.get("time_ps")
+    headline = (f"{len(reactions)} reaction{'s' * (len(reactions) != 1)} among {len(species)} species "
+                f"({len(data.get('events') or [])} events in {ps:g} ps)")
+    if n_ts:
+        headline += f" · {n_ts} TS{'s' * (n_ts != 1)}"
+    summary = [
+        {"label": "Reactor", "value": ", ".join(st.get("molecules") or []) or None},
+        {"label": "MD", "value": f"{st.get('method', '').upper()} at {st.get('temperature', 0):.0f} K, "
+                                 f"{st.get('time_ps')} ps, wall {st['radius']:.1f} → "
+                                 f"{st['radius'] * (st.get('compress') or 1):.1f} Å" if st.get("radius") else
+         f"an existing trajectory ({(data.get('n_frames') or 0) * (data.get('frame_fs') or 0) / 1000:.1f} ps)"},
+        {"label": "Energies", "value": "within one reaction only (different reactions have different atoms)"},
+    ]
+    groups = [_group("Reactions (optimized subsystem: reactants → products)", "path", rx_entries),
+              _group("Transition states", "ts", ts_entries), _group("IRC paths", "irc", irc_entries),
+              _group("Species", "minima", sp_entries)]
+    # No job-level barrier: each reaction's is on its own edge in Explore.
+    out = _result(headline, groups, summary, warnings=warnings)
+    out["nanoreactor"] = {"reactions": [{k: rx.get(k) for k in ("id", "label", "delta_e_kcal", "count", "reverse_count")}
+                                        for rx in reactions]}
+    return out
+
+
 COLLECTORS = {
+    "nanoreactor": collect_nanoreactor,
     "optimize": collect_optimize,
     "design-optimize": collect_optimize,
     "design-tsopt": collect_tsopt,
@@ -1165,7 +1265,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 16
+RESULT_VERSION = 23
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

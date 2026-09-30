@@ -10,6 +10,7 @@ import { Modals } from './components/Modals.js';
 import { ProfilesView } from './components/Profiles.js';
 import { ReferencesView } from './components/References.js';
 import { DesignView } from './components/Design.js';
+import { AnalyzeView } from './components/Analyze.js';
 import { PlaygroundApp, layoutToggle } from './components/Playground.js';
 
 function TopBar() {
@@ -21,7 +22,7 @@ function TopBar() {
     return { running: js.filter((j) => j.status === 'running').length, queued: js.filter((j) => j.status === 'queued').length };
   });
   const lastJob = useStore((s) => s.view.jobId);
-  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
+  const tabs = [['design', 'Design'], ['graph', 'Explore'], ['analyze', 'Analyze'], ['jobs', 'Calculations'], ['profiles', 'Settings'], ['refs', 'References']];
   const demo = useStore((s) => s.demo);
   const auth = useStore((s) => s.auth);
   const active = counts.running + counts.queued;
@@ -111,6 +112,7 @@ function App() {
         ${view.tab === 'profiles' && html`<${ProfilesView} />`}
         ${view.tab === 'refs' && html`<${ReferencesView} />`}
         ${view.tab === 'design' && html`<${DesignView} />`}
+        ${view.tab === 'analyze' && html`<${AnalyzeView} />`}
       </section>
       ${showInspector && html`<${Inspector} />`}
     </main>

@@ -53,10 +53,11 @@ class DemoPolicy:
         "vri-surface": {"workers": 2, "grid": 13},
         "graph-enumeration": {"rounds": 3, "max_products": 30, "n_break": 2, "n_form": 2, "max_pairs": 10,
                               "workers": 2, "maxiter": 500},
+        "nanoreactor": {"time_ps": 10.0, "max_connect": 5, "workers": 2, "instances": 3},
     })
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
-                          "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration")
+                          "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor")
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""

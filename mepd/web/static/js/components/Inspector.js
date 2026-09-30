@@ -2,12 +2,14 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
-import { PHONE_QUERY, STATUS_LABEL, conformerLabel, conformerRows, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus } from '../util.js';
+import { PHONE_QUERY, STATUS_LABEL, conformerLabel, conformerRows, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus, reactionOfEdge } from '../util.js';
 
 export { conformerLabel, conformerRows };
 import { ActionPanel } from './Actions.js';
 import { Viewer3D } from './Viewer3D.js';
 import { LevelChip } from './Library.js';
+import { ReactionCard, TsCell } from './Reactions.js';
+import { openAnalyze } from './Analyze.js';
 
 function useXyz(sid, conformer = null, version = '') {
   const [xyz, setXyz] = useState(null);
@@ -143,8 +145,30 @@ function PairDetail({ a, b }) {
     </section>`;
 }
 
+// A nanoreactor reaction: its equation, what it took (shuttles), and the
+// subsystem its calculations run on.
+function ReactionHead({ r, structures }) {
+  const name = (id) => structures[id]?.name || '?';
+  const side = (ids) => {
+    const c = {};
+    ids.forEach((id) => { c[id] = (c[id] || 0) + 1; });
+    return Object.entries(c).map(([id, n]) => `${n > 1 ? `${n} ` : ''}${name(id)}`).join(' + ');
+  };
+  const shuttles = [...new Set(r.shuttles || [])].map(name);
+  return html`<div class="rxn-head">
+    <div class="rxn-eq">${side(r.reactants)} → ${side(r.products)}</div>
+    <div class="small muted">
+      ${r.delta_e_kcal != null && html`<span title="Sum over the products minus the reactants, each optimized alone">ΔE ${r.delta_e_kcal >= 0 ? '+' : ''}${fmtKcal(r.delta_e_kcal)} kcal/mol · </span>`}
+      seen ${r.count || 0}×${r.reverse_count ? `, reverse ${r.reverse_count}×` : ''}
+      ${shuttles.length ? html` · <span title="On both sides: takes part (e.g. relays a proton) and comes out unchanged">needs ${shuttles.join(', ')}</span>` : ''}
+    </div>
+    <div class="rx-ts"><${TsCell} r=${r} /></div>
+  </div>`;
+}
+
 function EdgeDetail({ edge }) {
   const structures = useStore((s) => s.workspace.structures);
+  const reaction = useStore((s) => reactionOfEdge(s.workspace, edge.id));
   const allJobs = useStore((s) => s.jobs);
   const a = structures[edge.source], b = structures[edge.target];
   const [which, setWhich] = useState(0);
@@ -156,14 +180,16 @@ function EdgeDetail({ edge }) {
   const patch = (body) => attempt(() => api.patch(`/api/edges/${edge.id}`, body));
   return html`
     <section>
-      <div class="pair-head">
+      ${reaction ? html`<${ReactionHead} r=${reaction} structures=${structures} />` : html`<div class="pair-head">
         <span class="pair-role">start</span><strong>${a?.name}</strong>
         <button class="btn-icon" title="Reverse direction" onClick=${() => patch({ reverse: true })}>⇄</button>
         <span class="pair-role">end</span><strong>${b?.name}</strong>
       </div>
-      <${Editable} value=${edge.label || ''} onSave=${(label) => patch({ label })} className="label-input" placeholder="Add a label…" />
+      <${Editable} value=${edge.label || ''} onSave=${(label) => patch({ label })} className="label-input" placeholder="Add a label…" />`}
       <div class="stat-row">
-        <div class="stat" title=${st.barrier == null && st.barrierUnverified != null ? 'No TS/IRC found so far connects these two structures; this is only the highest point of the path' : 'Lowest barrier whose IRCs connect these two structures'}>
+        <div class=${`stat ${st.barrierJob ? 'linked' : ''}`} onClick=${() => st.barrierJob && openJob(st.barrierJob)}
+          title=${(st.barrier == null && st.barrierUnverified != null ? 'No TS/IRC found so far connects these two structures; this is only the highest point of the path' : 'Lowest barrier whose IRCs connect these two structures')
+            + (st.barrierJob ? '. Click for its TS, IRC and follow-ups' : '')}>
           <span class="stat-v">${st.barrier != null ? fmtKcal(st.barrier) : st.barrierUnverified != null ? `≈${fmtKcal(st.barrierUnverified)}?` : '—'}</span>
           <span class="stat-l">${st.barrier == null && st.barrierUnverified != null ? 'path max, not IRC-verified' : 'best ΔE‡ (kcal/mol)'}</span></div>
         <div class="stat"><span class="stat-v">${st.count}</span><span class="stat-l">calculations</span></div>
@@ -181,11 +207,12 @@ function EdgeDetail({ edge }) {
       ${st.warning && html`<p class="warn-box small">⚠ ${st.warning}</p>`}
       ${edge.origin?.kind === 'job' && html`<p class="small muted">From <a href="#" onClick=${(e) => { e.preventDefault(); openJob(edge.origin.job); }}>a job result</a>${edge.origin.headline ? ` · ${edge.origin.headline}` : ''}</p>`}
       <div class="segmented wide">
-        <button class=${which === 0 ? 'on' : ''} onClick=${() => setWhich(0)}>Start</button>
-        <button class=${which === 1 ? 'on' : ''} onClick=${() => setWhich(1)}>End</button>
+        <button class=${which === 0 ? 'on' : ''} onClick=${() => setWhich(0)}>${reaction ? 'Reactants' : 'Start'}</button>
+        <button class=${which === 1 ? 'on' : ''} onClick=${() => setWhich(1)}>${reaction ? 'Products' : 'End'}</button>
       </div>
       <${Viewer3D} xyz=${xyz} height=${200} />
-      <button class="btn-link danger small" onClick=${() => attempt(() => api.del(`/api/edges/${edge.id}`), 'Edge removed')}>Remove edge</button>
+      ${reaction && html`<p class="small muted">Only the molecules this reaction needs, optimized together; calculations here run on them.</p>`}
+      <button class="btn-link danger small" onClick=${() => attempt(() => api.del(`/api/edges/${edge.id}`), reaction ? 'Reaction removed' : 'Edge removed')}>${reaction ? 'Remove reaction' : 'Remove edge'}</button>
     </section>
     <${JobList} jobs=${jobs} />`;
 }
@@ -214,9 +241,10 @@ export function Inspector() {
   useEffect(() => { setCollapsed(false); setPane('run'); }, [sel]);
   const structures = useStore((s) => s.workspace.structures);
   const edges = useStore((s) => s.workspace.edges);
+  const workspace = useStore((s) => s.workspace);
   const nS = sel.structures.length, nE = sel.edges.length;
 
-  let head, body = null;
+  let head, body = null, moreCalcs = false;
   if (!nS && !nE) {
     return html`<aside class="inspector empty">
       <div class="pane-head"><h2>How it works</h2>
@@ -228,7 +256,9 @@ export function Inspector() {
           <li><b>Select</b><span>One structure to explore around it; two, or an edge, to connect them.</span></li>
           <li><b>Run a calculation</b><span>The options for your selection appear here. Results can be added back to the graph.</span></li>
         </ol>
-        <p class="small muted">Shift-click to select several. Shift-drag on the graph to box-select.</p>
+        ${Object.keys(workspace.reactions || {}).length > 0 && html`<p class="small rx-hint"><b>● Dots are reactions</b>${' '}
+          (from the nanoreactor): click one to see its species, energies, reaction complex and MD event, and to find its TS.</p>`}
+                <p class="small muted">Shift-click to select several. Shift-drag on the graph to box-select.</p>
       </div>
     </aside>`;
   }
@@ -238,6 +268,12 @@ export function Inspector() {
   } else if (nS === 2 && !nE) {
     head = 'Two structures';
     body = html`<${PairDetail} a=${structures[sel.structures[0]]} b=${structures[sel.structures[1]]} />`;
+  } else if (nE === 1 && !nS && reactionOfEdge(workspace, sel.edges[0])) {
+    head = 'Reaction';
+    const r = reactionOfEdge(workspace, sel.edges[0]);
+    body = html`<${ReactionCard} key=${r.id} r=${r} compact />
+      <button class="btn-link danger small" onClick=${() => attempt(() => api.del(`/api/edges/${r.edge}`), 'Reaction removed')}>Remove reaction</button>`;
+    moreCalcs = true;
   } else if (nE === 1 && !nS) {
     head = 'Edge';
     body = html`<${EdgeDetail} edge=${edges[sel.edges[0]]} />`;
@@ -256,6 +292,14 @@ export function Inspector() {
     </div>`;
   }
   if (sel.structures.some((id) => !structures[id]) || sel.edges.some((id) => !edges[id])) return null;
+  // Species selected: their reactions, or a new one with them, in Analyze.
+  if (nS > 0 && !nE && sel.structures.every((id) => !['ts', 'complex'].includes(structures[id]?.role))) {
+    const n = Object.values(workspace.reactions || {}).filter((r) => sel.structures.every((id) => [...r.reactants, ...r.products].includes(id))).length;
+    body = html`<div class="an-links small">
+      ${n > 0 && html`<a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ species: [...sel.structures], reaction: null }); }}>${n} reaction${n > 1 ? 's' : ''} of ${nS > 1 ? 'these' : 'this'} →</a>`}
+      <a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ compose: true, composeReactants: [...sel.structures], reaction: null }); }}>New reaction with ${nS > 1 ? 'these' : 'this'} →</a>
+    </div>${body}`;
+  }
   return html`
     <aside class=${`inspector has-selection ${collapsed ? 'collapsed' : ''}`}>
       <div class="pane-head" onClick=${() => setCollapsed(!collapsed)}>
@@ -268,7 +312,9 @@ export function Inspector() {
       </div>`}
       <div class="inspector-scroll">
         ${(!phone || pane === 'details') && body}
-        ${(!phone || pane === 'run') && html`<${ActionPanel} sel=${sel} />`}
+        ${(!phone || pane === 'run') && (moreCalcs
+          ? html`<details class="more-calcs"><summary>More calculations on this reaction's molecules</summary><${ActionPanel} sel=${sel} /></details>`
+          : html`<${ActionPanel} sel=${sel} />`)}
       </div>
     </aside>`;
 }

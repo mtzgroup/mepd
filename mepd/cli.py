@@ -1574,6 +1574,7 @@ def _tailscale_dns_name() -> Optional[str]:
 try:
     from mepd.discovery.cli import discovery_app  # noqa: E402
     import mepd.discovery.cli_expand  # noqa: E402,F401  (registers `discovery expand`)
+    import mepd.discovery.cli_nanoreactor  # noqa: E402,F401  (registers `discovery nanoreactor`)
 except ImportError:
     discovery_app = None
 

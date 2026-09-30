@@ -9,6 +9,7 @@ refetches /api/state.
 from __future__ import annotations
 
 import asyncio
+import logging
 import contextlib
 import json
 import multiprocessing
@@ -169,9 +170,22 @@ class ProfileIn(BaseModel):
     text: str
 
 
+class ProposeIn(BaseModel):
+    reactants: list[str]
+    n_break: int = Field(2, ge=0, le=3)
+    n_form: int = Field(2, ge=0, le=3)
+
+
+class ComposeIn(BaseModel):
+    reactants: list[str]
+    products: list[str] = []
+    proposal: Optional[dict] = None   # one of /api/reactions/propose's proposals, with its complex_xyz
+
+
 class DeleteIn(BaseModel):
     structures: list[str] = []
     edges: list[str] = []
+    reactions: list[str] = []
 
 
 class SessionIn(BaseModel):
@@ -265,6 +279,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if job["op"] == "design-optimize":
                 await run_in_threadpool(apply_design_optimization, manager.ws, job)
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "nanoreactor":
+                from mepd.web.nanoreactor import adopt_nanoreactor
+
+                if await run_in_threadpool(adopt_nanoreactor, manager.ws, job, final=True):
+                    manager._update(job)
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "graph-enumeration" and job["status"] == "done":
                 if await run_in_threadpool(adopt_expansion_steps, manager, job):
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
@@ -312,6 +332,20 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         """Jobs finished under an older result reader keep an outdated
         summary (e.g. a barrier from before IRC-route verification): redo
         those from the files on disk, in the background."""
+        # Nanoreactor reactions imported by an older reader lack what the reaction card shows.
+        from mepd.web.nanoreactor import adopt_nanoreactor
+
+        nano = [j for j in manager.jobs.values() if j["op"] == "nanoreactor" and j["status"] == "done"
+                and any(r.get("origin", {}).get("job") == j["id"] and "ladder" not in r
+                        for r in manager.ws.snapshot().get("reactions", {}).values())]
+        for job in nano:
+            try:
+                if adopt_nanoreactor(manager.ws, job, final=True):
+                    manager._update(job)
+            except Exception:
+                logging.getLogger(__name__).exception("could not refresh the reactions of %s", job["id"])
+        if nano:
+            bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
         stale = [j for j in manager.jobs.values()
                  if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
                      # ...or from before the edge's TS was recorded (route_ts, for VRI on edges)
@@ -1295,6 +1329,36 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def get_job(jid: str):
         return {"job": J().get(jid), "progress": J().progress_snapshot(jid)}
 
+    @app.get("/api/jobs/{jid}/route-ts", response_class=PlainTextResponse)
+    def job_route_ts(jid: str):
+        """The TS that sets a finished TS search's barrier (xyz)."""
+        J().get(jid)
+        fp = J().job_dir(jid) / "route_ts.xyz"
+        if not fp.is_file():
+            raise HTTPException(404, "this job has no verified TS")
+        return PlainTextResponse(fp.read_text())
+
+    @app.get("/api/jobs/{jid}/reactor")
+    def job_reactor(jid: str, start: int = 0):
+        """A nanoreactor job's trajectory from raw frame `start` on, and its events (live view)."""
+        from mepd.web.nanoreactor import reactor_view
+
+        job = J().get(jid)
+        if job.get("op") != "nanoreactor":
+            raise HTTPException(404, "not a nanoreactor job")
+        return reactor_view(Path(job["output_dir"]), start)
+
+    @app.get("/api/jobs/{jid}/reactor/events/{k}")
+    def job_reactor_event(jid: str, k: int):
+        """One reaction event of a nanoreactor job, at full time resolution, cut to its atoms."""
+        from mepd.web.nanoreactor import event_view
+
+        job = J().get(jid)
+        try:
+            return event_view(Path(job["output_dir"]), k)
+        except KeyError:
+            raise HTTPException(404, f"no event {k} (yet)") from None
+
     @app.get("/api/jobs/{jid}/live/{stream}")
     def get_live_stream(jid: str, stream: str):
         """One live stream in full (a finished minimization's whole replay,
@@ -1457,9 +1521,31 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return out
 
     # ------------------------------------------------------- bulk / export
+    @app.post("/api/reactions/propose")
+    async def reactions_propose(body: ProposeIn):
+        """What these species could become together (bond rules on their complex)."""
+        from mepd.web.compose import propose
+
+        return await run_in_threadpool(propose, W(), body.reactants, n_break=body.n_break, n_form=body.n_form)
+
+    @app.post("/api/reactions/compose")
+    async def reactions_compose(body: ComposeIn):
+        """A new reaction from species in the graph; its complexes (and new
+        product species) are minimized at the workspace level."""
+        from mepd.web.compose import compose
+
+        out = await run_in_threadpool(compose, W(), body.reactants, products=body.products or None,
+                                      proposal=body.proposal)
+        try:
+            queue_optimization(out["optimize"])
+        except WorkspaceError:
+            pass
+        publish_ws()
+        return out["reaction"]
+
     @app.post("/api/delete")
     def delete_many(body: DeleteIn):
-        removed = W().delete_many(body.structures, body.edges)
+        removed = W().delete_many(body.structures, body.edges, body.reactions)
         publish_ws()
         return removed
 

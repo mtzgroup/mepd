@@ -87,7 +87,7 @@ export function LevelBar() {
   const validate = useStore((s) => s.validateMinima);
   const structures = useStore((s) => s.workspace.structures);
   // TS structures (kind 'ts') are never counted: minimizing them would destroy them.
-  const off = Object.values(structures).filter((r) => ['other', 'none', 'failed'].includes(levelStatus(r, levels[levelProfile ?? '']?.key).kind));
+  const off = Object.values(structures).filter((r) => r.role !== 'complex' && ['other', 'none', 'failed'].includes(levelStatus(r, levels[levelProfile ?? '']?.key).kind));
   const busy = Object.values(structures).filter((r) => r.status === 'optimizing').length;
   const setLevel = (profile) => attempt(() => api.put('/api/level', { profile: profile || null }));
   const reopt = () => attempt(() => api.post('/api/structures/reoptimize', { structures: off.map((r) => r.id) }),
@@ -147,7 +147,9 @@ export function Library() {
   const [q, setQ] = useState('');
   const [drag, setDrag] = useState(false);
   const [adding, setAdding] = useState(false);
+  // A reaction's hidden subsystem ends (role "complex") are not library entries.
   const list = Object.values(structures)
+    .filter((r) => r.role !== 'complex')
     .filter((r) => !q || `${r.name} ${r.smiles} ${r.formula}`.toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => b.created - a.created);
 
@@ -156,14 +158,14 @@ export function Library() {
     setDrag(false);
     if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
   };
-  const empty = Object.keys(structures).length === 0;
+  const empty = !Object.values(structures).some((r) => r.role !== 'complex');
   const showAdd = adding || empty;
   // Nodes that are the same molecule (graphs from before conformers were
   // merged into one node): offer to fold them together.
   const seen = {};
   let dupes = 0;
   for (const r of Object.values(structures)) {
-    if (r.role === 'ts' || !r.smiles || r.reacted) continue;
+    if (r.role === 'ts' || r.role === 'complex' || !r.smiles || r.reacted) continue;
     const k = `${r.smiles}|${r.charge}|${r.multiplicity}`;
     if (seen[k]) dupes += 1; else seen[k] = true;
   }
@@ -173,7 +175,7 @@ export function Library() {
       onDragLeave=${(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDrag(false); }}
       onDrop=${onDrop}>
       <div class="pane-head">
-        <h2>Structures${!empty && html` <span class="count">${Object.keys(structures).length}</span>`}</h2>
+        <h2>Structures${!empty && html` <span class="count">${Object.values(structures).filter((r) => r.role !== 'complex').length}</span>`}</h2>
         ${!empty && html`<button class=${cls('btn small', !adding && 'primary')} onClick=${() => setAdding(!adding)}
           title="Add structures from SMILES or XYZ">${adding ? 'Close' : '＋ Add'}</button>`}
       </div>
@@ -181,7 +183,7 @@ export function Library() {
       ${dupes > 0 && html`<p class="level-note small">${dupes} structure${dupes > 1 ? 's are' : ' is'} the same molecule as another node.
         <button class="btn-link small" onClick=${() => attempt(() => api.post('/api/structures/merge-duplicates'), 'Merged into one node per molecule')}>Merge into conformers</button></p>`}
       ${showAdd && html`<${AddBox} onDone=${() => setAdding(false)} />`}
-      ${Object.keys(structures).length > 6 && html`
+      ${Object.values(structures).filter((r) => r.role !== 'complex').length > 6 && html`
         <input class="search" type="search" placeholder="Filter by name, SMILES or formula" value=${q} onInput=${(e) => setQ(e.target.value)} />`}
       ${empty
         ? html`<p class="empty-hint small muted">Add the reactants, products or any structure you want to explore. Each becomes a node in the graph.</p>`

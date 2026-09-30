@@ -51,6 +51,8 @@ def P(default, title: str, help: str = "", *, cli: Optional[str] = None, kind: s
     hidden in the form otherwise.
     """
     extra = {"cli": cli, "cli_kind": kind, "group": group, "advanced": advanced, "requires": requires}
+    if "labels" in kw:   # {value: what the form shows for it}
+        extra["labels"] = kw.pop("labels")
     return Field(default, title=title, description=help, json_schema_extra=extra, **kw)
 
 
@@ -489,6 +491,8 @@ class Operation:
     # needs on PATH}.
     family: Optional[dict] = None
     methods: tuple = ()
+    # target "set": every selected structure must have the same atoms (isomers).
+    same_atoms: bool = False
 
     def cli_problem(self) -> Optional[str]:
         if not self.cli_path:
@@ -529,6 +533,7 @@ class Operation:
             "schema": self.params_model.model_json_schema() if self.params_model else None,
             "family": self.family,
             "methods": [_method_view(m) for m in self.methods],
+            "same_atoms": self.same_atoms,
         }
 
     def parse_params(self, raw: Optional[dict]) -> Params:
@@ -551,8 +556,8 @@ TS_FAMILY = {"key": "ts", "title": "Transition state",
                         "sampling their conformers and atom mappings for every distinct channel."}
 
 NETWORK = {"key": "network", "title": "Reaction network expansion",
-           "summary": "Explore the reactions and minima around a structure. Pick a method; every species found "
-                      "joins Explore, joined to the one it came from."}
+           "summary": "Explore the reactions and minima around a structure (or, with the nanoreactor, among "
+                      "several). Pick a method; every species found joins Explore."}
 
 
 def _build_ts(ctx: JobContext, p: TsParams) -> list[str]:
@@ -723,6 +728,78 @@ def _build_discovery(command: str):
         return ["discovery", command, str(seed), *ctx.common_flags(), *generic_flags(p),
                 "--output", str(ctx.output_dir)]
     return build
+
+
+class NanoreactorParams(Params):
+    copies: str = P("4", "Copies of each", "Molecules of each selected structure in the reactor: one number for all, "
+                    "or by name, e.g. 'CC=O: 2, O: 6'.", kind="custom")
+    temperature: float = P(2000.0, "Temperature (K)", "Hot on purpose: reactions that take hours at room "
+                           "temperature happen within picoseconds.", cli="--temperature", gt=0)
+    time_ps: float = P(20.0, "Simulated time (ps)", cli="--time", gt=0)
+    compress: float = P(0.6, "Piston squeeze", "Narrow wall radius as a fraction of the wide one: smaller pushes "
+                        "the molecules harder together.", cli="--compress", gt=0, le=1)
+    md_method: Literal["gfn2", "gfn1", "gxtb"] = P(
+        "gfn2", "MD level", "The fast xtb method that drives the discovery MD. Every species, reaction and TS is "
+        "then refined at your level of theory.", cli="--md-method",
+        labels={"gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB", "gxtb": "g-xTB (slower)"})
+    connect: bool = P(False, "Find each reaction's TS", "Path search, TS optimization and IRC on every reaction's "
+                      "subsystem (only the molecules it needs). Or run a TS search later on any reaction you pick.",
+                      cli="--connect", kind="toggle")
+    max_connect: int = P(20, "Max TS searches", cli="--max-connect", ge=1, requires="connect")
+    period: float = P(1.0, "Piston period (ps)", cli="--period", gt=0, advanced=True, group="Reactor")
+    duty: float = P(0.75, "Time wide", "Fraction of each period at the wide radius.", cli="--duty", gt=0, le=1,
+                    advanced=True, group="Reactor")
+    radius: Optional[float] = P(None, "Wide radius (Å)", "Empty: from the number of atoms.", cli="--radius", gt=0,
+                                advanced=True, group="Reactor")
+    seed: int = P(0, "Packing seed", "Another seed packs the molecules differently: a new, independent run.",
+                  cli="--seed", advanced=True, group="Reactor")
+    min_lifetime: float = P(20.0, "Bond lifetime (fs)", "Bonds that live shorter than this are vibrations, not "
+                            "chemistry.", cli="--min-lifetime", gt=0, advanced=True, group="Events")
+    merge_window: float = P(100.0, "Merge window (fs)", "Bond changes this close in time, on shared molecules, are "
+                            "one reaction (e.g. both halves of a proton relay).", cli="--merge-window", gt=0,
+                            advanced=True, group="Events")
+    instances: int = P(3, "Occurrences refined", "Per reaction and species: more gives more chances of a clean "
+                       "optimization.", cli="--instances", ge=1, advanced=True, group="Events")
+    workers: int = P(2, "Parallel TS searches", cli="--workers", ge=1, advanced=True, group="Advanced",
+                     requires="connect")
+
+
+def _parse_copies(text: str, recs: list[dict]) -> list[int]:
+    """Copies per structure: '3' (all), '2, 6' (in selection order) or
+    'CC=O: 2, O: 6' (by name or SMILES; unnamed ones get 1)."""
+    text = str(text).strip()
+    if ":" in text:
+        counts = [1] * len(recs)
+        for item in [x for x in text.replace(";", ",").split(",") if x.strip()]:
+            name, _, n = item.rpartition(":")
+            hits = [k for k, r in enumerate(recs) if name.strip() in (r.get("name"), r.get("smiles"))]
+            if not hits or not n.strip().isdigit() or int(n) < 1:
+                raise WorkspaceError(f"copies: {item.strip()!r} names no selected structure, or its count is not "
+                                     f"a whole number >= 1")
+            for k in hits:
+                counts[k] = int(n)
+        return counts
+    parts = [p for p in text.replace(";", ",").replace(" ", ",").split(",") if p]
+    try:
+        counts = [int(p) for p in parts]
+    except ValueError:
+        raise WorkspaceError(f"copies must be whole numbers, e.g. '2, 6', or 'name: count' pairs; got {text!r}") from None
+    if len(counts) == 1:
+        counts *= len(recs)
+    if len(counts) != len(recs) or any(c < 1 for c in counts):
+        raise WorkspaceError(f"give one count (>= 1) per selected structure ({len(recs)}), one for all, or "
+                             f"'name: count' pairs; got {text!r}")
+    return counts
+
+
+def _build_nanoreactor(ctx: JobContext, p: NanoreactorParams) -> list[str]:
+    counts = _parse_copies(p.copies, ctx.structures)
+    mols = [f"{ctx.snapshot_structure(r, f'molecule_{i}')}*{n}" for i, (r, n) in enumerate(zip(ctx.structures, counts))]
+    flags = ctx.common_flags()
+    flags = flags[flags.index("--inputs"):] if "--inputs" in flags else []   # total charge below, spin from electrons
+    charge = sum(int(r["charge"]) * n for r, n in zip(ctx.structures, counts))
+    return ["discovery", "nanoreactor", *mols, "--charge", str(charge), *flags, *generic_flags(p),
+            "--output", str(ctx.output_dir)]
 
 
 class VriParams(Params):
@@ -990,9 +1067,23 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
                         "They are re-optimized at your level of theory and grown like any other species. One molecule at a "
                         "time: a cluster of several gets no products."})),
     Operation(
-        "network-splits", "All-pairs network", "Run recursive path searches between every pair of the "
-        "selected minima and assemble a reaction network. (`mepd network-splits`)",
-        "set", SET, NetworkSplitsParams, _build_network_splits, min_structures=2,
+        "nanoreactor", "Nanoreactor", "Put the selected molecules in a hot box whose wall periodically squeezes "
+        "them, and watch what reacts. Each reaction is cut out with only the molecules it needs (a water that "
+        "relays a proton is part of it; bystanders are not), refined at your level of theory, and joins Explore "
+        "as a reaction dot. (`mepd discovery nanoreactor`)",
+        "set", EXPLORE, NanoreactorParams, _build_nanoreactor, min_structures=1,
+        produces=["species", "reactions with only the molecules they need", "TSs on those subsystems"],
+        cli_path=("discovery", "nanoreactor"), cli_extra_flags=("--charge", "--inputs", "--output"),
+        family=NETWORK, methods=({
+            "label": "Nanoreactor", "rank": -1, "programs": ("xtb",), "install": "conda install -c conda-forge xtb",
+            "summary": "Hot, periodically squeezed molecular dynamics of the selected molecules (several copies, "
+                       "solvent, partners): whatever reacts becomes a reaction dot with only the molecules it needs, "
+                       "refined at your level of theory. Select several structures to put them in together."},)),
+    Operation(
+        "network-splits", "Paths between isomers", "Search a path between every pair of the selected isomers (same "
+        "atoms, same charge and spin) and join the steps it finds, with any intermediates, into one network. For "
+        "molecules with different atoms, use the Nanoreactor. (`mepd network-splits`)",
+        "set", SET, NetworkSplitsParams, _build_network_splits, min_structures=2, same_atoms=True,
         produces=["network edges", "intermediates"]),
     Operation(
         "vri", "Valley-ridge inflection", "Scan the IRC from this edge's transition state for a valley-ridge "
