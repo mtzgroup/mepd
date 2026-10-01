@@ -390,9 +390,7 @@ export function Graph() {
       seen = size;
       c.resize();
       // Structures added while another tab was showing: arrange on reveal.
-      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) {
-        (pendingArrange.current === 'tree' ? treeRef : arrangeRef).current();
-      }
+      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) arrangeRef.current();
     });
     ro.observe(host.current);
     return () => { mq.removeEventListener('change', onTheme); ro.disconnect(); c.destroy(); };
