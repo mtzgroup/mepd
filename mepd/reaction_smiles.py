@@ -113,7 +113,30 @@ def _embed(mol, seed: int):
             AllChem.UFFOptimizeMolecule(h, maxIters=500)
     except Exception:
         pass
+    _spread(h)
     return h
+
+
+def _spread(mol, gap: float = 2.6) -> None:
+    """Several molecules in one SMILES ('CC=O.O') are embedded on top of
+    each other; set them side by side along x, `gap` Angstrom apart at their
+    closest, so the geometry has the molecules' own bonds only (and is a
+    usable starting point)."""
+    Chem = _chem()
+    frags = Chem.GetMolFrags(mol)
+    if len(frags) < 2:
+        return
+    conf = mol.GetConformer()
+    pos = conf.GetPositions()
+    x_end = None
+    for idx in sorted(frags, key=len, reverse=True):
+        idx = list(idx)
+        block = pos[idx] - pos[idx].mean(axis=0)
+        if x_end is not None:
+            block[:, 0] += x_end - block[:, 0].min() + gap
+        x_end = block[:, 0].max()
+        for k, i in enumerate(idx):
+            conf.SetAtomPosition(i, block[k].tolist())
 
 
 def _kabsch(P: np.ndarray, Q: np.ndarray):

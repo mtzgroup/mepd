@@ -4,7 +4,8 @@ import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, state, useStore } from '../store.js';
-import { depictUrl, edgeStatus, edgeStatusKey, playgroundFitMargins, reactionOfEdge } from '../util.js';
+import { complexGeometries, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, playgroundFitMargins } from '../util.js';
+import { openAnalyze } from './Analyze.js';
 import { uploadFiles } from './Library.js';
 
 function css(name) {
@@ -39,20 +40,19 @@ function stylesheet() {
     { selector: 'edge:selected', style: { width: 5, 'underlay-color': css('--accent'), 'underlay-opacity': 0.25, 'underlay-padding': 5 } },
     // Reactions with any number of species (nanoreactor): a small dot joined
     // to its reactants and products by spokes; shuttles hang off it dashed.
-    { selector: 'node.rxn', style: {
-      shape: 'ellipse', width: 22, height: 22, 'background-image': 'none', 'background-color': css('--edge-idle'),
-      'border-width': 0, label: 'data(label)', 'font-size': 10, 'font-family': css('--font-mono'), color: css('--text'),
-      'text-valign': 'bottom', 'text-margin-y': 4, 'text-wrap': 'none',
+    // Reactions: a complex (several molecules together) is a small circle joined
+    // to its molecules; a reaction is an edge between two complexes (a one-molecule
+    // complex is that molecule's node), carrying the TS search like any edge.
+    { selector: 'node.cx', style: {
+      shape: 'ellipse', width: 30, height: 30, 'background-image': 'none', 'background-color': css('--panel'),
+      'border-width': 2.5, 'border-color': css('--accent'), label: 'data(label)', 'text-valign': 'center',
+      'text-margin-y': 0, 'font-size': 12, 'font-weight': 600, color: css('--accent'), 'text-background-opacity': 0,
     } },
-    { selector: 'node.rxn[status = "done"]', style: { 'background-color': css('--ok') } },
-    { selector: 'node.rxn[status = "running"]', style: { 'background-color': css('--accent') } },
-    { selector: 'node.rxn[status = "queued"]', style: { 'background-color': css('--warn') } },
-    { selector: 'node.rxn[status = "failed"]', style: { 'background-color': css('--danger') } },
-    { selector: 'node.rxn:selected', style: { 'border-width': 3, 'border-color': css('--accent') } },
-    { selector: 'edge.spoke', style: { 'line-style': 'solid', width: 1.5, 'target-arrow-shape': 'none', label: 'data(label)',
-      'curve-style': 'bezier' } },
-    { selector: 'edge.spoke.out', style: { 'target-arrow-shape': 'triangle', 'arrow-scale': 0.9 } },
-    { selector: 'edge.spoke.shuttle', style: { 'line-style': 'dashed', 'line-dash-pattern': [3, 3], opacity: 0.8 } },
+    { selector: 'node.cx:selected', style: { 'border-width': 3, 'border-color': css('--accent') } },
+    { selector: 'edge.member', style: { width: 1.2, 'line-style': 'solid', 'line-color': css('--border-strong'),
+      'target-arrow-shape': 'none', 'curve-style': 'straight', label: 'data(label)', opacity: 0.8 } },
+    { selector: 'edge.rxn-edge.no-ts', style: { 'line-style': 'dotted', 'line-color': css('--edge-idle'),
+      'target-arrow-color': css('--edge-idle'), opacity: 0.8 } },
     // A node being pointed at from the list (Library double-click): pulses a few times.
     { selector: 'node.flash', style: { 'underlay-color': css('--accent'), 'underlay-opacity': 0.35, 'underlay-padding': 16,
       'underlay-shape': 'round-rectangle', 'border-width': 3, 'border-color': css('--accent') } },
@@ -123,30 +123,44 @@ function spawnSpot(c, parent, taken) {
 
 const HARTREE_KCAL = 627.509;
 
-// Reactions (workspace.reactions) as graph elements: the dot, and one spoke
-// per distinct species (coefficient as its label; shuttles once, dashed).
-function reactionElements(r, structures, edges, jobs) {
-  const count = (ids) => ids.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
-  const shut = count(r.shuttles || []);
-  const inn = count(r.reactants), out = count(r.products);
-  const edge = r.edge ? edges[r.edge] : null;
-  const st = edge ? edgeStatus(edge, jobs) : { status: 'idle' };
-  const status = st.status === 'proposed' ? 'idle' : st.status;
-  let label = '';
-  if (st.barrier != null) label = `${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`;
-  else if (st.status === 'running') label = 'running…';
-  else if (r.delta_e_kcal != null) label = `ΔE ${r.delta_e_kcal >= 0 ? '+' : ''}${r.delta_e_kcal.toFixed(1)}`;
-  const els = [{ group: 'nodes', classes: 'rxn', data: { id: r.id, label, status, rxn: 1 } }];
-  const spoke = (sid, n, kind) => {
-    if (!structures[sid]) return;
-    els.push({ group: 'edges', classes: `spoke ${kind}`, data: {
-      id: `${r.id}|${kind}|${sid}`, rxn: r.id, status, label: n > 1 ? String(n) : '',
-      source: kind === 'out' ? r.id : sid, target: kind === 'out' ? sid : r.id } });
-  };
-  for (const [sid, n] of Object.entries(inn)) if (n - (shut[sid] || 0) > 0) spoke(sid, n - (shut[sid] || 0), 'in');
-  for (const [sid, n] of Object.entries(out)) if (n - (shut[sid] || 0) > 0) spoke(sid, n - (shut[sid] || 0), 'out');
-  for (const [sid, n] of Object.entries(shut)) spoke(sid, n, 'shuttle');
-  return els;
+// Reactions (workspace.reactions) as complexes and reaction edges. A side
+// with several molecules is one complex node per composition (shared by every
+// reaction from or to that mixture), joined to its molecules by member lines;
+// a one-molecule side is that molecule's own node. The reaction edge is the
+// workspace edge between the reaction's subsystem ends (so TS searches, status
+// and selection are an edge's), or a dotted stand-in when it has none.
+const complexId = (ids) => (ids.length === 1 ? ids[0] : `cx:${[...ids].sort().join('+')}`);
+
+function reactionGraph(workspace, jobs) {
+  const { structures, edges } = workspace;
+  const complexes = {}, rxEdges = [];
+  for (const r of Object.values(workspace.reactions || {})) {
+    if (![...r.reactants, ...r.products].every((id) => structures[id])) continue;
+    const ends = [r.reactants, r.products].map((ids) => {
+      const id = complexId(ids);
+      if (ids.length > 1 && !complexes[id]) complexes[id] = { id, members: [...ids] };
+      return id;
+    });
+    if (ends[0] === ends[1]) continue;
+    const edge = r.edge ? edges[r.edge] : null;
+    const st = edge ? edgeStatus(edge, jobs) : { status: 'none' };
+    let label = '';
+    if (st.barrier != null) label = `${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`;
+    else if (st.barrierUnverified != null) label = `≈${st.barrierUnverified.toFixed(1)}?`;
+    else if (st.status === 'running') label = 'running…';
+    else if (r.delta_e_kcal != null) label = `ΔE ${r.delta_e_kcal >= 0 ? '+' : ''}${r.delta_e_kcal.toFixed(1)}`;
+    rxEdges.push({ group: 'edges', classes: `rxn-edge${edge ? '' : ' no-ts'}`,
+      data: { id: edge ? edge.id : `rx:${r.id}`, source: ends[0], target: ends[1], status: st.status, label, rxn: r.id } });
+  }
+  const members = [];
+  for (const cx of Object.values(complexes)) {
+    const n = cx.members.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
+    for (const [sid, k] of Object.entries(n)) {
+      members.push({ group: 'edges', classes: 'member', data: { id: `${cx.id}|${sid}`, source: cx.id, target: sid,
+        label: k > 1 ? `×${k}` : '', member: 1 } });
+    }
+  }
+  return { complexes: Object.values(complexes), rxEdges, members };
 }
 
 // A reaction's subsystem ends are hidden structures; their edge is the
@@ -215,9 +229,12 @@ function computeView(workspace, view, collapsed, selected, focusIds, cyc) {
   }
   for (const s of Object.values(structures)) if (selected.has(s.id)) hide.delete(s.id);
   for (const r of Object.values(workspace.reactions || {})) {
-    const ids = [...r.reactants, ...r.products];
-    if (ids.some((id) => hide.has(id))) hide.add(r.id);
-    else if (ids.every((id) => dim.has(id))) dim.add(r.id);
+    for (const ids of [r.reactants, r.products]) {
+      if (ids.length < 2) continue;
+      const cid = complexId(ids);
+      if (ids.some((id) => hide.has(id))) hide.add(cid);
+      else if (ids.every((id) => dim.has(id))) dim.add(cid);
+    }
   }
   for (const e of Object.values(edges)) {
     const st = edgeStatus(e, state.jobs).status;
@@ -349,26 +366,32 @@ export function Graph() {
         }
         return;
       }
-      const rid = evt.target.data('rxn') ? (evt.target.isNode() ? id : evt.target.data('rxn')) : null;
-      if (rid) {
-        const r = state.workspace.reactions?.[rid];
-        if (r?.edge && state.workspace.edges[r.edge]) select({ edges: [r.edge] }, additive);
-        else if (r) select({ structures: [...new Set([...r.reactants, ...r.products])] }, additive);
+      if (evt.target.data('cx')) {          // a complex: its geometry (else, if it has none, its molecules)
+        const g = complexGeometries(state.workspace, id)[0];
+        select({ structures: g ? [g.sid] : [...new Set(evt.target.data('members'))] }, additive);
+        return;
+      }
+      if (evt.target.data('member')) {      // a member line: that molecule
+        select({ structures: [evt.target.data('target')] }, additive);
+        return;
+      }
+      if (id.startsWith('rx:')) {           // a reaction without TS endpoints: open its card
+        const r = state.workspace.reactions?.[evt.target.data('rxn')];
+        if (r) openAnalyze({ reaction: r.id });
         return;
       }
       if (evt.target.isNode()) select({ structures: [id] }, additive);
       else select({ edges: [id] }, additive);
     });
+    c.on('dbltap', 'edge', (evt) => {
+      // A reaction (or any) edge: open the calculation behind its barrier.
+      const edge = state.workspace.edges[evt.target.id()];
+      const job = edge && edgeStatus(edge, state.jobs).barrierJob;
+      if (job) openJob(job);
+    });
     c.on('dbltap', 'node', (evt) => {
       const id = evt.target.id();
-      if (evt.target.data('rxn')) {
-        // A reaction's dot: open the calculation behind its barrier.
-        const r = state.workspace.reactions?.[id];
-        const edge = r?.edge && state.workspace.edges[r.edge];
-        const job = edge && edgeStatus(edge, state.jobs).barrierJob;
-        if (job) openJob(job);
-        return;
-      }
+      if (evt.target.data('cx')) return;
       const kids = childrenOf(state.workspace.structures);
       const cur = collapsedRef.current;
       if (cur.includes(id)) setCollapsedRef.current(cur.filter((x) => x !== id));
@@ -377,7 +400,7 @@ export function Graph() {
     c.on('boxend', () => {
       // Box selection: take whatever cytoscape selected, in any order.
       setTimeout(() => {
-        const nodes = c.nodes(':selected').filter((n) => !n.data('rxn')).map((n) => n.id());
+        const nodes = c.nodes(':selected').filter((n) => !n.data('cx')).map((n) => n.id());
         const edges = nodes.length ? [] : c.edges(':selected').map((e) => e.id());
         select({ structures: nodes, edges });
       }, 0);
@@ -449,30 +472,32 @@ export function Graph() {
           if (cur.data('status') !== data.status || cur.data('label') !== data.label) cur.data(data);
         } else c.add({ group: 'edges', data });
       }
-      for (const r of Object.values(workspace.reactions || {})) {
-        const els = reactionElements(r, structures, edges, state.jobs);
-        const species = [...new Set([...r.reactants, ...r.products])].map((id) => c.getElementById(id)).filter((n) => n.nonempty());
-        for (const el of els) {
-          ids.add(el.data.id);
-          const cur = c.getElementById(el.data.id);
-          if (cur.nonempty()) {
-            if (cur.data('label') !== el.data.label || cur.data('status') !== el.data.status) cur.data(el.data);
-            continue;
-          }
-          if (el.group === 'nodes') {
-            // A new dot: its saved spot, else between its species (a little off
-            // the straight line, so parallel reactions between two species part).
-            let p = positions[r.id];
-            if (!p && species.length) {
-              const mx = species.reduce((a, n) => a + n.position('x'), 0) / species.length;
-              const my = species.reduce((a, n) => a + n.position('y'), 0) / species.length;
-              const k = Object.values(workspace.reactions).filter((o) => o.created < r.created
-                && [...o.reactants, ...o.products].some((id) => r.reactants.includes(id) || r.products.includes(id))).length;
-              p = { x: mx + (k % 2 ? 1 : -1) * 26 * Math.ceil(k / 2), y: my + 34 * (k % 2 ? 1 : -1) * Math.ceil(k / 2) };
-            }
-            c.add({ ...el, position: { ...(p || { x: 0, y: 0 }) } });
-          } else c.add(el);
+      const rg = reactionGraph(workspace, state.jobs);
+      for (const cx of rg.complexes) {
+        ids.add(cx.id);
+        const label = cx.members.map((m) => structures[m]?.name || '?').join(' + ');
+        if (c.getElementById(cx.id).nonempty()) continue;
+        // A new complex: its saved spot, else among its molecules (pulled a little
+        // toward the side, so complexes of the same molecules do not stack).
+        let p = positions[cx.id];
+        if (!p) {
+          const ms = [...new Set(cx.members)].map((m) => c.getElementById(m)).filter((n) => n.nonempty());
+          const mx = ms.reduce((acc, n) => acc + n.position('x'), 0) / Math.max(1, ms.length);
+          const my = ms.reduce((acc, n) => acc + n.position('y'), 0) / Math.max(1, ms.length);
+          const h = [...cx.id].reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) % 997, 7);
+          p = { x: mx + ((h % 7) - 3) * 18, y: my + 50 + ((h % 5) - 2) * 14 };
         }
+        c.add({ group: 'nodes', classes: 'cx', data: { id: cx.id, cx: 1, members: cx.members, label: String(cx.members.length),
+          title: label }, position: p });
+      }
+      for (const el of [...rg.members, ...rg.rxEdges]) {
+        ids.add(el.data.id);
+        const cur = c.getElementById(el.data.id);
+        if (cur.nonempty() && (cur.data('source') !== el.data.source || cur.data('target') !== el.data.target)) cur.remove();
+        const now = c.getElementById(el.data.id);
+        if (now.nonempty()) {
+          if (now.data('label') !== el.data.label || now.data('status') !== el.data.status) now.data(el.data);
+        } else c.add(el);
       }
       c.elements().forEach((el) => { if (!ids.has(el.id())) el.remove(); });
     });
@@ -554,10 +579,12 @@ export function Graph() {
     c.batch(() => {
       c.elements().unselect();
       for (const id of [...selection.structures, ...selection.edges]) c.getElementById(id).select();
-      for (const eid of selection.edges) {
-        const r = reactionOfEdge(state.workspace, eid);
-        if (r) c.getElementById(r.id).select();
+      for (const sid of selection.structures) {     // a complex's geometry: its circle
+        if (state.workspace.structures[sid]?.role !== 'complex') continue;
+        const cx = complexOfStructure(state.workspace, sid);
+        if (cx) c.getElementById(cx.key).select();
       }
+
     });
   }, [selection]);
 
@@ -604,7 +631,9 @@ export function Graph() {
     c.elements().filter((el) => !el.hasClass('vhidden')).layout({
       name: 'cose', animate: true, animationDuration: 400, fit: false, randomize: false,
       nodeDimensionsIncludeLabels: true, nodeRepulsion: () => 400000, nodeOverlap: 40,
-      idealEdgeLength: () => 180, componentSpacing: 120, padding: 40,
+      // A complex sits next to its molecules; reactions get room.
+      idealEdgeLength: (e) => (e.data('member') ? 60 : 200), edgeElasticity: (e) => (e.data('member') ? 200 : 100),
+      componentSpacing: 120, padding: 40,
     })
       .on('layoutstop', () => {
         arranging.current = false;
@@ -613,6 +642,79 @@ export function Graph() {
       }).run();
   };
   arrangeRef.current = layout;
+
+  // Rows: species lined up by how they arise -- the starting materials on top,
+  // then what forms from them in one reaction, two, ...; within a row the
+  // largest molecules first. Complexes sit between the rows of their molecules.
+  const rowsLayout = () => {
+    const c = cy.current;
+    if (!c) return;
+    const ws = state.workspace;
+    const nodes = c.nodes().filter((n) => !n.data('cx') && !n.hasClass('vhidden'));
+    const ids = nodes.map((n) => n.id());
+    const have = new Set(ids);
+    const steps = [
+      ...Object.values(ws.reactions || {}).map((r) => [r.reactants, r.products]),
+      ...Object.values(ws.edges).filter((e) => have.has(e.source) && have.has(e.target)).map((e) => [[e.source], [e.target]]),
+    ].filter(([a, b]) => [...a, ...b].every((id) => have.has(id)));
+    const inputs = new Set(Object.values(state.jobs).filter((j) => j.op === 'nanoreactor').flatMap((j) => j.targets.structures));
+    let start = ids.filter((id) => inputs.has(id) || !['job', 'composed'].includes(ws.structures[id]?.origin?.kind));
+    if (!start.length) {
+      const made = new Set(steps.flatMap(([, b]) => b));
+      start = ids.filter((id) => !made.has(id));
+    }
+    const gen = Object.fromEntries(start.map((id) => [id, 0]));
+    // Forward first (as the reactions were seen); then backward, to reach the rest.
+    for (const dir of [0, 1]) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const st of steps) {
+          const [from, to] = dir ? [st[1], st[0]] : st;
+          if (!from.every((id) => id in gen)) continue;
+          const g = Math.max(...from.map((id) => gen[id])) + 1;
+          for (const id of to) if (!(id in gen)) { gen[id] = g; changed = true; }
+        }
+      }
+    }
+    const last = Math.max(0, ...Object.values(gen)) + 1;
+    const heavy = (id) => (ws.structures[id]?.formula || '').replace(/H\d*/g, '').match(/[A-Z][a-z]?\d*/g)?.reduce(
+      (n, t) => n + (parseInt(t.replace(/[A-Za-z]/g, ''), 10) || 1), 0) || 0;
+    // The starting materials on one row; everything made below, in a wide grid
+    // read left to right, top to bottom: fewest steps first, then largest first.
+    const byStep = (a, b) => (gen[a] ?? last) - (gen[b] ?? last) || heavy(b) - heavy(a)
+      || (ws.structures[a]?.name || '').localeCompare(ws.structures[b]?.name || '');
+    const first = ids.filter((id) => gen[id] === 0).sort(byStep);
+    const made = ids.filter((id) => gen[id] !== 0).sort(byStep);
+    const WRAP = Math.max(6, Math.min(12, Math.ceil(Math.sqrt(ids.length) * 1.6)));
+    const DX = 170, DY = 230;
+    const pos = {};
+    const rowsOut = [];
+    for (let k = 0; k < first.length; k += WRAP) rowsOut.push(first.slice(k, k + WRAP));
+    for (let k = 0; k < made.length; k += WRAP) rowsOut.push(made.slice(k, k + WRAP));
+    rowsOut.forEach((row, r) => row.forEach((id, i) => {
+      pos[id] = { x: (i - (row.length - 1) / 2) * DX, y: r * DY + (r >= Math.ceil(first.length / WRAP) ? 60 : 0) };
+    }));
+    const SUB = 0;
+    const taken = [];
+    c.nodes('.cx').forEach((n) => {
+      const ms = [...new Set(n.data('members'))].filter((m) => pos[m]);
+      if (!ms.length) return;
+      let x = ms.reduce((a, m) => a + pos[m].x, 0) / ms.length;
+      const yy = Math.max(...ms.map((m) => pos[m].y)) + DY / 2 + 10;
+      while (taken.some((q) => Math.abs(q.x - x) < 44 && Math.abs(q.y - yy) < 30)) x += 46;
+      taken.push({ x, y: yy });
+      pos[n.id()] = { x, y: yy };
+    });
+    arranging.current = true;
+    c.nodes().filter((n) => pos[n.id()]).layout({
+      name: 'preset', positions: (n) => pos[n.id()], animate: true, animationDuration: 450, fit: false,
+    }).on('layoutstop', () => {
+      arranging.current = false;
+      if (state.layout === 'playground') fitInto(c, playgroundFitMargins()); else fitCapped(c);
+      savePositions(c);
+    }).run();
+  };
 
   // Commands from outside the graph (the playground layout's bottom dock):
   // 'arrange', 'select-all', or {cmd: 'fit', margins: {l, t, r, b}} to fit
@@ -624,7 +726,7 @@ export function Graph() {
       const d = typeof e.detail === 'string' ? { cmd: e.detail } : (e.detail || {});
       if (d.cmd === 'arrange') arrangeRef.current();
       else if (d.cmd === 'fit') (d.margins ? fitInto(c, d.margins) : fitCapped(c));
-      else if (d.cmd === 'select-all') select({ structures: c.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('rxn')).map((n) => n.id()) });
+      else if (d.cmd === 'select-all') select({ structures: c.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('cx')).map((n) => n.id()) });
       else if (d.cmd === 'view') setPanelRef.current((x) => !x);
       else if (d.cmd === 'restyle') c.style(stylesheet());          // colours come from CSS variables
       else if (d.cmd === 'center' && d.id) {
@@ -667,8 +769,10 @@ export function Graph() {
           title="Click a start structure, then an end structure, to draw an edge (C)">
           ${connectMode ? 'Connecting… Esc to stop' : '＋ Connect'}</button>
         <button class="btn small ghost" onClick=${layout} title="Auto-arrange the graph">Arrange</button>
+        <button class="btn small ghost" onClick=${rowsLayout}
+          title="Line species up: what you started from on top, then what each reaction step makes; complexes between">Rows</button>
         <button class="btn small ghost" onClick=${() => fitCapped(cy.current)} title="Fit everything in view">Fit</button>
-        <button class="btn small ghost" onClick=${() => select({ structures: cy.current.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('rxn')).map((n) => n.id()) })}
+        <button class="btn small ghost" onClick=${() => select({ structures: cy.current.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('cx')).map((n) => n.id()) })}
           title="Select every structure shown (then delete, download, or run one calculation on all)">Select all</button>
         <button class=${`btn small ${panel ? 'primary' : 'ghost'}`} onClick=${() => setPanel(!panel)}
           title="Filter what the graph shows, and fold branches away">View${counts.shown < counts.total ? ` · ${counts.shown}/${counts.total}` : ''}</button>

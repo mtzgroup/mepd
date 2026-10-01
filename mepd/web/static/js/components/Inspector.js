@@ -2,7 +2,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
-import { PHONE_QUERY, STATUS_LABEL, conformerLabel, conformerRows, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus, reactionOfEdge } from '../util.js';
+import { PHONE_QUERY, STATUS_LABEL, complexGeometries, complexOfStructure, conformerLabel, conformerRows, depictUrl, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus, reactionOfEdge } from '../util.js';
 
 export { conformerLabel, conformerRows };
 import { ActionPanel } from './Actions.js';
@@ -68,6 +68,47 @@ function Editable({ value, onSave, className = '', placeholder = '' }) {
   useEffect(() => setV(value), [value]);
   return html`<input class=${`editable ${className}`} value=${v} placeholder=${placeholder} onInput=${(e) => setV(e.target.value)}
     onBlur=${() => v !== value && onSave(v)} onKeyDown=${(e) => e.key === 'Enter' && e.target.blur()} />`;
+}
+
+// A complex: several molecules together, as optimized for a reaction. One
+// composition can have several geometries (one per reaction side).
+function ComplexDetail({ rec }) {
+  const workspace = useStore((s) => s.workspace);
+  const cx = complexOfStructure(workspace, rec.id);
+  const xyz = useXyz(rec.id, null, rec.conformer);
+  const [labels, setLabels] = useState(false);
+  if (!cx) return html`<p class="small muted">This complex no longer belongs to a reaction.</p>`;
+  const geos = complexGeometries(workspace, cx.key);
+  const count = cx.members.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
+  const reactions = Object.values(workspace.reactions || {}).filter((r) => [r.reactants, r.products].some(
+    (ids) => ids.length > 1 && [...ids].sort().join('+') === [...cx.members].sort().join('+')));
+  const name = (id) => workspace.structures[id]?.name || '?';
+  return html`<section>
+    <div class="rc-eq">${Object.entries(count).map(([id, n], i) => html`${i ? html`<span class="rc-op">+</span>` : ''}
+      <button class="rc-tile" title=${`${name(id)}: select it`} onClick=${() => select({ structures: [id] })}>
+        ${workspace.structures[id]?.smiles && html`<img src=${depictUrl(workspace.structures[id].smiles, 120, 90)} alt="" />`}
+        <span class="rc-name">${n > 1 ? `${n} × ` : ''}${name(id)}</span></button>`)}</div>
+    <${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />
+    <div class="viewer-tools">
+      <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
+      <a class="small" href=${`/api/structures/${rec.id}/xyz`} download=${`complex-${rec.formula}.xyz`}>Download xyz</a>
+    </div>
+    ${geos.length > 1 && html`<label class="field"><span class="field-label">Geometry (${geos.length}: one per reaction that has this complex)</span>
+      <select value=${rec.id} onChange=${(e) => select({ structures: [e.target.value] })}>
+        ${geos.map((g) => html`<option value=${g.sid}>${g.reaction.label} (${g.side})${workspace.structures[g.sid]?.energy != null ? ` · ${workspace.structures[g.sid].energy.toFixed(5)} Eh` : ''}</option>`)}
+      </select></label>`}
+    <dl class="props">
+      <dt>Formula</dt><dd>${rec.formula} (${rec.natoms} atoms)</dd>
+      <dt>Charge / spin</dt><dd>${rec.charge} / ${rec.multiplicity}</dd>
+      <dt>Level</dt><dd><${LevelChip} rec=${rec} /></dd>
+      ${rec.energy != null && html`<dt>Energy</dt><dd class="mono">${rec.energy.toFixed(6)} Eh</dd>`}
+    </dl>
+    <div class="row-actions">
+      <button class="btn" onClick=${() => attempt(() => api.post('/api/design/load', { structure: rec.id }), 'Loaded into Design').then((d) => d && openTab('design'))}>Edit in Design</button>
+    </div>
+    <div class="section-title">Reactions (${reactions.length})</div>
+    <ul class="sel-list">${reactions.map((r) => html`<li><a href="#" onClick=${(e) => { e.preventDefault(); if (r.edge) select({ edges: [r.edge] }); else openAnalyze({ reaction: r.id }); }}>${r.label}</a></li>`)}</ul>
+  </section>`;
 }
 
 function StructureDetail({ rec }) {
@@ -256,13 +297,18 @@ export function Inspector() {
           <li><b>Select</b><span>One structure to explore around it; two, or an edge, to connect them.</span></li>
           <li><b>Run a calculation</b><span>The options for your selection appear here. Results can be added back to the graph.</span></li>
         </ol>
-        ${Object.keys(workspace.reactions || {}).length > 0 && html`<p class="small rx-hint"><b>● Dots are reactions</b>${' '}
-          (from the nanoreactor): click one to see its species, energies, reaction complex and MD event, and to find its TS.</p>`}
+        ${Object.keys(workspace.reactions || {}).length > 0 && html`<p class="small rx-hint"><b>○ Circles are complexes</b>${' '}
+          (several molecules together), joined to their molecules. A reaction is the edge between two complexes (or two molecules):
+          click it for its species, energies, complexes and MD event, and to find its TS.</p>`}
                 <p class="small muted">Shift-click to select several. Shift-drag on the graph to box-select.</p>
       </div>
     </aside>`;
   }
-  if (nS === 1 && !nE) {
+  if (nS === 1 && !nE && structures[sel.structures[0]]?.role === 'complex') {
+    head = 'Complex';
+    body = html`<${ComplexDetail} rec=${structures[sel.structures[0]]} />`;
+    moreCalcs = true;
+  } else if (nS === 1 && !nE) {
     head = 'Structure';
     body = html`<${StructureDetail} rec=${structures[sel.structures[0]]} />`;
   } else if (nS === 2 && !nE) {
@@ -313,7 +359,7 @@ export function Inspector() {
       <div class="inspector-scroll">
         ${(!phone || pane === 'details') && body}
         ${(!phone || pane === 'run') && (moreCalcs
-          ? html`<details class="more-calcs"><summary>More calculations on this reaction's molecules</summary><${ActionPanel} sel=${sel} /></details>`
+          ? html`<details class="more-calcs"><summary>More calculations on ${nE ? "this reaction's molecules" : 'this complex'}</summary><${ActionPanel} sel=${sel} /></details>`
           : html`<${ActionPanel} sel=${sel} />`)}
       </div>
     </aside>`;

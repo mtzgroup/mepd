@@ -71,6 +71,37 @@ export function edgeStatus(edge, jobs = state.jobs) {
   return { status, barrier, barrierUnverified, barrierJob, count: related.length, warning };
 }
 
+// Complexes: a composition (several molecules together) is one graph node,
+// 'cx:<sorted structure ids>'; its geometries are the hidden 'complex'
+// structures of the reactions that start or end with that composition.
+export const complexKey = (ids) => `cx:${[...ids].sort().join('+')}`;
+
+export function complexGeometries(workspace, key) {
+  const out = [];
+  for (const r of Object.values(workspace.reactions || {})) {
+    [r.reactants, r.products].forEach((ids, side) => {
+      const sid = (r.complexes || [])[side];
+      if (ids.length > 1 && complexKey(ids) === key && sid && workspace.structures[sid]) {
+        out.push({ sid, reaction: r, side: side ? 'products' : 'reactants', members: ids });
+      }
+    });
+  }
+  const e = (g) => workspace.structures[g.sid]?.energy ?? Infinity;
+  return out.sort((a, b) => e(a) - e(b));
+}
+
+// The complex node (composition) a hidden complex structure belongs to.
+export function complexOfStructure(workspace, sid) {
+  for (const r of Object.values(workspace.reactions || {})) {
+    const k = (r.complexes || []).indexOf(sid);
+    if (k >= 0) {
+      const ids = k ? r.products : r.reactants;
+      return { key: ids.length > 1 ? complexKey(ids) : ids[0], members: ids, reaction: r };
+    }
+  }
+  return null;
+}
+
 // The reaction (nanoreactor) whose subsystem this edge joins, if any.
 export function reactionOfEdge(workspace, eid) {
   return Object.values(workspace.reactions || {}).find((r) => r.edge === eid) || null;

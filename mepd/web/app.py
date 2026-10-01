@@ -612,7 +612,23 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if demo is not None:
             demo.check_structures(len(W().snapshot()["structures"]), [len(s.symbols) for s, _ in todo])
         out, start, label = [], None, ""
-        for s, kw in todo:
+        skip = set()
+        for k, (s, kw) in enumerate(todo):
+            # A reaction with several molecules on a side: its molecules as species,
+            # the two ends as the reaction's complexes (see compose.reaction_from_endpoints).
+            if kw.get("_edge") == "start" and k + 1 < len(todo) and todo[k + 1][1].get("_edge") == "end":
+                from mepd.web.compose import reaction_from_endpoints
+
+                made = reaction_from_endpoints(W(), s, todo[k + 1][0], origin=kw["origin"], label=kw.get("_label") or "")
+                if made is not None:
+                    for res in made["added"]:
+                        out.append({**res["rec"], "merged": res["merged"], "duplicate": res["duplicate"],
+                                    "added_conformer": res["conformer"]})
+                    out[-1]["edge"], out[-1]["reaction"] = made["edge"], made["reaction"]["id"]
+                    skip.update({k, k + 1})
+        for k, (s, kw) in enumerate(todo):
+            if k in skip:
+                continue
             role = kw.pop("_edge", None)
             label = kw.pop("_label", label)
             added = W().add_or_merge(s, **kw)
@@ -1017,6 +1033,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     out["ts"] = (r["added"] + r["reused"])[0]
                 if group["kind"] == "irc" and group["entries"]:
                     e = group["entries"][0]
+                    from mepd.web.compose import reaction_from_endpoints
+
+                    ends = [chem.structures_from_xyz_text(e["frames"][k]["xyz"], job.get("charge"), job.get("multiplicity"))[0]
+                            for k in (0, len(e["frames"]) - 1)]
+                    made = reaction_from_endpoints(
+                        W(), ends[0], ends[1], origin={"kind": "design", "label": "Design TS"},
+                        energies=(e["frames"][0].get("energy_hartree"), e["frames"][-1].get("energy_hartree")),
+                        level=job.get("level"), ts={"job": job["id"], "entry": e["id"], "barrier_kcal": e.get("barrier_kcal")})
+                    if made is not None:   # the catalyst/solvent the design added: a reaction between complexes
+                        out["edge"], out["reaction"] = made["edge"], made["reaction"]["id"]
+                        continue
                     r = _import_picks(job, group, e, [0, len(e["frames"]) - 1], connect=True)
                     out["edge"] = r["edge"]
                     out["added"] += r["added"]
@@ -1061,10 +1088,20 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if not rx.get("balanced", True):
             raise WorkspaceError("the reactant and the product no longer have the same atoms (an edit was made on one "
                                  "side only): make them match before adding the reaction")
-        ends = []
-        for mb, smiles in ((d["molblock"], d.get("smiles")), (_product_in_reactant_order(d), rx["product"].get("smiles"))):
+        geoms = []
+        for mb in (d["molblock"], _product_in_reactant_order(d)):
             (s,) = chem.structures_from_xyz_text(design.to_xyz(mb, d["charge"], d["multiplicity"]),
                                                   d["charge"], d["multiplicity"])
+            geoms.append(s)
+        # Several molecules on a side: its molecules as species, the two ends as the reaction's complexes.
+        from mepd.web.compose import reaction_from_endpoints
+
+        made = reaction_from_endpoints(W(), geoms[0], geoms[1], label=d.get("name") or "",
+                                       origin={"kind": "design", "label": "Design (reaction)", "source": d.get("source")})
+        if made is not None:
+            return {"reaction": made["reaction"]["id"], "edge": made["edge"], "species": made["species"]}
+        ends = []
+        for s, smiles in zip(geoms, (d.get("smiles"), rx["product"].get("smiles"))):
             ends.append(W().add_or_merge(s, name=smiles, smiles=None, role="minimum",
                                          origin={"kind": "design", "label": "Design (reaction)", "source": d.get("source")}))
         (a, b), ws = ends, W()

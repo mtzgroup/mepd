@@ -157,3 +157,46 @@ def compose(ws: Workspace, reactants: list[str], *, products: Optional[list[str]
                           reverse_count=0, delta_e_kcal=None, complexes=sids, edge=edge["id"], events=[],
                           composed=time.time())
     return {"reaction": rec, "optimize": to_optimize}
+
+
+def reaction_from_endpoints(ws: Workspace, start, end, *, origin: dict, energies=(None, None),
+                            level: Optional[dict] = None, label: str = "", ts: Optional[dict] = None) -> Optional[dict]:
+    """Two endpoint geometries (same atoms, same order) as a reaction in the
+    uniform model -- if either holds more than one molecule: each end split
+    into its molecules (species nodes, merged with known ones), the exact
+    endpoint geometries kept as the reaction's two complexes, joined by the
+    reaction edge (where TS searches run). `ts` ({job, entry, barrier_kcal})
+    puts a TS already found on that edge. Returns None for a one-molecule to
+    one-molecule reaction (a plain edge between the two species is that
+    reaction already)."""
+    from mepd.web.nanoreactor import _label_of
+
+    sides = [_fragments(start), _fragments(end)]
+    if len(sides[0]) < 2 and len(sides[1]) < 2:
+        return None
+    ids, added = [], []
+    for frags in sides:
+        side = []
+        for f in frags:
+            res = ws.add_or_merge(f, optimized=False, origin={**origin, "label": f"{origin.get('label', 'reaction')} (molecule)"})
+            added.append(res)
+            side.append(res["rec"]["id"])
+        ids.append(side)
+    if sorted(ids[0]) == sorted(ids[1]):
+        raise WorkspaceError("both sides are the same molecules, so there is no reaction to search")
+    names = {sid: ws.structure(sid)["name"] for sid in ids[0] + ids[1]}
+    text = label or _label_of(ids[0], ids[1], names)
+    cx = []
+    for side, s, e in (("reactant", start, energies[0]), ("product", end, energies[1])):
+        cx.append(ws.add_structure(s, name=f"{text} [{side}s]", smiles=chem.perceive_smiles(s), energy=e,
+                                   optimized=e is not None, level=level if e is not None else None, role="complex",
+                                   merge=False, origin={**origin, "label": f"{origin.get('label', 'reaction')} {side}s"})["id"])
+    edge_origin = {**origin, "proposed": ts is None, "headline": "run a TS search on this reaction"}
+    if ts is not None:
+        edge_origin = {"kind": "job", "job": ts.get("job"), "entry": ts.get("entry"), "group": "irc", "has_ts": True,
+                       "barrier_kcal": ts.get("barrier_kcal"), "headline": "TS + IRC from Design"}
+    edge = ws.add_edge(cx[0], cx[1], origin=edge_origin)
+    rec = ws.put_reaction(reactants=ids[0], products=ids[1], origin={**origin, "job": None, "index": new_id("d_")},
+                          label=text, count=0, reverse_count=0, delta_e_kcal=None, complexes=cx, edge=edge["id"],
+                          events=[])
+    return {"reaction": rec, "edge": edge["id"], "species": ids, "added": added}
