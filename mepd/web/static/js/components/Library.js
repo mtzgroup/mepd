@@ -2,7 +2,7 @@
 // browse the library. Library entries and graph nodes are the same thing.
 import { html, useState } from '../lib.js';
 import { api, attempt, refreshState } from '../api.js';
-import { prefs, select, useStore } from '../store.js';
+import { openTab, prefs, select, state, useStore } from '../store.js';
 import { cls, depictUrl, levelStatus } from '../util.js';
 
 // "Added 2 structures · 1 new conformer of CCO · 1 already there"
@@ -121,8 +121,16 @@ function Card({ rec, selected, order }) {
   const origin = rec.origin?.kind;
   return html`
     <li class=${cls('card', selected && 'selected')} draggable="false"
-      onClick=${(e) => select({ structures: [rec.id] }, e.shiftKey || e.metaKey || e.ctrlKey)}
-      title=${rec.smiles || rec.formula}>
+      onClick=${(e) => {
+        select({ structures: [rec.id] }, e.shiftKey || e.metaKey || e.ctrlKey);
+        window.dispatchEvent(new CustomEvent('mepd:graph', { detail: { cmd: 'center', id: rec.id, ifHidden: true } }));
+      }}
+      onDblClick=${() => {
+        if (state.view.tab !== 'graph') openTab('graph');
+        // after the tab switch has laid the graph out
+        setTimeout(() => window.dispatchEvent(new CustomEvent('mepd:graph', { detail: { cmd: 'center', id: rec.id, zoom: true, flash: true } })), 60);
+      }}
+      title=${`${rec.smiles || rec.formula} — double-click to find it in the graph`}>
       <div class="card-img">
         ${url ? html`<img src=${url} alt="" loading="lazy" />` : html`<span class="muted small">${rec.formula}</span>`}
         ${order > 0 && html`<span class="order-badge" title="Selection order (1 = start)">${order}</span>`}

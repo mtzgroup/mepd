@@ -53,6 +53,9 @@ function stylesheet() {
       'curve-style': 'bezier' } },
     { selector: 'edge.spoke.out', style: { 'target-arrow-shape': 'triangle', 'arrow-scale': 0.9 } },
     { selector: 'edge.spoke.shuttle', style: { 'line-style': 'dashed', 'line-dash-pattern': [3, 3], opacity: 0.8 } },
+    // A node being pointed at from the list (Library double-click): pulses a few times.
+    { selector: 'node.flash', style: { 'underlay-color': css('--accent'), 'underlay-opacity': 0.35, 'underlay-padding': 16,
+      'underlay-shape': 'round-rectangle', 'border-width': 3, 'border-color': css('--accent') } },
     // View filters (see applyView).
     { selector: '.vhidden', style: { display: 'none' } },
     { selector: '.dim', style: { opacity: 0.16 } },
@@ -283,6 +286,7 @@ export function Graph() {
   const cy = useRef(null);
   const connectFrom = useRef(null);
   const saveTimer = useRef(null);
+  const flashTimer = useRef(null);
   const workspace = useStore((s) => s.workspace);
   const statusKey = useStore((s) => edgeStatusKey(s.jobs));
   const activeKey = useStore((s) => activeStructureKey(s.jobs));
@@ -624,8 +628,27 @@ export function Graph() {
       else if (d.cmd === 'view') setPanelRef.current((x) => !x);
       else if (d.cmd === 'restyle') c.style(stylesheet());          // colours come from CSS variables
       else if (d.cmd === 'center' && d.id) {
+        // {ifHidden}: only when it is off screen; {zoom}: close enough to read; {flash}: pulse it.
         const el = c.getElementById(d.id);
-        if (el.nonempty()) c.animate({ center: { eles: el }, duration: 250 });
+        if (el.empty()) return;
+        if (el.hasClass('vhidden')) el.removeClass('vhidden');   // filtered out of the view: show it anyway
+        const ext = c.extent(), p = el.position();
+        const inView = p.x > ext.x1 + 40 && p.x < ext.x2 - 40 && p.y > ext.y1 + 40 && p.y < ext.y2 - 40;
+        if (!d.ifHidden || !inView) {
+          const anim = { center: { eles: el }, duration: 350, easing: 'ease-in-out-cubic' };
+          if (d.zoom && c.zoom() < 0.9) anim.zoom = { level: 0.9, position: p };
+          c.stop(); c.animate(anim);
+        }
+        if (d.flash) {
+          clearInterval(flashTimer.current);
+          let n = 0;
+          el.addClass('flash');
+          flashTimer.current = setInterval(() => {
+            n += 1;
+            el.toggleClass('flash', n % 2 === 0);
+            if (n >= 5) { clearInterval(flashTimer.current); el.removeClass('flash'); }
+          }, 420);
+        }
       }
     };
     window.addEventListener('mepd:graph', on);
