@@ -273,7 +273,15 @@ def suggest_atom_mapping_candidates(
     lg_end = molecule_to_labeled_graph(mol_end)
 
     mapper = SlapMapper(binary=binary)
-    mapper.get_maps([lg_start, lg_end], break_sym_targets=list(range(len(lg_start.labels))))
+    try:
+        mapper.get_maps([lg_start, lg_end], break_sym_targets=list(range(len(lg_start.labels))))
+    except ValueError:
+        # SLAPMapper's symmetry branching can prune every result and then
+        # take min() of none (seen on a 50-atom pair). The un-branched pass
+        # still finds the best mapping; the symmetry expansion below fills
+        # the remaining candidates.
+        mapper = SlapMapper(binary=binary)
+        mapper.get_maps([lg_start, lg_end])
     if not mapper.results:
         return []
 

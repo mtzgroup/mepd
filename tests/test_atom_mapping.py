@@ -179,6 +179,30 @@ def test_suggest_atom_mapping_candidates_passes_break_sym_targets(monkeypatch):
     assert captured["break_sym_targets"] == list(range(len(start.symbols)))
 
 
+def test_suggest_atom_mapping_candidates_survive_slapmapper_symmetry_branching_failing(monkeypatch):
+    """SLAPMapper's symmetry branching can prune every result and then take
+    min() of none (a 50-atom pair did): the candidates then come from its
+    un-branched pass, not from no mapping at all."""
+    from slapmapper.core import SlapMapper
+
+    real_get_maps = SlapMapper.get_maps
+
+    def failing_with_targets(self, lgp, **kwargs):
+        if kwargs.get("break_sym_targets"):
+            raise ValueError("min() iterable argument is empty")
+        return real_get_maps(self, lgp, **kwargs)
+
+    monkeypatch.setattr(SlapMapper, "get_maps", failing_with_targets)
+    start = _propene()
+    order = [2, 1, 0, 6, 7, 8, 5, 3, 4]
+    end = Structure(symbols=np.asarray(start.symbols)[order], geometry=np.asarray(start.geometry)[order],
+                    charge=0, multiplicity=1)
+    candidates = suggest_atom_mapping_candidates(start, end, max_candidates=5)
+    assert candidates and not candidates[0].is_identity
+    for c in candidates:
+        assert [end.symbols[c.mapping[i]] for i in range(len(start.symbols))] == list(start.symbols)
+
+
 def test_suggest_atom_mapping_candidates_includes_symmetry_orbit_expansion():
     """Water's two Hs are topologically interchangeable -- SLAPMapper's own
     `_remove_isomorphic_results` collapses the swapped-H relabeling as
