@@ -109,7 +109,7 @@ function EndpointConformers({ ends, value, onChange }) {
   </div>`;
 }
 
-function ProfilePicker({ value, onChange }) {
+export function ProfilePicker({ value, onChange }) {
   const profiles = useStore((s) => s.profiles);
   const levels = useStore((s) => s.levels);
   const levelProfile = useStore((s) => s.levelProfile);

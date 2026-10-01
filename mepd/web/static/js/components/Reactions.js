@@ -6,7 +6,8 @@ import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, select, set, state, useStore } from '../store.js';
 import { depictUrl, edgeStatus, fmtKcal } from '../util.js';
-import { defaultProfile } from './Actions.js';
+import { ProfilePicker, defaultProfile } from './Actions.js';
+import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
 import { Viewer3D } from './Viewer3D.js';
 import { EventPlayer } from './ReactorLive.js';
 import { openAnalyze } from './Analyze.js';
@@ -59,8 +60,10 @@ export function TsCell({ r, why = 'not in Explore (deleted?)' }) {
     ? html`<a href="#" class="mono" onClick=${(e) => { e.preventDefault(); openJob(st.barrierJob); }}
         title=${`${st.barrier != null ? 'Barrier from the reactant side, TS + IRC verified' : 'Path maximum; no TS/IRC confirmed it'}. Open its TS search (TS, IRC, sample more paths)`}>${label}</a>`
     : html`<span class="mono" title=${st.barrier != null ? 'Barrier from the reactant side, TS + IRC verified' : 'Path maximum; no TS/IRC confirmed it'}>${label}</span>`)}
-    <button class="btn small" onClick=${() => findTs(r)} title="Path search, TS optimization and IRC on only this reaction’s molecules">
-      ${label ? 'Search again' : 'Find TS'}</button>
+    ${label
+    ? html`<button class="btn small" onClick=${() => openAnalyze({ reaction: r.id, retry: Date.now() })}
+        title="Open its settings (from the last search) to change what to try, then search again">Search again…</button>`
+    : html`<button class="btn small" onClick=${() => findTs(r)} title="Path search, TS optimization and IRC on only this reaction’s molecules">Find TS</button>`}
   </span>`;
 }
 
@@ -195,7 +198,40 @@ function useText(url) {
   return t;
 }
 
+// The settings of a TS search on a reaction: the last search's (to change
+// what went wrong), else the defaults; any compute profile (path method,
+// images and level of theory live there).
+function SearchSettings({ r, onDone }) {
+  const op = useStore((s) => s.operations.find((o) => o.key === 'ts'));
+  const prev = Object.values(state.jobs).filter((j) => j.op === 'ts' && j.targets.edges.includes(r.edge))
+    .sort((a, b) => b.created - a.created)[0];
+  const schema = op?.schema;
+  const [values, setValues] = useState(() => (schema ? clampToSchema(schema, { ...defaultsFor(schema), ...(prev?.params || {}) }) : {}));
+  const [profile, setProfile] = useState(prev?.profile ?? defaultProfile());
+  const [busy, setBusy] = useState(false);
+  if (!schema) return html`<p class="small muted">The TS search is not available here.</p>`;
+  const run = async () => {
+    setBusy(true);
+    const out = await attempt(() => api.post('/api/jobs', { op: 'ts', edges: [r.edge], params: values, profile }), 'TS search queued');
+    setBusy(false);
+    if (out) onDone(out[0]);
+  };
+  return html`<div class="rc-settings">
+    ${prev && html`<p class="small muted">Last search: ${prev.summary?.headline || prev.status} · profile <b>${prev.profile || 'built-in defaults'}</b>.
+      Change what to try: another profile (its path method, e.g. GSM, or more NEB images), or a single path instead of recursive splitting.</p>`}
+    <${ParamForm} schema=${schema} values=${values} onChange=${setValues} />
+    <${ProfilePicker} value=${profile} onChange=${setProfile} />
+    <div class="op-run">
+      <button class="btn primary" disabled=${busy} onClick=${run}>${busy ? 'Queuing…' : 'Run TS search'}</button>
+      <button class="btn-link small" onClick=${() => onDone(null)}>Cancel</button>
+    </div>
+  </div>`;
+}
+
 export function ReactionCard({ r, event = null, compact = false }) {
+  const nav = useStore((s) => s.analyze) || {};
+  const [settings, setSettings] = useState(() => Boolean(nav.retry && nav.reaction === r.id));
+  useEffect(() => { if (nav.retry && nav.reaction === r.id) setSettings(true); }, [nav.retry]);
   const structures = useStore((s) => s.workspace.structures);
   const edges = useStore((s) => s.workspace.edges);
   useStore((s) => s.jobs);
@@ -239,10 +275,15 @@ export function ReactionCard({ r, event = null, compact = false }) {
                 ${st.barrier != null ? `ΔE‡ ${fmtKcal(st.barrier)}` : `≈${fmtKcal(st.barrierUnverified)}? (not verified)`} kcal/mol from the reactant complex →</a>`
               : html`<span class="small muted">No TS yet.</span>`}
             <span class="spacer"></span>
-            <button class=${`btn ${st.barrierJob ? '' : 'primary'}`} onClick=${() => findTs(r)}
-              title="Path search, TS optimization and IRC between the optimized reactant and product complexes (only this reaction's molecules)">
-              ${st.barrierJob ? 'Search again' : 'Find transition state'}</button>
-          </div>`}
+            ${st.barrierJob
+              ? html`<button class="btn" onClick=${() => setSettings(!settings)} aria-expanded=${settings}
+                  title="Change the settings of the last search (path method, profile, ...) and search again">Search again…</button>`
+              : html`<button class="btn primary" onClick=${() => findTs(r)}
+                  title="Path search, TS optimization and IRC between the optimized reactant and product complexes (only this reaction's molecules), with the default settings">
+                  Find transition state</button>
+                <button class="btn-link small" onClick=${() => setSettings(!settings)} aria-expanded=${settings}>settings…</button>`}
+          </div>
+          ${settings && html`<${SearchSettings} r=${r} onDone=${(job) => { setSettings(false); if (state.analyze?.retry) set({ analyze: { ...state.analyze, retry: null } }); }} />`}`}
     </div>
 
     ${views.length > 0 && html`<div class="rc-view">

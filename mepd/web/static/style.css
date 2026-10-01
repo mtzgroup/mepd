@@ -1126,3 +1126,4 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .analyze-wrap { display: flex; flex-direction: column; height: 100%; }
 .analyze-wrap > .an-mode { margin: 12px 20px 0; align-self: flex-start; }
 .analyze-wrap > .analyze, .analyze-wrap > .kinetics { flex: 1; min-height: 0; }
+.rc-settings { border: 1px solid var(--border); border-radius: 4px; padding: 10px 12px; margin-top: 8px; background: var(--panel); }

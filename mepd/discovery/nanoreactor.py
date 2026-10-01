@@ -747,7 +747,9 @@ def detect_events(n_atoms: int, hist: BondHistory, s: DetectSettings, dt_fs: flo
                     {p for p in before if p[0] in m} == {p for p in after if p[0] in m} for m in grp_b):
                 continue
             g_atoms = set().union(*grp_b)
-            members_g = [ch[m] for m in members if ch[m][1] in g_atoms]
+            # Both atoms inside: a contact between two groups (a bond that formed
+            # and broke between molecules that react separately) is neither's.
+            members_g = [ch[m] for m in members if ch[m][1] in g_atoms and ch[m][2] in g_atoms]
             if not members_g:
                 continue
             events.append(Event(members_g[0][0], max(c[0] for c in members_g), tuple(sorted(g_atoms)),

@@ -264,3 +264,14 @@ def test_open_shell_fragments_get_a_structure_not_a_code():
     assert opened and not opened[0][2].startswith("?") and "unusual" not in opened[0][2]
     assert Chem.MolFromSmiles(opened[0][2]) is not None
     assert nr.Labeler(["C", "H", "H"]).candidates((0, 1, 2), {(0, 1), (0, 2)})[0][2] == "[CH2]"   # a carbene
+
+
+def test_an_event_keeps_only_bond_changes_inside_its_own_atoms():
+    # Two concurrent reactions, linked for a moment by a contact between them
+    # (C1-H13 forms and breaks): each event's changes stay within its atoms.
+    changes = [(100, 0, 3, False), (100, 2, 3, True),        # #1: direct tautomerization
+               (102, 1, 13, True), (112, 1, 13, False),     # contact with #2
+               (105, 8, 13, False), (130, 9, 13, True)]     # #2: its own H shift
+    hist = _history(changes)
+    for ev in nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT):
+        assert all(i in ev.atoms and j in ev.atoms for _, i, j, _ in ev.changes)

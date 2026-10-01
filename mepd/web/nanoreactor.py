@@ -418,5 +418,6 @@ def event_view(out: Path, k: int, pad_fs: float = 60.0) -> dict:
             "dump_fs": dump_fs, "frames": np.round(cut, 2).reshape(len(cut), -1).tolist(),
             "reactant_frame": ev["reactant_frame"] - a, "product_frame": ev["product_frame"] - a,
             "changes": [{"frame": c["frame"] - a, "atoms": [local[c["atoms"][0]], local[c["atoms"][1]]],
-                         "formed": c["formed"]} for c in ev.get("bond_changes") or []],
+                         "formed": c["formed"]} for c in ev.get("bond_changes") or []
+                        if c["atoms"][0] in local and c["atoms"][1] in local],   # runs from before that was filtered
             "reaction": ev.get("reaction"), "optimized": ends}
