@@ -32,11 +32,11 @@ def test_msreact_fragments_keep_the_atoms_in_order(tmp_path):
     assert all(list(p.symbols) == list(seed.symbols) and p.charge == 0 for p in products)
 
 
-def test_the_network_card_offers_four_methods_and_msreact_builds_its_command():
+def test_the_network_card_offers_five_methods_and_msreact_builds_its_command():
     methods = [(op, m) for op in OPERATIONS.values() if (op.family or {}).get("key") == "network" for m in op.methods]
     labels = [m["label"] for _, m in sorted(methods, key=lambda x: x[1]["rank"])]
-    assert labels == ["Bond rules", "CREST msreact", "Hessian sampling", "Basin hopping"]
-    assert "nanoreactor" not in OPERATIONS                        # the placeholder is now this method
+    assert labels == ["Nanoreactor", "Bond rules", "CREST msreact", "Hessian sampling", "Basin hopping"]
+    assert (OPERATIONS["nanoreactor"].family or {}).get("key") == "network"   # its own operation, on the same card
     op = OPERATIONS["graph-enumeration"]
     p = op.parse_params({"generator": "crest-msreact", "msreact_mode": "isomers", "msreact_nshifts": 2})
 
