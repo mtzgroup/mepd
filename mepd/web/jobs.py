@@ -41,6 +41,56 @@ def extends(job: dict) -> Optional[str]:
     return job.get("source_job") if job.get("op") == "channels-more" else None
 
 
+EXIT_FILE = "exit_code"   # written by mepd.web.job_runner when the run ends
+
+
+def _alive(pid: int, jdir: Path) -> bool:
+    """Whether `pid` is still the runner of the job in `jdir` (not a new
+    process that reused the number)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    try:
+        return str(jdir) in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return True   # no /proc (macOS): trust the pid
+
+
+def _find_run(jdir: Path) -> Optional[int]:
+    """The pid of a mepd run whose command line names `jdir` (Linux)."""
+    for d in Path("/proc").glob("[0-9]*") if Path("/proc").is_dir() else []:
+        try:
+            cmd = (d / "cmdline").read_bytes().decode(errors="replace")
+        except OSError:
+            continue
+        if str(jdir) in cmd and "mepd" in cmd:
+            return int(d.name)
+    return None
+
+
+class _Adopted:
+    """A run started by an earlier server (not our child): the
+    asyncio.subprocess.Process interface _wait, _kill and the monitor use,
+    by polling its pid and reading the exit code its runner wrote."""
+
+    def __init__(self, pid: int, jdir: Path):
+        self.pid, self.jdir, self.returncode = pid, jdir, None
+
+    async def wait(self) -> Optional[int]:
+        while _alive(self.pid, self.jdir) and not (self.jdir / EXIT_FILE).exists():
+            await asyncio.sleep(2.0)
+        for _ in range(10):   # the runner writes the code just before it exits
+            try:
+                self.returncode = int((self.jdir / EXIT_FILE).read_text().strip())
+                break
+            except (OSError, ValueError):
+                await asyncio.sleep(0.2)
+        return self.returncode
+
+
 def _bump_rev(job: dict) -> None:
     """Every change to a job record gets a larger `rev`, so a browser that
     receives two copies out of order (a live event and a full-state reload
@@ -172,6 +222,7 @@ class JobManager:
         self._watch: dict[str, dict] = {}
         self._tasks: list[asyncio.Task] = []
         self._timed_out: set[str] = set()
+        self._adopt: list[str] = []   # running when the last server went away (see load)
 
     # ---------------------------------------------------------- lifecycle
     def load(self) -> None:
@@ -181,10 +232,13 @@ class JobManager:
                 job = json.loads(fp.read_text())
             except Exception:
                 continue
-            if job.get("status") == "running":
-                # The server went away while this was running; its process is
-                # gone (it was in our session) or orphaned. Either way the
-                # user decides whether to resume.
+            if job.get("status") == "running" and self._still_running(job):
+                # The server went away while this ran, and the run carried on
+                # (or ended since, leaving its exit code): watch it again.
+                self._adopt.append(job["id"])
+            elif job.get("status") == "running":
+                # Its process is gone, without an exit code (stopped with the
+                # server): the user decides whether to resume.
                 job["status"] = "interrupted"
                 job["error"] = "server stopped while the job was running; resume to continue where it left off"
                 self._write(job)
@@ -195,6 +249,11 @@ class JobManager:
     async def start(self) -> None:
         self.bus.bind(asyncio.get_running_loop())
         self.load()
+        for jid in self._adopt:
+            proc = _Adopted(self.jobs[jid]["pid"], self.job_dir(jid))
+            self._procs[jid] = proc
+            asyncio.create_task(self._wait(self.jobs[jid], proc))
+        self._adopt = []
         self._tasks = [asyncio.create_task(self._scheduler()), asyncio.create_task(self._monitor())]
         self._wake.set()
 
@@ -456,12 +515,21 @@ class JobManager:
             asyncio.get_running_loop().call_later(8, self._kill, jid, signal.SIGKILL)
         return job
 
+    def _still_running(self, job: dict) -> bool:
+        """A job left 'running' by a server that went away: is its run
+        still going, or did it end since and record its exit code?"""
+        jdir = self.job_dir(job["id"])
+        if job.get("pid") is None:   # started before pids were recorded: find its process
+            job["pid"] = _find_run(jdir)
+        return (jdir / EXIT_FILE).exists() or (job.get("pid") is not None and _alive(job["pid"], jdir))
+
     def _kill(self, jid: str, sig: int) -> None:
         proc = self._procs.get(jid)
         if proc is None or proc.returncode is not None:
             return
         try:
-            os.killpg(proc.pid, sig)
+            # Its group (a run found by its folder after a restart need not lead it).
+            os.killpg(os.getpgid(proc.pid), sig)
         except ProcessLookupError:
             pass
 
@@ -514,23 +582,30 @@ class JobManager:
         log = open(jdir / "stdout.log", "ab")
         log.write(f"\n$ {job['command']}\n".encode())
         log.flush()
+        (jdir / EXIT_FILE).unlink(missing_ok=True)
         try:
+            # Through the runner (it records the exit code), so a server that
+            # restarts meanwhile can pick the run back up.
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "mepd.cli", *job["argv"],
+                sys.executable, "-m", "mepd.web.job_runner", str(jdir / EXIT_FILE), *job["argv"],
                 stdout=log, stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(jdir), env=env, start_new_session=True,
             )
         finally:
             log.close()
         self._procs[job["id"]] = proc
-        self._update(job, status="running", started=time.time(), finished=None)
+        self._update(job, status="running", started=time.time(), finished=None, pid=proc.pid)
         asyncio.create_task(self._wait(job, proc))
 
     async def _wait(self, job: dict, proc: asyncio.subprocess.Process) -> None:
         rc = await proc.wait()
         self._procs.pop(job["id"], None)
         jid = job["id"]
-        if jid in self._timed_out:
+        if isinstance(proc, _Adopted) and (rc is None or rc < 0) and jid not in self._cancel_requested:
+            # A run picked up after a restart that was then stopped (with the
+            # old server, or killed): resumable, like any run a server stopped.
+            status, error = "interrupted", "server stopped while the job was running; resume to continue where it left off"
+        elif jid in self._timed_out:
             self._timed_out.discard(jid)
             self._cancel_requested.discard(jid)
             status, error = "failed", f"stopped: exceeded the {self._runtime_limit(job) / 60:.0f}-minute run-time limit"

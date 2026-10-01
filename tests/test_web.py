@@ -324,6 +324,7 @@ def test_interrupted_jobs_survive_a_restart(tmp_path, quick_op):
     rec = json.loads(fp.read_text())
     rec["status"] = "running"
     fp.write_text(json.dumps(rec))
+    (fp.parent / "exit_code").unlink()
     with TestClient(create_app(ws)) as c:
         again = c.get(f"/api/jobs/{job['id']}").json()["job"]
         assert again["status"] == "interrupted"
