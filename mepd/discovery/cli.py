@@ -31,8 +31,8 @@ def _validation_kwargs(validate, cutoff, displacement) -> dict:
         return {}
     return {
         "validate_minima_with_hessian": True,
-        "hessian_minimum_frequency_cutoff": float(cutoff) if isinstance(cutoff, (int, float)) else 0.0,
-        "hessian_minima_rescue_displacement": float(displacement) if isinstance(displacement, (int, float)) else 0.1,
+        "hessian_minimum_frequency_cutoff": float(cutoff) if isinstance(cutoff, (int, float)) else -20.0,
+        "hessian_minima_rescue_displacement": float(displacement) if isinstance(displacement, (int, float)) else 0.3,
     }
 
 
@@ -248,11 +248,11 @@ def hessian_sample(
         "dropped from the minima (and written to rejected.xyz).",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+        -20.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement",
-        help="First rescue push along the unstable mode (bohr); escalates to 0.3 and 0.5 if needed.",
+        0.3, "--hessian-minima-rescue-displacement",
+        help="Rescue push along the unstable mode, both ways (bohr).",
     ),
     output: Path = typer.Option(
         Path("mepd_hessian_sample_output"), "--output", "-o",
@@ -547,11 +547,11 @@ def hessian_global(
         "dropped from the minima (and written to rejected.xyz).",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+        -20.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement",
-        help="First rescue push along the unstable mode (bohr); escalates to 0.3 and 0.5 if needed.",
+        0.3, "--hessian-minima-rescue-displacement",
+        help="Rescue push along the unstable mode, both ways (bohr).",
     ),
     output: Path = typer.Option(
         Path("mepd_hessian_global_output"), "--output", "-o",

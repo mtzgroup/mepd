@@ -336,14 +336,14 @@ def _dump_atom_mapping_candidates(
         chains[candidate.label] = chain
         chain.write_to_disk(debug_dump_dir / f"{candidate.label}.xyz")
 
-    identity_label = candidates[0].label
+    identity = next((c for c in candidates if c.label == "identity"), None)
     best = min(candidates, key=lambda c: all_scores[c.label][metric])
     veto_margin = run_inputs.atom_mapping_inputs.veto_margin
     if (
-        best.label != identity_label
-        and all_scores[identity_label][metric] - all_scores[best.label][metric] <= veto_margin
+        identity and best is not identity
+        and all_scores[identity.label][metric] - all_scores[best.label][metric] <= veto_margin
     ):
-        best = candidates[0]
+        best = identity
 
     lines = ["candidate\t" + "\t".join(METRICS)]
     for candidate in candidates:
@@ -446,14 +446,18 @@ def _check_endpoint_atom_mapping(
         return end_structure
 
     candidates = build_candidates(start_structure, end_structure, atom_maps)
-    if len(candidates) == 1:
-        # Every candidate SLAPMapper returned was the identity mapping.
+    if [c.label for c in candidates] in ([], ["identity"]):
+        # Every candidate SLAPMapper returned was the identity mapping (or there were none).
         return end_structure
 
     metric = run_inputs.atom_mapping_inputs.metric
+    n_other = sum(c.label != "identity" for c in candidates)
     typer.echo(
         f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
-        f"current numbering with {len(candidates) - 1} other(s) found by SLAPMapper, by {metric} "
+        f"current numbering with {n_other} other(s) found by SLAPMapper, by {metric} (lower is better)..."
+        if n_other < len(candidates) else
+        f"Atom mapping: the end's atoms are in a different element order from the start's, so its current "
+        f"numbering can't be used. Choosing among {n_other} numbering(s) found by SLAPMapper, by {metric} "
         f"(lower is better)..."
     )
 

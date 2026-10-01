@@ -141,9 +141,9 @@ def expand(
         False, "--validate-minima-with-hessian/--no-validate-minima-with-hessian", "-H/-noH",
         help="Hessian-check every new species (rescue push along an unstable mode; dropped if still not a minimum)."),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."),
+        -20.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement", help="First rescue push along the unstable mode (bohr)."),
+        0.3, "--hessian-minima-rescue-displacement", help="Rescue push along the unstable mode, both ways (bohr)."),
     connect: bool = typer.Option(
         False, "--connect/--no-connect",
         help="Then run a recursive path search (MSMEP, as in `mepd network-splits`) for every proposed "

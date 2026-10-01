@@ -1,12 +1,41 @@
 // Renders any operation's parameter form from its pydantic JSON schema.
 // Field extras from mepd.web.operations: group, advanced, cli, cli_kind.
-import { html } from '../lib.js';
+import { html, useEffect, useState } from '../lib.js';
+
+// A number field that lets you type: it keeps its own text while you edit
+// ("0.", "-", "1e-" are fine half-way) and reports a number only when the text
+// parses as one. A number input re-rendered from the parsed value on every
+// keystroke loses the "." (Chrome reports "0." as empty, which reset the field).
+export function NumberInput({ value, onChange, integer = false, min, max, placeholder = '', id, className = '', title }) {
+  const shown = (v) => (v == null || Number.isNaN(v) ? '' : String(v));
+  const [text, setText] = useState(shown(value));
+  const [editing, setEditing] = useState(false);
+  useEffect(() => { if (!editing) setText(shown(value)); }, [value, editing]);
+  const pattern = integer ? /^-?\d+$/ : /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/;
+  const bad = text.trim() !== '' && (!pattern.test(text.trim())
+    || (min != null && +text < min) || (max != null && +text > max));
+  return html`<input id=${id} type="text" inputmode=${integer ? 'numeric' : 'decimal'} class=${`${className} ${bad ? 'invalid' : ''}`}
+    value=${text} placeholder=${placeholder} title=${bad ? `Not a valid number${min != null ? ` (at least ${min})` : ''}${max != null ? ` (at most ${max})` : ''}` : title}
+    onFocus=${() => setEditing(true)}
+    onBlur=${() => { setEditing(false); setText(shown(value)); }}
+    onInput=${(e) => {
+      const raw = e.target.value;
+      setText(raw);
+      const t = raw.trim();
+      if (t === '') { onChange(null); return; }
+      if (pattern.test(t)) {
+        const v = integer ? parseInt(t, 10) : parseFloat(t);
+        if ((min == null || v >= min) && (max == null || v <= max)) onChange(v);
+      }
+    }} />`;
+}
 
 function fieldType(prop) {
   const variants = prop.anyOf ? prop.anyOf.filter((v) => v.type !== 'null') : [prop];
   const base = variants[0] || {};
   const nullable = !!prop.anyOf?.some((v) => v.type === 'null');
   if (base.enum || prop.enum) return { kind: 'enum', options: base.enum || prop.enum, nullable };
+  if (base.type === 'array' && base.items?.enum) return { kind: 'multi', options: base.items.enum };
   return { kind: base.type || 'string', nullable, min: base.minimum ?? base.exclusiveMinimum, max: base.maximum };
 }
 
@@ -23,24 +52,29 @@ function Field({ name, prop, value, onChange }) {
         ${prop.description && html`<span class="field-help">${prop.description}</span>`}
       </label>`;
   }
-  if (t.kind === 'enum') {
+  // Field extras may name what each value is shown as (`labels`).
+  const shown = (o) => prop.labels?.[o] ?? o;
+  if (t.kind === 'multi') {
+    const on = new Set(value || []);
+    control = html`<div class="chips" role="group">
+      ${t.options.map((o) => html`<button type="button" aria-pressed=${on.has(o)} class=${`chip ${on.has(o) ? 'on' : ''}`}
+        title=${shown(o)} onClick=${() => onChange(on.has(o) ? (value || []).filter((v) => v !== o) : [...(value || []), o])}>
+        ${String(shown(o)).replace(/\s*\(.*\)$/, '')}</button>`)}
+    </div>`;
+  } else if (t.kind === 'enum') {
     const options = t.options;
-    control = options.length <= 3 && options.every((o) => String(o).length <= 16)
+    control = options.length <= 3 && options.every((o) => String(shown(o)).length <= 24)
       ? html`<div class="segmented" role="radiogroup">
           ${options.map((o) => html`<button type="button" role="radio" aria-checked=${value === o}
-            class=${value === o ? 'on' : ''} onClick=${() => onChange(o)}>${o}</button>`)}
+            class=${value === o ? 'on' : ''} onClick=${() => onChange(o)}>${shown(o)}</button>`)}
         </div>`
       : html`<select id=${id} value=${value ?? ''} onChange=${(e) => onChange(e.target.value)}>
-          ${options.map((o) => html`<option value=${o}>${o}</option>`)}
+          ${options.map((o) => html`<option value=${o}>${shown(o)}</option>`)}
         </select>`;
   } else if (t.kind === 'integer' || t.kind === 'number') {
-    control = html`<input id=${id} type="number" step=${t.kind === 'integer' ? 1 : 'any'} min=${t.min} max=${t.max}
-      value=${value ?? ''} placeholder=${t.nullable ? 'default' : ''}
-      onInput=${(e) => {
-        const raw = e.target.value;
-        if (raw === '') onChange(t.nullable ? null : prop.default);
-        else onChange(t.kind === 'integer' ? parseInt(raw, 10) : parseFloat(raw));
-      }} />`;
+    control = html`<${NumberInput} id=${id} integer=${t.kind === 'integer'} min=${t.min} max=${t.max} value=${value}
+      placeholder=${t.nullable ? 'default' : String(prop.default ?? '')}
+      onChange=${(v) => onChange(v == null ? (t.nullable ? null : prop.default) : v)} />`;
   } else {
     control = html`<input id=${id} type="text" value=${value ?? ''} placeholder=${t.nullable ? 'default' : ''}
       onInput=${(e) => onChange(e.target.value === '' && t.nullable ? null : e.target.value)} />`;

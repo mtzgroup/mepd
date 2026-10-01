@@ -398,8 +398,8 @@ def run_hessian_sample(
     chain_inputs: ChainInputs | None = None,
     on_event: OnEvent = None,
     validate_minima_with_hessian: bool = False,
-    hessian_minimum_frequency_cutoff: float = 0.0,
-    hessian_minima_rescue_displacement: float = 0.1,
+    hessian_minimum_frequency_cutoff: float = -20.0,
+    hessian_minima_rescue_displacement: float = 0.3,
     live_prefix: str = "",
     live_label: str = "",
 ) -> HessianSampleResult:
@@ -741,8 +741,8 @@ def run_hessian_global_optimization(
     acceptance_baseline: str = "connected",
     on_event: OnEvent = None,
     validate_minima_with_hessian: bool = False,
-    hessian_minimum_frequency_cutoff: float = 0.0,
-    hessian_minima_rescue_displacement: float = 0.1,
+    hessian_minimum_frequency_cutoff: float = -20.0,
+    hessian_minima_rescue_displacement: float = 0.3,
 ) -> HessianGlobalOptResult:
     """Basin-hopping-style global optimization built on repeated Hessian
     sampling.

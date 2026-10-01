@@ -95,6 +95,30 @@ _OTHER = [
         ],
     },
     {
+        "feature": "Network properties",
+        "where": "Explore › Conditions › Analyze network, Compare",
+        "items": [
+            {"what": "Degree of rate control (what controls a network-level quantity)",
+             "note": "generalized to any quantity: yields, formation rates",
+             "cite": ["C. T. Campbell, J. Catal. 204, 520–524 (2001), doi:10.1006/jcat.2001.3396",
+                      "C. T. Campbell, ACS Catal. 7, 2770–2779 (2017), doi:10.1021/acscatal.7b00115"]},
+            {"what": "Networks as Markov chains: relaxation times, first-passage times",
+             "cite": ["D. J. Wales, Int. Rev. Phys. Chem. 25, 237–282 (2006), doi:10.1080/01442350600676921"]},
+        ],
+    },
+    {
+        "feature": "Substituent effects",
+        "where": "Substituent effects (a TS search's or channels run's follow-ups)",
+        "items": [
+            {"what": "Hammett σp constants (the electronic scale shifts are read against)",
+             "note": "defined for para-substituted benzoic acids; elsewhere a rough donor/acceptor ranking",
+             "cite": ["C. Hansch, A. Leo, R. W. Taft, Chem. Rev. 91, 165–195 (1991), doi:10.1021/cr00002a004"]},
+            {"what": "3D groups: RDKit ETKDG embedding and MMFF94",
+             "cite": ["S. Riniker, G. A. Landrum, J. Chem. Inf. Model. 55, 2562–2574 (2015), "
+                      "doi:10.1021/acs.jcim.5b00654"]},
+        ],
+    },
+    {
         "feature": "Valley-ridge inflection",
         "where": "Valley-ridge inflection, Check the bifurcation",
         "items": [

@@ -936,6 +936,33 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .graph-view-panel .gv-sep { border-top: 1px solid var(--border); margin: 8px 0; }
 .graph-view-panel p { margin: 4px 0; }
 .pg .graph-view-panel { top: 72px; }
+
+/* Multi-select chips (array-of-choices parameters, e.g. solvents) */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { border: 1px solid var(--border-strong); background: transparent; color: var(--muted); border-radius: 3px;
+  padding: 3px 9px; font-size: 13px; cursor: pointer; }
+.chip.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+
+/* Reaction conditions: solvent comparison */
+.conditions { margin: 8px 0 12px; }
+.conditions .insights { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 6px; }
+.conditions .insight { display: flex; gap: 8px; align-items: baseline; line-height: 1.45; }
+.conditions .insight-icon { flex: 0 0 1.2em; text-align: center; color: var(--muted); }
+.conditions .insight.accelerates { font-weight: 600; color: var(--heading); }
+.conditions .insight.accelerates .insight-icon { color: var(--ok); }
+.conditions .insight.slows .insight-icon { color: var(--danger); }
+.table-scroll { overflow-x: auto; max-width: 100%; }
+table.data { border-collapse: collapse; font-size: 13px; min-width: 100%; }
+table.data th { text-align: left; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border-strong); padding: 4px 8px; white-space: nowrap; }
+table.data td { border-bottom: 1px solid var(--border); padding: 4px 8px; white-space: nowrap; }
+table.data th.num { text-align: right; }
+.conditions-warn p { margin: 0 0 4px; }
+.conditions-warn ul { margin: 4px 0 0; padding-left: 20px; }
+table.data td.num { font-family: var(--font-mono); text-align: right; }
+table.data td.good { color: var(--ok); font-weight: 600; }
+table.data td.bad { color: var(--danger); }
+table.data tr.gas td { background: var(--accent-soft); }
+table.data tr.failed td { color: var(--muted); }
 .family-body { padding: 0 12px 10px; }
 .method-switch { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 6px; }
 .method-switch .method { font: inherit; font-size: 12.5px; padding: 4px 10px; border-radius: 14px; border: 1px solid var(--border-strong);
@@ -944,7 +971,31 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .method-switch .method.off { opacity: .55; }
 .method-summary { margin: 2px 0 8px; color: var(--muted); }
 .family-body .op-body { padding: 0; }
+
+/* Explore: experimental setups (Setups.js) */
+.graph-view-panel.setup-panel { width: 380px; max-height: calc(100% - 64px); overflow-y: auto; }
+.setup-panel .gv-label { flex: 0 0 96px; color: var(--muted); }
+.setup-panel .gv-row > select, .setup-panel .gv-row > input[type="text"] { flex: 1; min-width: 0; }
+.setup-panel .setup-start { flex: 1; min-width: 0; }
+.setup-panel .time-field { display: inline-flex; gap: 4px; }
+.setup-panel .warn-box .btn { margin: 4px 4px 0 0; }
+.prediction { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
+.pred-list { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 3px; }
+.pred-list li { display: grid; grid-template-columns: minmax(0, 1fr) 110px 44px; gap: 8px; align-items: center; cursor: pointer; font-size: 13px; }
+.pred-list li:hover .pred-name { color: var(--accent); }
+.pred-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pred-bar { height: 8px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.pred-bar i { display: block; height: 100%; background: var(--accent); }
+.pred-list .mono { text-align: right; }
 .quick-sample { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; }
+
+table.data.compact { margin: 6px 0; font-size: 12.5px; }
+table.data.compact td, table.data.compact th { padding: 2px 6px; }
+table.data tr.clickable { cursor: pointer; }
+.ctrl { margin: 3px 0; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.ctrl .good { color: var(--ok); } .ctrl .bad { color: var(--danger); }
+
+input.invalid { border-color: var(--danger); outline-color: var(--danger); }
 .scratch-start { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; margin-bottom: 6px;
   border: 1px solid var(--accent); border-radius: 8px; background: var(--accent-soft); }
 .scratch-start p { margin: 4px 0 0; max-width: 62ch; }

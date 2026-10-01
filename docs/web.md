@@ -41,11 +41,11 @@ vendored under `mepd/web/static/vendor/`, so it works without internet access.
 
 - **Structures added from SMILES or XYZ are minimized at the workspace level** with `mepd optimize`, one job per charge/multiplicity group (the add box has a checkbox to skip this). A SMILES embedding is only an RDKit/MMFF94 force-field geometry.
 - **Status is shown on the structure.** It appears straight away as *optimizing…*, and its geometry, SMILES and energy are replaced in place when the job finishes. Its chip shows the level (e.g. `gxtb`), or *not optimized*, *other level*, *opt failed* or *not a minimum*.
-- **Hessian check (on by default).** *Verify minima (Hessian)* makes every optimized structure pass a Hessian check: no frequency below the cutoff.
-  - A structure that stopped on a saddle point is pushed along its unstable mode, both ways, and re-optimized. The push starts at 0.1 bohr and escalates to 0.3 and then 0.5 bohr, stopping at the first push that reaches a minimum. The structure records which push worked.
-  - If every push fails, it is kept but flagged *not a minimum* and never trusted as one.
-  - Why escalate: eclipsed ethane optimizes straight onto the rotational saddle (−334 cm⁻¹). A 0.1 bohr push falls back onto it; 0.3 bohr reaches staggered.
-  - The same escalating rescue is used by mepd everywhere minima are Hessian-checked: recursive path searches, `mepd optimize`, Hessian sampling and basin hopping.
+- **Hessian check (on by default).** *Verify minima (Hessian)* makes every optimized structure pass a Hessian check: no frequency below the cutoff (default −20 cm⁻¹, so soft torsions and rotors pass).
+  - A structure that stopped on a saddle point is pushed along its unstable mode by the rescue push (0.3 bohr), both ways, and re-optimized. Larger pushes are not retried: on the KAIST set they mostly fell back onto the same saddle.
+  - If both pushes fail, it is kept but flagged *not a minimum* and never trusted as one.
+  - Why 0.3 bohr: eclipsed ethane (−334 cm⁻¹) falls back onto its saddle from 0.1 bohr; 0.3 reaches staggered.
+  - The same rescue is used by mepd everywhere minima are Hessian-checked: recursive path searches, `mepd optimize`, Hessian sampling and basin hopping.
 - **Changing the level** marks structures from the old level as off-level. *Re-optimize N off-level* redoes them, skipping TS structures.
 - **Jobs check levels too.** A job run with a profile at a different level shows a warning, and pair jobs re-minimize off-level endpoints themselves. Duplicate detection on import never compares energies from different levels.
 - **Path searches (TS, channels, all-pairs network).** *Validate minima with Hessian* is a basic option: every intermediate minimum a recursive split proposes must pass the same check. Its cutoff and push size are under Advanced.

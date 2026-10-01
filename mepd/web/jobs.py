@@ -456,7 +456,8 @@ class JobManager:
                     # What was submitted, to go back to if a TS search fails.
                     "design_snapshot": dict(design) if design is not None else None,
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
-                    "output_dir": source["output_dir"] if source is not None else str(jdir / "output"),
+                    "output_dir": source["output_dir"] if source is not None and not op.own_output
+                    else str(jdir / "output"),
                     "external": False, "source_job": source["id"] if source is not None else None,
                     "extends": extends_job_id or None,
                     "error": None, "last_line": "", "summary": None,

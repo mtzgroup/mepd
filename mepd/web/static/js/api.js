@@ -110,6 +110,7 @@ function applyState(data) {
     }
     s.jobs = fresh;
     s.operations = data.operations;
+    s.solvents = data.solvents || [];
     s.profiles = data.profiles;
     s.levelProfile = data.level_profile;
     s.validateMinima = data.validate_minima ?? true;

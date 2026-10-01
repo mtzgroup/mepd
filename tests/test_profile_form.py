@@ -45,7 +45,8 @@ def _toml(out):
 
 def test_form_reads_the_big_choices_and_relevant_groups():
     f = pf.form(BASE)
-    assert _choices(f) == {"path_method": "NEB", "engine": "gxtb", "interpolation": "geodesic", "optimizer": "cg"}
+    assert _choices(f) == {"path_method": "NEB", "engine": "gxtb", "interpolation": "geodesic", "optimizer": "cg",
+                           "solvent": ""}
     assert [o["value"] for o in _find(f, "interpolation")["options"]] == ["geodesic", "idpp", "lst", "linear"]
     assert [o["value"] for o in _find(f, "engine")["options"]] == ["gxtb", "qccompute", "chemcloud", "mlip", "fairchem", "ase"]
     assert f["images"]["value"] == 12
@@ -54,6 +55,13 @@ def test_form_reads_the_big_choices_and_relevant_groups():
     path = {x["path"]: x for x in f["groups"][0]["fields"]}
     assert path["path_min_inputs.max_steps"]["value"] == 300 and path["path_min_inputs.max_steps"]["key"]
     assert "path_min_inputs.validate_minima_with_hessian" not in path   # set per calculation instead
+
+
+def test_solvent_choice_writes_and_removes_the_solvation_table():
+    out = pf.apply(BASE, "solvent", "DCM")
+    assert 'solvent = "ch2cl2"' in out["text"] and _choices(out["form"])["solvent"] == "ch2cl2"
+    assert any("composite model" in n for n in out["form"]["notes"])
+    assert "[solvation]" not in pf.apply(out["text"], "solvent", "")["text"]
 
 
 def test_labels_read_as_words():

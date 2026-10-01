@@ -6,6 +6,12 @@
 import { html, useEffect, useMemo, useRef, useState } from '../lib.js';
 import { api } from '../api.js';
 import { depictUrl } from '../util.js';
+
+// Older runs named an external generator's products "external-<k>" where a
+// SMILES belongs: there is nothing to draw by that name.
+function drawable(smiles) {
+  return smiles && !/^external-\d+$/.test(smiles) ? smiles : null;
+}
 import { Viewer3D } from './Viewer3D.js';
 
 const FRAME_MS = 65, HOLD_MS = 800, FLY_MS = 700, REST_MS = 350;
@@ -101,7 +107,7 @@ export function NetworkLive({ job, reactions }) {
     const r = byId[id];
     const tile = tileRefs.current[id];
     const stage = stageRef.current;
-    const smiles = r?.plot?.product_smiles;
+    const smiles = drawable(r?.plot?.product_smiles);
     if (!tile || !stage || !smiles) return;
     tile.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
     await sleep(60);
@@ -197,7 +203,7 @@ export function NetworkLive({ job, reactions }) {
             <button type="button" key=${r.id} ref=${(el) => { if (el) tileRefs.current[r.id] = el; }}
                 class=${`nl-tile ${r.id === flying ? 'arriving' : ''} ${r.id === pinned ? 'pinned' : ''} ${r.outcome && r.outcome !== 'new species' ? 'dim' : ''}`}
                 onClick=${() => pin(r.id)} title=${r.caption || ''}>
-              ${r.plot?.product_smiles
+              ${drawable(r.plot?.product_smiles)
                 ? html`<img class="nl-depict" src=${depictUrl(r.plot.product_smiles, 180, 120)} alt=${r.plot.product_smiles} />`
                 : html`<div class="nl-depict"></div>`}
               <div class="nl-tile-foot">

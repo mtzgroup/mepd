@@ -6,6 +6,7 @@ import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, state, useStore } from '../store.js';
 import { complexNodes, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, isComplex, nodeOf, playgroundFitMargins, reactionOfEdge } from '../util.js';
 import { uploadFiles } from './Library.js';
+import { SetupPanel, activeSetup, edgeUnderSetup, setupEdgeLabel, setupKey } from './Setups.js';
 
 function css(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -36,6 +37,10 @@ function stylesheet() {
     { selector: 'edge[status = "running"]', style: { 'line-style': 'solid', 'line-color': css('--accent'), 'target-arrow-color': css('--accent'), width: 3.5 } },
     { selector: 'edge[status = "queued"]', style: { 'line-color': css('--warn'), 'target-arrow-color': css('--warn') } },
     { selector: 'edge[status = "failed"]', style: { 'line-color': css('--danger'), 'target-arrow-color': css('--danger') } },
+    // Under an experimental setup (Setups.js): does the step run in the reaction time?
+    { selector: 'edge[runs = "yes"]', style: { 'line-style': 'solid', 'line-color': css('--ok'), 'target-arrow-color': css('--ok'), width: 3.5 } },
+    { selector: 'edge[runs = "slow"]', style: { 'line-style': 'solid', 'line-color': css('--warn'), 'target-arrow-color': css('--warn') } },
+    { selector: 'edge[runs = "no"]', style: { 'line-style': 'solid', 'line-color': css('--edge-idle'), 'target-arrow-color': css('--edge-idle'), opacity: 0.7 } },
     { selector: 'edge:selected', style: { width: 5, 'underlay-color': css('--accent'), 'underlay-opacity': 0.25, 'underlay-padding': 5 } },
     // Reactions: a complex (several molecules together) is a small circle joined
     // to its molecules; a reaction is an edge between two complexes (a one-molecule
@@ -288,6 +293,9 @@ export function Graph() {
   const [view, setViewState] = useState(() => ({ ...VIEW_DEFAULT, ...prefs.get('graphView', {}) }));
   const [collapsed, setCollapsedState] = useState(() => prefs.get('graphCollapsed', []));
   const [panel, setPanel] = useState(false);
+  const [setupPanel, setSetupPanel] = useState(false);
+  const condKey = useStore(setupKey);
+  const setup = activeSetup(workspace);
   const setPanelRef = useRef(setPanel);
   const [counts, setCounts] = useState({ shown: 0, total: 0, kids: {} });
   const setView = (v) => { setViewState(v); prefs.set('graphView', v); };
@@ -459,17 +467,23 @@ export function Graph() {
           if (now.data('label') !== el.data.label || now.data('status') !== el.data.status) now.data(el.data);
         } else c.add(el);
       }
+      const cond = activeSetup(state.workspace);
       for (const e of Object.values(edges)) {
         const source = nodeOf(workspace, e.source), target = nodeOf(workspace, e.target);
         if (!source || !target || source === target) continue;
         ids.add(e.id);
         const st = edgeStatus(e, state.jobs);
-        const data = { id: e.id, source, target, status: st.status, label: edgeLabel(e, st, reactionOfEdge(workspace, e.id)) };
+        const data = { id: e.id, source, target, status: st.status, label: edgeLabel(e, st, reactionOfEdge(workspace, e.id)), runs: '' };
+        if (cond && !['running', 'queued'].includes(st.status)) {
+          const info = edgeUnderSetup(e, state.jobs, cond);
+          data.label = [e.label && !/^Channel|IRC$/.test(e.label) ? e.label : '', setupEdgeLabel(e, info, cond)].filter(Boolean).join(' · ');
+          data.runs = info.runs === 'none' ? '' : info.runs;
+        }
         const el = c.getElementById(e.id);
         if (el.nonempty() && (el.data('source') !== source || el.data('target') !== target)) el.remove();
         const cur = c.getElementById(e.id);
         if (cur.nonempty()) {
-          if (cur.data('status') !== data.status || cur.data('label') !== data.label) cur.data(data);
+          if (cur.data('status') !== data.status || cur.data('label') !== data.label || cur.data('runs') !== data.runs) cur.data(data);
         } else c.add({ group: 'edges', data });
       }
       c.elements().forEach((el) => { if (!ids.has(el.id())) el.remove(); });
@@ -746,19 +760,28 @@ export function Graph() {
         <button class="btn small ghost" onClick=${() => fitCapped(cy.current)} title="Fit everything in view">Fit</button>
         <button class="btn small ghost" onClick=${() => select({ structures: cy.current.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('cx')).map((n) => n.id()) })}
           title="Select every structure shown (then delete, download, or run one calculation on all)">Select all</button>
-        <button class=${`btn small ${panel ? 'primary' : 'ghost'}`} onClick=${() => setPanel(!panel)}
+        <button class=${`btn small ${panel ? 'primary' : 'ghost'}`} onClick=${() => { setSetupPanel(false); setPanel(!panel); }}
           title="Filter what the graph shows, and fold branches away">View${counts.shown < counts.total ? ` · ${counts.shown}/${counts.total}` : ''}</button>
+        <button class=${`btn small ${setupPanel || setup ? 'primary' : 'ghost'}`} onClick=${() => { setPanel(false); setSetupPanel(!setupPanel); }}
+          title="Experimental conditions: solvent, temperature, reaction time. See which steps run, and predict the outcome.">
+          ${setup ? `Conditions · ${setup.name}` : 'Conditions'}</button>
         ${howToHidden && html`<button class="btn small ghost" title="Show 'How it works'" aria-label="How it works"
           onClick=${() => { prefs.set('hideHowTo', false); set({ howToHidden: false }); }}>?</button>`}
         ${nSelected > 0 && html`<button class="btn small ghost danger-text" onClick=${deleteSelection}
           title="Delete the selected structures and edges (Delete key)">Delete ${nSelected}</button>`}
       </div>
-      ${!empty && html`<div class="legend" title="Edge colours. Labels are the lowest barrier ΔE‡ in kcal/mol; ≈x? means the path maximum, not yet confirmed by TS + IRC.">
+      ${!empty && setup && html`<div class="legend" title=${`Under ${setup.name}: barrier ΔE‡ (kcal/mol) and half-life; (gas) = no barrier in this solvent yet`}>
+        <span><i class="lg done"></i>runs in ${setup.time_s >= 86400 ? `${+(setup.time_s / 86400).toFixed(1)} d` : setup.time_s >= 3600 ? `${+(setup.time_s / 3600).toFixed(1)} h` : `${Math.round(setup.time_s / 60)} min`}</span>
+        <span><i class="lg queued"></i>within 100×</span>
+        <span><i class="lg idle"></i>too slow / not computed</span>
+      </div>`}
+      ${!empty && !setup && html`<div class="legend" title="Edge colours. Labels are the lowest barrier ΔE‡ in kcal/mol; ≈x? means the path maximum, not yet confirmed by TS + IRC.">
         <span><i class="lg idle"></i>not computed</span>
         <span><i class="lg running"></i>running</span>
         <span><i class="lg done"></i>ΔE‡, kcal/mol</span>
         <span><i class="lg failed"></i>failed</span>
       </div>`}
+      ${setupPanel && html`<${SetupPanel} onClose=${() => setSetupPanel(false)} />`}
       ${panel && html`<${ViewPanel} view=${view} setView=${setView} collapsed=${collapsed} setCollapsed=${setCollapsed}
         kids=${counts.kids} shown=${counts.shown} total=${counts.total} onClose=${() => setPanel(false)} focusCount=${selection.structures.length} />`}
       ${connectMode && html`<div class="graph-hint">Click the <b>start</b> structure, then the <b>end</b> structure.</div>`}

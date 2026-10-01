@@ -182,8 +182,7 @@ class NEBInputs:
 
     `hessian_minima_rescue_displacement`: first displacement, in bohr, applied along
         the lowest-frequency mode when attempting to rescue a Hessian-rejected
-        minimum; if that fails the rescue escalates to 0.3 and 0.5 bohr
-        (elementarystep.RESCUE_ESCALATION_BOHR)
+        minimum, both ways; no larger pushes are retried
 
     `ts_converged_stop`: stop as soon as the TS region has converged rather than
         waiting for the whole band (default: True). When the early elementary-step
@@ -246,8 +245,8 @@ class NEBInputs:
     plateau_exit_window: int = 50
     plateau_exit_rtol: float = 0.05
     validate_minima_with_hessian: bool = False
-    hessian_minimum_frequency_cutoff: float = 0.0
-    hessian_minima_rescue_displacement: float = 0.1
+    hessian_minimum_frequency_cutoff: float = -20.0
+    hessian_minima_rescue_displacement: float = 0.3
     recursive_same_pair_split_limit: int = 5
     recursive_cycle_revisits: int = 5
     direct_only: bool = False
@@ -409,6 +408,10 @@ class AtomMappingInputs:
     metric: str = "geodesic-distance"
     veto_margin: float = 0.0
     recheck_on_split: bool = False
+    # metric "rmsd-geodesic": only candidates within this many standard
+    # deviations of the lowest endpoint RMSD are scored by geodesic distance.
+    rmsd_window: float = 1.0
+    gi_variant_cap: int = 20   # rmsd-geodesic: GI paths for this many lowest-RMSD variants (0 = all)
 
     def copy(self) -> AtomMappingInputs:
         return AtomMappingInputs(**self.__dict__)
@@ -451,6 +454,10 @@ class RunInputs:
         with their own `fairchem_engine_kwds`), or "ase" (any ASE calculator:
         `ase_engine_kwds.calculator = "package.module:ClassName"` with its
         keyword arguments in `ase_engine_kwds.calculator_kwds`).
+    `solvation`: optional implicit solvent for whichever engine, e.g.
+        {solvent = "water", model = "alpb", method = "auto"} -- GFN2-xTB's own
+        model when the engine is GFN2-xTB, otherwise its solvation free energy
+        added to the engine's energies and gradients (see mepd/solvation.py).
     """
 
     engine_name: str = "gxtb"
@@ -474,6 +481,7 @@ class RunInputs:
     mlip_engine_kwds: dict = None
     geometry_optimizer_kwds: dict = None
     optimizer_kwds: dict = None
+    solvation: dict = None
 
     def __post_init__(self):
         disable_molecular_graphs = False
@@ -589,8 +597,8 @@ class RunInputs:
                 "skip_identical_graphs": True,
                 "disregard_stereochem": False,
                 "validate_minima_with_hessian": False,
-                "hessian_minimum_frequency_cutoff": 0.0,
-                "hessian_minima_rescue_displacement": 0.1,
+                "hessian_minimum_frequency_cutoff": -20.0,
+                "hessian_minima_rescue_displacement": 0.3,
                 "verbosity": 1,
             }
 
@@ -784,6 +792,12 @@ class RunInputs:
         setattr(eng, "disable_molecular_graphs", disable_molecular_graphs)
         if hasattr(eng, "n_parallel") and not getattr(self.chain_inputs, "do_parallel", True):
             eng.n_parallel = 1
+        if self.solvation:
+            from mepd.solvation import solvate_engine
+
+            self.solvation = dict(self.solvation)
+            eng = solvate_engine(eng, self.solvation)
+            setattr(eng, "disable_molecular_graphs", disable_molecular_graphs)
         self.engine = eng
         optimizer_kwds = dict(self.optimizer_kwds)
         optimizer_name = optimizer_kwds.pop("name").lower()

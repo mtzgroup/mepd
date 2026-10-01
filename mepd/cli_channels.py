@@ -21,6 +21,7 @@ from typing import Optional
 import typer
 
 from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
+from mepd.atom_mapping_metrics import HELP as _MAPPING_HELP, OFFERED as _OFFERED_METRICS
 from mepd.chain import Chain
 from mepd.nodes.nodehelpers import _is_connectivity_identical
 from mepd.cli_common import (
@@ -94,23 +95,27 @@ def _expand_pairs_by_mechanism(
     if not atom_mapping or not candidates:
         return structures, candidates, {}
 
-    from mepd.atom_mapping_selection import select_per_mechanism
+    from mepd.atom_mapping_selection import near_lowest, rmsd_window, select_per_mechanism
     from mepd.nodes.node import StructureNode
 
     metric = run_inputs.atom_mapping_inputs.metric
     budget = run_inputs.atom_mapping_inputs.n_candidates
+    # Filtered GI path: every pair by endpoint RMSD first (microseconds each),
+    # GI paths only for the pairs near each mechanism's lowest RMSD.
+    filtered = metric == "rmsd-geodesic"
+    first = "endpoint-rmsd" if filtered else metric
     typer.echo(
         f"Finding the mechanisms of the {len(candidates)} pair(s): every way the reactant's atoms can "
         f"become the product's, grouped by which bonds break and form (per mechanism, the atom "
-        f"numbering that fits best by {metric} is used)..."
+        f"numbering that fits best by {first} is used)..."
     )
 
-    def _one(pair):
+    def _one(pair, metric=first, only_keys=None):
         i, j = pair
         try:
             choices = select_per_mechanism(
                 structures[i].structure, structures[j].structure, metric, run_inputs,
-                max_variants_per_mechanism=budget,
+                max_variants_per_mechanism=budget, **({"only_keys": only_keys} if only_keys is not None else {}),
             )
         except Exception as exc:
             return pair, None, f"{type(exc).__name__}: {exc}"
@@ -132,6 +137,9 @@ def _expand_pairs_by_mechanism(
                          "structure": None if is_identity else end_structure})
 
     keys = sorted({r["key"] for r in rows})
+    if filtered:
+        rows = _gi_near_lowest_rmsd(rows, keys, _one, workers, rmsd_window(run_inputs),
+                                    max(1, pairs_per_mechanism), near_lowest)
     if pairs_per_mechanism > 0:
         kept = []
         for key in keys:
@@ -195,7 +203,7 @@ def _expand_pairs_by_mechanism(
         table = [
             {"pair": f"pair_{r['i']}_{r['pair_j']}", "start_conformer": r["i"],
              "end_structure": r["j"], "mechanism": r["key"], "score": r["score"],
-             "n_symmetry_variants": r["n_variants"]}
+             "n_symmetry_variants": r["n_variants"], **({"endpoint_rmsd": r["rmsd"]} if "rmsd" in r else {})}
             for r in rows
         ]
         # Earlier rows this run did not keep (e.g. a lower cap) stay listed, so their labels stay reserved.
@@ -208,6 +216,45 @@ def _expand_pairs_by_mechanism(
 
     summary = {"n_mechanisms": len(keys), "path_searches_per_mechanism": counts}
     return new_structures, new_candidates, summary
+
+
+def _gi_near_lowest_rmsd(rows: list[dict], keys: list, score_pair, workers: int, window: float, keep: int,
+                         near_lowest) -> list[dict]:
+    """--atom-mapping-metric rmsd-geodesic, second stage: per mechanism, the
+    (pair, mechanism) rows within `window` standard deviations of the lowest
+    endpoint RMSD (at least `keep` of them) get GI paths -- which choose
+    their symmetry variant and rank them -- and the rest are dropped.
+    On the KAIST direct-only sweep a 1-sigma window held 6% of the pairs and
+    56% of what GI paths over every pair would have picked; 2 sigma, 21% and
+    82%; 3 sigma, 51% and 96% (see docs/channels_candidates.md)."""
+    unmapped = [r for r in rows if r["score"] is None]
+    chosen: dict = {}
+    n_scored = 0
+    for key in keys:
+        mine = [r for r in rows if r["key"] == key and r["score"] is not None]
+        n_scored += len(mine)
+        for k in near_lowest([r["score"] for r in mine], window, keep=keep):
+            chosen.setdefault((mine[k]["i"], mine[k]["j"]), {})[key] = mine[k]
+    n_chosen = sum(len(v) for v in chosen.values())
+    typer.echo(f"Filtered GI path: {n_chosen} of {n_scored} (pair, mechanism) combination(s) are within "
+               f"{window:g} standard deviation(s) of their mechanism's lowest endpoint RMSD; computing GI "
+               f"paths for those (--atom-mapping-rmsd-window to widen).")
+    out = list(unmapped)
+    tasks = [(pair, set(by_key)) for pair, by_key in chosen.items()]
+    results = _fork_map(lambda t: score_pair(t[0], "rmsd-geodesic", t[1]), tasks, workers)
+    for (pair, by_key), (_, choices, error) in zip(chosen.items(), results):
+        got = {key: (score, nv, st, is_id) for key, score, nv, st, is_id in (choices or [])}
+        for key, row in by_key.items():
+            if key in got:
+                score, nv, st, is_id = got[key]
+                out.append({**row, "rmsd": row["score"], "score": score, "n_variants": nv,
+                            "structure": None if is_id else st})
+            else:
+                # The GI path could not be computed: keep the pair, ranked last.
+                out.append({**row, "rmsd": row["score"], "score": None})
+                if error:
+                    typer.echo(f"  pair {pair}: GI path failed ({error}); ranked last.")
+    return out
 
 
 def _load_conformer_pool(fp: Path, endpoint, label: str, charge: int, multiplicity: int) -> list:
@@ -770,21 +817,18 @@ def channels(
         "and consider (they're ties, not ranked by quality among themselves).",
     ),
     atom_mapping_metric: str = typer.Option(
-        "geodesic-distance", "--atom-mapping-metric",
-        help="--atom-mapping: how each candidate mapping (including 'don't "
-        "reindex') is scored -- 'geodesic-distance' (the geodesic optimizer's "
-        "own path length; needs a full interpolation per candidate) or "
-        "'path-rmsd' (cumulative per-frame RMSD along the path; same cost) are "
-        "the defaults' cost class; 'gi-energy' (highest QM energy along the "
-        "path) adds one engine evaluation per candidate on top of that; "
-        "'endpoint-rmsd' (Kabsch RMSD between the two fixed endpoints, no "
-        "interpolation at all -- orders of magnitude cheaper, but knows "
-        "nothing about what happens ALONG the path, so it's the weakest "
-        "signal of the four; EXPERIMENTAL, see docs/channels_candidates.md's "
-        "open-problem note on mapping cost before relying on it). Which "
-        "actually best predicts a correct mapping isn't settled -- "
-        "--debug-dump records all four per candidate to help compare them.",
+        "rmsd-geodesic", "--atom-mapping-metric",
+        help="--atom-mapping: " + _MAPPING_HELP + " One of: " + ", ".join(_OFFERED_METRICS) + ".",
     ),
+    atom_mapping_rmsd_window: Optional[float] = typer.Option(
+        None, "--atom-mapping-rmsd-window",
+        help="rmsd-geodesic: compute GI paths for the conformer pairs within this many standard deviations "
+        "of each mechanism's lowest endpoint RMSD. Default: the profile's atom_mapping_inputs.rmsd_window "
+        "(1). Larger keeps more of what GI paths over every pair would pick, at more cost."),
+    atom_mapping_gi_variants: Optional[int] = typer.Option(
+        None, "--atom-mapping-gi-variants",
+        help="rmsd-geodesic: GI paths for this many lowest-endpoint-RMSD symmetry variants per pair and "
+        "mechanism (0 = all). Default: atom_mapping_inputs.gi_variant_cap (20)."),
     atom_mapping_veto_margin: float = typer.Option(
         0.0, "--atom-mapping-veto-margin",
         help="--atom-mapping: a non-identity candidate must beat 'don't "
@@ -871,7 +915,7 @@ def channels(
         "(MMFF94) of the lowest -- the counterpart of --crest-ewin. Default: no window.",
     ),
     rmsd_cutoff: float = typer.Option(
-        0.5, "--rmsd-cutoff",
+        0.1, "--rmsd-cutoff",
         help="Minimum pairwise RMSD (bohr) for two conformers of the same endpoint "
         "to count as distinct.",
     ),
@@ -973,11 +1017,11 @@ def channels(
         "correctness check, not a convenience.",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff",
+        -20.0, "--hessian-minimum-frequency-cutoff",
         help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement",
+        0.3, "--hessian-minima-rescue-displacement",
         help="Displacement (bohr) applied along the lowest-frequency mode when "
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
@@ -1022,8 +1066,12 @@ def channels(
         raise typer.BadParameter("--rdkit-ewin must be positive.")
     if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
         raise typer.BadParameter(
-            f"--atom-mapping-metric must be one of {_ATOM_MAPPING_METRICS}."
+            f"--atom-mapping-metric must be one of {', '.join(_OFFERED_METRICS)}."
         )
+    if not isinstance(atom_mapping_rmsd_window, (int, float)):
+        atom_mapping_rmsd_window = None   # not given (e.g. called from Python): the profile's value
+    if atom_mapping_rmsd_window is not None and atom_mapping_rmsd_window < 0:
+        raise typer.BadParameter("--atom-mapping-rmsd-window must be 0 or more (standard deviations).")
     if atom_mapping_candidates <= 0:
         raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
     if crest_threads <= 0:
@@ -1058,6 +1106,10 @@ def channels(
     run_inputs.path_min_inputs.hessian_minima_rescue_displacement = hessian_minima_rescue_displacement
     run_inputs.atom_mapping_inputs.n_candidates = atom_mapping_candidates
     run_inputs.atom_mapping_inputs.metric = atom_mapping_metric
+    if atom_mapping_rmsd_window is not None:
+        run_inputs.atom_mapping_inputs.rmsd_window = atom_mapping_rmsd_window
+    if isinstance(atom_mapping_gi_variants, int):
+        run_inputs.atom_mapping_inputs.gi_variant_cap = max(0, atom_mapping_gi_variants)
     run_inputs.atom_mapping_inputs.veto_margin = atom_mapping_veto_margin
     run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     _echo_run_inputs_summary(run_inputs)

@@ -503,9 +503,9 @@ def test_validate_unique_minima_rejects_and_rededuplicates(monkeypatch):
 
 
 
-def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
-    """A rescue that fails at the configured push retries at 0.3 and 0.5
-    bohr (both directions), stopping at the first success."""
+def test_hessian_rescue_tries_one_push_each_way(monkeypatch):
+    """A rescue pushes +-rescue_displacement once each and never retries
+    larger pushes; it stops at the first success."""
     import mepd.elementarystep as es
 
     node = _fake_structure_node(2)
@@ -515,7 +515,7 @@ def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
     monkeypatch.setattr(es, "_run_geom_opt", lambda n, engine: [n])
 
     def validate(n, engine, frequency_cutoff):
-        ok = abs(tried[-1]) >= 0.3
+        ok = tried[-1] < 0
         return es.HessianMinimaValidation(is_minimum=ok, min_frequency=50.0 if ok else -300.0,
                                           reason="ok" if ok else "saddle", hessian_result=object())
 
@@ -524,8 +524,8 @@ def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
     rescued, check, _ = es._hessian_rescue_failed_candidate(
         node, engine=None, validation=start, frequency_cutoff=0.0, rescue_displacement=0.1,
         verbose=False, label="t")
-    assert tried == [0.1, -0.1, 0.3]                     # escalated once, stopped at the first success
-    assert rescued is node and check.is_minimum and "+0.300 bohr push" in check.reason
+    assert tried == [0.1, -0.1]
+    assert rescued is node and check.is_minimum and "-0.100 bohr push" in check.reason
 
     tried.clear()
     monkeypatch.setattr(es, "_validate_hessian_minimum",
@@ -534,8 +534,7 @@ def test_hessian_rescue_escalates_push_until_a_minimum(monkeypatch):
     rescued, check, _ = es._hessian_rescue_failed_candidate(
         node, engine=None, validation=start, frequency_cutoff=0.0, rescue_displacement=0.1,
         verbose=False, label="t")
-    assert tried == [0.1, -0.1, 0.3, -0.3, 0.5, -0.5] and rescued is None and not check.is_minimum
-    assert es._rescue_schedule(0.3) == [0.3, 0.5] and es._rescue_schedule(0.7) == [0.7]
+    assert tried == [0.1, -0.1] and rescued is None and not check.is_minimum
 
 
 def test_restore_rigid_body_hessian_recovers_a_projected_hessian_off_equilibrium():

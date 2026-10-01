@@ -27,6 +27,8 @@ from mepd.web.workspace import WorkspaceError
 
 # ------------------------------------------------------------------ choices
 
+from mepd.atom_mapping_metrics import LABELS as _MAPPING_LABELS, OFFERED as _OFFERED_METRICS
+
 PATH_METHODS = [
     ("NEB", "NEB", "Nudged elastic band (mepd's own), optionally with a climbing image."),
     ("FNEB", "FSM (FNEB)", "Freezing string method: grows the path from both ends, then relaxes it."),
@@ -87,7 +89,9 @@ GEOMOPT_DEFAULTS = {"coordsys": "cart", "maxit": 500, "convergence_set": "GAU_TI
 GI_DEFAULTS = {"nimages": 10, "friction": 0.001, "nudge": 0.1, "random_seed": 0, "align": True}
 CHAIN_DEFAULTS = {"k": 0.1, "delta_k": 0.09, "do_parallel": True, "node_freezing": True, "fraction_freeze": 0.1,
                   "node_rms_thre": 5.0, "node_ene_thre": 5.0, "frozen_atom_indices": ""}
-MAPPING_DEFAULTS = {"n_candidates": 200, "metric": "geodesic-distance", "veto_margin": 0.0, "recheck_on_split": False}
+MAPPING_DEFAULTS = {"n_candidates": 200, "metric": "geodesic-distance", "rmsd_window": 1.0, "gi_variant_cap": 20,
+                    "veto_margin": 0.0,
+                    "recheck_on_split": False}
 TERACHEM_MODEL = {"method": "ub3lyp", "basis": "3-21g"}
 
 # Keys every path method reads.
@@ -140,7 +144,7 @@ OPTIONS = {
     "mlip_engine_kwds.family": [("", "from the model name"), *((f, f) for f in ("aimnet2", "orb", "mace", "ani", "fairchem"))],
     "mlip_engine_kwds.geometry_optimizer": [(o, o) for o in ("LBFGSLineSearch", "LBFGS", "BFGS", "FIRE", "MDMin")],
     "program_kwds.device": [("cuda", "GPU (cuda)"), ("cpu", "CPU")],
-    "atom_mapping_inputs.metric": [(m, m) for m in ("geodesic-distance", "path-rmsd", "gi-energy", "endpoint-rmsd")],
+    "atom_mapping_inputs.metric": [(m, _MAPPING_LABELS[m]) for m in _OFFERED_METRICS],
 }
 
 HELP = {
@@ -197,6 +201,9 @@ HELP = {
     "do_parallel": "Compute images in parallel.",
     "frozen_atom_indices": "Atoms held fixed (space-separated indices, from 0).",
     "n_candidates": "Atom-mapping candidates scored per mechanism.",
+    "gi_variant_cap": "Filtered GI path: GI paths for this many lowest-RMSD symmetry variants (0 = all).",
+    "rmsd_window": "Filtered GI path: GI paths only for conformer pairs within this many standard deviations of "
+                   "the lowest endpoint RMSD (mepd channels).",
     "metric": "How candidate atom mappings are scored.",
     "veto_margin": "A remapping must beat 'don't reindex' by more than this.",
     "model": "Pretrained FAIR-Chem model name (e.g. uma-s-1p2p1, uma-m-1p1).",
@@ -507,6 +514,18 @@ def form(text: str) -> dict:
         basic.append(choice)
         if problem:
             issues.append(problem)
+    from mepd.solvation import SOLVENTS
+
+    solvation = _table(data, "solvation")
+    solvent = str(solvation.get("solvent") or "").lower()
+    basic.append(_choice("solvent", "Solvent", solvent,
+                         [("", "Gas phase", "")] + [(k, v.label, v.kind) for k, v in SOLVENTS.items()],
+                         "Implicit solvent for every calculation at this level (GFN2-xTB's model; other engines "
+                         "get its solvation free energy added). A solvent makes this a different level of theory."))
+    native = engine == "gxtb" and _table(data, "gxtb_engine_kwds").get("add_gxtb_flag", True) is False   # GFN2-xTB
+    if solvent and not native:
+        notes.append("In solvent, energies are this engine's plus GFN2-xTB's solvation free energy (ALPB unless "
+                     "[solvation] model says otherwise): a composite model.")
     basic.append(_choice("interpolation", "Initial path", interp, INTERPOLATIONS,
                          "How the first path between the two structures is built, and every sub-path a recursive "
                          "split creates." + (" FSM grows its own path from the two ends, so here this only sets "
@@ -716,6 +735,18 @@ def apply(text: str, path: str, value) -> dict:
             raise WorkspaceError(f"unknown optimizer {value!r}")
         if name != _optimizer_name(new):
             new["optimizer_kwds"] = {"name": name}   # each optimizer takes different settings
+    elif path == "solvent":
+        from mepd.solvation import get_solvent
+
+        if not value:
+            new.pop("solvation", None)
+        else:
+            try:
+                key = get_solvent(str(value)).key
+            except ValueError as exc:
+                raise WorkspaceError(str(exc)) from None
+            table = _table(new, "solvation")
+            new["solvation"] = {**table, "solvent": key}
     elif path == "remove_unused":
         method = normalized_method(new.get("path_min_method"))
         if _known_method(method):

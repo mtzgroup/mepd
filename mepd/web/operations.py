@@ -26,16 +26,16 @@ from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mepd.atom_mapping_metrics import METRICS as _ATOM_MAPPING_METRICS
+from mepd.atom_mapping_metrics import HELP as _MAPPING_HELP, LABELS as _MAPPING_LABELS, OFFERED as _OFFERED_METRICS
 from mepd.web.workspace import Workspace, WorkspaceError, is_ts
 
 # "job": a follow-up on another job's output; "design": the Design tab's molecule
 Target = Literal["structure", "pair", "set", "job", "design", "complex"]
+# The three offered: endpoint RMSD, GI path, filtered GI path (mepd still
+# accepts the other two from older profiles, but no form offers them).
 # Subscripting with a tuple lists its items, so this stays in step with
-# mepd's metric registry instead of drifting behind it (it did: the UI
-# offered three of the four for a while). `Literal[*METRICS]` would be
-# tidier but needs 3.11, and this package still supports 3.10.
-AtomMappingMetric = Literal[_ATOM_MAPPING_METRICS]
+# mepd's list (`Literal[*OFFERED]` would need 3.11).
+AtomMappingMetric = Literal[_OFFERED_METRICS]
 
 
 def P(default, title: str, help: str = "", *, cli: Optional[str] = None, kind: str = "value",
@@ -94,12 +94,7 @@ _ENDPOINTS_HELP = (
     "structure has been minimized (so the path starts from those minima), and the SMILES "
     "only for two raw SMILES embeddings (mepd then builds an atom-mapped pair itself)."
 )
-_MAPPING_METRIC_HELP = (
-    "How each candidate atom mapping is scored. geodesic-distance / path-rmsd: interpolate a path per "
-    "candidate. gi-energy: adds one energy per candidate. endpoint-rmsd: aligned RMSD between the two "
-    "endpoints, no interpolation (orders of magnitude cheaper, but blind to what happens along the path; "
-    "experimental in mepd)."
-)
+_MAPPING_METRIC_HELP = _MAPPING_HELP
 
 
 class TsParams(Params):
@@ -124,17 +119,16 @@ class TsParams(Params):
     atom_mapping_metric: AtomMappingMetric = P(
         "geodesic-distance", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
-        requires="atom_mapping")
+        requires="atom_mapping", labels=_MAPPING_LABELS)
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
-        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        "have no imaginary frequency beyond the cutoff; a failing one is pushed along its unstable mode and re-optimized.",
         cli="--validate-minima-with-hessian", kind="toggle", requires="path_mode=recursive|parallel")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
-        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
         requires="validate_minima_with_hessian", gt=0)
     same_pair_split_limit: int = P(5, "Same-pair split limit", cli="--same-pair-split-limit",
                                    group="Recursive splitting", advanced=True, ge=0,
@@ -185,7 +179,8 @@ class ChannelsParams(Params):
         requires="backend=crest")
     crest_timeout: float = P(3600.0, "CREST timeout (s)", cli="--crest-timeout", group="Conformers",
                              advanced=True, requires="backend=crest")
-    rmsd_cutoff: float = P(0.5, "Dedup RMSD (bohr)", cli="--rmsd-cutoff", group="Conformers", advanced=True)
+    rmsd_cutoff: float = P(0.1, "Dedup RMSD (bohr)", "Conformers closer than this (snap-RMSD, bohr) count as one.",
+                           cli="--rmsd-cutoff", group="Conformers", advanced=True, gt=0)
     random_seed: int = P(0, "Random seed", cli="--random-seed", group="Conformers", advanced=True)
     reuse_conformers: bool = P(True, "Reuse conformer pools",
                                "Take an endpoint's conformers from an earlier Reaction channels run on the same "
@@ -195,19 +190,24 @@ class ChannelsParams(Params):
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
     atom_mapping_metric: AtomMappingMetric = P(
-        "geodesic-distance", "Mapping metric", _MAPPING_METRIC_HELP,
+        "rmsd-geodesic", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Pairs", advanced=True,
-        requires="atom_mapping")
+        requires="atom_mapping", labels=_MAPPING_LABELS)
+    atom_mapping_rmsd_window: float = P(
+        1.0, "RMSD window (σ)", "Filtered GI path: GI paths for the conformer pairs within this many standard "
+        "deviations of each mechanism's lowest endpoint RMSD. On the KAIST set 1σ kept 6% of the pairs and 56% of "
+        "what GI paths over every pair would pick; 2σ 21% / 82%; 3σ 51% / 96%.",
+        cli="--atom-mapping-rmsd-window", group="Pairs", advanced=True, ge=0,
+        requires="atom_mapping_metric=rmsd-geodesic")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
-        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        "have no imaginary frequency beyond the cutoff; a failing one is pushed along its unstable mode and re-optimized.",
         cli="--validate-minima-with-hessian", kind="toggle")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
-        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
         requires="validate_minima_with_hessian", gt=0)
 
 
@@ -229,14 +229,14 @@ class HessianSampleParams(Params):
                                         requires="amplitude_policy=energy")
     maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
     validate_minima_with_hessian: bool = P(
-        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency; one "
+        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency beyond the cutoff; one "
         "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped "
         "(listed as rejected) if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
         advanced=True, requires="validate_minima_with_hessian", gt=0)
 
 
@@ -258,27 +258,27 @@ class HessianGlobalParams(Params):
     random_seed: Optional[int] = P(None, "Random seed", cli="--random-seed", advanced=True, group="Advanced")
     maxiter: int = P(500, "Max optimizer iterations", cli="--maxiter", advanced=True, group="Advanced")
     validate_minima_with_hessian: bool = P(
-        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency; one "
+        True, "Validate minima with Hessian", "Every minimum found must have no imaginary frequency beyond the cutoff; one "
         "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped "
         "(listed as rejected) if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
         advanced=True, requires="validate_minima_with_hessian", gt=0)
 
 
 class OptimizeParams(Params):
     validate_minima_with_hessian: bool = P(
-        True, "Verify minima with Hessian", "After optimizing, require no imaginary frequency; a structure "
+        True, "Verify minima with Hessian", "After optimizing, require no imaginary frequency beyond the cutoff; a structure "
         "that stopped on a saddle point is pushed along its unstable mode and re-optimized, and flagged "
         "'not a minimum' if that fails too.", cli="--validate-minima-with-hessian", kind="toggle")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode; escalates to 0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation",
         advanced=True, requires="validate_minima_with_hessian", gt=0)
 
 
@@ -287,14 +287,13 @@ class NetworkSplitsParams(Params):
     parallel: bool = P(False, "Parallel branches", cli="--parallel", kind="switch")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
-        "have no imaginary frequency; a failing one is pushed along its unstable mode and re-optimized.",
+        "have no imaginary frequency beyond the cutoff; a failing one is pushed along its unstable mode and re-optimized.",
         cli="--validate-minima-with-hessian", kind="toggle")
     hessian_minimum_frequency_cutoff: float = P(
-        0.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
+        -20.0, "Lowest allowed frequency (cm⁻¹)", cli="--hessian-minimum-frequency-cutoff",
         group="Hessian validation", advanced=True, requires="validate_minima_with_hessian")
     hessian_minima_rescue_displacement: float = P(
-        0.1, "Rescue push (bohr)", "First push along the unstable mode before re-optimizing; escalates to "
-        "0.3 and 0.5 bohr if the rescue fails.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
+        0.3, "Rescue push (bohr)", "Push along the unstable mode, both ways, before re-optimizing.", cli="--hessian-minima-rescue-displacement", group="Hessian validation", advanced=True,
         requires="validate_minima_with_hessian", gt=0)
 
     same_pair_split_limit: int = P(5, "Same-pair split limit", cli="--same-pair-split-limit",
@@ -311,7 +310,7 @@ class ConformersParams(Params):
                        cli="--minimize", kind="toggle")
     validate_minima_with_hessian: bool = P(False, "Hessian-check each", cli="--validate-minima-with-hessian",
                                            kind="toggle", requires="minimize")
-    rmsd_cutoff: float = P(0.5, "Distinct beyond RMSD (bohr)", cli="--rmsd-cutoff", gt=0, advanced=True,
+    rmsd_cutoff: float = P(0.1, "Distinct beyond RMSD (bohr)", cli="--rmsd-cutoff", gt=0, advanced=True,
                            group="Sampling")
     crest_method: Literal["--gfn2", "--gfnff", "--gfn2//gfnff"] = P(
         "--gfn2", "CREST level", cli="--crest-method", advanced=True, group="Sampling", requires="backend=crest")
@@ -373,7 +372,7 @@ class ExpandParams(Params):
                                 cli="--allow-zwitterions", kind="switch", advanced=True, group="Rules",
                                 requires="generator=bond-rules")
     validate_minima_with_hessian: bool = P(
-        True, "Validate species with Hessian", "Every new species must have no imaginary frequency; one that "
+        True, "Validate species with Hessian", "Every new species must have no imaginary frequency beyond the cutoff; one that "
         "stopped on a saddle point is pushed along its unstable mode and re-optimized, and dropped if that fails.",
         cli="--validate-minima-with-hessian", kind="toggle")
     connect: bool = P(False, "Connect by path search", "Run a recursive path search for every proposed reaction "
@@ -659,6 +658,9 @@ class ChannelsMoreParams(Params):
                                  "best-scoring conformer pairs (0 = all of them). Pairs already searched are "
                                  "kept and skipped.", kind="custom", ge=0)
     workers: int = P(4, "Workers", "Processes for atom mapping, path searches and TS/IRC.", kind="custom", ge=1)
+    rmsd_window: Optional[float] = P(
+        None, "RMSD window (σ)", "Filtered GI path only: widen the window to GI-score more conformer pairs "
+        "(empty: as before).", kind="custom", ge=0, advanced=True)
 
 
 def _replace_flags(argv: list[str], flags: dict) -> list[str]:
@@ -702,9 +704,11 @@ def _build_channels_more(ctx: JobContext, p: ChannelsMoreParams) -> list[str]:
                              "could not be numbered like its earlier ones, so it cannot be extended safely")
     if not (out / "pair_mechanisms.json").exists():
         raise WorkspaceError("that run has no pair table (pair_mechanisms.json) to extend")
-    return _replace_flags(list(src["argv"]), {
-        "--pairs-per-mechanism": p.pairs_per_mechanism, "--workers": p.workers,
-        "--start-pool": pools["start"], "--end-pool": pools["end"], "--output": out})
+    flags = {"--pairs-per-mechanism": p.pairs_per_mechanism, "--workers": p.workers,
+             "--start-pool": pools["start"], "--end-pool": pools["end"], "--output": out}
+    if p.rmsd_window is not None:
+        flags["--atom-mapping-rmsd-window"] = f"{p.rmsd_window:g}"
+    return _replace_flags(list(src["argv"]), flags)
 
 
 def _build_tsopt(ctx: JobContext, p: TsOptParams) -> list[str]:
@@ -1008,6 +1012,135 @@ def _build_network_splits(ctx: JobContext, p: NetworkSplitsParams) -> list[str]:
     return ["network-splits", *minima, *ctx.common_flags(), *generic_flags(p), "--output", str(ctx.output_dir)]
 
 
+def _solvent_labels() -> dict:
+    from mepd.solvation import SOLVENTS
+
+    return {k: f"{v.label} (ε {v.epsilon:g}, {v.kind})" for k, v in SOLVENTS.items()}
+
+
+def _solvent_keys() -> tuple:
+    from mepd.solvation import SOLVENTS
+
+    return tuple(SOLVENTS)
+
+
+SolventKey = Literal[_solvent_keys()]
+
+
+class SolventParams(Params):
+    solvents: list[SolventKey] = P(
+        ["water", "methanol", "dmso", "acetonitrile", "thf", "toluene"], "Solvents",
+        "Each is an implicit (continuum) solvent. Pick several kinds (protic, polar aprotic, nonpolar) to see a trend.",
+        kind="custom", labels=_solvent_labels())
+    mode: Literal["single-point", "reoptimize"] = P(
+        "single-point", "Geometries",
+        "Keep gas-phase: solvent energies along the gas-phase path (seconds; a first estimate, and mepd says when "
+        "it does not hold). Re-optimize: search the TS again in each solvent, with its IRC and minimized ends "
+        "(minutes per solvent).", cli="--mode",
+        labels={"single-point": "Keep gas-phase (fast)", "reoptimize": "Re-optimize in solvent"})
+    temperature: float = P(298.15, "Temperature (K)", "For half-lives and rates (298.15 K = 25 °C).",
+                           cli="--temperature", gt=0)
+    model: Literal["alpb", "gbsa", "cpcmx"] = P(
+        "alpb", "Solvent model", "GFN2-xTB's implicit models: ALPB (default), GBSA, CPCM-X.", cli="--model",
+        advanced=True)
+
+
+def _build_solvent(ctx: JobContext, p: SolventParams) -> list[str]:
+    if ctx.source is None:
+        raise WorkspaceError("Solvent effects follow up on a finished TS search")
+    if not p.solvents:
+        raise WorkspaceError("pick at least one solvent")
+    text = ctx.ws.read_profile(ctx.profile) if ctx.profile else ""
+    if "[solvation]" in (text or ""):
+        raise WorkspaceError("this job already ran in solvent (its profile has a [solvation] table)")
+    argv = ["solvent", ctx.source["output_dir"], *ctx.common_flags()]
+    for key in dict.fromkeys(p.solvents):
+        argv += ["--solvent", key]
+    return [*argv, *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+class MechanoParams(Params):
+    mode: Literal["bell", "reoptimize"] = P(
+        "bell", "Method", "Estimate: Bell's first-order barrier shifts from the geometries you have (instant). "
+        "Check under force: re-optimize the reactant, TS and IRC on the force-modified surface for the main levers "
+        "(minutes).", cli="--mode", labels={"bell": "Estimate (instant)", "reoptimize": "Check under force"})
+    pair: str = P("", "Atoms to pull", "Two atom numbers 'i,j' (0-based, as the viewer's atom indices show). "
+                  "Empty: rank every heavy-atom pair.", kind="custom")
+    forces: str = P("0.5, 1, 1.5", "Forces to check (nN)", "Used by 'Check under force'.", kind="custom",
+                    requires="mode=reoptimize")
+    max_force: float = P(2.5, "Largest force (nN)", "Scanned for selectivity switches. Covalent bonds break at ~4–6 nN.",
+                         cli="--max-force", gt=0, le=6, advanced=True)
+    hydrogens: bool = P(False, "Pull on hydrogens too", cli="--hydrogens", kind="toggle", advanced=True)
+    temperature: float = P(298.15, "Temperature (K)", "For half-lives (298.15 K = 25 °C).", cli="--temperature",
+                           gt=0, advanced=True)
+
+
+def _build_mechano(ctx: JobContext, p: MechanoParams) -> list[str]:
+    if ctx.source is None:
+        raise WorkspaceError("Mechanical force follows up on a finished TS search or channels run")
+    argv = ["force", ctx.source["output_dir"], *ctx.common_flags()]
+    if p.pair.strip():
+        parts = p.pair.replace("-", ",").split(",")
+        if len(parts) != 2 or not all(x.strip().isdigit() for x in parts):
+            raise WorkspaceError(f"atoms to pull: give two atom numbers like 0,7 (got {p.pair!r})")
+        argv += ["--pair", ",".join(x.strip() for x in parts)]
+    if p.mode == "reoptimize":
+        try:
+            forces = [float(x) for x in p.forces.replace(";", ",").split(",") if x.strip()]
+        except ValueError:
+            raise WorkspaceError(f"forces: give numbers in nN, e.g. 0.5, 1, 1.5 (got {p.forces!r})") from None
+        if not forces or any(not 0 < f <= 6 for f in forces):
+            raise WorkspaceError("forces must be between 0 and 6 nN")
+        for f in forces:
+            argv += ["--force", f"{f:g}"]
+    return [*argv, *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+def _group_keys() -> tuple:
+    from mepd.substituents import group_smiles
+
+    return tuple(group_smiles())
+
+
+def _group_labels() -> dict:
+    from mepd.substituents import SHORT, SIGMA_P
+
+    return {g: SHORT.get(g, g) + (f" (σp {SIGMA_P[g]:+.2f})" if g in SIGMA_P else "") for g in _group_keys()}
+
+
+GroupKey = Literal[_group_keys()]
+
+
+class SubstituentParams(Params):
+    groups: list[GroupKey] = P(
+        ["amino", "hydroxyl", "methoxy", "methyl", "fluoro", "chloro", "trifluoromethyl", "cyano", "nitro"],
+        "Groups", "Each replaces one hydrogen at a time. Donors to acceptors shows the electronic trend.",
+        kind="custom", labels=_group_labels())
+    mode: Literal["fast", "reoptimize"] = P(
+        "fast", "Geometries", "Fast: relax only the new group (seconds per variant). Re-optimize: TS search, IRC "
+        "and minimized reactant for every variant (about a minute each).", cli="--mode",
+        labels={"fast": "Relax the group (fast)", "reoptimize": "Re-optimize the TS"})
+    sites: str = P("", "Where", "Atom numbers (0-based, as the viewer shows): a hydrogen, or the heavy atom whose "
+                   "hydrogens to replace. Empty: every hydrogen that is not transferred.", kind="custom")
+    max_sites: int = P(8, "Most sites", "Closest to the reacting atoms first.", cli="--max-sites", ge=1, le=40,
+                       advanced=True)
+
+
+def _build_substituents(ctx: JobContext, p: SubstituentParams) -> list[str]:
+    if ctx.source is None:
+        raise WorkspaceError("Substituent effects follow up on a finished TS search or channels run")
+    if not p.groups:
+        raise WorkspaceError("pick at least one group")
+    argv = ["substituents", ctx.source["output_dir"], *ctx.common_flags()]
+    for g in dict.fromkeys(p.groups):
+        argv += ["--group", g]
+    for x in [t.strip() for t in p.sites.replace(";", ",").split(",") if t.strip()]:
+        if not x.isdigit():
+            raise WorkspaceError(f"where: give atom numbers like 4, 7 (got {p.sites!r})")
+        argv += ["--site", x]
+    return [*argv, *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
 PAIR = "Connect two structures"
 EXPLORE = "Explore around a structure"
 SET = "Across a set of structures"
@@ -1153,6 +1286,31 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "(TS1, VRI, TS2, P1, P2 on one map). (`mepd discovery vri-surface`)",
         "job", FROM_TS, VriSurfaceParams, _build_vri_followup("vri-surface"), source_ops=("vri",),
         cli_path=("discovery", "vri-surface")),
+    Operation(
+        "solvent", "Solvent effects", "Recompute this reaction's barrier in implicit solvents and see which "
+        "conditions speed it up or slow it down: barriers, half-lives, and the temperature each solvent needs. "
+        "(`mepd solvent`)",
+        "job", "Reaction conditions", SolventParams, _build_solvent, source_ops=("ts", "tsopt", "design-tsopt"),
+        cli_path=("solvent",), cli_extra_flags=("--solvent", "--charge", "--multiplicity", "--inputs", "--output"),
+        own_output=True, produces=["barriers in each solvent", "insights on conditions"]),
+    Operation(
+        "mechanochem", "Mechanical force", "Which atoms to pull on to speed a channel up or hold it back, how hard, "
+        "and when pulling makes a slower channel win. (`mepd force`)",
+        "job", "Reaction conditions", MechanoParams, _build_mechano,
+        source_ops=("ts", "tsopt", "design-tsopt", "channels"), cli_path=("force",),
+        cli_extra_flags=("--pair", "--force", "--charge", "--multiplicity", "--inputs", "--output"),
+        own_output=True, produces=["pulling pairs per channel", "selectivity switches under force"],
+        # Off in the web UI until its results are trusted (the user's call, 2026-09-29): not offered, not
+        # run from here, results not shown. `mepd force` still works on the command line.
+        available=False, unavailable_reason="Mechanical force is off in the web UI for now; `mepd force` runs it "
+        "on the command line."),
+    Operation(
+        "substituents", "Substituent effects", "Swap hydrogens for functional groups, one at a time, and see how "
+        "each shifts the barrier and which channel wins. (`mepd substituents`)",
+        "job", "Reaction conditions", SubstituentParams, _build_substituents,
+        source_ops=("ts", "tsopt", "design-tsopt", "channels"), cli_path=("substituents",),
+        cli_extra_flags=("--group", "--site", "--charge", "--multiplicity", "--inputs", "--output"),
+        own_output=True, produces=["barrier shift per site and group", "substituted TSs"]),
 ]}
 
 

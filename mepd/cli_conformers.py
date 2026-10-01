@@ -18,7 +18,7 @@ def conformers(
     backend: str = typer.Option("rdkit", "--backend", help="'rdkit' (ETKDG + MMFF) or 'crest' (CREST metadynamics)."),
     n_conformers: int = typer.Option(20, "--n-conformers", help="Most distinct conformers to keep (0 = no cap)."),
     rmsd_cutoff: float = typer.Option(
-        0.5, "--rmsd-cutoff", help="Conformers closer than this (bohr, symmetry-aware RMSD) count as one."),
+        0.1, "--rmsd-cutoff", help="Conformers closer than this (bohr, symmetry-aware RMSD) count as one."),
     crest_method: str = typer.Option("--gfn2", "--crest-method", help="CREST's level: --gfn2, --gfnff or --gfn2//gfnff."),
     crest_ewin: float = typer.Option(6.0, "--crest-ewin", help="CREST energy window (kcal/mol)."),
     minimize: bool = typer.Option(
@@ -64,5 +64,5 @@ def conformers(
         typer.echo("Minimizing each conformer at the --inputs level...")
         optimize(structures=[output / "conformers.xyz"], inputs=inputs, charge=seed.structure.charge,
                  multiplicity=seed.structure.multiplicity, validate_minima_with_hessian=validate_minima_with_hessian,
-                 hessian_minimum_frequency_cutoff=0.0, hessian_minima_rescue_displacement=0.1,
+                 hessian_minimum_frequency_cutoff=-20.0, hessian_minima_rescue_displacement=0.3,
                  output=output / "optimized")

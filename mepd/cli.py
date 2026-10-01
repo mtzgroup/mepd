@@ -22,9 +22,13 @@ from typing import List, Optional
 import typer
 
 from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
+from mepd.atom_mapping_metrics import HELP as _MAPPING_HELP, OFFERED as _OFFERED_METRICS
 from mepd.chain import Chain
 from mepd.cli_channels import channels
 from mepd.cli_conformers import conformers
+from mepd.cli_solvent import solvent
+from mepd.cli_force import force
+from mepd.cli_substituents import substituents
 from mepd.cli_complex import complex_
 from mepd.cli_common import (
     _check_endpoint_atom_mapping,
@@ -269,11 +273,11 @@ def run(
         "check, not a convenience.",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff",
+        -20.0, "--hessian-minimum-frequency-cutoff",
         help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement",
+        0.3, "--hessian-minima-rescue-displacement",
         help="Displacement (bohr) applied along the lowest-frequency mode when "
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
@@ -320,19 +324,8 @@ def run(
     ),
     atom_mapping_metric: str = typer.Option(
         "geodesic-distance", "--atom-mapping-metric",
-        help="--atom-mapping: how each candidate mapping (including 'don't "
-        "reindex') is scored -- 'geodesic-distance' (the geodesic optimizer's "
-        "own path length; needs a full interpolation per candidate) or "
-        "'path-rmsd' (cumulative per-frame RMSD along the path; same cost) are "
-        "the defaults' cost class; 'gi-energy' (highest QM energy along the "
-        "path) adds one engine evaluation per candidate on top of that; "
-        "'endpoint-rmsd' (Kabsch RMSD between the two fixed endpoints, no "
-        "interpolation at all -- orders of magnitude cheaper, but knows "
-        "nothing about what happens ALONG the path, so it's the weakest "
-        "signal of the four; EXPERIMENTAL, see docs/channels_candidates.md's "
-        "open-problem note on mapping cost before relying on it). Which "
-        "actually best predicts a correct mapping isn't settled -- "
-        "--debug-dump records all four per candidate to help compare them.",
+        help="--atom-mapping: " + _MAPPING_HELP + " (One pair here, so rmsd-geodesic compares its "
+        "candidates by GI path.) One of: " + ", ".join(_OFFERED_METRICS) + ".",
     ),
     atom_mapping_veto_margin: float = typer.Option(
         0.0, "--atom-mapping-veto-margin",
@@ -377,7 +370,7 @@ def run(
         raise typer.BadParameter("--same-pair-split-limit must be a positive integer.")
     if atom_mapping_metric not in _ATOM_MAPPING_METRICS:
         raise typer.BadParameter(
-            f"--atom-mapping-metric must be one of {_ATOM_MAPPING_METRICS}."
+            f"--atom-mapping-metric must be one of {', '.join(_OFFERED_METRICS)}."
         )
     if atom_mapping_candidates <= 0:
         raise typer.BadParameter("--atom-mapping-candidates must be a positive integer.")
@@ -1118,11 +1111,11 @@ def network_splits(
         "check, not a convenience.",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff",
+        -20.0, "--hessian-minimum-frequency-cutoff",
         help="Minimum allowed frequency (cm^-1) for --validate-minima-with-hessian.",
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement",
+        0.3, "--hessian-minima-rescue-displacement",
         help="Displacement (bohr) applied along the lowest-frequency mode when "
         "rescuing a Hessian-rejected minimum, for --validate-minima-with-hessian.",
     ),
@@ -1229,6 +1222,9 @@ def network_splits(
 # never needs to import from this one.
 app.command("channels")(channels)
 app.command("conformers")(conformers)
+app.command("solvent")(solvent)
+app.command("force")(force)
+app.command("substituents")(substituents)
 app.command("complex")(complex_)
 
 
@@ -1252,10 +1248,10 @@ def optimize(
         "as not a minimum.",
     ),
     hessian_minimum_frequency_cutoff: float = typer.Option(
-        0.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
+        -20.0, "--hessian-minimum-frequency-cutoff", help="Minimum allowed frequency (cm^-1)."
     ),
     hessian_minima_rescue_displacement: float = typer.Option(
-        0.1, "--hessian-minima-rescue-displacement", help="Rescue displacement along the unstable mode (bohr)."
+        0.3, "--hessian-minima-rescue-displacement", help="Rescue displacement along the unstable mode (bohr)."
     ),
     output: Path = typer.Option(
         Path("mepd_optimize_output"), "--output", "-o", help="Directory to write results into."

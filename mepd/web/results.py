@@ -1084,6 +1084,168 @@ def collect_vri(out: Path, charge: int, multiplicity: int) -> dict:
     return result
 
 
+def collect_solvent(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd solvent` output: summary.json plus one folder per solvent with
+    the profile's files in that solvent. The job's own barrier stays None:
+    it is not a gas-phase barrier, so edge badges (which take the lowest
+    barrier of an edge's jobs) must never pick it up; the solvent barriers
+    live in result["conditions"] instead."""
+    data = _read_json(out / "summary.json")
+    if not data:
+        return _result("No solvent results yet", [], [])
+    source = Path(data.get("source") or "")
+    entries = []
+
+    def profile_entry(eid: str, label: str, folder: Path, prof: dict) -> Optional[dict]:
+        if not prof or prof.get("barrier_kcal") is None or not prof.get("irc_file"):
+            return None
+        irc = _load_chain(folder / prof["irc_file"], charge, multiplicity)
+        if irc is None:
+            return None
+        nodes = list(reversed(irc.nodes)) if prof.get("reverse") else list(irc.nodes)
+        return _entry(eid, f"{label} · {prof['barrier_kcal']:.1f} kcal/mol", nodes, prof.get("floor_hartree"),
+                      barrier=prof["barrier_kcal"], note=prof.get("ts_label") or "")
+
+    gas = data.get("gas") or {}
+    entries.append(profile_entry("gas", "Gas phase", source, gas))
+    for row in data.get("solvents", []):
+        entries.append(profile_entry(f"solvent_{row['key']}", row["label"], out / row.get("dir", row["key"]), row))
+    entries = [e for e in entries if e]
+    rows = [r for r in data.get("solvents", []) if r.get("barrier_kcal") is not None]
+    if rows and gas.get("barrier_kcal") is not None:
+        best = min(rows, key=lambda r: r["barrier_kcal"])
+        headline = (f"Gas {gas['barrier_kcal']:.1f} kcal/mol · lowest in {best['label']}: "
+                    f"{best['barrier_kcal']:.1f} ({best['barrier_kcal'] - gas['barrier_kcal']:+.1f})")
+    else:
+        headline = "No barrier in solvent could be computed"
+    mode = data.get("mode")
+    summary = [{"label": "Geometries", "value": "gas-phase (single points)" if mode == "single-point"
+                else "re-optimized in each solvent"},
+               {"label": "Solvent model", "value": f"{data.get('model_label')} "
+                + ("(the engine's own)" if data.get("method") == "native" else "via GFN2-xTB correction")},
+               {"label": "Temperature", "value": f"{float(data.get('temperature', 298.15)):.0f} K"}]
+    result = _result(headline, [_group("Energy profiles", "path", entries)], summary)
+    result["conditions"] = {k: data.get(k) for k in ("mode", "model", "model_label", "method", "temperature",
+                                                     "gas", "solvents", "insights", "warnings", "kind")}
+    _reword_conditions(result["conditions"])
+    return result
+
+
+def _reword_conditions(cond: dict) -> None:
+    """Findings, half-lives and warnings in today's wording, rebuilt from
+    the numbers a run saved (older runs stored longer sentences)."""
+    try:
+        from mepd.cli_solvent import modernize_warning
+        from mepd.conditions import kinetics_row, solvent_insights
+
+        temperature = float(cond.get("temperature") or 298.15)
+        for row in [cond.get("gas") or {}, *(cond.get("solvents") or [])]:
+            if row.get("barrier_kcal") is not None:
+                row["t_half"] = kinetics_row(row["barrier_kcal"], temperature)["t_half"]
+        ok = [r for r in cond.get("solvents") or [] if r.get("barrier_kcal") is not None and r.get("shift_kcal") is not None]
+        cond["insights"] = solvent_insights(cond.get("gas") or {}, ok, temperature, mode=cond.get("mode") or "")
+        cond["warnings"] = [modernize_warning(w, cond.get("model_label") or "") for w in cond.get("warnings") or []]
+    except Exception:
+        pass    # keep what the run wrote
+
+
+def collect_mechanochem(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd force` output: summary.json (levers per channel, selectivity
+    switches, checks under force) plus <channel>_<i>-<j>_<F>nN/ folders
+    with the TS and IRC re-optimized under force. Like a solvent job, it
+    never reports a barrier_kcal of its own (see collect_solvent)."""
+    data = _read_json(out / "summary.json")
+    if not data:
+        return _result("No force results yet", [], [])
+    entries = []
+    for row in data.get("efei") or []:
+        if not row.get("dir"):
+            continue
+        irc = _load_chain(out / row["dir"] / "irc.xyz", charge, multiplicity)
+        if irc is None:
+            continue
+        floor = _min(_node_energy(n) for n in irc.nodes[: max(1, len(irc.nodes) // 2)])
+        entries.append(_entry(row["dir"], f"{row['label']} · {row['pair_label']} at {row['force_nN']:g} nN",
+                              irc.nodes, floor, note="energies on the force-modified surface (E − F·d)"))
+    sel = (data.get("selectivity") or [None])[0]
+    kinds = {c["id"]: c.get("kind") for c in data.get("channels") or []}
+    steer = next((x for x in data.get("selectivity") or [] if kinds.get(x["channel"]) == "direct"), None)
+    mechano = {k: data.get(k) for k in ("mode", "temperature", "channels", "selectivity", "insights",
+                                         "warnings", "efei", "max_force", "kind")}
+    _reword_mechano(mechano)
+    top = next((i for i in mechano.get("insights") or [] if i["level"] == "accelerates"), None)
+    if steer is not None or sel is not None:
+        x = steer or sel
+        headline = f"Pulling {x['pair_label']} apart (≥ {x['force_nN']:.1f} nN) lets {x['label']} win over {x['overtakes']}"
+    elif top is not None:
+        headline = top["text"].split(" (")[0]      # "Best lever: pull C0–C4 apart"
+    else:
+        headline = "No pulling pair changes these barriers much"
+    summary = [{"label": "Method", "value": "Bell estimate" + (" + re-optimized under force"
+                                                             if data.get("mode") == "reoptimize" else "")},
+               {"label": "Channels", "value": str(len(data.get("channels") or []))}]
+    result = _result(headline, [_group("Paths under force", "path", entries)], summary)
+    result["mechano"] = mechano
+    return result
+
+
+def _reword_mechano(m: dict) -> None:
+    """Findings and warnings in today's wording, rebuilt from the saved
+    levers, crossovers and checks under force (see _reword_conditions)."""
+    try:
+        from mepd.cli_force import _efei_insights
+        from mepd.mechanochem import WARNINGS, _insights
+
+        channels = m.get("channels") or []
+        if channels:
+            insights = _insights(None, channels, m.get("selectivity") or [], float(m.get("temperature") or 298.15))
+            m["insights"] = insights + (_efei_insights(m["efei"]) if m.get("efei") else [])
+        old = m.get("warnings") or []
+        if old and old[0].startswith("Bell's first-order estimate"):
+            m["warnings"] = list(WARNINGS) + old[2:]
+    except Exception:
+        pass    # keep what the run wrote
+
+
+def collect_substituents(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd substituents` output: summary.json (shift per channel x site x
+    group) plus <channel>/<site>_<h>_<group>.xyz (substituted reactant, TS,
+    product). No barrier_kcal of its own (see collect_solvent)."""
+    data = _read_json(out / "summary.json")
+    if not data:
+        return _result("No substituent results yet", [], [])
+    channels = data.get("channels") or []
+    lead = min(channels, key=lambda c: c["barrier_kcal"])["id"] if channels else None
+    groups = []
+    for ch in channels:
+        rows = sorted((r for r in data.get("variants") or [] if r["channel"] == ch["id"] and r.get("file")
+                       and r["status"] == "ok"), key=lambda r: r["barrier_kcal"])
+        entries = []
+        for r in rows:
+            chain = _load_chain(out / r["file"], charge, multiplicity)
+            if chain is None:
+                continue
+            entries.append(_entry(f"{ch['id']}:{r['site']}:{r['group']}",
+                                  f"{r['label']} · {r['barrier_kcal']:.1f} ({r['shift']:+.1f})", chain.nodes,
+                                  _node_energy(chain[0]), barrier=r["barrier_kcal"], ts_index=1,
+                                  note="reactant end · TS · product end"))
+        title = "Substituted" + (f": {ch['label']}" if len(channels) > 1 else "")
+        grp = _group(title, "path", entries)
+        if grp:
+            groups.insert(0, grp) if ch["id"] == lead else groups.append(grp)
+    top = next((i["text"] for i in data.get("insights") or [] if i["level"] in ("selectivity", "accelerates")), None)
+    headline = top or "No substituent shifts this barrier much"
+    summary = [{"label": "Geometries", "value": "group relaxed (fast)" if data.get("mode") == "fast"
+                else "TS re-optimized"},
+               {"label": "Variants", "value": str(sum(1 for r in data.get("variants") or [] if r["status"] == "ok"))}]
+    result = _result(headline, groups, summary)
+    result["substituents"] = {k: data.get(k) for k in ("mode", "groups", "group_labels", "sites", "channels",
+                                                       "insights", "trends", "warnings")}
+    result["substituents"]["variants"] = [{k: v for k, v in r.items() if k != "file"}
+                                          for r in data.get("variants") or []]
+    return result
+
+
 def _xyz_frames(texts: list, baseline: Optional[float]) -> list[dict]:
     """Frames from xyz texts whose comment line may carry 'energy=<Eh>'
     (the nanoreactor's files: each species has its own charge, so no Chain)."""
@@ -1201,6 +1363,9 @@ COLLECTORS = {
     # Follow-ups add to the VRI folder: they show the same, updated, result.
     "vri-check": collect_vri,
     "vri-surface": collect_vri,
+    "solvent": collect_solvent,
+    "mechanochem": collect_mechanochem,
+    "substituents": collect_substituents,
 }
 
 
@@ -1289,7 +1454,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 23
+RESULT_VERSION = 24
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:
@@ -1330,7 +1495,30 @@ def summarize(result: dict) -> dict:
             "barrier_warning": negative_barrier_text(result["barrier_kcal"])
             if result.get("barrier_kcal") is not None and result["barrier_kcal"] < NEGATIVE_BARRIER_TOL else None,
             # Which TS sets that barrier (no geometry: that is in route_ts.xyz).
-            "route_ts": {k: v for k, v in result["route_ts"].items() if k != "xyz"} if result.get("route_ts") else None}
+            "route_ts": {k: v for k, v in result["route_ts"].items() if k != "xyz"} if result.get("route_ts") else None,
+            # A solvent job: per-solvent barriers (for Explore's conditions),
+            # never in barrier_kcal (see collect_solvent).
+            "conditions": _conditions_summary(result.get("conditions")),
+            "mechano": {"insight": next((i["text"] for i in result["mechano"].get("insights") or []
+                                         if i["level"] in ("selectivity", "accelerates")), None)}
+            if result.get("mechano") else None,
+            "substituents": {"insight": next((i["text"] for i in result["substituents"].get("insights") or []
+                                              if i["level"] in ("selectivity", "accelerates")), None)}
+            if result.get("substituents") else None}
+
+
+def _conditions_summary(cond: Optional[dict]) -> Optional[dict]:
+    if not cond:
+        return None
+    gas = cond.get("gas") or {}
+    return {"mode": cond.get("mode"), "temperature": cond.get("temperature"), "model": cond.get("model"),
+            "gas_kcal": gas.get("barrier_kcal"),
+            "gas_reaction_kcal": gas.get("reaction_kcal"),
+            "solvents": {r["key"]: {"label": r["label"], "barrier_kcal": r.get("barrier_kcal"),
+                                    "shift_kcal": r.get("shift_kcal"), "kind": r.get("kind"),
+                                    "reaction_kcal": r.get("reaction_kcal")}
+                         for r in cond.get("solvents") or []},
+            "insight": next((i["text"] for i in cond.get("insights") or [] if i["level"] == "accelerates"), None)}
 
 
 def find_entry(result: dict, entry_id: str) -> tuple[dict, dict]:

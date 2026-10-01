@@ -472,20 +472,6 @@ def _emit_hessian_validation_message(
             update_status(status)
 
 
-# Pushes tried after the configured one, in bohr, when a rescue fails. A
-# single small push is not always enough: eclipsed ethane re-optimizes
-# straight back onto its torsional saddle from +-0.1 bohr but reaches
-# staggered from +-0.3.
-RESCUE_ESCALATION_BOHR = (0.3, 0.5)
-
-
-def _rescue_schedule(first: float) -> list[float]:
-    """The pushes to try, smallest first: the configured one, then each
-    escalation step larger than it."""
-    first = float(first)
-    return [first] + [d for d in RESCUE_ESCALATION_BOHR if d > first + 1e-9]
-
-
 def _hessian_rescue_failed_candidate(
     node: Node,
     engine: Engine,
@@ -497,11 +483,11 @@ def _hessian_rescue_failed_candidate(
     label: str,
     status: Optional[str] = "Checking if elementary step",
 ) -> tuple[Node | None, HessianMinimaValidation | None, int]:
-    """Push a Hessian-rejected structure along its lowest mode, both ways,
-    and reoptimize -- first by `rescue_displacement`, then by each larger step
-    of RESCUE_ESCALATION_BOHR -- stopping at the first reoptimized geometry
-    that passes the Hessian check. Returns (rescued node or None, best
-    validation seen, gradient calls spent)."""
+    """Push a Hessian-rejected structure along its lowest mode by
+    +-`rescue_displacement` and reoptimize, keeping the first geometry that
+    passes the Hessian check. No larger pushes are retried: on g-xTB they
+    mostly reoptimize back to the same soft saddle. Returns (rescued node or
+    None, best validation seen, gradient calls spent)."""
     mode, mode_frequency = _lowest_frequency_mode(validation.hessian_result, node)
     if mode is None:
         msg = (
@@ -511,18 +497,16 @@ def _hessian_rescue_failed_candidate(
         _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
         return None, None, 0
 
-    schedule = _rescue_schedule(rescue_displacement)
     msg = (
         f"Attempting Hessian rescue for {label} split candidate: displacing "
         f"along lowest-frequency mode ({mode_frequency:.3f} cm^-1) by "
-        f"{', '.join(f'±{d:.3f}' for d in schedule)} bohr (in that order, until one "
-        "reoptimizes to a minimum)."
+        f"±{float(rescue_displacement):.3f} bohr."
     )
     _emit_hessian_validation_message(msg, accepted=False, verbose=verbose, status=status)
 
     rescue_grad_calls = 0
     best_validation: HessianMinimaValidation | None = None
-    pushes = [s * d for d in schedule for s in (1.0, -1.0)]
+    pushes = [float(rescue_displacement), -float(rescue_displacement)]
     for k, signed_dr in enumerate(pushes, start=1):
         if status is None:   # say what is running (e.g. `mepd optimize`), not a generic status
             update_status(f"Hessian rescue of {label}: {signed_dr:+.2f} bohr push, re-optimizing and "
@@ -581,13 +565,13 @@ def validate_minimum_with_rescue(
     node: Node,
     engine: Engine,
     *,
-    frequency_cutoff: float = 0.0,
-    rescue_displacement: float = 0.1,
+    frequency_cutoff: float = -20.0,
+    rescue_displacement: float = 0.3,
     label: str = "structure",
 ) -> tuple[Node, dict]:
     """Hessian-check that `node` is a minimum; if it is not, push it along
-    its lowest mode (both directions) and reoptimize, escalating the push
-    (see _hessian_rescue_failed_candidate) until one attempt succeeds.
+    its lowest mode (both directions) and reoptimize
+    (see _hessian_rescue_failed_candidate).
 
     Returns (node to keep, record). `record` has is_minimum, min_frequency,
     rescued and validation (a human-readable reason). When the rescue
@@ -974,8 +958,8 @@ def elem_step_check_kwargs(parameters) -> dict:
             return getattr(parameters, key, default)
     return {
         "validate_minima_with_hessian": bool(get("validate_minima_with_hessian", False)),
-        "hessian_minimum_frequency_cutoff": float(get("hessian_minimum_frequency_cutoff", 0.0)),
-        "hessian_minima_rescue_displacement": float(get("hessian_minima_rescue_displacement", 0.1)),
+        "hessian_minimum_frequency_cutoff": float(get("hessian_minimum_frequency_cutoff", -20.0)),
+        "hessian_minima_rescue_displacement": float(get("hessian_minima_rescue_displacement", 0.3)),
         "disregard_stereochem": bool(get("disregard_stereochem", False)),
     }
 
@@ -985,8 +969,8 @@ def check_if_elem_step(
     engine: Engine,
     verbose: bool = True,
     validate_minima_with_hessian: bool = False,
-    hessian_minimum_frequency_cutoff: float = 0.0,
-    hessian_minima_rescue_displacement: float = 0.1,
+    hessian_minimum_frequency_cutoff: float = -20.0,
+    hessian_minima_rescue_displacement: float = 0.3,
     geodesic_kwargs: dict | None = None,
     disregard_stereochem: bool = False,
 ) -> ElemStepResults:
@@ -1459,8 +1443,8 @@ def _chain_is_concave(
     min_slope_thre=SLOPE_THRESH,
     verbose: bool = True,
     validate_minima_with_hessian: bool = False,
-    hessian_minimum_frequency_cutoff: float = 0.0,
-    hessian_minima_rescue_displacement: float = 0.1,
+    hessian_minimum_frequency_cutoff: float = -20.0,
+    hessian_minima_rescue_displacement: float = 0.3,
     disregard_stereochem: bool = False,
 ) -> ConcavityResults:
     """

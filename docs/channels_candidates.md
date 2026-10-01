@@ -87,7 +87,7 @@ The input geometry is always the first conformer.
 
 1. **snap-RMSD** (`qcinf.snap_rmsd`): permutation-aware and rotationally
    aligned. A conformer is kept only if it is at least `--rmsd-cutoff`
-   (0.5 bohr) from every conformer already kept, walking from lowest
+   (0.1 bohr) from every conformer already kept, walking from lowest
    energy up. A candidate that doesn't perceive as the same molecule is
    rejected, and the count goes to `n_rejected_not_isomorphic` in
    `stats.json`.
@@ -196,6 +196,41 @@ chair (32.8) was reached, but only by one of the [1,3]-mapped searches. The
 value of K has only been checked against the every-pair run on that one
 system. Raise K, or use 0 (every pair × every mechanism), when a missed
 low channel would matter.
+
+### Filtered GI path (the default, `--atom-mapping-metric rmsd-geodesic`)
+
+Scoring every pair × mechanism by GI path (geodesic interpolation length)
+is the expensive part of step 6. On KAIST rxn_186 (64 × 37 conformers,
+2368 pairs) it used up a whole 600 s search budget before any path search
+started, and 7 of the 72 geodesic runs in the direct-only sweep failed
+that way.
+
+The filtered GI path works in two stages:
+1. Every pair × mechanism is scored by endpoint RMSD, which costs
+   microseconds per pair.
+2. Per mechanism, only the pairs within `--atom-mapping-rmsd-window`
+   standard deviations of the lowest RMSD (default **1**; profile
+   `atom_mapping_inputs.rmsd_window`) get GI paths, at least
+   `--pairs-per-mechanism` of them. Their GI paths choose each pair's
+   symmetry variant and rank the pairs.
+
+A pair's own symmetry variants are always compared by GI path. On 149
+KAIST pairs, endpoint RMSD agreed with the GI path's choice of variant only
+34 times, and preferred the GI path's *worst* variant 18 times.
+
+What the window keeps, on the direct-only KAIST sweep (60 mechanisms, 8084
+pairs, 180 GI-path picks; a "pick" is among the GI path's top 3 per
+mechanism over every pair):
+
+| Window | GI-path picks kept | Pairs GI-scored |
+|---|---|---|
+| lowest + 1σ | 56% (7 mechanisms lose all) | 6% |
+| lowest + 2σ | 82% | 21% |
+| lowest + 3σ | 96% | 51% |
+
+With 1σ, rxn_186's mapping step takes 21 s: 52 of 2368 pairs are
+GI-scored. Widen the window (the web form's *RMSD window*, or *Sample more
+paths*) when a missed channel would matter.
 
 ## 8–9. Path search, TS optimization, classification
 

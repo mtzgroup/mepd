@@ -127,7 +127,7 @@ class ConformerInputs:
     n_embed: Optional[int] = None
     rdkit_ewin_kcal: Optional[float] = None
     rdkit_torsion_prefs: str = "both"
-    rmsd_cutoff: float = 0.5
+    rmsd_cutoff: float = 0.1
     optimize_with_mmff: bool = True
     random_seed: int = 0
     crest: CrestInputs = field(default_factory=CrestInputs)

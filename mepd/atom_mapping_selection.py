@@ -49,8 +49,11 @@ def build_candidates(
     non-identity mapping in `atom_maps` -- de-duplicated if two mappings
     happen to produce the same atom order (SLAPMapper's tied candidates can
     coincide after symmetry, even though `_remove_isomorphic_results`
-    already dedupes most of those upstream)."""
-    candidates = [MappingCandidate(label="identity", end_structure=end_structure, atom_map=None)]
+    already dedupes most of those upstream). Identity is left out when the
+    end's element order differs from the start's: it would pair up
+    mismatched atoms, so its score means nothing."""
+    same_order = list(start_structure.symbols) == list(end_structure.symbols)
+    candidates = [MappingCandidate(label="identity", end_structure=end_structure, atom_map=None)] if same_order else []
     seen_orders = {tuple(range(len(end_structure.symbols)))}
     i = 0
     for atom_map in atom_maps:
@@ -111,6 +114,38 @@ def _interpolate(candidate: MappingCandidate, start_structure: Structure, run_in
     return chain, smoother
 
 
+def rmsd_window(run_inputs) -> float:
+    ami = getattr(run_inputs, "atom_mapping_inputs", None)
+    return float(getattr(ami, "rmsd_window", 1.0) if ami is not None else 1.0)
+
+
+def lowest_rmsd_variants(candidates: list, start_structure: Structure, run_inputs, *, always: tuple = ()) -> list:
+    """rmsd-geodesic: the `gi_variant_cap` lowest-endpoint-RMSD candidates (plus `always`)."""
+    cap = int(getattr(getattr(run_inputs, "atom_mapping_inputs", None), "gi_variant_cap", 20))
+    if cap <= 0 or len(candidates) <= cap:
+        return list(candidates)
+    rmsd = [_aligned_rmsd(start_structure, c.end_structure) for c in candidates]
+    keep = set(sorted(range(len(candidates)), key=rmsd.__getitem__)[:cap])
+    keep |= {k for k, c in enumerate(candidates) if c.label in always}
+    return [c for k, c in enumerate(candidates) if k in keep]
+
+
+def near_lowest(values: list[float], window: float = 1.0, *, keep: int = 1) -> list[int]:
+    """Indices of the values within `window` standard deviations of the
+    lowest (the "degenerate" ones, as far as that score can tell), lowest
+    first; at least `keep` of them (the next-lowest fill up), all when they
+    are all equal."""
+    import numpy as np
+
+    if not values:
+        return []
+    v = np.asarray(values, dtype=float)
+    order = [int(i) for i in np.argsort(v, kind="stable")]
+    cut = float(v.min()) + window * float(v.std())
+    inside = [i for i in order if v[i] <= cut + 1e-12]
+    return inside if len(inside) >= keep else order[:keep]
+
+
 def score_candidate(
     candidate: MappingCandidate, metric: str, start_structure: Structure, run_inputs,
 ) -> tuple[float, Optional[Chain]]:
@@ -126,7 +161,9 @@ def score_candidate(
 
     chain, smoother = _interpolate(candidate, start_structure, run_inputs)
 
-    if metric == "geodesic-distance":
+    # "rmsd-geodesic" filters conformer PAIRS by endpoint RMSD (mepd channels);
+    # a candidate that is scored at all is scored by its GI path.
+    if metric in ("geodesic-distance", "rmsd-geodesic"):
         return float(smoother.length), chain
     if metric == "path-rmsd":
         return float(chain.path_length[-1]), chain
@@ -152,6 +189,7 @@ def score_candidate_all_metrics(
         "gi-energy": float(max(chain.energies_kcalmol)),
         "endpoint-rmsd": _aligned_rmsd(start_structure, candidate.end_structure),
     }
+    scores["rmsd-geodesic"] = scores["geodesic-distance"]   # a scored candidate is scored by its GI path
     return scores, chain
 
 
@@ -172,14 +210,17 @@ def select_best_candidate(
     with identity winning exact ties)."""
     scores: dict[str, float] = {}
     chains: dict[str, Chain] = {}
+    identity = next((c for c in candidates if c.label == "identity"), None)
+    if metric == "rmsd-geodesic":
+        candidates = lowest_rmsd_variants(candidates, start_structure, run_inputs,
+                                          always=(identity.label,) if identity else ())
     for candidate in candidates:
         score, chain = score_candidate(candidate, metric, start_structure, run_inputs)
         scores[candidate.label] = score
         chains[candidate.label] = chain
 
-    identity = candidates[0]
     best = min(candidates, key=lambda c: scores[c.label])
-    if best.label != "identity" and scores[identity.label] - scores[best.label] <= veto_margin:
+    if identity and best is not identity and scores[identity.label] - scores[best.label] <= veto_margin:
         best = identity
 
     return SelectionResult(winner=best, scores=scores, chains=chains)
@@ -212,7 +253,7 @@ def maybe_realign_pair(
         return end_structure, False
 
     candidates = build_candidates(start_structure, end_structure, atom_maps)
-    if len(candidates) == 1:
+    if [c.label for c in candidates] in ([], ["identity"]):
         return end_structure, False
 
     try:
@@ -236,7 +277,7 @@ class MechanismChoice:
 
 def select_per_mechanism(
     start_structure: Structure, end_structure: Structure, metric: str, run_inputs,
-    *, max_variants_per_mechanism: int = 200,
+    *, max_variants_per_mechanism: int = 200, only_keys: Optional[set] = None,
 ) -> list[MechanismChoice]:
     """For one (reactant, product) pair: every mechanism SLAPMapper's
     minimal-cost mappings allow, each represented by its best symmetry
@@ -247,7 +288,8 @@ def select_per_mechanism(
     The current ordering ("identity") is scored as one more variant of
     whichever mechanism it implies, or as a mechanism of its own if it
     isn't one of SLAPMapper's. Returns [] if there is nothing to map
-    (slapmapper missing, atom counts or compositions differ)."""
+    (slapmapper missing, atom counts or compositions differ). `only_keys`:
+    score only these mechanisms (the others are left out)."""
     from mepd.atom_mapping import (
         HAS_SLAPMAPPER, mechanism_key, realign_end_to_start, suggest_mechanism_candidates,
     )
@@ -272,7 +314,8 @@ def select_per_mechanism(
             )
             for n, m in enumerate(atom_maps)
         ]
-    if not any(c.atom_map is None for cands in by_key.values() for c in cands):
+    if (list(start_structure.symbols) == list(end_structure.symbols)
+            and not any(c.atom_map is None for cands in by_key.values() for c in cands)):
         key = mechanism_key(start_structure, end_structure)
         by_key.setdefault(key, []).append(
             MappingCandidate(label=f"{key} identity", end_structure=end_structure, atom_map=None)
@@ -280,7 +323,10 @@ def select_per_mechanism(
 
     choices = []
     for key, cands in by_key.items():
-        scored = [(score_candidate(c, metric, start_structure, run_inputs)[0], c) for c in cands]
+        if only_keys is not None and key not in only_keys:
+            continue
+        pool = lowest_rmsd_variants(cands, start_structure, run_inputs) if metric == "rmsd-geodesic" else cands
+        scored = [(score_candidate(c, metric, start_structure, run_inputs)[0], c) for c in pool]
         score, best = min(scored, key=lambda sc: sc[0])
         choices.append(MechanismChoice(key=key, winner=best, score=score, n_variants=len(cands)))
     choices.sort(key=lambda ch: ch.score)

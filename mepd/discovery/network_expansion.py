@@ -169,6 +169,20 @@ def _lewis_mol(symbols, edges, charge, multiplicity, *, allow_radicals, allow_zw
     return mol
 
 
+def _display_smiles(structure) -> Optional[str]:
+    """A SMILES to draw `structure` by, when its Lewis SMILES could not be
+    assigned (hypervalent atoms, unusual bonding): connectivity-perceived,
+    as the web library does (RDKit, then Open Babel). None if neither can."""
+    import qcinf
+
+    for backend in ("rdkit", "openbabel"):
+        try:
+            return qcinf.structure_to_smiles(structure, backend=backend)
+        except Exception:
+            continue
+    return None
+
+
 def _smiles(mol) -> str:
     from rdkit import Chem
 
@@ -572,12 +586,16 @@ class _LiveReactions:
         src = species[p.source]
         sym = list(src.node.symbols)
         bonds = [f"−{sym[i]}{i}–{sym[j]}{j}" for i, j in p.broken] + [f"+{sym[i]}{i}–{sym[j]}{j}" for i, j in p.formed]
+        # An external generator's proposal is named "external-<k>", not a SMILES:
+        # never draw by that name (the live view showed broken images).
+        fallback = None if p.smiles.startswith("external-") else (p.smiles or None)
         self._progress.write_morph(
             stream, frames, label=f"#{int(stream[3:])} from species {p.source}",
             caption=(" ".join(bonds) or "from the external generator") + note,
             status=status, finished=status in ("done", "failed"), outcome=outcome,
             energies_kcal=(src.rel_energy_kcal, product_kcal),
-            reactant_smiles=src.smiles, product_smiles=product_smiles or p.smiles,
+            reactant_smiles=src.smiles or self._drawable(src.node.structure),
+            product_smiles=product_smiles or fallback,
             extra={"source": p.source, "bonds": " ".join(bonds)})
 
     def _event(self, edge: ProposedEdge, species) -> None:
@@ -612,6 +630,14 @@ class _LiveReactions:
     def optimizing(self, p: Proposal, species) -> None:
         self.propose(p, species, status="running")
 
+    def _drawable(self, structure) -> Optional[str]:
+        """`_display_smiles`, remembered per geometry (the seed recurs in every record)."""
+        cache = self.__dict__.setdefault("_smiles_cache", {})
+        key = id(structure)
+        if key not in cache:
+            cache[key] = (structure, _display_smiles(structure))
+        return cache[key][1]
+
     def finish(self, edge: ProposedEdge, species, product: Optional[StructureNode] = None) -> None:
         if not self.enabled:
             return
@@ -629,7 +655,8 @@ class _LiveReactions:
         write = lambda frames: self._write(  # noqa: E731
             p, species, frames or self._frames_of.get(id(p)) or [], status="failed" if edge.outcome == "failed" else "done",
             outcome=_OUTCOME_LABEL.get(edge.outcome, edge.outcome), product_kcal=kcal,
-            product_smiles=species[edge.target].smiles if edge.target is not None else None, note=note)
+            product_smiles=(species[edge.target].smiles if edge.target is not None else None)
+            or self._drawable(node.structure), note=note)
         self._submit(self.job(species[p.source].node, node), write)
 
 
@@ -705,8 +732,8 @@ def expand_network(
             from mepd.elementarystep import validate_minimum_with_rescue
 
             opt, record = validate_minimum_with_rescue(
-                opt, engine, frequency_cutoff=float(validate_minima.get("frequency_cutoff", 0.0)),
-                rescue_displacement=float(validate_minima.get("rescue_displacement", 0.1)), label="seed")
+                opt, engine, frequency_cutoff=float(validate_minima.get("frequency_cutoff", -20.0)),
+                rescue_displacement=float(validate_minima.get("rescue_displacement", 0.3)), label="seed")
             if not record["is_minimum"]:
                 raise RuntimeError(f"The seed is not a minimum at this level of theory: {record.get('validation')}")
         seed = opt
@@ -873,8 +900,8 @@ def expand_network(
                 from mepd.elementarystep import validate_minimum_with_rescue
 
                 opt, record = validate_minimum_with_rescue(
-                    opt, engine, frequency_cutoff=float(validate_minima.get("frequency_cutoff", 0.0)),
-                    rescue_displacement=float(validate_minima.get("rescue_displacement", 0.1)),
+                    opt, engine, frequency_cutoff=float(validate_minima.get("frequency_cutoff", -20.0)),
+                    rescue_displacement=float(validate_minima.get("rescue_displacement", 0.3)),
                     label=f"proposal {p.label}")
                 if not record["is_minimum"]:
                     edge = ProposedEdge(p.source, p, "not_minimum", error=str(record.get("validation")))

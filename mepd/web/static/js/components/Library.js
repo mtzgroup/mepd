@@ -101,7 +101,7 @@ export function LevelBar() {
           <option value="">${levels['']?.label ?? ''} · mepd defaults</option>
         </select>
       </label>
-      <label class="check small" title="After a structure is minimized, compute its Hessian and require no imaginary frequency. A structure stuck on a saddle point is pushed along its unstable mode and re-minimized; if that fails it is flagged 'not a minimum'.">
+      <label class="check small" title="After a structure is minimized, compute its Hessian and require no imaginary frequency beyond 20i cm⁻¹. A structure stuck on a saddle point is pushed along its unstable mode and re-minimized; if that fails it is flagged 'not a minimum'.">
         <input type="checkbox" class="switch" checked=${validate}
           onChange=${(e) => attempt(() => api.put('/api/level', { validate_minima: e.target.checked }))
             .then((r) => r && refreshState())} />

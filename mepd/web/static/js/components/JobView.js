@@ -424,7 +424,7 @@ function ResultPanel({ job }) {
 
   if (error) return html`<div class="warn-box">Could not read results: ${error} <button class="btn small" onClick=${load}>Retry</button></div>`;
   if (!result) return html`<p class="muted">Reading results…</p>`;
-  if (!result.groups.length) {
+  if (!result.groups.length && !result.mechano && !result.conditions && !result.substituents) {
     return html`<div class="empty-hint"><p>${result.headline}</p>
       ${running && html`<button class="btn small" onClick=${load} disabled=${loading}>${loading ? 'Reading…' : 'Check for partial results'}</button>`}</div>`;
   }
@@ -459,10 +459,15 @@ function ResultPanel({ job }) {
         </details>`}
       ${job.op === 'nanoreactor' && html`<${SpawnedSearches} job=${job} />`}
       ${result.nanoreactor && html`<${ReactionTable} job=${job} reactions=${result.nanoreactor.reactions} />`}
+      ${result.conditions && html`<${ConditionsPanel} cond=${result.conditions} />`}
+      ${result.mechano && html`<p class="level-note small">Mechanical-force results are not shown in the web UI for now;
+        this job's files are under Files.</p>`}
+      ${result.substituents && html`<${SubstituentPanel} x=${result.substituents} />`}
+      ${['ts', 'tsopt', 'design-tsopt', 'channels'].includes(job.op) && html`<${ConditionsFollowUps} job=${job} />`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}
       ${job.op === 'ts' && html`<${TsFollowUps} job=${job} />`}
-      <div class="result-body">
+      ${result.groups.length > 0 && html`<div class="result-body">
         <div class="entries-col">
           ${pickGroup && html`<${BulkBar} group=${pickGroup} picked=${picked} inGraph=${inGraph} busy=${adding}
             onSet=${(ids) => setPicked(new Set(ids))} onAdd=${addPicked} />`}
@@ -506,7 +511,7 @@ function ResultPanel({ job }) {
                 : html`<button class="btn small primary" onClick=${() => importEntry('one', { frame: 0 })}>Add to Explore</button>`}
             </div>
           </div>`}
-      </div>
+      </div>`}
       ${result.vri?.explorer && html`<${VriExplorer} job=${job} />`}
     </div>`;
 }
@@ -648,6 +653,190 @@ function TsFollowUps({ job }) {
           </div>
         </div>`}
       </div>
+    </section>`;
+}
+
+// ------------------------------------------------------------ conditions
+const INSIGHT_ICON = { accelerates: '▼', slows: '▲', trend: '↗', caution: '⚠', note: 'ℹ' };
+
+function fmtC(t) { return t == null ? '—' : `${Math.round(t)} °C`; }
+
+// A solvent comparison (a `mepd solvent` result): what it means first, then
+// the numbers. The single-point warning is always in view, never folded.
+export function ConditionsPanel({ cond, compact = false }) {
+  const T = cond.temperature ?? 298.15;
+  const gas = cond.gas || {};
+  const rows = cond.solvents || [];
+  const reopt = cond.mode === 'reoptimize';
+  const cautions = (cond.insights || []).filter((i) => i.level === 'caution');
+  const rest = (cond.insights || []).filter((i) => i.level !== 'caution');
+  // The single-point caveat leads; the composite-model note is quieter.
+  const composite = (cond.warnings || []).filter((w) => /composite model/i.test(w));
+  const lead = (cond.warnings || []).filter((w) => !composite.includes(w));
+  return html`
+    <section class="conditions">
+      ${(lead.length > 0 || cautions.length > 0) && html`<div class="warn-box small conditions-warn">
+        ${lead.map((w) => html`<p>⚠ ${w}</p>`)}
+        ${cautions.length > 0 && html`<ul>${cautions.map((i) => html`<li>${i.text}</li>`)}</ul>`}
+      </div>`}
+      ${rest.length > 0 && html`<ul class="insights">
+        ${rest.map((i) => html`<li class=${`insight ${i.level}`}><span class="insight-icon" aria-hidden="true">${INSIGHT_ICON[i.level] || 'ℹ'}</span>${i.text}</li>`)}
+      </ul>`}
+      ${!compact && html`<div class="table-scroll"><table class="data conditions-table">
+        <thead><tr><th>Medium</th><th>Kind</th><th class="num" title="Barrier ΔE‡ (kcal/mol): electronic energy plus solvation free energy">ΔE‡</th>
+          <th class="num" title="Change from the gas-phase barrier">vs gas</th>
+          ${reopt && html`<th class="num" title="The same, from single points on the gas-phase path">single-point</th>`}
+          <th title=${`First-order half-life at ${Math.round(T - 273.15)} °C (Eyring)`}>t½ at ${Math.round(T - 273.15)} °C</th>
+          <th title="Temperature at which the half-life is 1 hour">1 h at</th><th>bp</th></tr></thead>
+        <tbody>
+          <tr class="gas"><td>Gas phase</td><td class="muted">—</td><td class="num">${fmtKcal(gas.barrier_kcal)}</td><td class="muted">—</td>
+            ${reopt && html`<td class="muted">—</td>`}<td>${gas.t_half ?? '—'}</td><td>${fmtC(gas.t_1h_c)}</td><td class="muted">—</td></tr>
+          ${rows.map((r) => html`<tr class=${r.error ? 'failed' : ''} title=${(r.notes || []).join('\n')}>
+            <td>${r.label}</td><td class="small muted">${r.kind}</td>
+            ${r.error ? html`<td class="num muted" title=${r.error}>no TS</td><td class="muted">—</td>
+              ${reopt && html`<td class="num muted" title="From single points on the gas-phase path">${fmtKcal(r.single_point_barrier_kcal)}</td>`}
+              <td class="muted">—</td><td class="muted">—</td><td class="small muted">${fmtC(r.bp_c)}</td>` : html`
+              <td class="num">${fmtKcal(r.barrier_kcal)}</td>
+              <td class=${`num ${r.shift_kcal <= -3 ? 'good' : r.shift_kcal >= 3 ? 'bad' : ''}`}>${r.shift_kcal == null ? '—' : (r.shift_kcal > 0 ? '+' : '') + r.shift_kcal.toFixed(1)}</td>
+              ${reopt && html`<td class="num muted">${fmtKcal(r.single_point_barrier_kcal)}</td>`}
+              <td>${r.t_half ?? '—'}</td><td>${fmtC(r.t_1h_c)}</td><td class="small muted">${fmtC(r.bp_c)}</td>`}
+          </tr>`)}
+        </tbody></table></div>`}
+      ${composite.map((w) => html`<p class="small muted">${w}</p>`)}
+    </section>`;
+}
+
+function fmtNn(f) { return f == null ? '—' : `${f.toFixed(1)} nN`; }
+
+// A `mepd force` result: which atoms to pull on, per channel; when pulling
+// makes a slower channel win; and, if run, the check under force.
+export function MechanoPanel({ m }) {
+  const [lead, ...notes] = m.warnings || [];
+  const channels = m.channels || [];
+  return html`
+    <section class="conditions">
+      ${lead && html`<div class="warn-box small conditions-warn"><p>⚠ ${lead}</p></div>`}
+      <ul class="insights">
+        ${(m.insights || []).map((i) => html`<li class=${`insight ${i.level === 'selectivity' ? 'accelerates' : i.level}`}>
+          <span class="insight-icon" aria-hidden="true">${{ accelerates: '▼', slows: '▲', selectivity: '⇄', check: '✓', caution: '⚠' }[i.level] || 'ℹ'}</span>${i.text}</li>`)}
+      </ul>
+      <div class="table-scroll"><table class="data">
+        <thead><tr><th>Channel</th><th class="num">ΔE‡</th><th>Pull apart to speed up</th><th class="num" title="Barrier change per nN (Bell)">per nN</th>
+          <th class="num">at 1 nN</th><th class="num" title="Force for a 1 h half-life">1 h at</th><th>Pull apart to hold back</th><th class="num">per nN</th></tr></thead>
+        <tbody>${channels.map((c) => {
+          const f = c.favor?.[0], d = c.disfavor?.[0];
+          return html`<tr><td>${c.label}${c.kind === 'offtarget' ? html` <span class="small muted">(off-target)</span>` : ''}</td>
+            <td class="num">${fmtKcal(c.barrier_kcal)}</td>
+            <td class="mono" title=${(c.favor || []).map((x) => `${x.label}: Δq‡ ${x.dq.toFixed(2)} Å`).join('\n')}>${f ? f.label : '—'}</td>
+            <td class="num good">${f ? f.per_nN_kcal.toFixed(1) : '—'}</td><td class="num">${f ? fmtKcal(f.barrier_at_1nN) : '—'}</td>
+            <td class="num" title=${f?.force_for_1h > (m.max_force ?? 2.5) ? 'Out of reach: beyond the forces scanned, near bond rupture' : ''}>
+              ${f?.force_for_1h > (m.max_force ?? 2.5) ? html`<span class="muted">> ${m.max_force ?? 2.5} nN</span>` : fmtNn(f?.force_for_1h)}</td>
+            <td class="mono" title=${(c.disfavor || []).map((x) => `${x.label}: Δq‡ ${x.dq.toFixed(2)} Å`).join('\n')}>${d ? d.label : '—'}</td>
+            <td class="num bad">${d ? '+' + (-d.per_nN_kcal).toFixed(1) : '—'}</td></tr>`;
+        })}</tbody></table></div>
+      ${(m.efei || []).length > 0 && html`<div class="table-scroll"><table class="data">
+        <thead><tr><th>Check under force</th><th>Pair</th><th class="num">Force</th><th class="num">Bell</th><th class="num">Re-optimized</th><th></th></tr></thead>
+        <tbody>${m.efei.map((r) => html`<tr class=${r.status === 'ok' ? '' : 'failed'}><td>${r.label}</td><td class="mono">${r.pair_label}</td>
+          <td class="num">${r.force_nN} nN</td><td class="num">${fmtKcal(r.barrier_bell)}</td>
+          <td class="num">${r.barrier_efei == null ? '—' : fmtKcal(r.barrier_efei)}</td>
+          <td class="small muted">${r.status === 'ok' ? '' : r.status === 'other_minima' ? 'connects other minima' : (r.error || 'failed')}</td></tr>`)}
+        </tbody></table></div>`}
+      ${notes.map((w) => html`<p class="small muted">${w} (Atom numbers: the viewer's.)</p>`)}
+    </section>`;
+}
+
+// A `mepd substituents` result: barrier shift (kcal/mol) per site x group,
+// for one channel at a time; green lowers the barrier, red raises it.
+export function SubstituentPanel({ x }) {
+  const channels = x.channels || [];
+  const lead = channels.reduce((a, c) => (!a || c.barrier_kcal < a.barrier_kcal ? c : a), null);
+  const [chId, setChId] = useState(lead?.id);
+  const ch = channels.find((c) => c.id === chId) || lead;
+  const cell = {};
+  for (const v of x.variants || []) if (v.channel === ch?.id) cell[`${v.site}:${v.group}`] = v;
+  const [first, ...rest] = x.warnings || [];
+  const shade = (d) => {
+    const a = Math.min(1, Math.abs(d) / 10) * 0.55;
+    return d < 0 ? `background: rgba(73, 110, 92, ${a})` : `background: rgba(178, 59, 59, ${a})`;
+  };
+  return html`
+    <section class="conditions">
+      ${first && html`<div class="warn-box small conditions-warn"><p>⚠ ${first}</p></div>`}
+      <ul class="insights">
+        ${(x.insights || []).map((i) => html`<li class=${`insight ${i.level === 'selectivity' ? 'accelerates' : i.level}`}>
+          <span class="insight-icon" aria-hidden="true">${{ accelerates: '▼', slows: '▲', trend: '↗', selectivity: '⇄' }[i.level] || 'ℹ'}</span>${i.text}</li>`)}
+      </ul>
+      ${channels.length > 1 && html`<label class="small">Channel <select value=${ch?.id} onChange=${(e) => setChId(e.target.value)}>
+        ${channels.map((c) => html`<option value=${c.id}>${c.label} (ΔE‡ ${fmtKcal(c.barrier_kcal)})</option>`)}</select></label>`}
+      <div class="table-scroll"><table class="data subst-table">
+        <thead><tr><th title="Heavy atom whose hydrogen is replaced (viewer's atom numbers)">Site</th>
+          ${(x.groups || []).map((g) => html`<th class="num">${x.group_labels?.[g] || g}</th>`)}
+          <th class="num" title="Slope of the shift against Hammett σp, and r²">vs σp</th></tr></thead>
+        <tbody>${(x.sites || []).map((s) => {
+          const t = (x.trends || []).find((r) => r.site === s.anchor);
+          return html`<tr><td class="mono">${s.label}</td>
+            ${(x.groups || []).map((g) => {
+              const v = cell[`${s.anchor}:${g}`];
+              if (!v) return html`<td></td>`;
+              if (v.status !== 'ok' || v.clash || v.barrier_kcal < -0.1) {
+                const why = v.clash ? 'clashes with the rest' : v.status === 'reacted' ? 'reacted while relaxing'
+                  : v.barrier_kcal < -0.1 ? `negative ΔE‡ (${v.barrier_kcal.toFixed(1)})` : (v.error || v.status);
+                return html`<td class="num muted" title=${why}>×</td>`;
+              }
+              return html`<td class="num" style=${shade(v.shift)} title=${`ΔE‡ ${v.barrier_kcal.toFixed(1)} kcal/mol`}>${v.shift > 0 ? '+' : ''}${v.shift.toFixed(1)}</td>`;
+            })}
+            <td class="num small muted">${t ? `${t.slope > 0 ? '+' : ''}${t.slope.toFixed(0)} (${t.r2.toFixed(2)})` : ''}</td></tr>`;
+        })}</tbody></table></div>
+      ${rest.map((w) => html`<p class="small muted">${w}</p>`)}
+    </section>`;
+}
+
+// Follow-ups on a finished TS search or channels run that ask how conditions
+// change it (solvent, mechanical force); each keeps its own folder and its
+// latest result is shown right here.
+// (Mechanical force is off in the web UI for now: not listed here, not offered, not shown.)
+const CONDITION_OPS = { solvent: 'conditions', substituents: 'substituents' };
+const CONDITION_NAMES = { solvent: 'solvent comparison', substituents: 'substituent scan' };
+
+function LatestCondition({ run, opKey }) {
+  const [res, setRes] = useState(null);
+  useEffect(() => {
+    setRes(null);
+    api.get(`/api/jobs/${run.id}/result`).then(setRes).catch(() => {});
+  }, [run.id, run.finished]);
+  const payload = res?.[CONDITION_OPS[opKey]];
+  if (!payload) return null;
+  return html`<p class="small muted">Latest ${CONDITION_NAMES[opKey]}
+      (<a href="#" onClick=${(e) => { e.preventDefault(); openJob(run.id); }}>full result</a>):</p>
+    ${opKey === 'solvent' ? html`<${ConditionsPanel} cond=${payload} />` : html`<${SubstituentPanel} x=${payload} />`}`;
+}
+
+const CONDITION_NOTES = {
+  substituents: 'Each group replaces one hydrogen, placed along the old bond. Fast relaxes only the group (a first estimate); re-optimizing searches each TS again.',
+  solvent: "Solvent energies come from GFN2-xTB's implicit models (added to this job's level unless it is GFN2-xTB itself). Keeping gas-phase geometries takes seconds; re-optimizing searches the TS again in each solvent.",
+};
+
+function ConditionsFollowUps({ job }) {
+  const operations = useStore((s) => s.operations);
+  const runsKey = useStore((s) => Object.values(s.jobs).filter((j) => j.source_job === job.id && CONDITION_OPS[j.op])
+    .map((j) => `${j.id}:${j.status}:${j.finished}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.source_job === job.id && CONDITION_OPS[j.op])
+    .sort((a, b) => b.created - a.created), [runsKey]);
+  const ops = operations.filter((o) => CONDITION_OPS[o.key] && o.available && (o.source_ops || []).includes(job.op));
+  // They all start from a TS with its IRC: nothing to offer without a barrier (a channels run
+  // that classified no channel included).
+  if (!ops.length || job.status !== 'done' || job.summary?.barrier_kcal == null) return null;
+  return html`
+    <section class="followups">
+      <h3 class="section-title">Reaction conditions</h3>
+      ${ops.map((op) => {
+        const mine = runs.filter((r) => r.op === op.key);
+        const latest = mine.find((r) => r.status === 'done');
+        return html`<div key=${op.key}>
+          ${latest && html`<${LatestCondition} run=${latest} opKey=${op.key} />`}
+          <${FollowUpCard} op=${op} job=${job} runs=${mine} done=${!!latest} note=${CONDITION_NOTES[op.key]} />
+        </div>`;
+      })}
     </section>`;
 }
 

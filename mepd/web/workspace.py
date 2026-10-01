@@ -98,10 +98,19 @@ def effective_level(profile_text: Optional[str]) -> dict:
     """What decides energies for a profile, with mepd's defaults filled in
     and everything else (threads, parallelism, executables, optimizer and
     path settings) left out: two profiles with the same effective level give
-    comparable energies."""
+    comparable energies. An implicit solvent ([solvation]) is part of it."""
     import tomli
 
     data = tomli.loads(profile_text) if profile_text else {}
+    level = _engine_level(data)
+    solv = data.get("solvation")
+    if isinstance(solv, dict) and solv.get("solvent"):
+        level["solvation"] = {"solvent": str(solv["solvent"]).lower(), "model": str(solv.get("model", "alpb")).lower(),
+                              "method": str(solv.get("method", "auto")).lower()}
+    return level
+
+
+def _engine_level(data: dict) -> dict:
 
     def table(key):
         t = data.get(key)
@@ -204,6 +213,9 @@ def level_label(profile_text: Optional[str]) -> str:
     model = (data.get("program_kwds") or {}).get("model") if isinstance(data.get("program_kwds"), dict) else None
     if model:
         parts.append("/".join(str(model.get(k)) for k in ("method", "basis") if model.get(k)))
+    solv = data.get("solvation")
+    if isinstance(solv, dict) and solv.get("solvent"):
+        parts.append(f"· {str(solv.get('model', 'alpb')).upper()}({solv['solvent']})")
     return " ".join(parts)
 
 
@@ -934,6 +946,25 @@ class Workspace:
             self._data["design"] = design
             self._save()
             return design
+
+    # ------------------------------------------------------------- setups
+    def set_setups(self, setups: list[dict], active: Optional[str]) -> None:
+        """Experimental setups (mepd.web.setups) and the one Explore shows."""
+        from mepd.web.setups import normalize
+
+        clean = [normalize(x) for x in setups]
+        if active is not None and active not in {x["id"] for x in clean}:
+            raise WorkspaceError(f"unknown setup {active!r}")
+        with self._lock:
+            self._data["setups"] = clean
+            self._data["active_setup"] = active
+            self._save()
+
+    def setup(self, sid: Optional[str]) -> dict:
+        for x in self._data.get("setups") or []:
+            if x["id"] == sid:
+                return dict(x)
+        raise WorkspaceError(f"unknown setup {sid!r}")
 
     # ----------------------------------------------------------- positions
     def set_positions(self, positions: dict[str, dict]) -> None:

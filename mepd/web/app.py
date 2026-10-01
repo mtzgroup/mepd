@@ -126,6 +126,27 @@ class EdgePatch(BaseModel):
     conformers: Optional[dict[str, Optional[str]]] = None   # {structure id: conformer id, or None = lowest}
 
 
+def _solvent_list() -> list[dict]:
+    from mepd.solvation import SOLVENTS
+
+    return [{"key": v.key, "label": v.label, "kind": v.kind, "epsilon": v.epsilon, "bp_c": v.bp_c}
+            for v in SOLVENTS.values()]
+
+
+class SetupsIn(BaseModel):
+    setups: list[dict] = []
+    active: Optional[str] = None
+
+
+class SetupCompareIn(BaseModel):
+    base: str
+    other: str
+
+
+class SetupFillIn(BaseModel):
+    mode: str = "single-point"
+
+
 class JobIn(BaseModel):
     op: str
     structures: list[str] = []
@@ -380,7 +401,9 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         stale = [j for j in manager.jobs.values()
                  if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
                      # ...or from before the edge's TS was recorded (route_ts, for VRI on edges)
-                     or (j["op"] in ("ts", "channels") and "route_ts" not in j["summary"]))]
+                     or (j["op"] in ("ts", "channels") and "route_ts" not in j["summary"])
+                     # ...or a solvent comparison from before reaction energies were kept
+                     or (j["op"] == "solvent" and "gas_reaction_kcal" not in (j["summary"].get("conditions") or {})))]
         if stale:
             async def redo() -> None:
                 for job in stale:
@@ -519,6 +542,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             "auth": bool(auth_token) or demo is not None,
             "demo": demo.public() if demo is not None else None,
             "cpus": os.cpu_count(),
+            "solvents": _solvent_list(),
         }
 
     @app.get("/api/events")
@@ -1257,6 +1281,54 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             W().set_status(body.structures, "optimizing")
             publish_ws()
         return created
+
+    @app.put("/api/setups")
+    def put_setups(body: SetupsIn):
+        """Experimental setups for Explore (mepd.web.setups), and which one it shows."""
+        W().set_setups(body.setups, body.active)
+        publish_ws()
+        return {"setups": W().snapshot().get("setups", []), "active": W().snapshot().get("active_setup")}
+
+    @app.post("/api/setups/{sid}/predict")
+    async def predict_setup(sid: str):
+        """Run the graph forward in time under a setup: what the flask holds at the end."""
+        from mepd.web.setups import predict
+
+        return await run_in_threadpool(predict, W().snapshot(), dict(J().jobs), W().setup(sid))
+
+    @app.post("/api/setups/{sid}/analyze")
+    async def analyze_setup(sid: str):
+        """Whole-network properties under a setup (kinetics, equilibrium,
+        timescales, bottlenecks) and the TSs and species that control them."""
+        from mepd.web.setups import analyze
+
+        return await run_in_threadpool(analyze, W().snapshot(), dict(J().jobs), W().setup(sid), W().levels())
+
+    @app.post("/api/setups/compare")
+    async def compare_setup(body: SetupCompareIn):
+        """How the network's properties change from one setup to another, and
+        which steps' energy changes explain it."""
+        from mepd.web.setups import compare_setups
+
+        return await run_in_threadpool(compare_setups, W().snapshot(), dict(J().jobs), W().setup(body.base),
+                                       W().setup(body.other), W().levels())
+
+    @app.post("/api/setups/{sid}/fill")
+    async def fill_setup(sid: str, body: SetupFillIn):
+        """Queue 'Solvent effects' on every edge that has a gas-phase TS but
+        no barrier in this setup's solvent yet."""
+        from mepd.web.setups import fill_requests
+
+        setup = W().setup(sid)
+        todo = fill_requests(W().snapshot(), dict(J().jobs), setup)
+        if demo is not None and todo:
+            demo.check_capacity(J().list())
+        created = []
+        for req in todo:
+            created += J().submit("solvent", structure_ids=[], edge_ids=[], params={
+                "solvents": [setup["solvent"]], "mode": body.mode, "temperature": setup["temperature"]},
+                profile=None, source_job_id=req["source_job"])
+        return {"queued": [j["id"] for j in created], "edges": [r["edge"] for r in todo]}
 
     _channels_map_cache: dict = {}
 

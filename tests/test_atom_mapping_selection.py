@@ -86,6 +86,17 @@ def test_build_candidates_includes_identity_and_each_mapping():
     assert np.allclose(np.asarray(mapping_candidate.end_structure.geometry), np.asarray(start.geometry))
 
 
+def test_build_candidates_leaves_out_identity_when_element_order_differs():
+    start = _propene()
+    order = [3, 0, 1, 2, 4, 5, 6, 7, 8]  # an H first: identity would pair C with H
+    end = Structure(symbols=np.asarray(start.symbols)[order], geometry=np.asarray(start.geometry)[order],
+                    charge=0, multiplicity=1)
+    candidates = build_candidates(start, end, suggest_atom_mapping_candidates(start, end))
+    assert candidates and all(c.label != "identity" for c in candidates)
+    best = select_best_candidate(candidates, "endpoint-rmsd", start, _run_inputs_for_test())
+    assert list(best.winner.end_structure.symbols) == list(start.symbols)
+
+
 def test_build_candidates_deduplicates_identical_orders():
     start = _propene()
     end = _scrambled_propene()

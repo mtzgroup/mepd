@@ -465,8 +465,7 @@ def test_legacy_ts_records_are_recognized_by_name():
 
 def test_saddle_point_is_flagged_not_trusted(client):
     """Eclipsed ethane optimizes onto the rotational saddle; the Hessian check
-    catches it and the escalating rescue (0.1 fails, 0.3 bohr works) relaxes it
-    to staggered."""
+    catches it and the 0.3 bohr rescue push relaxes it to staggered."""
     eclipsed = """8
 eclipsed ethane
 C 0.000000 0.000000 0.765000
@@ -481,8 +480,7 @@ H -0.509000 -0.881614 -1.160000
     (s,) = client.post("/api/structures", json={"text": eclipsed, "name": "ethane"}).json()
     job = [j for j in client.get("/api/state").json()["jobs"] if j["op"] == "optimize"][0]
     assert "--validate-minima-with-hessian" in job["argv"]
-    # starts at mepd's 0.1 bohr; the rescue itself escalates to 0.3 (which is what frees eclipsed ethane)
-    assert job["argv"][job["argv"].index("--hessian-minima-rescue-displacement") + 1] == "0.1"
+    assert job["argv"][job["argv"].index("--hessian-minima-rescue-displacement") + 1] == "0.3"
     assert _wait(client, job["id"], timeout=180)["status"] == "done"
     for _ in range(50):
         rec = client.get("/api/state").json()["workspace"]["structures"][s["id"]]
@@ -512,7 +510,7 @@ def test_hessian_sample_validates_minima_and_marks_rejects(client, tmp_path):
     (s,) = _add(client, WATER_XYZ)
     (cmd,) = client.post("/api/jobs", json={"op": "hessian-sample", "structures": [s["id"]], "dry_run": True}).json()
     assert "--validate-minima-with-hessian" in cmd["argv"]
-    assert cmd["argv"][cmd["argv"].index("--hessian-minima-rescue-displacement") + 1] == "0.1"
+    assert cmd["argv"][cmd["argv"].index("--hessian-minima-rescue-displacement") + 1] == "0.3"
     (cmd,) = client.post("/api/jobs", json={"op": "hessian-global", "structures": [s["id"]], "dry_run": True}).json()
     assert "--validate-minima-with-hessian" in cmd["argv"]
 
@@ -1087,12 +1085,13 @@ def test_atom_mapping_metric_choices_track_the_metric_registry(client):
     """The UI spells no metric out by hand any more: the list it offered was
     duplicated per form and had already drifted a metric behind the registry,
     leaving `endpoint-rmsd` unreachable from the browser for a while."""
-    from mepd.atom_mapping_metrics import METRICS
+    from mepd.atom_mapping_metrics import OFFERED
     from mepd.web.operations import ChannelsParams, TsParams
 
+    # The forms offer the registry's three (endpoint RMSD, GI path, filtered GI path).
     for model in (ChannelsParams, TsParams):
         choices = model.model_json_schema()["properties"]["atom_mapping_metric"]["enum"]
-        assert tuple(choices) == METRICS, f"{model.__name__} drifted from METRICS"
+        assert tuple(choices) == OFFERED, f"{model.__name__} drifted from OFFERED"
 
     # ...and the odd one out survives the trip to a command line.
     (s,) = _add(client, "C=CCOC=C")
@@ -1220,6 +1219,15 @@ def test_a_reaction_smiles_adds_both_ends_and_their_edge(client):
     assert edge["origin"]["kind"] == "reaction" and set(edge["conformers"]) == {added[0]["id"], added[1]["id"]}
     bad = client.post("/api/structures", json={"text": "CC>>CCC", "optimize": False})
     assert bad.status_code == 400 and "not balanced" in bad.json()["detail"]
+
+
+def test_mechanical_force_is_off_in_the_web_ui(client):
+    """Mechanical force is switched off in the web UI (the user's call): not
+    offered, not runnable, not cited on the References tab."""
+    ops = {o["key"]: o for o in client.get("/api/state").json()["operations"]}
+    assert ops["mechanochem"]["available"] is False and "command line" in ops["mechanochem"]["unavailable_reason"]
+    assert ops["solvent"]["available"] and ops["substituents"]["available"]
+    assert not any("echanical" in e["feature"] for e in client.get("/api/references").json())
 
 
 def test_complex_built_from_species(tmp_path):
