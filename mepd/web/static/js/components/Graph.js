@@ -144,6 +144,187 @@ function complexGraph(workspace) {
 // The molecules an edge end stands for: a complex's members, else itself.
 const sideOf = (ws, sid) => (isComplex(ws.structures[sid]) ? ws.structures[sid].members || [] : [sid]);
 
+// Tree: each subnetwork (molecules joined by reactions; shuttles and tiny
+// molecules such as water do not join them) laid out on its own, the
+// subnetworks side by side along x, the largest first. Within one, a
+// synthesis reads left to right: every molecule sits in the column after
+// the step that first can make it (longest path from what it starts from),
+// every step between its inputs and outputs with its two complexes, and a
+// building block just left of the step that uses it -- for a
+// retrosynthesis, the target on the right and its routes fanning out to the
+// left. Rows follow a few ordering sweeps (each node towards the mean row of
+// its neighbours) to cut crossings. Tiny molecules (H2, water, OH) hang just
+// under the first step that uses or releases them. Molecules in no reaction
+// share a small grid at the end. Returns {id: {x, y}}, or null when nothing
+// reacts into anything.
+const heavyAtoms = (s) => (s?.formula || '').replace(/H\d*/g, '').match(/[A-Z][a-z]?\d*/g)?.reduce(
+  (n, t) => n + (parseInt(t.replace(/[A-Za-z]/g, ''), 10) || 1), 0) || 0;
+
+export function treePositions(ws, shown) {
+  const COL = 235, DY = 150, GAP = 320, CXO = 62;
+  const tiny = (id) => heavyAtoms(ws.structures[id]) <= 1;
+  const steps = [];
+  const inReaction = new Set();
+  for (const r of Object.values(ws.reactions || {})) {
+    const e = r.edge && ws.edges[r.edge];
+    const ends = e ? [nodeOf(ws, e.source), nodeOf(ws, e.target)] : [null, null];
+    const allR = [...new Set(r.reactants)].filter((id) => shown.has(id));
+    const allP = [...new Set(r.products)].filter((id) => shown.has(id));
+    const shuttles = allR.filter((id) => allP.includes(id));
+    const rs = allR.filter((id) => !shuttles.includes(id));
+    const ps = allP.filter((id) => !shuttles.includes(id));
+    if (!rs.length || !ps.length) continue;
+    // Tiny molecules are drawn beside the step, unless the step is about them alone.
+    const ins = rs.some((id) => !tiny(id)) ? rs.filter((id) => !tiny(id)) : rs;
+    const outs = ps.some((id) => !tiny(id)) ? ps.filter((id) => !tiny(id)) : ps;
+    steps.push({ id: `s${steps.length}`, ins, outs, small: [...rs, ...ps, ...shuttles].filter((id) => !ins.includes(id) && !outs.includes(id)),
+      cx: ends.map((x) => (x && x.startsWith('cx:') ? x : null)), rank: Math.min(...(r.retro?.routes || [99])) });
+    if (e) inReaction.add(e.id);
+  }
+  // A plain edge between two molecules (an isomerization): source -> target.
+  for (const e of Object.values(ws.edges)) {
+    if (inReaction.has(e.id)) continue;
+    const a = nodeOf(ws, e.source), b = nodeOf(ws, e.target);
+    if (a && b && a !== b && shown.has(a) && shown.has(b) && !a.startsWith('cx:') && !b.startsWith('cx:')) {
+      steps.push({ id: `s${steps.length}`, ins: [a], outs: [b], small: [], cx: [null, null], rank: 99 });
+    }
+  }
+  if (!steps.length) return null;
+  steps.sort((x, y) => x.rank - y.rank);
+
+  // Subnetworks.
+  const parent = {};
+  const find = (x) => { while (parent[x] !== x) x = parent[x]; return x; };
+  for (const st of steps) {
+    const ids = [st.id, ...st.ins, ...st.outs];
+    for (const id of ids) if (parent[id] === undefined) parent[id] = id;
+    for (const id of ids.slice(1)) { const a = find(ids[0]), b = find(id); if (a !== b) parent[a] = b; }
+  }
+  const groups = {};
+  for (const st of steps) (groups[find(st.id)] ||= []).push(st);
+
+  const pos = {};
+  const blocks = [];
+  for (const group of Object.values(groups)) {
+    const mols = [...new Set(group.flatMap((st) => [...st.ins, ...st.outs]))];
+    const made = new Set(group.flatMap((st) => st.outs));
+    // Columns: molecules even, steps odd, by the longest path from the
+    // starting molecules, with the links that close a cycle set aside
+    // (found by a depth-first search from them).
+    const out = {};
+    for (const st of group) {
+      for (const m of st.ins) (out[m] ||= []).push(st.id);
+      out[st.id] = [...st.outs];
+    }
+    const nodes = [...mols, ...group.map((st) => st.id)];
+    const back = new Set();
+    const state = {};
+    const starts = [...mols.filter((m) => !made.has(m)), ...nodes];
+    for (const s0 of starts) {
+      if (state[s0]) continue;
+      const stack = [[s0, 0]];
+      state[s0] = 1;
+      while (stack.length) {
+        const top = stack[stack.length - 1];
+        const next = (out[top[0]] || [])[top[1]++];
+        if (next === undefined) { state[top[0]] = 2; stack.pop(); continue; }
+        if (state[next] === 1) back.add(`${top[0]}>${next}`);
+        else if (!state[next]) { state[next] = 1; stack.push([next, 0]); }
+      }
+    }
+    const indeg = Object.fromEntries(nodes.map((n) => [n, 0]));
+    for (const a of nodes) for (const b of out[a] || []) if (!back.has(`${a}>${b}`)) indeg[b] += 1;
+    const isStep = new Set(group.map((st) => st.id));
+    const col = {};
+    const queue = nodes.filter((n) => indeg[n] === 0);
+    for (const n of queue) col[n] = 0;
+    while (queue.length) {
+      const a = queue.shift();
+      if (isStep.has(a) ? col[a] % 2 === 0 : col[a] % 2 === 1) col[a] += 1;   // steps odd, molecules even
+      for (const b of out[a] || []) {
+        if (back.has(`${a}>${b}`)) continue;
+        col[b] = Math.max(col[b] ?? 0, col[a] + 1);
+        if (--indeg[b] === 0) queue.push(b);
+      }
+    }
+    for (const n of nodes) if (!(n in col)) col[n] = isStep.has(n) ? 1 : 0;
+    // A molecule nothing here makes sits just before its first use.
+    for (const m of mols) {
+      if (made.has(m)) continue;
+      const uses = group.filter((st) => st.ins.includes(m)).map((st) => col[st.id]);
+      if (uses.length) col[m] = Math.min(...uses) - 1;
+    }
+    // Rows: barycentre sweeps over the columns.
+    const nbr = {};
+    const link = (a, b) => { (nbr[a] ||= []).push(b); (nbr[b] ||= []).push(a); };
+    for (const st of group) { st.ins.forEach((m) => link(m, st.id)); st.outs.forEach((m) => link(m, st.id)); }
+    const cols = {};
+    const order = [...group.map((st) => st.id), ...mols];
+    for (const id of order) (cols[col[id]] ||= []).push(id);
+    const keys = Object.keys(cols).map(Number).sort((a, b) => a - b);
+    const row = {};
+    const setRows = () => keys.forEach((k) => cols[k].forEach((id, i) => { row[id] = i - (cols[k].length - 1) / 2; }));
+    setRows();
+    for (let sweep = 0; sweep < 8; sweep++) {
+      const ks = sweep % 2 ? [...keys].reverse() : keys;
+      for (const k of ks) {
+        const side = sweep % 2 ? 1 : -1;
+        const bc = (id) => {
+          const ns = (nbr[id] || []).filter((n) => col[n] === k + side);
+          return ns.length ? ns.reduce((s, n) => s + row[n], 0) / ns.length : row[id];
+        };
+        cols[k].sort((a, b) => bc(a) - bc(b));
+        cols[k].forEach((id, i) => { row[id] = i - (cols[k].length - 1) / 2; });
+      }
+    }
+    const local = {};
+    for (const id of order) local[id] = { x: col[id] * COL, y: row[id] * DY };
+    const block = {};
+    for (const m of mols) block[m] = local[m];
+    for (const st of group) {
+      const { x, y } = local[st.id];
+      const [rcx, pcx] = st.cx;
+      if (rcx && !block[rcx]) block[rcx] = { x: x - CXO, y };
+      if (pcx && !block[pcx]) block[pcx] = { x: x + CXO, y };
+    }
+    // Tiny molecules: just under the first step that has them, never on another node.
+    const taken = Object.values(block);
+    for (const st of group) {
+      st.small.forEach((m, k) => {
+        if (block[m] || pos[m]) return;
+        const { x, y } = local[st.id];
+        let q = { x: x + (k - (st.small.length - 1) / 2) * 105, y: y + 82 };
+        while (taken.some((o) => Math.abs(o.x - q.x) < 95 && Math.abs(o.y - q.y) < 70)) q = { x: q.x, y: q.y + 72 };
+        block[m] = q;
+        taken.push(q);
+      });
+    }
+    blocks.push(block);
+    for (const [id, q] of Object.entries(block)) if (!pos[id]) pos[id] = q;
+  }
+  // Side by side along x, the largest subnetwork first, tops aligned; then
+  // the molecules in no reaction, in a small grid of their own.
+  blocks.sort((a, b) => Object.keys(b).length - Object.keys(a).length);
+  const lone = [...shown].filter((id) => !pos[id] && !id.startsWith('cx:'));
+  if (lone.length) {
+    const cols = Math.max(2, Math.ceil(Math.sqrt(lone.length)));
+    const grid = {};
+    lone.forEach((id, k) => { grid[id] = { x: (k % cols) * 160, y: Math.floor(k / cols) * DY }; });
+    blocks.push(grid);
+    Object.assign(pos, grid);
+  }
+  let cursor = 0;
+  for (const block of blocks) {
+    const qs = Object.entries(block).filter(([id, q]) => pos[id] === q).map(([, q]) => q);
+    if (!qs.length) continue;
+    const x0 = Math.min(...qs.map((q) => q.x)), x1 = Math.max(...qs.map((q) => q.x));
+    const y0 = Math.min(...qs.map((q) => q.y));
+    for (const q of qs) { q.x += cursor - x0; q.y -= y0; }
+    cursor += x1 - x0 + GAP;
+  }
+  return pos;
+}
+
 const VIEW_DEFAULT = { q: '', only: false, maxRel: null, hideProposed: false, hideFailed: false, hideTS: false, focusHops: 0 };
 
 function nodeLabel(s) {
@@ -286,6 +467,7 @@ export function Graph() {
   const arranging = useRef(false);      // a layout is animating
   const pendingArrange = useRef(false); // new nodes arrived while the graph was hidden
   const arrangeRef = useRef(() => {});
+  const treeRef = useRef(() => {});
   const selection = useStore((s) => s.selection);
   const connectMode = useStore((s) => s.connectMode);
   const howToHidden = useStore((s) => s.howToHidden);
@@ -315,7 +497,7 @@ export function Graph() {
   // --- init once
   useEffect(() => {
     const c = cytoscape({
-      container: host.current, style: stylesheet(), minZoom: 0.15, maxZoom: 3,
+      container: host.current, style: stylesheet(), minZoom: 0.05, maxZoom: 3,
       boxSelectionEnabled: true, selectionType: 'additive',
     });
     cy.current = c;
@@ -401,7 +583,9 @@ export function Graph() {
       seen = size;
       c.resize();
       // Structures added while another tab was showing: arrange on reveal.
-      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) arrangeRef.current();
+      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) {
+        (pendingArrange.current === 'tree' ? treeRef : arrangeRef).current();
+      }
     });
     ro.observe(host.current);
     return () => { mq.removeEventListener('change', onTheme); ro.disconnect(); c.destroy(); };
@@ -415,6 +599,7 @@ export function Graph() {
     const ids = new Set();
     let placed = 0;
     let unplaced = 0;   // new nodes with no saved position -> the graph re-arranges
+    let unplacedRetro = 0;   // ... as a tree, when they are a retrosynthesis's routes
     const spawned = [];  // new nodes found from a node already shown: grow out of it instead
     const extent = c.extent();
     c.batch(() => {
@@ -434,7 +619,7 @@ export function Graph() {
             c.add({ group: 'nodes', data, position: { ...parent.position() }, style: { opacity: 0 } });
             continue;
           }
-          if (!positions[s.id]) unplaced += 1;
+          if (!positions[s.id]) { unplaced += 1; if (s.origin?.retro) unplacedRetro += 1; }
           const p = positions[s.id] || {
             x: (extent.x1 + extent.x2) / 2 + ((placed % 4) - 1.5) * 130,
             y: (extent.y1 + extent.y2) / 2 + Math.floor(placed / 4) * 120,
@@ -514,7 +699,8 @@ export function Graph() {
           { duration: reduced ? 0 : 500 });
       }
     }
-    if (unplaced) arrangeRef.current();   // e.g. minima just added from a result
+    if (unplacedRetro) treeRef.current();
+    else if (unplaced) arrangeRef.current();   // e.g. minima just added from a result
     else if (placed && Object.keys(positions).length === 0) fitCapped(c);
   }, [workspace, statusKey]);
 
@@ -633,67 +819,22 @@ export function Graph() {
   };
   arrangeRef.current = layout;
 
-  // Rows: species lined up by how they arise -- the starting materials on top,
-  // then what forms from them in one reaction, two, ...; within a row the
-  // largest molecules first. Complexes sit between the rows of their molecules.
-  const rowsLayout = () => {
+  const treeLayout = () => {
     const c = cy.current;
     if (!c) return;
-    const ws = state.workspace;
-    const nodes = c.nodes().filter((n) => !n.data('cx') && !n.hasClass('vhidden'));
-    const ids = nodes.map((n) => n.id());
-    const have = new Set(ids);
-    const steps = Object.values(ws.edges).filter((e) => nodeOf(ws, e.source) && nodeOf(ws, e.target))
-      .map((e) => [sideOf(ws, e.source), sideOf(ws, e.target)])
-      .filter(([a, b]) => [...a, ...b].every((id) => have.has(id)));
-    const inputs = new Set(Object.values(state.jobs).filter((j) => j.op === 'nanoreactor').flatMap((j) => j.targets.structures));
-    let start = ids.filter((id) => inputs.has(id) || !['job', 'composed'].includes(ws.structures[id]?.origin?.kind));
-    if (!start.length) {
-      const made = new Set(steps.flatMap(([, b]) => b));
-      start = ids.filter((id) => !made.has(id));
+    if (!host.current || host.current.offsetWidth === 0) {   // hidden tab: do it when shown
+      pendingArrange.current = 'tree';
+      return;
     }
-    const gen = Object.fromEntries(start.map((id) => [id, 0]));
-    // Forward first (as the reactions were seen); then backward, to reach the rest.
-    for (const dir of [0, 1]) {
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const st of steps) {
-          const [from, to] = dir ? [st[1], st[0]] : st;
-          if (!from.every((id) => id in gen)) continue;
-          const g = Math.max(...from.map((id) => gen[id])) + 1;
-          for (const id of to) if (!(id in gen)) { gen[id] = g; changed = true; }
-        }
-      }
-    }
-    const last = Math.max(0, ...Object.values(gen)) + 1;
-    const heavy = (id) => (ws.structures[id]?.formula || '').replace(/H\d*/g, '').match(/[A-Z][a-z]?\d*/g)?.reduce(
-      (n, t) => n + (parseInt(t.replace(/[A-Za-z]/g, ''), 10) || 1), 0) || 0;
-    // The starting materials on one row; everything made below, in a wide grid
-    // read left to right, top to bottom: fewest steps first, then largest first.
-    const byStep = (a, b) => (gen[a] ?? last) - (gen[b] ?? last) || heavy(b) - heavy(a)
-      || (ws.structures[a]?.name || '').localeCompare(ws.structures[b]?.name || '');
-    const first = ids.filter((id) => gen[id] === 0).sort(byStep);
-    const made = ids.filter((id) => gen[id] !== 0).sort(byStep);
-    const WRAP = Math.max(6, Math.min(12, Math.ceil(Math.sqrt(ids.length) * 1.6)));
-    const DX = 170, DY = 230;
-    const pos = {};
-    const rowsOut = [];
-    for (let k = 0; k < first.length; k += WRAP) rowsOut.push(first.slice(k, k + WRAP));
-    for (let k = 0; k < made.length; k += WRAP) rowsOut.push(made.slice(k, k + WRAP));
-    rowsOut.forEach((row, r) => row.forEach((id, i) => {
-      pos[id] = { x: (i - (row.length - 1) / 2) * DX, y: r * DY + (r >= Math.ceil(first.length / WRAP) ? 60 : 0) };
-    }));
-    const SUB = 0;
-    const taken = [];
+    pendingArrange.current = false;
+    const shown = new Set(c.nodes().filter((n) => !n.hasClass('vhidden')).map((n) => n.id()));
+    const pos = treePositions(state.workspace, shown);
+    if (!pos) { layout(); return; }
+    // Complexes no reaction placed: among their molecules.
     c.nodes('.cx').forEach((n) => {
+      if (pos[n.id()] || !shown.has(n.id())) return;
       const ms = [...new Set(n.data('members'))].filter((m) => pos[m]);
-      if (!ms.length) return;
-      let x = ms.reduce((a, m) => a + pos[m].x, 0) / ms.length;
-      const yy = Math.max(...ms.map((m) => pos[m].y)) + DY / 2 + 10;
-      while (taken.some((q) => Math.abs(q.x - x) < 44 && Math.abs(q.y - yy) < 30)) x += 46;
-      taken.push({ x, y: yy });
-      pos[n.id()] = { x, y: yy };
+      if (ms.length) pos[n.id()] = { x: ms.reduce((a, m) => a + pos[m].x, 0) / ms.length, y: Math.max(...ms.map((m) => pos[m].y)) + 70 };
     });
     arranging.current = true;
     c.nodes().filter((n) => pos[n.id()]).layout({
@@ -704,6 +845,7 @@ export function Graph() {
       savePositions(c);
     }).run();
   };
+  treeRef.current = treeLayout;
 
   // Commands from outside the graph (the playground layout's bottom dock):
   // 'arrange', 'select-all', or {cmd: 'fit', margins: {l, t, r, b}} to fit
@@ -714,6 +856,7 @@ export function Graph() {
       if (!c) return;
       const d = typeof e.detail === 'string' ? { cmd: e.detail } : (e.detail || {});
       if (d.cmd === 'arrange') arrangeRef.current();
+      else if (d.cmd === 'tree') treeRef.current();
       else if (d.cmd === 'fit') (d.margins ? fitInto(c, d.margins) : fitCapped(c));
       else if (d.cmd === 'select-all') select({ structures: c.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('cx')).map((n) => n.id()) });
       else if (d.cmd === 'view') setPanelRef.current((x) => !x);
@@ -758,8 +901,8 @@ export function Graph() {
           title="Click a start structure, then an end structure, to draw an edge (C)">
           ${connectMode ? 'Connecting… Esc to stop' : '＋ Connect'}</button>
         <button class="btn small ghost" onClick=${layout} title="Auto-arrange the graph">Arrange</button>
-        <button class="btn small ghost" onClick=${rowsLayout}
-          title="Line species up: what you started from on top, then what each reaction step makes; complexes between">Rows</button>
+        <button class="btn small ghost" onClick=${treeLayout}
+          title="Lay reactions out as a synthesis tree: each target on the right, the steps that make it to its left, building blocks at the far left">Tree</button>
         <button class="btn small ghost" onClick=${() => fitCapped(cy.current)} title="Fit everything in view">Fit</button>
         <button class="btn small ghost" onClick=${() => select({ structures: cy.current.nodes().filter((n) => !n.hasClass('vhidden') && !n.data('cx')).map((n) => n.id()) })}
           title="Select every structure shown (then delete, download, or run one calculation on all)">Select all</button>

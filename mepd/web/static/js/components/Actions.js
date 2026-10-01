@@ -281,10 +281,12 @@ function FamilyCard({ family, methods, sel, open, onToggle }) {
         <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
       </button>
       ${open && html`<div class="family-body">
+        ${[...new Set(methods.map((x) => x.group || ''))].map((g) => html`
+        ${g && html`<div class="method-group small">${g}</div>`}
         <div class="method-switch" role="tablist">
-          ${methods.map((x) => html`<button role="tab" aria-selected=${x.id === m.id} class=${`method ${x.id === m.id ? 'on' : ''} ${x.available ? '' : 'off'}`}
+          ${methods.filter((x) => (x.group || '') === g).map((x) => html`<button role="tab" aria-selected=${x.id === m.id} class=${`method ${x.id === m.id ? 'on' : ''} ${x.available ? '' : 'off'}`}
             title=${x.available ? x.summary : x.reason} onClick=${() => choose(x.id)}>${x.label}</button>`)}
-        </div>
+        </div>`)}
         <p class="small method-summary">${m.summary}</p>
         ${!m.available ? html`<p class="warn-box small">Not available here: ${m.reason}.</p>`
           : m.fit.disabled ? html`<p class="small why-disabled">${m.fit.disabled}</p>`

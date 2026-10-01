@@ -196,4 +196,13 @@ def references() -> list[dict]:
                       "doi:10.1002/jcc.21224"]},
         ],
     }
-    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor, kinetics, complexes]]
+    from mepd.retro import REFERENCES as RETRO
+
+    retro = {
+        "feature": "Retrosynthesis",
+        "where": "Reaction network expansion › Retrosynthesis",
+        "items": [{"what": stage.replace("_", " ").capitalize().replace("Local-llm", "Local LLM")
+                   .replace("Reactiont5", "ReactionT5").replace("Aizynthfinder", "AiZynthFinder"),
+                   "note": m["method"], "cite": m["cite"]} for stage, m in RETRO.items()],
+    }
+    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor, retro, kinetics, complexes]]

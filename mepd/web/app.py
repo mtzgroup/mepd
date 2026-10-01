@@ -329,6 +329,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     from mepd.web.nanoreactor import spawn_ts_searches
 
                     spawn_ts_searches(manager, job)
+            if job["op"] == "retrosynthesis" and job["status"] == "done":
+                from mepd.web.retro import adopt_retro
+
+                if await run_in_threadpool(adopt_retro, manager.ws, job):
+                    manager._update(job)
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "complex" and job["status"] == "done" and not job.get("external"):
                 made = await run_in_threadpool(adopt_complexes, manager.ws, job)
                 if made:

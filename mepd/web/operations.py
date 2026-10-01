@@ -545,9 +545,11 @@ def _method_view(m: dict) -> dict:
     import shutil
 
     missing = [prog for prog in m.get("programs", ()) if shutil.which(prog) is None]
+    reason = f"needs {' and '.join(missing)} on the server's PATH ({m['install']})" if missing else ""
+    if not reason and callable(m.get("check")):   # e.g. a Python package or a one-time setup
+        reason = m["check"]() or ""
     return {"label": m["label"], "summary": m.get("summary", ""), "fixed": m.get("fixed", {}), "rank": m.get("rank", 0),
-            "available": not missing,
-            "reason": f"needs {' and '.join(missing)} on the server's PATH ({m['install']})" if missing else ""}
+            "group": m.get("group", ""), "available": not reason, "reason": reason}
 
 
 TS_FAMILY = {"key": "ts", "title": "Transition state",
@@ -734,6 +736,64 @@ def _build_discovery(command: str):
     return build
 
 
+class RetroParams(Params):
+    # Chosen by the method switch, not in the form.
+    method: Literal["templates", "reactiont5", "local-llm", "aizynthfinder"] = P(
+        "templates", "Method", kind="custom", group="Hidden")
+    routes: int = P(5, "Routes", "How many routes to report (and add to Explore), cheapest first.", cli="--routes",
+                    ge=1, le=50)
+    max_depth: int = P(6, "Most steps", "Longest route from a building block to the target.", cli="--max-depth",
+                       ge=1, le=15)
+    iterations: int = P(100, "Search budget (molecules expanded)", cli="--iterations", ge=1)
+    time_limit: float = P(120.0, "Search budget (s)", cli="--time-limit", gt=0)
+    stock: Literal["auto", "paroutes", "zinc"] = P(
+        "auto", "Building blocks", "What a route may start from. PaRoutes: ~20k building blocks and common reagents "
+        "(downloaded on first use, 0.8 MB). ZINC: AiZynthFinder's in-stock set (needs `mepd retro setup "
+        "--aizynthfinder`). Automatic: ZINC if set up, else PaRoutes.", kind="custom",
+        labels={"auto": "Automatic", "paroutes": "PaRoutes", "zinc": "ZINC in-stock"})
+    stock_file: str = P("", "Also these (file)", "A file on the server with your own building blocks: one SMILES "
+                        "or InChIKey per line, or a CSV with a smiles column.", kind="custom", advanced=True,
+                        group="Building blocks")
+    max_heavy: int = P(2, "Small molecules count as available up to (heavy atoms)", "H2, CO, ethylene... (the "
+                       "stocks list common reagents themselves); 0: only what is in the stock.", cli="--max-heavy",
+                       ge=0, advanced=True, group="Building blocks")
+    verify: Literal["none", "top", "all"] = P(
+        "none", "Check steps with path searches", "Off: routes come back in seconds as proposed reactions in "
+        "Explore, where you can run 'Find TS' on any step. Best route / every route: each step also gets a path "
+        "search + TS + IRC at the profile's level of theory (slow: minutes to hours per step).", cli="--verify",
+        labels={"none": "Off", "top": "Best route", "all": "Every route"})
+    llm_url: str = P("http://localhost:11434/v1", "Local LLM server", "An OpenAI-compatible endpoint on this "
+                     "machine: Ollama (http://localhost:11434/v1), llama.cpp server (http://localhost:8080/v1), "
+                     "vLLM, LM Studio.", kind="custom", requires="method=local-llm")
+    llm_model: str = P("", "Model", "Its name on the server (e.g. qwen3:8b); empty: the first one it serves.",
+                       kind="custom", requires="method=local-llm")
+    llm_samples: int = P(1, "Answers per molecule", "Ask several times and pool the answers (a proposal given "
+                         "repeatedly counts more).", kind="custom", ge=1, le=10, requires="method=local-llm")
+    roundtrip: bool = P(True, "Round-trip check", "Ask the forward model to predict the product of each proposal; "
+                        "one that doesn't give the target back is ranked lower.", kind="custom",
+                        requires="method=reactiont5")
+    width: int = P(10, "Proposals per molecule", cli="--width", ge=1, advanced=True, group="Search")
+    workers: int = P(4, "Parallel workers", "Step checks run side by side.", cli="--workers", ge=1,
+                     advanced=True, group="Search")
+
+
+def _build_retro(ctx: JobContext, p: RetroParams) -> list[str]:
+    rec = ctx.structures[0]
+    target = rec.get("smiles") or str(ctx.snapshot_structure(rec, "target"))
+    argv = ["retro", "plan", target, "--method", p.method, *ctx.common_flags(), *generic_flags(p)]
+    stocks = {"auto": [], "paroutes": ["paroutes-n1", "paroutes-n5"], "zinc": ["zinc"]}[p.stock]
+    if p.stock_file.strip():
+        stocks = (stocks or ["auto"]) + [p.stock_file.strip()]
+    for s in stocks:
+        argv += ["--stock", s]
+    opts = {"local-llm": {"url": p.llm_url, "model": p.llm_model, "samples": p.llm_samples},
+            "reactiont5": {"roundtrip": str(p.roundtrip).lower()}}.get(p.method, {})
+    for k, v in opts.items():
+        if v != "":
+            argv += ["--option", f"{k}={v}"]
+    return argv + ["--output", str(ctx.output_dir)]
+
+
 class NanoreactorParams(Params):
     copies: str = P("4", "Copies of each", "Molecules of each selected structure in the reactor: one number for all, "
                     "or by name, e.g. 'CC=O: 2, O: 6'.", kind="custom")
@@ -806,6 +866,27 @@ def _parse_copies(text: str, recs: list[dict]) -> list[int]:
         raise WorkspaceError(f"give one count (>= 1) per selected structure ({len(recs)}), one for all, or "
                              f"'name: count' pairs; got {text!r}")
     return counts
+
+
+def _retro_methods():
+    """The retrosynthesis methods as the family card's method switch; each
+    says why it can't run here (a package or the AiZynthFinder setup missing)."""
+    from mepd.retro.proposers import PROPOSERS
+
+    summaries = {
+        "templates": "USPTO reaction templates ranked by AiZynthFinder's policy network, run inside mepd: routes "
+                     "in seconds. Data (~110 MB, CC-BY) downloads on first use.",
+        "reactiont5": "ReactionT5, a local chemistry language model, writes the reactants of each molecule; a "
+                      "forward model checks them. Runs on this machine (GPU if there is one); ~1.6 GB of weights "
+                      "on first use.",
+        "local-llm": "An open-weight LLM you run locally (Ollama, llama.cpp, vLLM) proposes disconnections; RDKit "
+                     "checks every one. Nothing leaves your machine.",
+        "aizynthfinder": "AiZynthFinder's own tree search with its USPTO models and the ZINC stock, in its own "
+                         "environment.",
+    }
+    for rank, (name, prop) in enumerate(PROPOSERS.items()):
+        yield {"label": prop.label, "rank": 10 + rank, "fixed": {"method": name}, "summary": summaries[name],
+               "group": "Retrosynthesis: routes back to building blocks", "check": prop.problem}
 
 
 def _build_nanoreactor(ctx: JobContext, p: NanoreactorParams) -> list[str]:
@@ -1244,6 +1325,15 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
                         "isomers the molecule can reach, e.g. likely precursors (read backwards) or nearby products. "
                         "They are re-optimized at your level of theory and grown like any other species. One molecule at a "
                         "time: a cluster of several gets no products."})),
+    Operation(
+        "retrosynthesis", "Retrosynthesis", "Routes from purchasable building blocks to this molecule: a "
+        "tree search over single steps proposed by the chosen method; each route's steps join Explore as "
+        "reactions coming back from the target, ready for 'Find TS'. (`mepd retro plan`)",
+        "structure", EXPLORE, RetroParams, _build_retro,
+        produces=["routes", "precursor species", "proposed reactions (optionally path-searched)"],
+        cli_path=("retro", "plan"), cli_extra_flags=("--charge", "--multiplicity", "--inputs", "--output", "--stock",
+                                                     "--option", "--method"),
+        family=NETWORK, methods=tuple(_retro_methods())),
     Operation(
         "nanoreactor", "Nanoreactor", "Put the selected molecules in a hot box whose wall periodically squeezes "
         "them, and watch what reacts. Each reaction is cut out with only the molecules it needs (a water that "

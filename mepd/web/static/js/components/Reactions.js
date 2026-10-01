@@ -259,7 +259,7 @@ export function ReactionCard({ r, event = null, compact = false }) {
   const height = compact ? 230 : 340;
   return html`<div class=${`reaction-card ${compact ? 'compact' : ''}`}>
     <${Equation} r=${r} structures=${structures} />
-    <div class="small muted rc-meta">${r.origin?.kind === 'composed' ? 'composed by hand' : html`seen ${r.count || 0}× in the MD${r.reverse_count ? `, reverse ${r.reverse_count}×` : ''}`}
+    <div class="small muted rc-meta">${r.origin?.kind === 'composed' ? 'composed by hand' : r.retro ? `retrosynthesis step · ${r.retro.method}${r.retro.reagents?.length ? ` · reagents ${r.retro.reagents.join(', ')}` : ''}` : html`seen ${r.count || 0}× in the MD${r.reverse_count ? `, reverse ${r.reverse_count}×` : ''}`}
       · energies over the same atoms, kcal/mol
       ${compact && html` · <a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ reaction: r.id }); }}>open in Analyze</a>`}</div>
     <${Ladder} r=${r} st=${st} structures=${structures} />

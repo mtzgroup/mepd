@@ -1190,3 +1190,21 @@ input.invalid { border-color: var(--danger); outline-color: var(--danger); }
 .analyze-wrap > .an-mode { margin: 12px 20px 0; align-self: flex-start; }
 .analyze-wrap > .analyze, .analyze-wrap > .kinetics { flex: 1; min-height: 0; }
 .rc-settings { border: 1px solid var(--border); border-radius: 4px; padding: 10px 12px; margin-top: 8px; background: var(--panel); }
+
+/* Retrosynthesis routes (Retro.js) */
+.retro-routes { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 14px; }
+.retro-route { border: 1px solid var(--border); border-radius: 4px; background: var(--panel); }
+.retro-route-head { display: flex; align-items: center; gap: 10px; padding: 6px 10px; }
+.retro-route.open .retro-route-head { border-bottom: 1px solid var(--border); }
+.retro-mini { display: inline-flex; gap: 2px; }
+.retro-step { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 6px 10px; }
+.retro-step + .retro-step { border-top: 1px dashed var(--border); }
+.retro-step.on { background: var(--accent-soft); }
+.retro-eq { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.retro-plus, .retro-arrow { color: var(--label); font-size: 16px; padding: 0 2px; }
+.retro-arrow { font-size: 20px; }
+.retro-mol { display: inline-flex; border: 1.5px solid transparent; border-radius: 4px; background: #fff; }
+.retro-mol.stock { border-color: var(--ok); }
+.retro-mol img { display: block; }
+.retro-card { grid-column: 1 / -1; }
+.method-group { color: var(--label); text-transform: uppercase; letter-spacing: .04em; font-size: 11px; margin: 10px 0 4px; }

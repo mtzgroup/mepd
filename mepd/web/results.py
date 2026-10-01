@@ -33,8 +33,11 @@ from mepd.web.workspace import HARTREE_TO_KCAL
 
 def detect_operation(path: Path) -> Optional[str]:
     if path.is_dir():
-        if (path / "network.json").exists() and (_read_json(path / "summary.json") or {}).get("kind") == "nanoreactor":
+        kind = (_read_json(path / "summary.json") or {}).get("kind")
+        if (path / "network.json").exists() and kind == "nanoreactor":
             return "nanoreactor"
+        if (path / "routes.json").exists() and kind == "retro":
+            return "retrosynthesis"
         if (path / "conformers").is_dir():
             return "channels"
         if (path / "summary.json").exists() and list(path.glob("opt_*.xyz")):
@@ -1343,7 +1346,57 @@ def collect_nanoreactor(out: Path, charge: int, multiplicity: int) -> dict:
     return out
 
 
+def collect_retro(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd retro plan` output: routes.json (+ summary.json); while running,
+    the routes so far from live_network.json."""
+    from mepd.retro.steps import byproducts, coreactants, step_key
+
+    summary = _read_json(out / "summary.json") or {}
+    data = _read_json(out / "routes.json")
+    live = data is None
+    if live:
+        net = _read_json(out / "live_network.json") or {}
+        return {**_result("Searching…" if net else "No routes yet", [], []),
+                "retro": {"live": True, "target": net.get("target"), "routes": [],
+                          "steps_so_far": len(net.get("reactions") or [])}}
+    routes = data.get("routes") or []
+    shown = routes or ([data["best_partial"]] if data.get("best_partial") else [])
+
+    def step_view(s: dict) -> dict:
+        v = s.get("verification") or {}
+        info = s.get("info") or {}
+        return {"key": step_key(s), "product": s["product"], "reactants": s["reactants"], "method": s["method"],
+                "score": s.get("score"), "byproducts": byproducts(s), "coreactants": coreactants(s), "reagents": info.get("reagents") or [],
+                "reaction": info.get("reaction") or "", "delta_e_kcal": info.get("delta_e_kcal"),
+                "roundtrip": info.get("roundtrip"), "barrier_kcal": v.get("barrier_kcal"),
+                "verified": v.get("verified"), "check": v.get("status")}
+
+    views = [{"rank": k + 1, "n_steps": r["n_steps"], "score": r.get("score"), "solved": r.get("solved"),
+              "highest_barrier_kcal": r.get("highest_barrier_kcal"), "all_verified": r.get("all_verified"),
+              # forward order: deepest steps (made first) first
+              "steps": [step_view(s) for s in sorted(r["steps"], key=lambda s: -s.get("depth", 0))],
+              "leaves": r.get("leaves") or []} for k, r in enumerate(shown)]
+    stats = summary.get("stats") or {}
+    if routes:
+        best = routes[0]
+        headline = f"{len(routes)} route{'s' if len(routes) != 1 else ''} · best {best['n_steps']} " \
+                   f"step{'s' if best['n_steps'] != 1 else ''}"
+    else:
+        headline = "No route reaches the stock" + (" · closest shown" if shown else "")
+    rows = [{"label": "Method", "value": summary.get("method")},
+            {"label": "Building blocks", "value": summary.get("stock")},
+            {"label": "Search", "value": f"{stats['seconds']:g} s" + (f", {stats['expansions']} expansions"
+                                                                      if stats.get("expansions") is not None else "")
+             if stats.get("seconds") is not None else None},
+            {"label": "Target in stock", "value": "yes" if summary.get("target_in_stock") else None}]
+    out_ = _result(headline, [], rows)
+    out_["retro"] = {"live": False, "target": data.get("target"), "solved": bool(routes), "routes": views,
+                     "verify": summary.get("verify")}
+    return out_
+
+
 COLLECTORS = {
+    "retrosynthesis": collect_retro,
     "nanoreactor": collect_nanoreactor,
     "optimize": collect_optimize,
     "design-optimize": collect_optimize,
@@ -1454,7 +1507,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 24
+RESULT_VERSION = 25
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:
