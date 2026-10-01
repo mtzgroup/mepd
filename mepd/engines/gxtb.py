@@ -253,6 +253,17 @@ class GXTBCalculator(Engine):
         self.extra_args = [str(arg) for arg in self.extra_args]
         self.env = {str(k): str(v) for k, v in dict(self.env or {}).items()}
 
+    def _resolve_executable(self) -> None:
+        """The default name "gxtb" not on PATH: an installed g-xTB build, or
+        (first use) the official release, fetched by mepd.programs."""
+        if self.executable == "gxtb" and shutil.which("gxtb") is None:
+            from mepd.programs import gxtb_executable
+
+            try:
+                self.executable = gxtb_executable() or self.executable
+            except RuntimeError as exc:
+                raise ElectronicStructureError(msg=str(exc)) from exc
+
     def compute_gradients(self, chain: Union[Chain, List]) -> NDArray:
         try:
             grads = np.array([node.gradient for node in chain])
@@ -345,6 +356,7 @@ class GXTBCalculator(Engine):
         watch: Callable[[], None] | None = None,
         extra_args: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        self._resolve_executable()
         cmd = [
             self.executable,
             str(xyz_path.name),
@@ -475,6 +487,7 @@ class GXTBCalculator(Engine):
         multiplicity: int,
         cwd: Path,
     ) -> subprocess.CompletedProcess[str]:
+        self._resolve_executable()
         cmd = [
             self.executable,
             str(xyz_path.name),

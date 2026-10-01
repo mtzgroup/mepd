@@ -45,16 +45,19 @@ Until then, use one of the open models above.
 ## Installing
 
 ```bash
-uv sync --inexact --extra mlip      # fairchem-core, AIMNet2, ANI
+uv sync                             # fairchem-core, AIMNet2, ANI (with everything else)
 ```
 
 Orb and MACE pin versions that conflict with fairchem-core, so each goes in an
 environment of its own:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-orb uv sync --extra orb --extra ase
-UV_PROJECT_ENVIRONMENT=.venv-mace uv sync --extra mace --extra ase
+uv venv .venv-orb && uv pip install --python .venv-orb -e ".[ase,server]" "orb-models>=0.7.0"
+uv venv .venv-mace && uv pip install --python .venv-mace -e ".[ase,server]" "mace-torch>=0.3.16"
 ```
+
+(`server` is the web app without the `mlip` extra, which `web` includes; drop it for a
+CLI-only environment.)
 
 ## Your own model
 

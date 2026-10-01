@@ -144,7 +144,7 @@ FAMILIES: dict[str, tuple[Callable, Callable]] = {
 }
 
 _AIMNET_ELEMENTS = "H B C N O F Si P S Cl As Se Br I"
-_ORB_INSTALL = "pip install orb-models  (or the `orb` extra; not in the same environment as fairchem-core)"
+_ORB_INSTALL = "pip install orb-models  (in an environment without fairchem-core; see docs/mlip.md)"
 MODELS: dict[str, MLIPSpec] = {
     "aimnet2-rxn": MLIPSpec("aimnet2", "AIMNet2 trained for reactions (wB97M-D3 level)",
                             'pip install "aimnet[ase]"', elements="H C N O",
@@ -163,7 +163,7 @@ MODELS: dict[str, MLIPSpec] = {
     "ani-2x": MLIPSpec("ani", "ANI-2x (wB97X/6-31G*)", "pip install torchani",
                        elements="H C N O F S Cl", charge_and_spin="neutral closed-shell only"),
     "mace-off": MLIPSpec("mace", "MACE-OFF23 organic force field (size: small/medium/large via options)",
-                         "pip install mace-torch  (or the `mace` extra; not in the same environment as fairchem-core)",
+                         "pip install mace-torch  (in an environment without fairchem-core; see docs/mlip.md)",
                          elements="H C N O F P S Cl Br I", charge_and_spin="neutral closed-shell only"),
 }
 for _name, _repo in (("uma-s-1p2p1", "facebook/UMA"), ("uma-s-1p2", "facebook/UMA"),

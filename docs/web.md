@@ -6,11 +6,13 @@ A browser interface over the mepd CLI. It is meant for three kinds of use:
 - **Exploration** around a structure.
 - **Hand-built reaction networks.** Draw the network, then run any calculation on some or all of its edges.
 
-The web UI is an optional part of the package: its Python dependencies are the `web` extra, and
-the page itself ships inside the package.
+The web UI is an optional part of the package. Its `web` extra installs everything its features
+use (ASE/Sella, tblite, SLAPMapper, the MLIPs, retrosynthesis), and the page itself ships inside
+the package. g-xTB, the default level of a new workspace, is not a Python package: if it is not
+installed, mepd downloads the official release (about 40 MB) the first time it is needed.
 
 ```bash
-uv sync --extra web          # dev checkout
+uv sync                      # dev checkout (installs everything, web app included)
 pip install "mepd[web] @ git+https://github.com/mtzgroup/mepd.git"   # or from git
 mepd web my_workspace        # opens http://127.0.0.1:8765
 mepd web my_workspace --max-jobs 4 --port 9000 --no-open

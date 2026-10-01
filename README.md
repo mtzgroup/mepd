@@ -12,19 +12,20 @@ This repository contains:
 ## Installation
 
 ```bash
-pip install "git+https://github.com/mtzgroup/mepd.git"
+pip install "mepd[web] @ git+https://github.com/mtzgroup/mepd.git"   # everything, web app included
+pip install "git+https://github.com/mtzgroup/mepd.git"               # the core library and CLI only
 ```
 
-For local development:
+For local development, a plain `uv sync` installs everything (the web app and every optional
+feature); `uv run` keeps it that way:
 
 ```bash
 uv sync
 uv run pytest
 ```
 
-Every optional feature at once: `uv sync --all-extras --no-extra orb --no-extra mace`.
-Plain `--all-extras` fails, because the `mlip` extra (FAIR-Chem) can't share an environment
-with `orb` or `mace`. To use those, give each its own environment (see `docs/mlip.md`).
+Orb and MACE models are the exception: they can't share an environment with FAIR-Chem, so each
+goes in an environment of its own (see `docs/mlip.md`).
 
 ## Quick Start
 
@@ -78,7 +79,7 @@ Use the Python API for lower-level NEB, MLPGI, MSMEP, and elementary-step workfl
 ## Web interface
 
 ```bash
-uv sync --extra web          # or: pip install "mepd[web] @ git+https://github.com/mtzgroup/mepd.git"
+uv sync                      # or: pip install "mepd[web] @ git+https://github.com/mtzgroup/mepd.git"
 mepd web my_workspace
 ```
 

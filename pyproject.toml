@@ -39,16 +39,26 @@ discovery = [
 ]
 # `mepd web`: browser UI (FastAPI server; Preact, Cytoscape and 3Dmol are
 # vendored under mepd/web/static/vendor, so no JS build step or internet).
+# Everything the web app's features use comes with it, so a first install
+# just works: `pip install "mepd[web] @ git+..."` or, in a checkout, a plain
+# `uv sync` (the `app` group below makes it the default).
 web = [
+    "mepd[server,viz,discovery,ase,gxtb,aam,mlip,retro,retro-ml]",
+]
+# The web server alone (an Orb or MACE environment, which cannot hold `mlip`).
+server = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "python-multipart>=0.0.9",
 ]
 # ASEEngine (engine_name="ase") and its SELLA-based TS-opt/IRC support. Not
 # needed for the qc*/chemcloud-backed engines, which are the main workhorse.
+# tblite: GFN2-xTB as an ASE calculator, from PyPI wheels -- the level a new
+# workspace uses when the g-xTB program is not installed.
 ase = [
     "ase>=3.26.0",
     "sella>=2.3.4",
+    "tblite>=0.4",
 ]
 # GXTBCalculator (engine_name="gxtb") wraps g-xTB as an ase.Calculator --
 # a temporary workaround until qccompute supports g-xTB natively. TS-opt/IRC
@@ -80,12 +90,19 @@ mlip = [
 ]
 # Orb and MACE cannot share an environment with fairchem-core (orb-models
 # pins nvalchemi-toolkit-ops<0.4, fairchem needs >=0.4.1; mace-torch pins
-# e3nn 0.4, fairchem needs 0.6): install one of these instead of `mlip`.
-orb = [
-    "orb-models>=0.7.0; python_version >= '3.12'",
+# e3nn 0.4, fairchem needs 0.6), so they are not extras (an extra that can't
+# be installed with the others breaks `uv sync --all-extras`): install one
+# into an environment of its own, see docs/mlip.md.
+# `mepd retro`: template retrosynthesis (rdchiral) ranked by AiZynthFinder's
+# public ONNX policy (run here; AiZynthFinder itself is optional, in its own
+# env via `mepd retro setup --aizynthfinder`). See docs/retrosynthesis.md.
+retro = [
+    "onnxruntime>=1.20",
+    "rdchiral>=1.1",
 ]
-mace = [
-    "mace-torch>=0.3.16",
+# `mepd retro --method reactiont5`: local ReactionT5 models (also needs torch).
+retro-ml = [
+    "transformers>=4.46",
 ]
 
 [project.scripts]
@@ -95,6 +112,9 @@ mepd = "mepd.cli:app"
 dev = [
     "pytest>=8.0.0",
 ]
+# The full app, installed by a plain `uv sync` / `uv run` (default-groups),
+# so neither ever strips the extras the web app needs.
+app = ["mepd[web]"]
 
 [build-system]
 requires = ["hatchling"]
@@ -108,10 +128,7 @@ packages = ["mepd"]
 # cap, not a known incompatibility -- it raises the cap once its CI passes.
 # Keep the numpy the rest of the project runs on instead of downgrading it.
 override-dependencies = ["numpy>=2.2.6,<2.6"]
-conflicts = [
-    [{ extra = "mlip" }, { extra = "orb" }],
-    [{ extra = "mlip" }, { extra = "mace" }],
-]
+default-groups = ["dev", "app"]
 
 [tool.hatch.metadata]
 # The `aam` optional-dependency group pins slapmapper via a git URL

@@ -1418,7 +1418,7 @@ def models() -> None:
         'Use one with engine_name = "mlip" and [mlip_engine_kwds] model = "<name>". '
         'A local file: add family = "aimnet2" | "orb" | "fairchem" | "mace" and checkpoint = "/path". '
         'Any other ASE calculator: calculator = "package.module:ClassOrFactory" (+ calculator_kwds). '
-        'Install: `uv sync --inexact --extra mlip` (fairchem, AIMNet2, ANI), or `--extra orb` / `--extra mace` in a separate environment.'
+        'Installed with mepd[web] / a plain `uv sync` (fairchem, AIMNet2, ANI); Orb and MACE go in an environment of their own (docs/mlip.md).'
     ))
 
 
