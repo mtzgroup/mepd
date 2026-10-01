@@ -69,7 +69,10 @@
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
+/* The app fills the window and every tab scrolls inside itself: the page
+   never scrolls, so a transient overflow can't toggle page scrollbars (whose
+   width changed the graph's size, which changed the overflow: a resize loop). */
+html, body { height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--bg); color: var(--text); font: 15px/1.5 var(--font-ui); -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 #app { height: 100%; display: flex; flex-direction: column; }
 a { color: var(--accent); text-decoration: none; }
