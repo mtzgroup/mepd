@@ -57,7 +57,8 @@ class DemoPolicy:
     })
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
-                          "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor")
+                          "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor",
+                          "solvent")
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""

@@ -12,6 +12,7 @@ import { api, attempt } from '../api.js';
 import { set, state, useStore } from '../store.js';
 import { depictUrl, edgeStatus, fmtKcal } from '../util.js';
 import { NO_TS_SHORT, ReactionCard, findTs, noTsWhy } from './Reactions.js';
+import { KineticsView } from './Kinetics.js';
 
 const count = (ids) => ids.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
 
@@ -149,6 +150,18 @@ function Composer({ initial, onDone }) {
 
 // ------------------------------------------------------------ the view
 export function AnalyzeView() {
+  const mode = useStore((s) => (s.analyze || {}).view) || 'reactions';
+  const nav0 = useStore((s) => s.analyze) || {};
+  const toggle = html`<div class="segmented an-mode">
+    <button class=${mode === 'reactions' ? 'on' : ''} onClick=${() => set({ analyze: { ...nav0, view: 'reactions' } })}>Reactions</button>
+    <button class=${mode === 'kinetics' ? 'on' : ''} onClick=${() => set({ analyze: { ...nav0, view: 'kinetics' } })}
+      title="The network as a kinetic model: what forms, what controls it, and how it moves with temperature">Kinetics</button>
+  </div>`;
+  if (mode === 'kinetics') return html`<div class="analyze-wrap">${toggle}<${KineticsView} /></div>`;
+  return html`<div class="analyze-wrap">${toggle}<${ReactionsAnalyze} /></div>`;
+}
+
+function ReactionsAnalyze() {
   const ws = useStore((s) => s.workspace);
   const jobs = useStore((s) => s.jobs);
   const nav = useStore((s) => s.analyze) || {};
@@ -230,5 +243,5 @@ export function AnalyzeView() {
 // From Explore: open Analyze on a reaction, on the reactions of some
 // species, or with the composer started from them.
 export function openAnalyze(patch) {
-  set({ analyze: { ...(state.analyze || {}), compose: false, ...patch }, view: { tab: 'analyze', jobId: state.view.jobId } });
+  set({ analyze: { ...(state.analyze || {}), compose: false, view: 'reactions', ...patch }, view: { tab: 'analyze', jobId: state.view.jobId } });
 }

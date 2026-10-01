@@ -1072,3 +1072,57 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .rx-spawned ul { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }
 .rx-spawned li { display: flex; gap: 8px; align-items: center; font-size: 13px; }
 .rx-spawned li a { font-family: var(--font-mono); font-size: 12px; }
+
+/* Analyze › Kinetics. Series colours: the dataviz reference categorical
+   slots (validated against these surfaces: adjacent CVD ΔE ≥ 8.4, normal ≥ 19.3;
+   light-mode contrast relief = the legend, hover readout and table). */
+:root { --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300;
+  --div-pos: #2a78d6; --div-neg: #e34948; --div-mid: #d9d6cf; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+    --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; }
+}
+:root[data-theme="dark"] { --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+  --div-pos: #3987e5; --div-neg: #e66767; --div-mid: #383835; }
+.an-mode { margin-bottom: 8px; }
+.kinetics { display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 20px; padding: 16px 20px; height: 100%; overflow: hidden; }
+@media (max-width: 900px) { .kinetics { grid-template-columns: 1fr; overflow: auto; } }
+.kn-setup { overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.kn-results { overflow: auto; padding-bottom: 24px; }
+.kn-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.kn-row input[type=number] { width: 90px; }
+.kn-row input.tiny { width: 64px; }
+.kn-mix { display: flex; flex-direction: column; gap: 6px; }
+.kn-mix-row { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; background: var(--panel); }
+.kn-mix-row img { width: 48px; height: 36px; object-fit: contain; background: var(--node-bg); border-radius: 2px; }
+.kn-mix-name { flex: 1; font-family: var(--font-mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.kn-mix-row input[type=number] { width: 64px; }
+.kn-out section { margin: 14px 0 18px; }
+.kn-head { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 4px; }
+.kn-chart { position: relative; max-width: 640px; }
+.kn-chart svg { width: 100%; height: auto; display: block; }
+.kn-grid { stroke: var(--border); stroke-width: 1; }
+.kn-tick { font: 10px var(--font-mono); fill: var(--muted); }
+.kn-axis { font: 11px var(--font-ui); fill: var(--muted); }
+.kn-line { fill: none; stroke-width: 2; stroke-linejoin: round; }
+.kn-cross { stroke: var(--muted); stroke-dasharray: 3 3; }
+.kn-dot { stroke: var(--bg); stroke-width: 2; }
+.kn-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; margin-top: 4px; color: var(--text); }
+.kn-legend i, .kn-tip i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.kn-tip { font-size: 12px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; margin-top: 4px; }
+.kn-tip span { margin-left: 8px; font-family: var(--font-mono); }
+.kn-bars { display: flex; flex-direction: column; gap: 3px; max-width: 680px; }
+.kn-bar-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(120px, 1fr) 52px; gap: 8px; align-items: center; background: none; border: 0;
+  padding: 3px 4px; text-align: left; cursor: pointer; color: var(--text); border-radius: 3px; }
+.kn-bar-row:hover { background: var(--panel-2); }
+.kn-bar-label { font-family: var(--font-mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kn-bar-track { position: relative; height: 12px; }
+.kn-bar-mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--div-mid); }
+.kn-bar { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+.kn-bar.pos { background: var(--div-pos); } .kn-bar.neg { background: var(--div-neg); }
+.kn-bar-v { font-size: 12px; text-align: right; color: var(--text); }
+.kn-sub { margin-top: 10px; }
+.kn-excl ul { margin: 6px 0; padding-left: 18px; }
+.analyze-wrap { display: flex; flex-direction: column; height: 100%; }
+.analyze-wrap > .an-mode { margin: 12px 20px 0; align-self: flex-start; }
+.analyze-wrap > .analyze, .analyze-wrap > .kinetics { flex: 1; min-height: 0; }

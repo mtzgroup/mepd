@@ -124,3 +124,29 @@ def test_live_and_final_versions_of_a_reaction_are_one_reaction(tmp_path, networ
     assert len(rx) == 2                                   # the live one plus the one only the final run has
     assert sorted(r["label"] for r in rx.values()) == ["CC=O + O -> C=CO + O", "CC=O -> C=CO"]
     assert len([s for s in ws.snapshot()["structures"].values() if s["role"] != "complex"]) == 3
+
+
+def test_kinetics_uses_reactions_with_barriers_and_ranks_what_controls_the_target(tmp_path, network):
+    from mepd.web.kinetics import analyze
+
+    ws = Workspace(tmp_path / "ws")
+    job = {"id": "j1", "op": "nanoreactor", "output_dir": str(network), "params": {}, "level": None}
+    adopt_nanoreactor(ws, job)
+    snap = ws.snapshot()
+    rx = {r["label"]: r for r in snap["reactions"].values()}
+    direct, shuttled = rx["CC=O -> C=CO"], rx["CC=O + O -> C=CO + O"]
+    jobs = {"t1": {"id": "t1", "targets": {"edges": [direct["edge"]]}, "status": "done",
+                   "summary": {"barrier_kcal": 40.0, "barrier_verified": True}}}
+    sid = {s["smiles"]: s["id"] for s in snap["structures"].values() if s["role"] == "minimum"}
+    # Short enough to be under kinetic control (at equilibrium no barrier would matter, X = 0).
+    out = analyze(snap, jobs, None, initial={sid["CC=O"]: 1.0, sid["O"]: 1.0}, held=[], temperature=500,
+                  time_s=1e-10, target=sid["C=CO"])
+    # the shuttled route has its barrier from the run itself (31 kcal/mol, on its edge)
+    labels = [s["label"] for s in out["steps"]]
+    assert sorted(labels) == ["CC=O + O -> C=CO + O", "CC=O -> C=CO"]
+    assert out["target"]["final"] > 0
+    ctl = dict(zip(labels, out["control"]["steps"]))
+    assert ctl["CC=O + O -> C=CO + O"] > 0.9 > ctl["CC=O -> C=CO"]       # the lower route controls it
+    out2 = analyze(snap, {}, None, initial={sid["CC=O"]: 1.0}, held=[], temperature=500, time_s=1.0, target=None)
+    assert [s["label"] for s in out2["steps"]] == ["CC=O + O -> C=CO + O"]  # without the TS job: only the run's own
+    assert any(e["label"] == "CC=O -> C=CO" and e["reason"] == "no barrier yet" for e in out2["excluded"])

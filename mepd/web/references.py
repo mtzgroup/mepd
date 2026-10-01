@@ -143,4 +143,16 @@ def references() -> list[dict]:
         "items": [{"what": stage.replace("_", " ").capitalize(), "note": m["method"], "cite": m["cite"]}
                   for stage, m in NANOREACTOR.items()],
     }
-    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor]]
+    kinetics = {
+        "feature": "Kinetics",
+        "where": "Analyze › Kinetics",
+        "items": [
+            {"what": "Degree of rate control (which barriers control what forms)",
+             "cite": ["C. T. Campbell, J. Catal. 204, 520–524 (2001), doi:10.1006/jcat.2001.3396",
+                      "C. T. Campbell, ACS Catal. 7, 2770–2779 (2017), doi:10.1021/acscatal.7b00115"]},
+            {"what": "Thermodynamic degree of rate control (which species trap material)",
+             "cite": ["C. Stegelmann, A. Andreasen, C. T. Campbell, J. Am. Chem. Soc. 131, 8077–8082 (2009), "
+                      "doi:10.1021/ja9000097"]},
+        ],
+    }
+    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor, kinetics]]

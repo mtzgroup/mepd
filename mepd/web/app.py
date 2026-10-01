@@ -170,6 +170,18 @@ class ProfileIn(BaseModel):
     text: str
 
 
+class KineticsIn(BaseModel):
+    initial: dict = {}                  # structure id -> M
+    held: list[str] = []                # constant feed
+    temperature: float = Field(298.15, gt=0)
+    time_s: float = Field(3600.0, gt=0)
+    target: Optional[str] = None
+    include_unverified: bool = False
+    control: bool = True
+    control_what: Literal["amount", "rate"] = "amount"
+    sweep: list[float] = []
+
+
 class ProposeIn(BaseModel):
     reactants: list[str]
     n_break: int = Field(2, ge=0, le=3)
@@ -1547,6 +1559,22 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return out
 
     # ------------------------------------------------------- bulk / export
+    @app.post("/api/kinetics")
+    async def kinetics(body: KineticsIn):
+        """Microkinetics of the workspace's network (Analyze › Kinetics)."""
+        from mepd.web.kinetics import analyze
+
+        ws = W()
+        level = ws.level_of(ws.level_profile).get("key")
+        try:
+            return await run_in_threadpool(
+                analyze, ws.snapshot(), dict(J().jobs), level, initial=body.initial, held=body.held,
+                temperature=body.temperature, time_s=body.time_s, target=body.target,
+                include_unverified=body.include_unverified, control=body.control, control_what=body.control_what,
+                sweep=body.sweep[:12])
+        except RuntimeError as exc:
+            raise WorkspaceError(str(exc)) from None
+
     @app.post("/api/reactions/propose")
     async def reactions_propose(body: ProposeIn):
         """What these species could become together (bond rules on their complex)."""
