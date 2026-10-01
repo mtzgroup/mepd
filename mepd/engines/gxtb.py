@@ -247,6 +247,9 @@ class GXTBCalculator(Engine):
     timeout_s: float = 3600.0
 
     def __post_init__(self) -> None:
+        # Nothing configured: $GXTB_EXECUTABLE, else `gxtb`, which (if not on
+        # PATH) _resolve_executable looks up -- or fetches -- on first use.
+        self._default_executable = self.executable is None and not os.getenv("GXTB_EXECUTABLE")
         if self.executable is None:
             self.executable = os.getenv("GXTB_EXECUTABLE") or "gxtb"
         self.executable = str(self.executable)
@@ -254,9 +257,10 @@ class GXTBCalculator(Engine):
         self.env = {str(k): str(v) for k, v in dict(self.env or {}).items()}
 
     def _resolve_executable(self) -> None:
-        """The default name "gxtb" not on PATH: an installed g-xTB build, or
-        (first use) the official release, fetched by mepd.programs."""
-        if self.executable == "gxtb" and shutil.which("gxtb") is None:
+        """No executable configured and `gxtb` not on PATH: an installed g-xTB
+        build, or (first use) the official release, fetched by mepd.programs.
+        An executable given explicitly (even "gxtb") is used as given."""
+        if getattr(self, "_default_executable", False) and self.executable == "gxtb" and shutil.which("gxtb") is None:
             from mepd.programs import gxtb_executable
 
             try:

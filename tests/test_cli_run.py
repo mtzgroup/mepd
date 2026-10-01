@@ -1017,3 +1017,34 @@ def test_make_default_inputs_rejects_unknown_method(tmp_path):
 
     with pytest.raises(typer.BadParameter):
         make_default_inputs(output=tmp_path / "x.toml", method="not-a-method")
+
+
+def test_cli_run_recursive_with_no_path_at_all_fails_and_says_why(tmp_path, monkeypatch, capsys):
+    """Every path search failed (e.g. an SCF that never converged): no output
+    chain. That is a failed run (exit 1, so the web UI shows 'failed' with
+    the reason), not a finished one with nothing in it."""
+    import typer
+
+    from mepd.msmep import MSMEP
+
+    _install_fake_gxtb_with_coordinate_dependent_energy(monkeypatch)
+
+    class NoPath:
+        def write_to_disk(self, path):
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "node_0_failed.txt").write_text("electronic_structure_error: the SCF did not converge\n\ntrace")
+
+        @property
+        def output_chain(self):
+            raise ValueError("TreeNode has no leaf chains and no root output chain.")
+
+    monkeypatch.setattr(MSMEP, "run_recursive_minimize", lambda self, chain: NoPath())
+    start_fp, end_fp = tmp_path / "start.xyz", tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(6.0).to_xyz())
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    with pytest.raises(typer.Exit) as exc:
+        _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, recursive=True, output=tmp_path / "out")
+    assert exc.value.exit_code == 1
+    assert "electronic_structure_error: the SCF did not converge" in capsys.readouterr().out

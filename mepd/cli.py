@@ -512,8 +512,14 @@ def run(
         try:
             final_chain = history.output_chain
         except ValueError as exc:
+            # No path at all: a failure, not a finished run (with why, from
+            # the tree's failure notes, e.g. an SCF that never converged).
+            why = sorted({fp.read_text().splitlines()[0].strip() for fp in tree_path.glob("*_failed.txt")
+                          if fp.read_text().strip()})
             typer.echo(f"Could not assemble a final output chain: {exc}")
-            return
+            if why:
+                typer.echo("The path search failed: " + "; ".join(why))
+            raise typer.Exit(1)
         out_path = output / "mep_output.xyz"
         final_chain.write_to_disk(out_path)
         typer.echo(f"Wrote assembled output path to {out_path}")

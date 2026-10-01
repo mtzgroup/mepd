@@ -12,6 +12,8 @@ import pytest
 
 import mepd.programs as programs
 
+pytestmark = pytest.mark.real_programs   # the real lookup (conftest stubs it elsewhere)
+
 
 def _fake_release(monkeypatch, tmp_path, *, corrupt=False):
     buf = io.BytesIO()
