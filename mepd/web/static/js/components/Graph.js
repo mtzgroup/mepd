@@ -338,7 +338,10 @@ export function Graph() {
           const src = connectFrom.current;
           connectFrom.current = null;
           c.nodes().removeClass('connect-source');
-          attempt(() => api.post('/api/edges', { source: src, target: id })).then((edge) => {
+          // A complex node is a composition (its id is not a structure): connect its
+          // lowest-energy geometry, as selecting it does.
+          const end = (nid) => (nid.startsWith('cx:') ? complexNodes(state.workspace)[nid]?.geometries[0] ?? nid : nid);
+          attempt(() => api.post('/api/edges', { source: end(src), target: end(id) })).then((edge) => {
             if (edge) select({ edges: [edge.id] });
           });
         }

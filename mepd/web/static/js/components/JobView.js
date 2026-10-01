@@ -11,6 +11,7 @@ import { NetworkLive } from './NetworkLive.js';
 import { ChannelsMap } from './ChannelsMap.js';
 import { OptTree } from './OptTree.js';
 import { ReactorLive } from './ReactorLive.js';
+import { ComplexLive } from './ComplexLive.js';
 import { ReactionTable, SpawnedSearches } from './Reactions.js';
 import { Viewer3D } from './Viewer3D.js';
 
@@ -980,7 +981,7 @@ export function JobView({ jobId: openedId }) {
       </div>
       <div class="tab-body">
         ${current === 'result' && html`<${ResultPanel} job=${page} />`}
-        ${current === 'live' && html`<${LivePanel} key=${run.id} job=${run} />`}
+        ${current === 'live' && (job.op === 'complex' ? html`<${ComplexLive} key=${run.id} job=${run} />` : html`<${LivePanel} key=${run.id} job=${run} />`)}
         ${current === 'reactor' && html`<${ReactorLive} key=${run.id} job=${run} />`}
         ${current === 'map' && html`<${ChannelsMap} job=${page} />`}
         ${current === 'tree' && html`<${OptTree} job=${page} />`}

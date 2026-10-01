@@ -1511,6 +1511,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             raise HTTPException(404, "not a nanoreactor job")
         return reactor_view(Path(job["output_dir"]), start)
 
+    @app.get("/api/jobs/{jid}/complex-live")
+    def job_complex_live(jid: str):
+        """A running `complex` job's frames so far (mepd.web.complex_live)."""
+        from mepd.web.complex_live import complex_live
+
+        job = J().get(jid)
+        if job.get("op") != "complex":
+            raise HTTPException(404, "not a complex job")
+        counts = [int(c) for c in str((job.get("params") or {}).get("counts", "")).replace(",", " ").split() if c.isdigit()]
+        return complex_live(Path(job["output_dir"]), (job.get("params") or {}).get("method", ""), sum(counts))
+
     @app.get("/api/jobs/{jid}/reactor/events/{k}")
     def job_reactor_event(jid: str, k: int):
         """One reaction event of a nanoreactor job, at full time resolution, cut to its atoms."""

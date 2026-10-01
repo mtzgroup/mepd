@@ -109,19 +109,26 @@ def _packmol(structures, radius: float, seed: int, tolerance: float, exe: str):
 
 
 # ---------------------------------------------------------------- programs
-def xtb_dock_executable() -> Optional[str]:
-    """An xtb whose `dock` works: $MEPD_XTB_DOCK, the xtb shipped with g-xTB
-    (the xtb 6.7.1 release build segfaults in aISS's final optimizations),
-    else xtb on PATH."""
-    for exe in (os.getenv("MEPD_XTB_DOCK"), str(Path.home() / ".local/opt/gxtb-2.0.1/bin/xtb"), shutil.which("xtb")):
-        if exe and Path(exe).exists():
-            return exe
-    return None
+def xtb_dock_executable(download: bool = True) -> Optional[str]:
+    """An xtb whose `dock` works: $MEPD_XTB_DOCK, else the g-xTB build
+    (mepd.programs: found, or fetched on first use; the xtb 6.7.1 release
+    build segfaults in aISS's final optimizations), else xtb on PATH."""
+    from mepd import programs
+
+    if os.getenv("MEPD_XTB_DOCK"):
+        return os.environ["MEPD_XTB_DOCK"]
+    try:
+        exe = programs.gxtb_executable(download)
+    except RuntimeError:
+        exe = None
+    return exe or shutil.which("xtb")
 
 
 def missing_programs(method: str) -> list[str]:
     if method == "dock" or method == "nci":
-        need = ["xtb"] if xtb_dock_executable() is None else []
+        from mepd.discovery.nanoreactor import missing_programs as xtb_missing
+
+        need = ["xtb"] if xtb_dock_executable(download=False) is None and xtb_missing("gxtb") else []
         return need + (["crest"] if method == "nci" and shutil.which("crest") is None else [])
     if method == "qcg":
         return ["crest"] if shutil.which("crest") is None else []

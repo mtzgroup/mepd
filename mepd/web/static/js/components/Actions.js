@@ -6,7 +6,8 @@ import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, prefs, useStore, state } from '../store.js';
 import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
-import { conformerLabel, conformerRows, isTs } from '../util.js';
+import { conformerLabel, conformerRows, isComplex, isTs } from '../util.js';
+import { ComplexMethodForm, memberCounts } from './ComplexBuild.js';
 
 // How many jobs an operation would create for this selection (0 = not applicable).
 export function applicability(op, sel) {
@@ -141,6 +142,9 @@ function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = 
   const [profile, setProfile] = useState(() => defaultProfile());
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState(null);
+  // A complex's Conformers: arrange its molecules (the complex builders), or
+  // sample the whole as one structure (RDKit/CREST, as for a molecule).
+  const [cxWay, setCxWay] = useState('arrange');
 
   useEffect(() => { setPreview(null); }, [sel, values, profile, JSON.stringify(fixed)]);
 
@@ -231,7 +235,20 @@ function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = 
           </div>
           ${preview && html`<pre class="cmd-preview">${preview.join('\n\n')}</pre>`}
         </div>`;
-  if (embedded) return opBody;
+  const cxRec = op.key === 'conformers' && sel.structures.length === 1 && !sel.edges.length ? structures[sel.structures[0]] : null;
+  const isCx = cxRec && isComplex(cxRec) && (cxRec.members || []).length > 1;
+  const cardBody = !isCx ? opBody : html`<div class="op-body">
+    <div class="segmented wide">
+      <button class=${cxWay === 'arrange' ? 'on' : ''} onClick=${() => setCxWay('arrange')}>Arrange the molecules</button>
+      <button class=${cxWay === 'sample' ? 'on' : ''} onClick=${() => setCxWay('sample')}>RDKit / CREST</button>
+    </div>
+    ${cxWay === 'arrange'
+      ? html`<p class="small muted">Other arrangements of its molecules; each becomes a geometry of this complex.</p>
+        <${ComplexMethodForm} counts=${memberCounts(cxRec.members)} exclude=${['side']} runLabel="Find arrangements" />`
+      : html`<p class="small muted">Samples the complex as one structure, as for a molecule: its conformers join this geometry.
+        Plain CREST can let the molecules drift apart; Arrange › Ensemble (CREST's NCI mode) keeps them together.</p>${opBody}`}
+  </div>`;
+  if (embedded) return cardBody;
   return html`
     <div class=${`op-card ${open ? 'open' : ''}`}>
       <button type="button" class="op-head" onClick=${onToggle} aria-expanded=${open}>
@@ -241,7 +258,7 @@ function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = 
         </span>
         <span class="op-chevron" aria-hidden="true">${open ? '−' : '+'}</span>
       </button>
-      ${open && opBody}
+      ${open && cardBody}
     </div>`;
 }
 

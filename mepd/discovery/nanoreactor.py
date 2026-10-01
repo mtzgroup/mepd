@@ -108,7 +108,7 @@ def pick_md_method(engine=None) -> tuple[str, Optional[str]]:
         return "gfn2", None
     exe = engine_gxtb_executable(engine) if engine is not None else None
     try:
-        _xtb_command("gxtb", exe)
+        _xtb_command("gxtb", exe, download=False)   # what is installed (not a download just to pick)
         return "gxtb", exe
     except RuntimeError:
         return "level", None
@@ -231,18 +231,19 @@ def _pack(molecules: Sequence, radius: float, seed: int, min_distance: float, tr
 # Discovery MD (xtb)
 # ---------------------------------------------------------------------------
 
-def _xtb_command(method: str, executable: Optional[str] = None) -> list[str]:
+def _xtb_command(method: str, executable: Optional[str] = None, download: bool = True) -> list[str]:
+    """xtb's command for `method` (gfn1/gfn2, or gxtb: the g-xTB build,
+    fetched on first use: mepd.programs)."""
+    from mepd import programs
+
     if method == "gxtb":
-        exe = executable or os.getenv("GXTB_EXECUTABLE") or shutil.which("gxtb")
-        if not exe:
-            gx = Path.home() / ".local/opt/gxtb-2.0.1/bin/xtb"
-            exe = str(gx) if gx.exists() else None
+        exe = executable or programs.gxtb_executable(download)
         if not exe:
             raise RuntimeError("g-xTB MD needs the g-xTB xtb build: set GXTB_EXECUTABLE.")
         return [exe] + (["--gxtb"] if Path(exe).name != "gxtb" else [])
-    exe = executable or shutil.which("xtb")
+    exe = executable or programs.xtb_executable(download)
     if not exe:
-        raise RuntimeError("The nanoreactor MD needs the xtb program on PATH (conda install -c conda-forge xtb).")
+        raise RuntimeError("The nanoreactor MD needs xtb (conda install -c conda-forge xtb), or g-xTB.")
     return [exe, "--gfn", method[-1]]
 
 
@@ -254,13 +255,22 @@ def _xtb_argv(cmd: list[str], input_file: str, *args: str) -> list[str]:
 
 
 def missing_programs(method: str = "gfn2") -> list[str]:
+    """What `method` needs that is neither installed nor fetched on first
+    use (g-xTB is downloaded when needed, where a release build exists)."""
     if method == "level":   # a mepd engine: nothing extra to install
         return []
     try:
-        _xtb_command(method)
+        _xtb_command(method, download=False)
         return []
     except RuntimeError:
-        return ["xtb"]
+        pass
+    import platform
+
+    from mepd import programs
+
+    if not os.getenv("MEPD_NO_DOWNLOAD") and (platform.system(), platform.machine()) in programs._GXTB_ASSETS:
+        return []
+    return ["xtb"]
 
 
 def _write_xyz(fp: Path, symbols, coords, comment: str = "") -> None:

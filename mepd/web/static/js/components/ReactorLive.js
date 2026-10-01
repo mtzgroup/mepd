@@ -16,14 +16,14 @@ const FPS = 30;   // reactor frames shown per second at 1x (a frame is ~10 fs)
 // the only ones that read a colour -- stutter.
 const _css = {};
 let _cssTheme = null;
-function cssVar(name, fallback) {
+export function cssVar(name, fallback) {
   const theme = `${document.documentElement.dataset.theme || ''}|${window.matchMedia('(prefers-color-scheme: dark)').matches}`;
   if (theme !== _cssTheme) { for (const k of Object.keys(_css)) delete _css[k]; _cssTheme = theme; }
   if (!(name in _css)) _css[name] = getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
   return _css[name];
 }
 
-function xyzText(symbols, flat) {
+export function xyzText(symbols, flat) {
   const lines = [String(symbols.length), ''];
   for (let a = 0; a < symbols.length; a += 1) {
     lines.push(`${symbols[a]} ${flat[3 * a]} ${flat[3 * a + 1]} ${flat[3 * a + 2]}`);
@@ -56,7 +56,7 @@ const fmtPs = (fs) => `${(fs / 1000).toFixed(2)} ps`;
 
 // A 3Dmol canvas redrawn per frame: the model is rebuilt each time so bonds
 // are perceived anew (they form and break), keeping the camera.
-function useStage(host) {
+export function useStage(host) {
   const viewer = useRef(null);
   const fitted = useRef(false);
   const el = useRef(null);
@@ -121,7 +121,7 @@ function useStage(host) {
   return { draw, setWall, viewer: () => viewer.current, refit: () => { fitted.current = false; wall.current = null; } };
 }
 
-const FULL = { stick: { radius: 0.12 }, sphere: { scale: 0.2 } };
+export const FULL = { stick: { radius: 0.12 }, sphere: { scale: 0.2 } };
 // Bystanders while an event runs: thin and grey, but opaque. (Transparency
 // makes 3Dmol depth-sort every frame, and 3D text labels upload a texture
 // per frame: either one stalls the animation on a real GPU. The reaction

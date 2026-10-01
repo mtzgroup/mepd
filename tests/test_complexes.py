@@ -49,7 +49,7 @@ def test_bad_requests_are_explained():
         complexes.build(_mols(), "nope")
 
 
-@pytest.mark.skipif(complexes.xtb_dock_executable() is None, reason="needs xtb")
+@pytest.mark.skipif(complexes.xtb_dock_executable(download=False) is None, reason="needs xtb")
 def test_docking_adds_the_molecules_one_at_a_time(tmp_path):
     poses = complexes.build(_mols(), "dock", tmp_path, keep=2)
     assert 1 <= len(poses) <= 2
@@ -70,3 +70,30 @@ def test_the_cli_keeps_each_complex_s_charge_and_spin(tmp_path):
     assert res.exit_code == 0, res.output
     (s,) = chem.structures_from_xyz_text((tmp_path / "out" / "complexes.xyz").read_text())
     assert (int(s.charge), int(s.multiplicity)) == (-1, 2)
+
+
+def test_the_live_view_reads_what_the_programs_have_written_so_far(tmp_path):
+    from mepd.web.complex_live import complex_live
+
+    xyz = lambda rows, c="": f"{len(rows)}\n{c}\n" + "".join(f"{s} {x} {y} {z}\n" for s, x, y, z in rows)
+    water = [("O", 0, 0, 0), ("H", 0.76, 0, 0.5), ("H", -0.76, 0, 0.5)]
+    two = water + [(s, x + 2.8, y, z) for s, x, y, z in water]
+    step = tmp_path / "work" / "step_1"
+    step.mkdir(parents=True)
+    assert complex_live(tmp_path, "dock", 2)["stage"] == "Building the complex…"
+    (step / "host.xyz").write_text(xyz(water))
+    (step / "guest.xyz").write_text(xyz(water))
+    v = complex_live(tmp_path, "dock", 2)
+    assert [f["caption"] for f in v["frames"]] == ["Molecule 2 of 2: finding where it binds…"]
+    assert len(v["frames"][0]["symbols"]) == 6
+    (step / "optimized_structures.xyz").write_text(xyz(two, " -10.0") + xyz(two, " -10.5") + "6\n half")
+    v = complex_live(tmp_path, "dock", 2)
+    assert v["frames"][-1]["caption"] == "Molecule 2 of 2: settled" and v["frames"][-1]["tween"]
+    # QCG: the solute, then the shell as it grows (complete frames only).
+    q = tmp_path / "q" / "work"
+    (q / "grow").mkdir(parents=True)
+    (q / "solute.xyz").write_text(xyz(water))
+    (q / "solvent.xyz").write_text(xyz(water))
+    (q / "grow" / "qcg_grow.xyz").write_text(xyz(two) + "9\n")
+    caps = [f["caption"] for f in complex_live(tmp_path / "q", "qcg", 3)["frames"]]
+    assert caps == ["The solute", "Solvent molecule 1 of 2 added"]

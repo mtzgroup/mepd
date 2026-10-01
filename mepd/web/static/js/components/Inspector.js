@@ -10,6 +10,7 @@ import { Viewer3D } from './Viewer3D.js';
 import { LevelChip } from './Library.js';
 import { ReactionCard, TsCell } from './Reactions.js';
 import { openAnalyze } from './Analyze.js';
+import { ComplexMethodForm } from './ComplexBuild.js';
 
 function useXyz(sid, conformer = null, version = '') {
   const [xyz, setXyz] = useState(null);
@@ -282,46 +283,23 @@ function usePhone() {
 }
 
 // Species selected: so many of each, combined into one complex (a new
-// complex node, minimized at the workspace level): docked, an ensemble or a
-// solvation shell (a job), or packed / side by side (at once).
+// complex node, minimized at the workspace level).
 function CombineComplex({ sids }) {
   const structures = useStore((s) => s.workspace.structures);
-  const op = useStore((s) => s.operations.find((o) => o.key === 'complex'));
   const [open, setOpen] = useState(false);
   const [counts, setCounts] = useState({});
-  const methods = op?.methods || [];
-  const [method, setMethod] = useState(null);
-  const pick = methods.find((m) => m.fixed.method === method) || methods.find((m) => m.available) || methods[0];
   const n = (id) => counts[id] ?? (sids.length === 1 ? 2 : 1);
-  const total = sids.reduce((t, id) => t + n(id), 0);
   if (!open) {
     return html`<a href="#" onClick=${(e) => { e.preventDefault(); setOpen(true); }}>Combine into a complex →</a>`;
   }
-  const make = () => attempt(() => api.post('/api/complexes', {
-    counts: Object.fromEntries(sids.filter((id) => n(id) > 0).map((id) => [id, n(id)])), method: pick?.fixed.method || 'side',
-  }), null).then((out) => {
-    if (!out) return;
-    setOpen(false);
-    if (out.job) openJob(out.job);
-    else select({ structures: [out.complex.id] });
-  });
   return html`<div class="combine-cx">
-    <div class="small"><b>Combine into a complex</b></div>
+    <div class="small"><b>Combine into a complex</b>
+      <button class="btn-link small" style="float: right" onClick=${() => setOpen(false)}>Cancel</button></div>
     ${sids.map((id) => html`<label class="combine-row small">
       <input type="number" class="tiny" min="0" max="12" value=${n(id)}
         onInput=${(e) => setCounts({ ...counts, [id]: Math.max(0, Math.min(12, +e.target.value || 0)) })} />
       × ${structures[id]?.name}</label>`)}
-    ${methods.length > 0 && html`<label class="combine-row small">How
-      <select value=${pick?.fixed.method} onChange=${(e) => setMethod(e.target.value)}>
-        ${methods.map((m) => html`<option value=${m.fixed.method} disabled=${!m.available} title=${m.reason}>${m.label}${m.available ? '' : ' (not installed)'}</option>`)}
-      </select></label>
-    <p class="small muted combine-help">${pick?.summary}</p>`}
-    <div class="row-actions">
-      <button class="btn primary" disabled=${total < 2 || total > 12} onClick=${make}
-        title="Then minimized at the workspace level; shown as a complex node if it holds together">
-        Create complex (${total} molecules)</button>
-      <button class="btn-link small" onClick=${() => setOpen(false)}>Cancel</button>
-    </div>
+    <${ComplexMethodForm} counts=${Object.fromEntries(sids.map((id) => [id, n(id)]))} onDone=${() => setOpen(false)} />
   </div>`;
 }
 
