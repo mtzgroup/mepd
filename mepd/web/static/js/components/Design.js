@@ -493,8 +493,12 @@ export function DesignView() {
         { label: 'Show', run: () => { select({ structures: [rec.reactant.id, rec.product.id] }); openTab('graph'); } });
       return;
     }
+    // Several molecules: a complex of them, each molecule a species of its own.
+    const n = rec.members?.length || 0;
     toast(rec.duplicate ? `${rec.name} already has this geometry` : rec.merged
-      ? `Added as a new conformer of ${rec.name}` : `Added ${rec.name} to the graph`, 'ok', 6000,
+      ? `Added as a new conformer of ${rec.name}`
+      : n > 1 ? `Added to Explore as a complex of ${n} molecules (${new Set(rec.members).size} species)`
+        : `Added ${rec.name} to the graph`, 'ok', 6000,
     { label: 'Show', run: () => { select({ structures: [rec.id] }); openTab('graph'); } });
   };
   const tsopt = async () => {
