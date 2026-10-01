@@ -380,10 +380,19 @@ export function Graph() {
     const onTheme = () => c.style(stylesheet());
     mq.addEventListener('change', onTheme);
     // The graph stays mounted while other tabs are shown; re-measure on reveal.
-    const ro = new ResizeObserver(() => {
+    let seen = '';
+    const ro = new ResizeObserver(([entry]) => {
+      // Whole pixels only: a sub-pixel change is rounding, not a resize, and
+      // resizing on it can feed itself (fractional display scales).
+      const { width, height } = entry.contentRect;
+      const size = `${Math.round(width)}x${Math.round(height)}`;
+      if (size === seen) return;
+      seen = size;
       c.resize();
       // Structures added while another tab was showing: arrange on reveal.
-      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) arrangeRef.current();
+      if (pendingArrange.current && host.current && host.current.offsetWidth > 0) {
+        (pendingArrange.current === 'tree' ? treeRef : arrangeRef).current();
+      }
     });
     ro.observe(host.current);
     return () => { mq.removeEventListener('change', onTheme); ro.disconnect(); c.destroy(); };

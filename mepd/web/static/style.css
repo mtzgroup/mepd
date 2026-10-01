@@ -212,7 +212,10 @@ input.switch:checked::after { transform: translateX(13px); }
 .lg.running { border-color: var(--accent); }
 .lg.done { border-color: var(--ok); }
 .lg.failed { border-color: var(--danger); border-top-style: dashed; }
-.graph { flex: 1; min-height: 300px; }
+/* Sized by the layout only: the canvas inside must never feed back into it
+   (at a fractional display scale its rounded size did, and graph and legend
+   shook in a resize loop). */
+.graph { flex: 1; min-height: 300px; position: relative; overflow: hidden; contain: strict; }
 .graph-wrap .graph { background: radial-gradient(circle, color-mix(in srgb, var(--border-strong) 45%, transparent) 1px, transparent 1.2px) 0 0 / 22px 22px; }
 .graph-wrap.connecting .graph { cursor: crosshair; }
 .graph-hint { position: absolute; top: 62px; left: 50%; transform: translateX(-50%); background: var(--accent-strong); color: #fff; padding: 5px 12px; border-radius: var(--radius); font-size: 13px; box-shadow: var(--shadow); pointer-events: none; }
