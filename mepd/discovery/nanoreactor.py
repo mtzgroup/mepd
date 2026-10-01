@@ -443,30 +443,41 @@ class _EngineForces:
 
 
 def _relax_in_wall(forces: _EngineForces, pos: np.ndarray, radius_bohr: float, masses: np.ndarray,
-                   steps: int = 300, fmax: float = 5e-3) -> np.ndarray:
+                   steps: int = 300, fmax: float = 5e-3, trajectory: Optional[Path] = None,
+                   symbols: Sequence = (), every: int = 3) -> np.ndarray:
     """FIRE minimization inside the wall: takes the strain out of a packed
-    reactor (else it turns into heat and blows atoms out)."""
+    reactor (else it turns into heat and blows atoms out). `trajectory`:
+    every few steps appended there (multi-frame xyz, like xtb's xtbopt.log),
+    for live viewers."""
+    import contextlib
+
     v = np.zeros_like(pos)
     dt, alpha, n_pos = 0.5, 0.1, 0
-    for _ in range(steps):
-        _, g = forces(pos, radius_bohr)
-        f = -g
-        if np.max(np.linalg.norm(f, axis=1)) < fmax:
-            break
-        p = float(np.sum(f * v))
-        if p > 0:
-            fn = np.linalg.norm(f) or 1.0
-            v = (1 - alpha) * v + alpha * np.linalg.norm(v) * f / fn
-            n_pos += 1
-            if n_pos > 5:
-                dt, alpha = min(dt * 1.1, 2.0), alpha * 0.99
-        else:
-            v[:] = 0.0
-            dt, alpha, n_pos = dt * 0.5, 0.1, 0
-        v = v + dt * _ACC * f / masses[:, None]
-        step = dt * v
-        norm = np.linalg.norm(step, axis=1, keepdims=True)
-        pos = pos + np.where(norm > 0.2, step * 0.2 / np.maximum(norm, 1e-12), step)   # at most 0.2 bohr per atom
+    with (Path(trajectory).open("w") if trajectory is not None else contextlib.nullcontext()) as trj:
+        for k in range(steps):
+            energy, g = forces(pos, radius_bohr)
+            if trj is not None and k % every == 0:
+                xyz = pos / ANGSTROM_TO_BOHR
+                trj.write(f"{len(symbols)}\n energy: {energy:.10f}\n"
+                          + "".join(f"{sym} {x:.6f} {y:.6f} {z:.6f}\n" for sym, (x, y, z) in zip(symbols, xyz)))
+                trj.flush()
+            f = -g
+            if np.max(np.linalg.norm(f, axis=1)) < fmax:
+                break
+            p = float(np.sum(f * v))
+            if p > 0:
+                fn = np.linalg.norm(f) or 1.0
+                v = (1 - alpha) * v + alpha * np.linalg.norm(v) * f / fn
+                n_pos += 1
+                if n_pos > 5:
+                    dt, alpha = min(dt * 1.1, 2.0), alpha * 0.99
+            else:
+                v[:] = 0.0
+                dt, alpha, n_pos = dt * 0.5, 0.1, 0
+            v = v + dt * _ACC * f / masses[:, None]
+            step = dt * v
+            norm = np.linalg.norm(step, axis=1, keepdims=True)
+            pos = pos + np.where(norm > 0.2, step * 0.2 / np.maximum(norm, 1e-12), step)   # at most 0.2 bohr per atom
     return pos
 
 
@@ -502,7 +513,8 @@ def run_engine_md(symbols, coords_angstrom, *, charge: int, multiplicity: int, s
         _write_xyz(workdir / "packed.xyz", symbols, coords_angstrom, "nanoreactor packed")
         _emit(on_event, "md_relax", natoms=len(symbols))
         pos = _relax_in_wall(forces, np.asarray(coords_angstrom) * ANGSTROM_TO_BOHR,
-                             settings.radius * ANGSTROM_TO_BOHR, masses)
+                             settings.radius * ANGSTROM_TO_BOHR, masses, trajectory=workdir / "relax.xyz",
+                             symbols=symbols)
         _write_xyz(workdir / "reactor.xyz", symbols, pos / ANGSTROM_TO_BOHR, "nanoreactor relaxed")
     vel = rng.normal(size=pos.shape) * np.sqrt(kt / masses)[:, None]
     vel -= (masses[:, None] * vel).sum(axis=0) / masses.sum()      # no drift of the whole reactor

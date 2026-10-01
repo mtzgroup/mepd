@@ -194,6 +194,13 @@ class ComposeIn(BaseModel):
     proposal: Optional[dict] = None   # one of /api/reactions/propose's proposals, with its complex_xyz
 
 
+class ComplexIn(BaseModel):
+    counts: dict[str, int]            # species id -> how many
+    method: str = "side"              # mepd.complexes.METHODS: side/packed at once, the others as a job
+    keep: int = 3
+    profile: Optional[str] = None
+
+
 class DeleteIn(BaseModel):
     structures: list[str] = []
     edges: list[str] = []
@@ -301,6 +308,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     from mepd.web.nanoreactor import spawn_ts_searches
 
                     spawn_ts_searches(manager, job)
+            if job["op"] == "complex" and job["status"] == "done" and not job.get("external"):
+                made = await run_in_threadpool(adopt_complexes, manager.ws, job)
+                if made:
+                    try:
+                        queue_optimization(made)
+                    except WorkspaceError:
+                        pass
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "graph-enumeration" and job["status"] == "done":
                 if await run_in_threadpool(adopt_expansion_steps, manager, job):
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
@@ -1099,7 +1114,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         made = reaction_from_endpoints(W(), geoms[0], geoms[1], label=d.get("name") or "",
                                        origin={"kind": "design", "label": "Design (reaction)", "source": d.get("source")})
         if made is not None:
-            return {"reaction": made["reaction"]["id"], "edge": made["edge"], "species": made["species"]}
+            return {"reaction": made["reaction"]["id"], "edge": made["edge"], "species": made["species"],
+                    "existing": bool(made.get("existing"))}
         ends = []
         for s, smiles in zip(geoms, (d.get("smiles"), rx["product"].get("smiles"))):
             ends.append(W().add_or_merge(s, name=smiles, smiles=None, role="minimum",
@@ -1634,6 +1650,42 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         publish_ws()
         return out["reaction"]
 
+    @app.post("/api/complexes")
+    async def complexes_make(body: ComplexIn):
+        """A complex of species in the graph (so many of each), minimized at
+        the workspace level; Explore draws it as a complex node. Placed side
+        by side or packed at once; docked, an NCI ensemble or a solvation
+        shell as a `complex` job (its geometries join when it ends:
+        adopt_complexes)."""
+        from mepd.complexes import INSTANT, METHODS, missing_programs
+        from mepd.web.compose import complex_members, make_complex
+
+        if body.method not in METHODS:
+            raise WorkspaceError(f"unknown method {body.method!r}")
+        if body.method not in INSTANT:
+            complex_members(W(), body.counts)
+            if missing_programs(body.method):
+                raise WorkspaceError(f"{body.method} needs {', '.join(missing_programs(body.method))} on PATH")
+            ids = [sid for sid, n in body.counts.items() if int(n) > 0]
+            if demo is not None:
+                demo.check_op("complex", {"method": body.method})
+                demo.check_capacity(J().list())
+            jobs = J().submit("complex", structure_ids=ids, edge_ids=[], profile=body.profile,
+                              params={"method": body.method, "keep": body.keep,
+                                      "counts": ", ".join(str(int(body.counts[sid])) for sid in ids)},
+                              label=f"Complex ({body.method}): " + " + ".join(
+                                  f"{body.counts[sid]} {W().structure(sid)['name']}" if body.counts[sid] > 1
+                                  else W().structure(sid)["name"] for sid in ids))
+            return {"job": jobs[0]["id"]}
+        out = await run_in_threadpool(make_complex, W(), body.counts, body.method)
+        if not out["existing"]:
+            try:
+                queue_optimization([out["complex"]["id"]])
+            except WorkspaceError:
+                pass
+        publish_ws()
+        return out
+
     @app.post("/api/delete")
     def delete_many(body: DeleteIn):
         removed = W().delete_many(body.structures, body.edges, body.reactions)
@@ -1771,6 +1823,52 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
     return added
 
 
+def adopt_complexes(ws: Workspace, job: dict) -> list[str]:
+    """A finished `complex` job's geometries as complexes (each one a
+    geometry of its complex node; the same one again is recognized).
+    Geometries whose molecules bonded on the way are dropped: a geometry is
+    kept when it holds the molecules asked for (by formula, a species that
+    is itself several molecules counting as those). What happened is written
+    to output/adopted.json for the result page. Returns the new complexes
+    (to minimize)."""
+    from collections import Counter
+
+    from mepd.web.compose import _fragments
+    from mepd.web.operations import _parse_copies
+
+    out = Path(job["output_dir"])
+    fp = out / "complexes.xyz"
+    if not fp.exists():
+        return []
+    known = ws.snapshot()["structures"]
+    recs = [known[sid] for sid in job["targets"]["structures"] if sid in known]
+    if len(recs) != len(job["targets"]["structures"]):
+        return []    # a species was deleted meanwhile
+    counts = _parse_copies((job.get("params") or {}).get("counts", "1"), recs)
+    method = (job.get("params") or {}).get("method", "")
+    want = Counter()
+    for rec, n in zip(recs, counts):
+        for f in _fragments(ws.load_structure(rec["id"])):
+            want[chem.formula(f)] += n
+    made, duplicates, reacted = [], 0, 0
+    frames = chem.structures_from_xyz_text(fp.read_text())
+    for k, s in enumerate(frames):
+        if Counter(chem.formula(f) for f in _fragments(s)) != want:
+            reacted += 1     # its molecules bonded (or fell apart) on the way: not a complex of these
+            continue
+        res = ws.add_or_merge(s, optimized=False, origin={"kind": "job", "job": job["id"], "entry": f"complex_{k}",
+                                                          "label": f"Complex {k + 1} ({method})"})
+        if res["rec"].get("role") != "complex":
+            reacted += 1
+        elif res["duplicate"]:
+            duplicates += 1
+        else:
+            made.append(res["rec"]["id"])
+    (out / "adopted.json").write_text(json.dumps({"kept": len(made), "duplicates": duplicates, "reacted": reacted,
+                                                  "total": len(frames), "complexes": made}))
+    return made
+
+
 def adopt_expansion_steps(manager: JobManager, job: dict) -> bool:
     """A finished expansion's verified steps (summary.json) onto its graph
     edges -- the same as the live events do while it runs; this covers runs
@@ -1900,6 +1998,12 @@ def apply_optimization(ws: Workspace, job: dict) -> None:
             validation = {k: rec[k] for k in ("is_minimum", "min_frequency", "rescued", "validation") if k in rec} or None
             ws.replace_geometry(sid, s, energy=rec.get("energy"), level=job.get("level"), validation=validation,
                                 conformer=confs[i] if i < len(confs) else None)
+            if ws.structure(sid).get("members"):   # a complex: did it hold together?
+                from mepd.web.compose import complex_intact
+                try:
+                    ws.set_intact(sid, complex_intact(ws, sid))
+                except Exception:
+                    pass
         else:
             why = (rec or {}).get("error") or job.get("error") or job["status"]
             ws.set_status([sid], "opt_failed", f"optimization {job['status']}: {str(why).splitlines()[-1][:300]}")

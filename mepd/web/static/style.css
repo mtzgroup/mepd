@@ -959,6 +959,7 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
   background: var(--bg); opacity: 0.9; padding: 2px 6px; border-radius: 3px; pointer-events: none; }
 .rx-legend { position: absolute; bottom: 8px; left: 10px; font-family: var(--font-mono); pointer-events: none; }
 .rx-legend .lg-form { color: var(--ok); } .rx-legend .lg-break { color: var(--danger); margin-left: 8px; }
+.rx-legend .lg-wall { color: var(--accent); } .rx-legend .lg-squeeze { color: var(--warn); margin-left: 8px; }
 .rx-live-pill { color: var(--accent); font-weight: 600; }
 .rx-transport { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .rx-transport input[type=range] { flex: 1; }
@@ -1045,6 +1046,11 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .an-detail { overflow: auto; min-height: 0; padding-bottom: 20px; }
 .an-filter { background: var(--accent-soft); padding: 4px 8px; border-radius: 3px; }
 .an-links { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.combine-cx { border: 1px solid var(--border, #ddd); border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.combine-row { display: flex; align-items: center; gap: 6px; }
+.combine-row input { width: 52px; }
+.combine-row select { flex: 1; }
+.combine-help { margin: 0; }
 .composer { display: flex; flex-direction: column; gap: 12px; }
 .cp-row { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
 .cp-arrow { font-size: 24px; padding-top: 22px; }

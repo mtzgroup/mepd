@@ -10,7 +10,7 @@
 import { html, useMemo, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { set, state, useStore } from '../store.js';
-import { depictUrl, edgeStatus, fmtKcal } from '../util.js';
+import { depictUrl, edgeStatus, fmtKcal, isSpecies } from '../util.js';
 import { NO_TS_SHORT, ReactionCard, findTs, noTsWhy } from './Reactions.js';
 import { KineticsView } from './Kinetics.js';
 
@@ -87,7 +87,7 @@ function SpeciesPicker({ label, ids, onChange, species }) {
 
 function Composer({ initial, onDone }) {
   const structures = useStore((s) => s.workspace.structures);
-  const species = useMemo(() => Object.values(structures).filter((s) => s.role !== 'complex' && s.role !== 'ts')
+  const species = useMemo(() => Object.values(structures).filter(isSpecies)
     .sort((a, b) => a.name.localeCompare(b.name)), [structures]);
   const [reactants, setReactants] = useState(initial || []);
   const [products, setProducts] = useState([]);

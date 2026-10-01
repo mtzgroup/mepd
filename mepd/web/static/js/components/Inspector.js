@@ -2,7 +2,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
-import { PHONE_QUERY, STATUS_LABEL, complexGeometries, complexOfStructure, conformerLabel, conformerRows, depictUrl, edgeStatus, fmtAgo, fmtKcal, lastLine, levelStatus, reactionOfEdge } from '../util.js';
+import { complexNodes, complexOfStructure, conformerLabel, conformerRows, depictUrl, edgeStatus, fmtAgo, fmtKcal, isComplex, isSpecies, lastLine, levelStatus, PHONE_QUERY, reactionOfEdge, reactionsOfComplex, STATUS_LABEL } from '../util.js';
 
 export { conformerLabel, conformerRows };
 import { ActionPanel } from './Actions.js';
@@ -77,25 +77,36 @@ function ComplexDetail({ rec }) {
   const cx = complexOfStructure(workspace, rec.id);
   const xyz = useXyz(rec.id, null, rec.conformer);
   const [labels, setLabels] = useState(false);
-  if (!cx) return html`<p class="small muted">This complex no longer belongs to a reaction.</p>`;
-  const geos = complexGeometries(workspace, cx.key);
+  if (!cx) return html`<p class="small muted">This complex does not record its molecules.</p>`;
+  const geos = complexNodes(workspace)[cx.key]?.geometries || [rec.id];
   const count = cx.members.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
-  const reactions = Object.values(workspace.reactions || {}).filter((r) => [r.reactants, r.products].some(
-    (ids) => ids.length > 1 && [...ids].sort().join('+') === [...cx.members].sort().join('+')));
+  const reactions = reactionsOfComplex(workspace, cx.members);
+  // Where a geometry came from: the reaction it starts or ends, or built from species.
+  const from = (sid) => {
+    const r = Object.values(workspace.reactions || {}).find((x) => (x.complexes || []).includes(sid));
+    return r ? `${r.label} (${r.complexes.indexOf(sid) ? 'products' : 'reactants'})`
+      : workspace.structures[sid]?.origin?.label || 'built from species';
+  };
+  const built = !Object.values(workspace.reactions || {}).some((x) => (x.complexes || []).includes(rec.id));
   const name = (id) => workspace.structures[id]?.name || '?';
   return html`<section>
     <div class="rc-eq">${Object.entries(count).map(([id, n], i) => html`${i ? html`<span class="rc-op">+</span>` : ''}
       <button class="rc-tile" title=${`${name(id)}: select it`} onClick=${() => select({ structures: [id] })}>
         ${workspace.structures[id]?.smiles && html`<img src=${depictUrl(workspace.structures[id].smiles, 120, 90)} alt="" />`}
         <span class="rc-name">${n > 1 ? `${n} × ` : ''}${name(id)}</span></button>`)}</div>
+    ${built && rec.status === 'optimizing' && html`<p class="small muted">Minimizing at the workspace level…</p>`}
+    ${built && rec.status === 'opt_failed' && html`<p class="warn-box small">Minimization failed: ${rec.status_error || ''}</p>`}
+    ${built && rec.intact === false && html`<div class="warn-box small">On minimization these molecules reacted or
+      fell apart: no minimum of this complex was found, so Explore does not show it.
+      <button class="btn-link danger small" onClick=${() => attempt(() => api.post('/api/delete', { structures: [rec.id] }), 'Complex removed').then(() => clearSelection())}>Remove it</button></div>`}
     <${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />
     <div class="viewer-tools">
       <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
       <a class="small" href=${`/api/structures/${rec.id}/xyz`} download=${`complex-${rec.formula}.xyz`}>Download xyz</a>
     </div>
-    ${geos.length > 1 && html`<label class="field"><span class="field-label">Geometry (${geos.length}: one per reaction that has this complex)</span>
+    ${geos.length > 1 && html`<label class="field"><span class="field-label">Geometry (${geos.length}; calculations run on the one shown)</span>
       <select value=${rec.id} onChange=${(e) => select({ structures: [e.target.value] })}>
-        ${geos.map((g) => html`<option value=${g.sid}>${g.reaction.label} (${g.side})${workspace.structures[g.sid]?.energy != null ? ` · ${workspace.structures[g.sid].energy.toFixed(5)} Eh` : ''}</option>`)}
+        ${geos.map((g) => html`<option value=${g}>${from(g)}${workspace.structures[g]?.energy != null ? ` · ${workspace.structures[g].energy.toFixed(5)} Eh` : ''}</option>`)}
       </select></label>`}
     <dl class="props">
       <dt>Formula</dt><dd>${rec.formula} (${rec.natoms} atoms)</dd>
@@ -106,6 +117,7 @@ function ComplexDetail({ rec }) {
     <div class="row-actions">
       <button class="btn" onClick=${() => attempt(() => api.post('/api/design/load', { structure: rec.id }), 'Loaded into Design').then((d) => d && openTab('design'))}>Edit in Design</button>
     </div>
+    ${built && html`<button class="btn-link danger small" onClick=${() => attempt(() => api.post('/api/delete', { structures: [rec.id] }), 'Complex removed').then(() => clearSelection())}>Remove complex</button>`}
     <div class="section-title">Reactions (${reactions.length})</div>
     <ul class="sel-list">${reactions.map((r) => html`<li><a href="#" onClick=${(e) => { e.preventDefault(); if (r.edge) select({ edges: [r.edge] }); else openAnalyze({ reaction: r.id }); }}>${r.label}</a></li>`)}</ul>
   </section>`;
@@ -143,7 +155,7 @@ function StructureDetail({ rec }) {
         <dt>Level</dt><dd><${LevelChip} rec=${rec} />
           ${rec.level && html` <span class="small muted">${rec.level.profile ?? 'mepd defaults'}</span>`}
           ${levelStatus(rec).kind !== 'ok' && levelStatus(rec).kind !== 'busy' && html`
-            <button class="btn-link small" onClick=${() => attempt(() => api.post('/api/structures/reoptimize', { structures: [rec.id] }), 'Re-optimizing at the workspace level')}>re-optimize</button>`}
+            <button class="btn-link small" style="margin-left: 6px" onClick=${() => attempt(() => api.post('/api/structures/reoptimize', { structures: [rec.id] }), 'Re-optimizing at the workspace level')}>re-optimize</button>`}
           ${rec.status_error && html`<div class="small warn-text">${rec.status_error}</div>`}
           ${rec.validation && rec.validation.is_minimum && html`<div class="small muted">Hessian: lowest frequency ${rec.validation.min_frequency?.toFixed(1)} cm⁻¹${rec.validation.rescued ? ' (after a rescue push off a saddle point)' : ''}</div>`}</dd>
         ${rec.energy != null && html`<dt>Energy</dt><dd class="mono">${rec.energy.toFixed(6)} Eh</dd>`}
@@ -269,6 +281,50 @@ function usePhone() {
   return phone;
 }
 
+// Species selected: so many of each, combined into one complex (a new
+// complex node, minimized at the workspace level): docked, an ensemble or a
+// solvation shell (a job), or packed / side by side (at once).
+function CombineComplex({ sids }) {
+  const structures = useStore((s) => s.workspace.structures);
+  const op = useStore((s) => s.operations.find((o) => o.key === 'complex'));
+  const [open, setOpen] = useState(false);
+  const [counts, setCounts] = useState({});
+  const methods = op?.methods || [];
+  const [method, setMethod] = useState(null);
+  const pick = methods.find((m) => m.fixed.method === method) || methods.find((m) => m.available) || methods[0];
+  const n = (id) => counts[id] ?? (sids.length === 1 ? 2 : 1);
+  const total = sids.reduce((t, id) => t + n(id), 0);
+  if (!open) {
+    return html`<a href="#" onClick=${(e) => { e.preventDefault(); setOpen(true); }}>Combine into a complex →</a>`;
+  }
+  const make = () => attempt(() => api.post('/api/complexes', {
+    counts: Object.fromEntries(sids.filter((id) => n(id) > 0).map((id) => [id, n(id)])), method: pick?.fixed.method || 'side',
+  }), null).then((out) => {
+    if (!out) return;
+    setOpen(false);
+    if (out.job) openJob(out.job);
+    else select({ structures: [out.complex.id] });
+  });
+  return html`<div class="combine-cx">
+    <div class="small"><b>Combine into a complex</b></div>
+    ${sids.map((id) => html`<label class="combine-row small">
+      <input type="number" class="tiny" min="0" max="12" value=${n(id)}
+        onInput=${(e) => setCounts({ ...counts, [id]: Math.max(0, Math.min(12, +e.target.value || 0)) })} />
+      × ${structures[id]?.name}</label>`)}
+    ${methods.length > 0 && html`<label class="combine-row small">How
+      <select value=${pick?.fixed.method} onChange=${(e) => setMethod(e.target.value)}>
+        ${methods.map((m) => html`<option value=${m.fixed.method} disabled=${!m.available} title=${m.reason}>${m.label}${m.available ? '' : ' (not installed)'}</option>`)}
+      </select></label>
+    <p class="small muted combine-help">${pick?.summary}</p>`}
+    <div class="row-actions">
+      <button class="btn primary" disabled=${total < 2 || total > 12} onClick=${make}
+        title="Then minimized at the workspace level; shown as a complex node if it holds together">
+        Create complex (${total} molecules)</button>
+      <button class="btn-link small" onClick=${() => setOpen(false)}>Cancel</button>
+    </div>
+  </div>`;
+}
+
 export function Inspector() {
   const phone = usePhone();
   // On phones the sheet opens on what you came for -- the calculations -- with
@@ -299,15 +355,15 @@ export function Inspector() {
         </ol>
         ${Object.keys(workspace.reactions || {}).length > 0 && html`<p class="small rx-hint"><b>○ Circles are complexes</b>${' '}
           (several molecules together), joined to their molecules. A reaction is the edge between two complexes (or two molecules):
-          click it for its species, energies, complexes and MD event, and to find its TS.</p>`}
+          click it for its species, energies, complexes and MD event, and to find its TS.
+          Reactions whose complexes did not survive optimization (no verified minimum) are listed in Analyze only.</p>`}
                 <p class="small muted">Shift-click to select several. Shift-drag on the graph to box-select.</p>
       </div>
     </aside>`;
   }
-  if (nS === 1 && !nE && structures[sel.structures[0]]?.role === 'complex') {
+  if (nS === 1 && !nE && isComplex(structures[sel.structures[0]])) {
     head = 'Complex';
     body = html`<${ComplexDetail} rec=${structures[sel.structures[0]]} />`;
-    moreCalcs = true;
   } else if (nS === 1 && !nE) {
     head = 'Structure';
     body = html`<${StructureDetail} rec=${structures[sel.structures[0]]} />`;
@@ -339,11 +395,12 @@ export function Inspector() {
   }
   if (sel.structures.some((id) => !structures[id]) || sel.edges.some((id) => !edges[id])) return null;
   // Species selected: their reactions, or a new one with them, in Analyze.
-  if (nS > 0 && !nE && sel.structures.every((id) => !['ts', 'complex'].includes(structures[id]?.role))) {
+  if (nS > 0 && !nE && sel.structures.every((id) => isSpecies(structures[id]))) {
     const n = Object.values(workspace.reactions || {}).filter((r) => sel.structures.every((id) => [...r.reactants, ...r.products].includes(id))).length;
     body = html`<div class="an-links small">
       ${n > 0 && html`<a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ species: [...sel.structures], reaction: null }); }}>${n} reaction${n > 1 ? 's' : ''} of ${nS > 1 ? 'these' : 'this'} →</a>`}
       <a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ compose: true, composeReactants: [...sel.structures], reaction: null }); }}>New reaction with ${nS > 1 ? 'these' : 'this'} →</a>
+      <${CombineComplex} key=${sel.structures.join(',')} sids=${sel.structures} />
     </div>${body}`;
   }
   return html`
@@ -359,7 +416,7 @@ export function Inspector() {
       <div class="inspector-scroll">
         ${(!phone || pane === 'details') && body}
         ${(!phone || pane === 'run') && (moreCalcs
-          ? html`<details class="more-calcs"><summary>More calculations on ${nE ? "this reaction's molecules" : 'this complex'}</summary><${ActionPanel} sel=${sel} /></details>`
+          ? html`<details class="more-calcs"><summary>More calculations on this reaction's molecules</summary><${ActionPanel} sel=${sel} /></details>`
           : html`<${ActionPanel} sel=${sel} />`)}
       </div>
     </aside>`;

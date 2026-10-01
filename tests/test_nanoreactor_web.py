@@ -150,3 +150,47 @@ def test_kinetics_uses_reactions_with_barriers_and_ranks_what_controls_the_targe
     out2 = analyze(snap, {}, None, initial={sid["CC=O"]: 1.0}, held=[], temperature=500, time_s=1.0, target=None)
     assert [s["label"] for s in out2["steps"]] == ["CC=O + O -> C=CO + O"]  # without the TS job: only the run's own
     assert any(e["label"] == "CC=O -> C=CO" and e["reason"] == "no barrier yet" for e in out2["excluded"])
+
+
+def test_reactor_view_shows_packing_and_relaxation_before_the_md(tmp_path):
+    from mepd.web.nanoreactor import reactor_view
+
+    md = tmp_path / "md"
+    md.mkdir()
+    frame = lambda x, e=None: f"2\n{'' if e is None else f' energy: {e} gnorm: 0.1'}\nO 0 0 0\nO {x} 0 0\n"
+    (md / "schedule.json").write_text(json.dumps({"dump_fs": 2.0, "time_ps": 1.0, "segments": [[0.5, 6.0], [0.5, 4.5]]}))
+    assert reactor_view(tmp_path)["prep"] is None                     # not packed yet
+    (md / "packed.xyz").write_text(frame(1.0))
+    prep = reactor_view(tmp_path)["prep"]
+    assert prep["stage"] == "packed" and prep["radius"] == 6.0 and len(prep["frames"]) == 1
+    # xtb writing its optimization: complete frames only, energies relative to the first step.
+    (md / "xtbopt.log").write_text(frame(1.1, -10.0) + frame(1.2, -10.01) + "2\n energy")
+    prep = reactor_view(tmp_path)["prep"]
+    assert prep["stage"] == "relaxing" and prep["steps"] == 2 and prep["frames"][-1][3] == 1.2
+    assert prep["energy_kcal"] == [None, 0.0, pytest.approx(-6.3, abs=0.1)]
+    (md / "reactor.xyz").write_text(frame(1.2))
+    assert reactor_view(tmp_path)["prep"]["stage"] == "relaxed"
+    # The first MD segment running, none finished yet: its frames show right away.
+    (md / "xtb.trj").write_text(frame(1.3) + frame(1.4) + "2\n")
+    view = reactor_view(tmp_path)
+    assert view["prep"] is None and view["n_frames"] == 2 and view["symbols"] == ["O", "O"]
+    (md / "xtb.trj").unlink()                                          # the segment ends: moved to segment_000.xyz
+    (md / "segment_000.xyz").write_text(frame(1.3) + frame(1.4))
+    assert reactor_view(tmp_path)["n_frames"] == 2
+
+
+def test_engine_relaxation_writes_its_steps(tmp_path):
+    from mepd.discovery import nanoreactor as nr
+
+    class Spring:   # two atoms on a spring, wall far away
+        def __call__(self, pos, radius):
+            d = pos[1] - pos[0]
+            r = np.linalg.norm(d)
+            g = (r - 2.0) * d / r
+            return 0.5 * (r - 2.0) ** 2, np.array([-g, g])
+
+    pos = nr._relax_in_wall(Spring(), np.array([[0.0, 0, 0], [3.0, 0, 0]]), 50.0, np.array([16.0, 16.0]),
+                            trajectory=tmp_path / "relax.xyz", symbols=["O", "O"])
+    assert abs(np.linalg.norm(pos[1] - pos[0]) - 2.0) < 0.05
+    syms, frames, comments = nr.read_xyz_frames(tmp_path / "relax.xyz")
+    assert syms == ["O", "O"] and len(frames) > 1 and "energy:" in comments[0]

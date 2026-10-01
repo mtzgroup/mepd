@@ -30,7 +30,7 @@ from mepd.atom_mapping_metrics import METRICS as _ATOM_MAPPING_METRICS
 from mepd.web.workspace import Workspace, WorkspaceError, is_ts
 
 # "job": a follow-up on another job's output; "design": the Design tab's molecule
-Target = Literal["structure", "pair", "set", "job", "design"]
+Target = Literal["structure", "pair", "set", "job", "design", "complex"]
 # Subscripting with a tuple lists its items, so this stays in step with
 # mepd's metric registry instead of drifting behind it (it did: the UI
 # offered three of the four for a while). `Literal[*METRICS]` would be
@@ -814,6 +814,21 @@ def _build_nanoreactor(ctx: JobContext, p: NanoreactorParams) -> list[str]:
             "--output", str(ctx.output_dir)]
 
 
+class ComplexParams(Params):
+    method: Literal["dock", "nci", "qcg", "packed", "side"] = P(
+        "dock", "How", "dock: xtb's aISS docking; nci: a CREST ensemble of arrangements; qcg: a CREST solvation "
+        "shell (one solute, copies of one solvent); packed / side: placed without a search.", cli="--method")
+    counts: str = P("1", "How many of each", "One count per selected structure, in selection order.", kind="custom")
+    keep: int = P(3, "Geometries kept", "dock and nci: the best few, each a geometry of the complex.",
+                  cli="--keep", ge=1, le=10)
+
+
+def _build_complex(ctx: JobContext, p: ComplexParams) -> list[str]:
+    counts = _parse_copies(p.counts, ctx.structures)
+    mols = [f"{ctx.snapshot_structure(r, f'molecule_{i}')}*{n}" for i, (r, n) in enumerate(zip(ctx.structures, counts))]
+    return ["complex", *mols, *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
 class VriParams(Params):
     branches: Literal["both", "forward", "reverse"] = P(
         "both", "IRC branches", "Which side(s) of TS1 to scan for a valley-ridge transition.", cli="--branches")
@@ -1036,6 +1051,24 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "goes back to the structure submitted. (`mepd ts --guess`)",
         "design", "Design", TsOptParams, _build_design_tsopt, min_structures=0,
         produces=["a TS and its IRC ends, from the design"]),
+    Operation(
+        "complex", "Build a complex", "Several molecules together (not bonded), from species in the graph: docked, "
+        "an ensemble, a solvation shell or packed; then minimized at the workspace level. (`mepd complex`)",
+        "complex", "Complexes", ComplexParams, _build_complex, min_structures=1, cli_path=("complex",),
+        produces=["complexes"], methods=(
+            {"label": "Dock", "rank": 0, "fixed": {"method": "dock"}, "programs": ["xtb"],
+             "install": "conda install -c conda-forge xtb",
+             "summary": "xtb's aISS docking finds where the molecules stick (H-bonds, stacking). Seconds."},
+            {"label": "Ensemble", "rank": 1, "fixed": {"method": "nci"}, "programs": ["xtb", "crest"],
+             "install": "conda install -c conda-forge crest",
+             "summary": "CREST searches arrangements of the complex; the best few are kept. Minutes."},
+            {"label": "Solvation shell", "rank": 2, "fixed": {"method": "qcg"}, "programs": ["xtb", "crest"],
+             "install": "conda install -c conda-forge crest",
+             "summary": "CREST grows the copies of one solvent around one solute. A minute or so."},
+            {"label": "Packed", "rank": 3, "fixed": {"method": "packed"},
+             "summary": "Random orientations in a small sphere, like the nanoreactor (Packmol if installed). Instant."},
+            {"label": "Side by side", "rank": 4, "fixed": {"method": "side"},
+             "summary": "In a row, a few Å apart. Instant."})),
     Operation(
         "tsopt", "Optimize TS from guess", "Treat the structure as a TS guess: saddle optimization, "
         "optionally followed by IRC. (`mepd ts`)",

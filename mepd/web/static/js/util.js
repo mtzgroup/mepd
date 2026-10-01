@@ -71,35 +71,55 @@ export function edgeStatus(edge, jobs = state.jobs) {
   return { status, barrier, barrierUnverified, barrierJob, count: related.length, warning };
 }
 
-// Complexes: a composition (several molecules together) is one graph node,
-// 'cx:<sorted structure ids>'; its geometries are the hidden 'complex'
-// structures of the reactions that start or end with that composition.
+// Complexes. A complex structure (role 'complex': several molecules
+// together, from a reaction or built from species) records its molecules,
+// `members` (sorted, repeated for 2 A). Every complex of one composition is
+// one graph node, 'cx:<members>'; a one-molecule "complex" is that
+// molecule's node. Calculations, edges and selection work on the complex's
+// structures exactly as on a molecule's: nodeOf() is the only mapping.
 export const complexKey = (ids) => `cx:${[...ids].sort().join('+')}`;
 
-export function complexGeometries(workspace, key) {
-  const out = [];
-  for (const r of Object.values(workspace.reactions || {})) {
-    [r.reactants, r.products].forEach((ids, side) => {
-      const sid = (r.complexes || [])[side];
-      if (ids.length > 1 && complexKey(ids) === key && sid && workspace.structures[sid]) {
-        out.push({ sid, reaction: r, side: side ? 'products' : 'reactants', members: ids });
-      }
-    });
-  }
-  const e = (g) => workspace.structures[g.sid]?.energy ?? Infinity;
-  return out.sort((a, b) => e(a) - e(b));
+export const isComplex = (rec) => rec?.role === 'complex';
+// A molecule node: not a transition state, not a complex.
+export const isSpecies = (rec) => !!rec && rec.role !== 'ts' && rec.role !== 'complex';
+
+// Explore shows a complex only as a verified minimum: all its molecules
+// still there, and it did not react or fall apart when minimized.
+const shownComplex = (ws, s) => s.role === 'complex' && s.members?.length && s.intact !== false
+  && s.members.every((id) => ws.structures[id]);
+
+// The graph node a structure is drawn as (null: not drawn).
+export function nodeOf(ws, sid) {
+  const s = ws.structures[sid];
+  if (!s) return null;
+  if (s.role !== 'complex') return sid;
+  if (!shownComplex(ws, s)) return null;
+  return s.members.length > 1 ? complexKey(s.members) : s.members[0];
 }
 
-// The complex node (composition) a hidden complex structure belongs to.
-export function complexOfStructure(workspace, sid) {
-  for (const r of Object.values(workspace.reactions || {})) {
-    const k = (r.complexes || []).indexOf(sid);
-    if (k >= 0) {
-      const ids = k ? r.products : r.reactants;
-      return { key: ids.length > 1 ? complexKey(ids) : ids[0], members: ids, reaction: r };
-    }
+// Complex nodes: key -> {id, members, geometries: structure ids, lowest energy first}.
+export function complexNodes(ws) {
+  const out = {};
+  for (const s of Object.values(ws.structures)) {
+    if (!shownComplex(ws, s) || s.members.length < 2) continue;
+    const id = complexKey(s.members);
+    (out[id] ||= { id, members: s.members, geometries: [] }).geometries.push(s.id);
   }
-  return null;
+  const e = (sid) => ws.structures[sid].energy ?? Infinity;
+  for (const n of Object.values(out)) n.geometries.sort((x, y) => e(x) - e(y));
+  return out;
+}
+
+// The complex node a complex structure belongs to: {key, members}.
+export function complexOfStructure(ws, sid) {
+  const m = ws.structures[sid]?.members;
+  return m?.length ? { key: m.length > 1 ? complexKey(m) : m[0], members: m } : null;
+}
+
+// The reactions that start or end at a complex composition.
+export function reactionsOfComplex(ws, members) {
+  const key = complexKey(members);
+  return Object.values(ws.reactions || {}).filter((r) => [r.reactants, r.products].some((ids) => complexKey(ids) === key));
 }
 
 // The reaction (nanoreactor) whose subsystem this edge joins, if any.

@@ -20,31 +20,15 @@ import numpy as np
 from qcconst.constants import ANGSTROM_TO_BOHR
 
 from mepd.web import chem
-from mepd.web.workspace import Workspace, WorkspaceError, new_id
-
-_Z = {"H": 1, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "Si": 14, "P": 15, "S": 16, "Cl": 17, "Br": 35, "I": 53}
+from mepd.web.workspace import Workspace, WorkspaceError, is_species, new_id
 
 
 def place(structures: list, gap: float = 2.6):
-    """One structure holding every molecule, side by side along x, each
-    centred, the closest contact between neighbours `gap` Angstrom."""
-    from qcdata import Structure
+    """One structure holding every molecule, side by side along x (see
+    mepd.complexes, which has the other ways of building a complex)."""
+    from mepd.complexes import side_by_side
 
-    symbols, blocks, x_end = [], [], None
-    for s in structures:
-        xyz = np.asarray(s.geometry, dtype=float).reshape(-1, 3) / ANGSTROM_TO_BOHR
-        xyz = xyz - xyz.mean(axis=0)
-        if x_end is not None:
-            xyz[:, 0] += x_end - xyz[:, 0].min() + gap
-        x_end = xyz[:, 0].max()
-        symbols += list(s.symbols)
-        blocks.append(xyz)
-    coords = np.vstack(blocks)
-    coords -= coords.mean(axis=0)
-    charge = sum(int(s.charge) for s in structures)
-    electrons = sum(_Z.get(x, 0) for x in symbols) - charge
-    return Structure(symbols=symbols, geometry=coords * ANGSTROM_TO_BOHR, charge=charge,
-                     multiplicity=1 if electrons % 2 == 0 else 2)
+    return side_by_side(structures, gap)
 
 
 def _elements(structures) -> Counter:
@@ -58,7 +42,7 @@ def species_structures(ws: Workspace, sids: list[str]) -> list:
     out = []
     for sid in sids:
         rec = ws.structure(sid)
-        if rec.get("role") in ("ts", "complex"):
+        if not is_species(rec):
             raise WorkspaceError(f"{rec['name']} is not a molecule (a {rec['role']})")
         out.append(ws.load_structure(sid))
     return out
@@ -150,13 +134,55 @@ def compose(ws: Workspace, reactants: list[str], *, products: Optional[list[str]
                                origin={"kind": "composed", "label": f"composed {side}s"})
         sids.append(rec["id"])
         to_optimize.append(rec["id"])
-    edge = ws.add_edge(sids[0], sids[1], origin={"kind": "composed", "proposed": True,
+    edge = ws.add_edge(sids[0], sids[1], reaction=False, origin={"kind": "composed", "proposed": True,
                                                  "headline": "composed reaction: run a TS search on it"})
     rec = ws.put_reaction(reactants=list(reactants), products=list(products),
                           origin={"kind": "composed", "job": None, "index": key}, label=label, count=0,
                           reverse_count=0, delta_e_kcal=None, complexes=sids, edge=edge["id"], events=[],
                           composed=time.time())
     return {"reaction": rec, "optimize": to_optimize}
+
+
+def complex_members(ws: Workspace, counts: dict) -> list:
+    """{species id: how many} -> the complex's members (sorted, repeated)."""
+    members = sorted(sid for sid, n in counts.items() for _ in range(int(n)))
+    if len(members) < 2:
+        raise WorkspaceError("a complex needs at least two molecules")
+    if len(members) > 12:
+        raise WorkspaceError("at most 12 molecules in one complex")
+    species_structures(ws, list(dict.fromkeys(members)))   # all molecules (not TSs or complexes)
+    return members
+
+
+def make_complex(ws: Workspace, counts: dict, method: str = "side") -> dict:
+    """A complex of species in the graph, `counts` {species id: how many},
+    built at once: "side" (side by side; the complex already built is
+    returned instead) or "packed" (random orientations in the smallest
+    sphere: each call another arrangement, a new geometry of the complex).
+    Minimizing gathers them. Returns {"complex", "existing"}."""
+    from mepd.complexes import build
+
+    members = complex_members(ws, counts)
+    have = [rec for rec in ws.snapshot()["structures"].values()
+            if rec.get("role") == "complex" and sorted(rec.get("members") or []) == members]
+    if have and method == "side":
+        return {"complex": have[0], "existing": True}
+    (s,) = build(species_structures(ws, members), method, seed=len(have))
+    res = ws.add_or_merge(s, optimized=False, origin={"kind": "composed", "label": f"complex built from species ({method})"})
+    if res["rec"].get("role") != "complex":
+        raise WorkspaceError("these molecules bonded when placed together: no complex of them")
+    return {"complex": res["rec"], "existing": res["duplicate"]}
+
+
+def complex_intact(ws: Workspace, sid: str) -> Optional[bool]:
+    """Whether a built complex's geometry holds exactly its molecules (none
+    reacted, none drifted off as a bond change would show)."""
+    rec = ws.structure(sid)
+    if not rec.get("members"):
+        return None
+    want = Counter(chem.canonical_key(ws.structure(m).get("smiles") or "") for m in rec["members"])
+    got = Counter(chem.canonical_key(chem.perceive_smiles(f) or "") for f in _fragments(ws.load_structure(sid)))
+    return want == got
 
 
 def reaction_from_endpoints(ws: Workspace, start, end, *, origin: dict, energies=(None, None),
@@ -184,6 +210,12 @@ def reaction_from_endpoints(ws: Workspace, start, end, *, origin: dict, energies
         ids.append(side)
     if sorted(ids[0]) == sorted(ids[1]):
         raise WorkspaceError("both sides are the same molecules, so there is no reaction to search")
+    # The same reaction (same molecules on each side) already in Explore: reuse it.
+    snap = ws.snapshot()
+    for r in (snap.get("reactions") or {}).values():
+        if sorted(r["reactants"]) == sorted(ids[0]) and sorted(r["products"]) == sorted(ids[1]) \
+                and r.get("edge") in snap["edges"]:
+            return {"reaction": r, "edge": r["edge"], "species": ids, "added": added, "existing": True}
     names = {sid: ws.structure(sid)["name"] for sid in ids[0] + ids[1]}
     text = label or _label_of(ids[0], ids[1], names)
     cx = []
@@ -195,7 +227,7 @@ def reaction_from_endpoints(ws: Workspace, start, end, *, origin: dict, energies
     if ts is not None:
         edge_origin = {"kind": "job", "job": ts.get("job"), "entry": ts.get("entry"), "group": "irc", "has_ts": True,
                        "barrier_kcal": ts.get("barrier_kcal"), "headline": "TS + IRC from Design"}
-    edge = ws.add_edge(cx[0], cx[1], origin=edge_origin)
+    edge = ws.add_edge(cx[0], cx[1], reaction=False, origin=edge_origin)
     rec = ws.put_reaction(reactants=ids[0], products=ids[1], origin={**origin, "job": None, "index": new_id("d_")},
                           label=text, count=0, reverse_count=0, delta_e_kcal=None, complexes=cx, edge=edge["id"],
                           events=[])

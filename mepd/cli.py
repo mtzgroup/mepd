@@ -25,6 +25,7 @@ from mepd.atom_mapping_selection import METRICS as _ATOM_MAPPING_METRICS
 from mepd.chain import Chain
 from mepd.cli_channels import channels
 from mepd.cli_conformers import conformers
+from mepd.cli_complex import complex_
 from mepd.cli_common import (
     _check_endpoint_atom_mapping,
     _collect_ts_guess_tasks,
@@ -1222,6 +1223,7 @@ def network_splits(
 # never needs to import from this one.
 app.command("channels")(channels)
 app.command("conformers")(conformers)
+app.command("complex")(complex_)
 
 
 @app.command("optimize")

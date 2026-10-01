@@ -155,4 +155,21 @@ def references() -> list[dict]:
                       "doi:10.1021/ja9000097"]},
         ],
     }
-    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor, kinetics]]
+    complexes = {
+        "feature": "Complexes",
+        "where": "Explore › select species › Combine into a complex",
+        "items": [
+            {"what": "Dock: automated interaction site screening (aISS) in xtb",
+             "cite": ["C. Plett, S. Grimme, Angew. Chem. Int. Ed. 62, e202214477 (2023), doi:10.1002/anie.202214477"]},
+            {"what": "Ensemble: CREST conformer search in NCI mode",
+             "cite": ["P. Pracht, F. Bohle, S. Grimme, Phys. Chem. Chem. Phys. 22, 7169–7192 (2020), "
+                      "doi:10.1039/C9CP06869D"]},
+            {"what": "Solvation shell: quantum cluster growth (QCG) in CREST",
+             "cite": ["S. Spicher, C. Plett, P. Pracht, A. Hansen, S. Grimme, J. Chem. Theory Comput. 18, 3174–3189 "
+                      "(2022), doi:10.1021/acs.jctc.2c00239"]},
+            {"what": "Packed: Packmol (when installed; else the nanoreactor's own random packing)",
+             "cite": ["L. Martínez, R. Andrade, E. G. Birgin, J. M. Martínez, J. Comput. Chem. 30, 2157–2164 (2009), "
+                      "doi:10.1002/jcc.21224"]},
+        ],
+    }
+    return [_with_links(e) for e in [*_OTHER, expansion, nanoreactor, kinetics, complexes]]

@@ -9,6 +9,7 @@ from typing import Optional
 import numpy as np
 
 from mepd import microkinetics as mk
+from mepd.web.workspace import is_species
 
 HARTREE_KCAL = 627.509474
 
@@ -44,7 +45,7 @@ def build(snap: dict, jobs: dict, level_key: Optional[str], *, include_unverifie
     def usable(rec):
         return rec and rec.get("energy") is not None and (level_key is None or (rec.get("level") or {}).get("key") == level_key)
 
-    ids = [sid for sid, r in st.items() if r.get("role") not in ("ts", "complex") and usable(r)]
+    ids = [sid for sid, r in st.items() if is_species(r) and usable(r)]
     index = {sid: k for k, sid in enumerate(ids)}
     steps, info, excluded = [], [], []
     for r in (snap.get("reactions") or {}).values():

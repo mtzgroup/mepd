@@ -67,7 +67,7 @@ def test_older_workspace_gets_conformers_and_duplicates_merge(tmp_path):
     assert all(len(r["conformers"]) == 1 for r in ws.snapshot()["structures"].values())
     assert ws.merge_duplicates() == {"merged": 1}
     snap = ws.snapshot()
-    assert set(snap["structures"]) == {one["id"], three["id"]}
+    assert set(snap["structures"]) == {one["id"], three["id"], *three["members"]}   # three: a complex of H + OH
     assert len(snap["structures"][one["id"]]["conformers"]) == 2
     (edge,) = snap["edges"].values()
     assert {edge["source"], edge["target"]} == {one["id"], three["id"]}

@@ -88,7 +88,9 @@ def test_structures_from_smiles_and_multiframe_xyz(client):
     assert xyz.splitlines()[0].strip() == "3"
 
     state = client.get("/api/state").json()
-    assert len(state["workspace"]["structures"]) == 3
+    # The bent water is two molecules: a complex of [H] + [OH], and those two species.
+    assert frames[1]["role"] == "complex" and len(frames[1]["members"]) == 2
+    assert len(state["workspace"]["structures"]) == 5
     assert {op["key"] for op in state["operations"]} >= {"ts", "channels", "hessian-sample", "network-splits"}
 
     r = client.get("/api/depict", params={"smiles": "C=CCOC=C"})
@@ -404,7 +406,7 @@ def test_bulk_delete_and_downloads(client, tmp_path, quick_op):
     r = client.post("/api/delete", json={"structures": [a["id"]], "edges": [e2["id"]]}).json()
     assert r["structures"] == [a["id"]] and set(r["edges"]) == {e1["id"], e2["id"]}  # a's edge goes too
     ws = client.get("/api/state").json()["workspace"]
-    assert set(ws["structures"]) == {b["id"], c["id"]} and ws["edges"] == {}
+    assert set(ws["structures"]) == {b["id"], c["id"], *b["members"]} and ws["edges"] == {}   # b: a complex
 
     (job,) = client.post("/api/jobs", json={"op": "quick", "structures": [b["id"]]}).json()
     _wait(client, job["id"])
@@ -784,7 +786,7 @@ def test_bulk_add_to_graph(client, tmp_path):
     assert len(r["added"][0]["conformers"]) == 2 or len(client.get("/api/state").json()["workspace"]["structures"][r["added"][0]["id"]]["conformers"]) == 2
     r = client.post(f"/api/jobs/{job['id']}/import-entries", json={"entries": ["min_0", "min_1"]}).json()
     assert len(r["added"]) == 1 and len(r["reused"]) == 1          # min_0 was already in the Graph
-    assert len(client.get("/api/state").json()["workspace"]["structures"]) == 2
+    assert len(client.get("/api/state").json()["workspace"]["structures"]) == 4   # min_1: a complex + its 2 molecules
     assert client.post(f"/api/jobs/{job['id']}/import-entries", json={"entries": ["nope"]}).status_code == 404
 
 
@@ -1139,7 +1141,9 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
     fp.write_text(json.dumps(events[0]) + "\n" + json.dumps(events[1])[:20])   # second line half-written
     jobs._adopt_live_events(job)
     snap = ws.snapshot()
-    assert len(snap["structures"]) == 2 and len(snap["edges"]) == 1 and bus.events == ["workspace"]
+    # min_1 (an H pulled off) is two molecules: a complex and its 2 species; its edge, a reaction.
+    assert len(snap["structures"]) == 4 and len(snap["edges"]) == 1 and bus.events == ["workspace"]
+    assert len(snap["reactions"]) == 1
     (edge,) = snap["edges"].values()
     assert edge["source"] == seed["id"] and edge["origin"]["proposed"]
     first = snap["structures"][edge["target"]]
@@ -1149,7 +1153,7 @@ def test_live_species_are_spawned_into_the_graph_connected_to_their_parent(tmp_p
     jobs._adopt_live_events(job)
     jobs._adopt_live_events(job)          # nothing new: nothing added twice
     snap = ws.snapshot()
-    assert len(snap["structures"]) == 3
+    assert len(snap["structures"]) == 5
     pairs = {(e["source"], e["target"]) for e in snap["edges"].values()}
     second = job["live_nodes"]["2"]
     assert pairs == {(seed["id"], first["id"]), (first["id"], second), (seed["id"], second)}
@@ -1216,3 +1220,100 @@ def test_a_reaction_smiles_adds_both_ends_and_their_edge(client):
     assert edge["origin"]["kind"] == "reaction" and set(edge["conformers"]) == {added[0]["id"], added[1]["id"]}
     bad = client.post("/api/structures", json={"text": "CC>>CCC", "optimize": False})
     assert bad.status_code == 400 and "not balanced" in bad.json()["detail"]
+
+
+def test_complex_built_from_species(tmp_path):
+    from mepd.web import chem
+    from mepd.web.compose import complex_intact, make_complex
+    from mepd.web.workspace import Workspace, WorkspaceError
+
+    ws = Workspace(tmp_path / "cx")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ)
+    w = ws.add_structure(water, name="water", smiles="O", origin={"kind": "test"})
+    out = make_complex(ws, {w["id"]: 2})
+    cx = out["complex"]
+    assert not out["existing"] and cx["role"] == "complex" and cx["members"] == [w["id"], w["id"]], cx
+    assert cx["natoms"] == 6 and cx["name"] == "2 water"
+    assert complex_intact(ws, cx["id"]) is True              # two waters side by side, unbonded
+    assert make_complex(ws, {w["id"]: 2})["existing"]        # one per composition
+    with pytest.raises(WorkspaceError):
+        make_complex(ws, {w["id"]: 1})
+    ws.delete_many([w["id"]], [])                            # goes with its molecules
+    assert cx["id"] not in ws.snapshot()["structures"]
+
+
+def test_several_molecules_enter_as_a_complex_and_its_edges_are_reactions(tmp_path):
+    from mepd.web import chem
+    from mepd.web.compose import place
+    from mepd.web.workspace import Workspace
+
+    ws = Workspace(tmp_path / "cx2")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ)
+    (hcn,) = chem.structures_from_xyz_text(HCN_XYZ)
+    w = ws.add_structure(water, name="water", origin={"kind": "test"})
+    pair = place([water, hcn])
+    cx = ws.add_structure(pair, origin={"kind": "test", "label": "cluster"})
+    assert cx["role"] == "complex" and len(cx["members"]) == 2 and w["id"] in cx["members"]
+    again = ws.add_or_merge(pair, origin={"kind": "test"})      # same molecules, same geometry: that complex
+    assert again["duplicate"] and again["rec"]["id"] == cx["id"]
+    hcn_id = next(m for m in cx["members"] if m != w["id"])
+    assert ws.structure(hcn_id)["role"] == "minimum"
+    # An edge from the complex is a reaction between molecules.
+    (hnc,) = chem.structures_from_xyz_text("3\nHNC\nC 0 0 0\nN 0 0 1.17\nH 0 0 2.17\n")
+    other = ws.add_structure(place([water, hnc]), origin={"kind": "test"})
+    edge = ws.add_edge(cx["id"], other["id"])
+    (rx,) = ws.snapshot()["reactions"].values()
+    assert rx["edge"] == edge["id"] and rx["complexes"] == [cx["id"], other["id"]]
+    assert sorted(rx["reactants"]) == cx["members"] and sorted(rx["products"]) == other["members"]
+    # Removing the edge removes the reaction but not the complexes (nodes in their own right).
+    ws.delete_many([], [edge["id"]])
+    snap = ws.snapshot()
+    assert not snap["reactions"] and cx["id"] in snap["structures"] and other["id"] in snap["structures"]
+
+
+def test_older_reaction_complexes_learn_their_members(tmp_path):
+    import json as _json
+
+    from mepd.web import chem
+    from mepd.web.compose import place
+    from mepd.web.workspace import Workspace
+
+    ws = Workspace(tmp_path / "old")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ)
+    a = ws.add_structure(water, name="a", origin={"kind": "test"})
+    b = ws.add_structure(water, name="b", origin={"kind": "test"}, merge=False)
+    c = ws.add_structure(place([water, water]), role="complex", merge=False, origin={"kind": "test"})
+    d = ws.add_structure(place([water, water]), role="complex", merge=False, origin={"kind": "test"})
+    ws.put_reaction(reactants=[a["id"], a["id"]], products=[b["id"], b["id"]], origin={"kind": "test", "job": None, "index": 1},
+                    complexes=[c["id"], d["id"]])
+    data = _json.loads((tmp_path / "old" / "workspace.json").read_text())
+    for sid in (c["id"], d["id"]):
+        data["structures"][sid].pop("members", None)
+    (tmp_path / "old" / "workspace.json").write_text(_json.dumps(data))
+    st = Workspace(tmp_path / "old").snapshot()["structures"]
+    assert st[c["id"]]["members"] == [a["id"], a["id"]] and st[d["id"]]["members"] == [b["id"], b["id"]]
+
+
+def test_a_complex_job_s_geometries_join_its_complex_node(tmp_path):
+    from mepd.web import chem
+    from mepd.web.app import adopt_complexes
+    from mepd.web.compose import place
+    from mepd.web.workspace import Workspace
+
+    ws = Workspace(tmp_path / "cxjob")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ)
+    (hcn,) = chem.structures_from_xyz_text(HCN_XYZ)
+    w = ws.add_structure(water, name="water", origin={"kind": "test"})
+    h = ws.add_structure(hcn, name="hcn", origin={"kind": "test"})
+    out = tmp_path / "out"
+    out.mkdir()
+    one, two = place([hcn, water, water]), place([water, hcn, water], gap=3.0)
+    bonded = one.model_copy(update={"geometry": np.asarray(one.geometry) * 0.3})    # squashed: atoms bond
+    (out / "complexes.xyz").write_text(one.to_xyz() + two.to_xyz() + one.to_xyz() + bonded.to_xyz())
+    job = {"id": "j_cx", "output_dir": str(out), "targets": {"structures": [h["id"], w["id"]]},
+           "params": {"method": "dock", "counts": "1, 2"}}
+    made = adopt_complexes(ws, job)
+    assert len(made) == 2                                      # the repeat is a duplicate, the bonded one skipped
+    recs = [ws.structure(sid) for sid in made]
+    assert all(r["role"] == "complex" and r["members"] == sorted([h["id"], w["id"], w["id"]]) for r in recs)
+    assert recs[0]["origin"]["label"] == "Complex 1 (dock)"

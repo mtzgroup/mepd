@@ -230,7 +230,7 @@ def _complex_pair(ws, job: dict, rx: dict, c: dict, level, label: str):
                     "label": f"Reaction {rx['id']} {side}s", "nanoreactor": True})
         sids.append(rec["id"])
     try:
-        edge = ws.add_edge(sids[0], sids[1], label="", origin={
+        edge = ws.add_edge(sids[0], sids[1], reaction=False, label="", origin={
             "kind": "job", "job": job["id"], "proposed": True, "nanoreactor": True, "reaction": rx["id"],
             "headline": "reaction from the nanoreactor: run a TS search on its subsystem"})
     except WorkspaceError:
@@ -281,9 +281,9 @@ def _trajectory(out: Path):
     import numpy as np
 
     segs = sorted((out / "md").glob("segment_*.xyz"))
-    if segs:
+    symbols = _segment(segs[0])[0] if segs else _md_symbols(out / "md")
+    if symbols:
         parts = [_segment(fp) for fp in segs]
-        symbols = parts[0][0]
         frames = [p[1] for p in parts if len(p[1])]
         # The segment xtb is running now (md/xtb.trj, moved to segment_k.xyz
         # when it ends): its complete frames too, so a long segment does not
@@ -292,7 +292,8 @@ def _trajectory(out: Path):
         running = _running_frames(out / "md", len(symbols))
         if running is not None and len(running) and len(sorted((out / "md").glob("segment_*.xyz"))) == len(segs):
             frames.append(running)
-        return symbols, np.concatenate(frames)
+        if frames:
+            return symbols, np.concatenate(frames)
     data = _json(out / "network.json") or {}
     fp = Path(data.get("trajectory") or "")
     if fp.is_file():
@@ -300,26 +301,81 @@ def _trajectory(out: Path):
     return [], np.zeros((0, 0, 3))
 
 
+def _md_symbols(md: Path) -> list:
+    """The reactor's atoms before any MD segment has finished (the first
+    segment is running): from the relaxed (or packed) reactor."""
+    from mepd.discovery.nanoreactor import read_xyz_frames
+
+    for name in ("reactor.xyz", "packed.xyz"):
+        try:
+            return list(read_xyz_frames(md / name)[0])
+        except (OSError, ValueError, IndexError):
+            continue
+    return []
+
+
 def _running_frames(md: Path, n_atoms: int):
+    frames, _ = _growing_xyz(md / "xtb.trj", n_atoms)
+    return frames
+
+
+def _growing_xyz(fp: Path, n_atoms: int):
+    """(frames rounded to 0.01 A, comment lines) of a multi-frame xyz a
+    program is still writing: its complete frames only. (None, []) if none."""
     import numpy as np
 
     try:
-        text = (md / "xtb.trj").read_text()
+        lines = fp.read_text().splitlines()
     except OSError:
-        return None
-    lines = text.splitlines()
+        return None, []
     block = n_atoms + 2
     whole = len(lines) // block
     if not whole:
-        return None
+        return None, []
     out = np.empty((whole, n_atoms, 3))
     try:
         for f in range(whole):
             rows = lines[f * block + 2:(f + 1) * block]
             out[f] = [[float(v) for v in r.split()[1:4]] for r in rows]
     except (ValueError, IndexError):   # a frame being written
+        return None, []
+    return np.round(out, 2), [lines[f * block + 1] for f in range(whole)]
+
+
+def _prep(out: Path, max_frames: int = 150):
+    """Before the MD: the packed reactor and its relaxation inside the wall
+    (xtb's xtbopt.log, or relax.xyz from an engine MD), frame by frame, with
+    the energy of each step (kcal/mol from the first) when known. None
+    before packing."""
+    import re
+
+    import numpy as np
+
+    from mepd.discovery.nanoreactor import read_xyz_frames
+
+    md = out / "md"
+    try:
+        symbols, packed, _ = read_xyz_frames(md / "packed.xyz")
+    except (OSError, ValueError, IndexError):
         return None
-    return np.round(out, 2)
+    frames, energies = [np.round(packed[0], 2)], [None]
+    for name in ("xtbopt.log", "relax.xyz"):
+        got, comments = _growing_xyz(md / name, len(symbols))
+        if got is not None:
+            frames += list(got)
+            for c in comments:
+                m = re.search(r"energy:\s*(-?\d+\.\d+)", c)
+                energies.append(float(m.group(1)) if m else None)
+            break
+    known = [e for e in energies if e is not None]
+    rel = [None if e is None else round((e - known[0]) * 627.509474, 1) for e in energies]
+    idx = np.unique(np.linspace(0, len(frames) - 1, min(max_frames, len(frames))).round().astype(int)).tolist()
+    sched = _json(md / "schedule.json") or {}
+    radius = (sched.get("segments") or [[None, None]])[0][1]
+    return {"stage": "relaxed" if (md / "reactor.xyz").exists() else ("relaxing" if len(frames) > 1 else "packed"),
+            "symbols": list(symbols), "steps": len(frames) - 1, "radius": radius,
+            "frames": [frames[k].reshape(-1).tolist() for k in idx], "step": idx,
+            "energy_kcal": [rel[k] for k in idx]}
 
 
 def _json(fp: Path):
@@ -382,7 +438,7 @@ def reactor_view(out: Path, start: int = 0) -> dict:
         return next((r for end, r in bounds if tf <= end + 1e-6), bounds[-1][1] if bounds else None)
 
     events, final = _events(out)
-    return {"symbols": list(symbols), "dump_fs": dump_fs, "stride": stride, "total_ps": total_ps,
+    return {"prep": _prep(out) if not len(frames) else None, "symbols": list(symbols), "dump_fs": dump_fs, "stride": stride, "total_ps": total_ps,
             "n_frames": int(len(frames)), "start": first, "frames": [frames[k].reshape(-1).tolist() for k in idx],
             "radius": [radius(k) for k in idx], "events": events, "final": final}
 

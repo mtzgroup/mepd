@@ -4,8 +4,7 @@ import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, state, useStore } from '../store.js';
-import { complexGeometries, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, playgroundFitMargins } from '../util.js';
-import { openAnalyze } from './Analyze.js';
+import { complexNodes, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, isComplex, nodeOf, playgroundFitMargins, reactionOfEdge } from '../util.js';
 import { uploadFiles } from './Library.js';
 
 function css(name) {
@@ -38,8 +37,6 @@ function stylesheet() {
     { selector: 'edge[status = "queued"]', style: { 'line-color': css('--warn'), 'target-arrow-color': css('--warn') } },
     { selector: 'edge[status = "failed"]', style: { 'line-color': css('--danger'), 'target-arrow-color': css('--danger') } },
     { selector: 'edge:selected', style: { width: 5, 'underlay-color': css('--accent'), 'underlay-opacity': 0.25, 'underlay-padding': 5 } },
-    // Reactions with any number of species (nanoreactor): a small dot joined
-    // to its reactants and products by spokes; shuttles hang off it dashed.
     // Reactions: a complex (several molecules together) is a small circle joined
     // to its molecules; a reaction is an edge between two complexes (a one-molecule
     // complex is that molecule's node), carrying the TS search like any edge.
@@ -51,8 +48,6 @@ function stylesheet() {
     { selector: 'node.cx:selected', style: { 'border-width': 3, 'border-color': css('--accent') } },
     { selector: 'edge.member', style: { width: 1.2, 'line-style': 'solid', 'line-color': css('--border-strong'),
       'target-arrow-shape': 'none', 'curve-style': 'straight', label: 'data(label)', opacity: 0.8 } },
-    { selector: 'edge.rxn-edge.no-ts', style: { 'line-style': 'dotted', 'line-color': css('--edge-idle'),
-      'target-arrow-color': css('--edge-idle'), opacity: 0.8 } },
     // A node being pointed at from the list (Library double-click): pulses a few times.
     { selector: 'node.flash', style: { 'underlay-color': css('--accent'), 'underlay-opacity': 0.35, 'underlay-padding': 16,
       'underlay-shape': 'round-rectangle', 'border-width': 3, 'border-color': css('--accent') } },
@@ -123,49 +118,26 @@ function spawnSpot(c, parent, taken) {
 
 const HARTREE_KCAL = 627.509;
 
-// Reactions (workspace.reactions) as complexes and reaction edges. A side
-// with several molecules is one complex node per composition (shared by every
-// reaction from or to that mixture), joined to its molecules by member lines;
-// a one-molecule side is that molecule's own node. The reaction edge is the
-// workspace edge between the reaction's subsystem ends (so TS searches, status
-// and selection are an edge's), or a dotted stand-in when it has none.
-const complexId = (ids) => (ids.length === 1 ? ids[0] : `cx:${[...ids].sort().join('+')}`);
-
-function reactionGraph(workspace, jobs) {
-  const { structures, edges } = workspace;
-  const complexes = {}, rxEdges = [];
-  for (const r of Object.values(workspace.reactions || {})) {
-    if (![...r.reactants, ...r.products].every((id) => structures[id])) continue;
-    const ends = [r.reactants, r.products].map((ids) => {
-      const id = complexId(ids);
-      if (ids.length > 1 && !complexes[id]) complexes[id] = { id, members: [...ids] };
-      return id;
-    });
-    if (ends[0] === ends[1]) continue;
-    const edge = r.edge ? edges[r.edge] : null;
-    const st = edge ? edgeStatus(edge, jobs) : { status: 'none' };
-    let label = '';
-    if (st.barrier != null) label = `${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`;
-    else if (st.barrierUnverified != null) label = `≈${st.barrierUnverified.toFixed(1)}?`;
-    else if (st.status === 'running') label = 'running…';
-    else if (r.delta_e_kcal != null) label = `ΔE ${r.delta_e_kcal >= 0 ? '+' : ''}${r.delta_e_kcal.toFixed(1)}`;
-    rxEdges.push({ group: 'edges', classes: `rxn-edge${edge ? '' : ' no-ts'}`,
-      data: { id: edge ? edge.id : `rx:${r.id}`, source: ends[0], target: ends[1], status: st.status, label, rxn: r.id } });
-  }
+// Complex nodes (util.complexNodes), each joined to its molecules by member
+// lines (x2 for two of one). Edges need no special case: every workspace
+// edge is drawn between the nodes its ends are drawn as (util.nodeOf), so a
+// reaction's edge joins its two complexes, and a calculation run on a
+// complex adds its results to the complex node like to any other.
+function complexGraph(workspace) {
+  const complexes = Object.values(complexNodes(workspace));
   const members = [];
-  for (const cx of Object.values(complexes)) {
+  for (const cx of complexes) {
     const n = cx.members.reduce((m, id) => ({ ...m, [id]: (m[id] || 0) + 1 }), {});
     for (const [sid, k] of Object.entries(n)) {
       members.push({ group: 'edges', classes: 'member', data: { id: `${cx.id}|${sid}`, source: cx.id, target: sid,
         label: k > 1 ? `×${k}` : '', member: 1 } });
     }
   }
-  return { complexes: Object.values(complexes), rxEdges, members };
+  return { complexes, members };
 }
 
-// A reaction's subsystem ends are hidden structures; their edge is the
-// reaction's dot (selecting the dot selects that edge).
-const isComplex = (s) => s?.role === 'complex';
+// The molecules an edge end stands for: a complex's members, else itself.
+const sideOf = (ws, sid) => (isComplex(ws.structures[sid]) ? ws.structures[sid].members || [] : [sid]);
 
 const VIEW_DEFAULT = { q: '', only: false, maxRel: null, hideProposed: false, hideFailed: false, hideTS: false, focusHops: 0 };
 
@@ -228,19 +200,16 @@ function computeView(workspace, view, collapsed, selected, focusIds, cyc) {
     for (const id of Object.keys(structures)) if (!keep.has(id)) hide.add(id);
   }
   for (const s of Object.values(structures)) if (selected.has(s.id)) hide.delete(s.id);
-  for (const r of Object.values(workspace.reactions || {})) {
-    for (const ids of [r.reactants, r.products]) {
-      if (ids.length < 2) continue;
-      const cid = complexId(ids);
-      if (ids.some((id) => hide.has(id))) hide.add(cid);
-      else if (ids.every((id) => dim.has(id))) dim.add(cid);
-    }
+  for (const cx of Object.values(complexNodes(workspace))) {
+    if (cx.members.some((id) => hide.has(id))) hide.add(cx.id);
+    else if (cx.members.every((id) => dim.has(id))) dim.add(cx.id);
   }
   for (const e of Object.values(edges)) {
     const st = edgeStatus(e, state.jobs).status;
     if (view.hideProposed && e.origin?.proposed && !['done', 'running', 'queued'].includes(st)) hide.add(e.id);
     if (view.hideFailed && st === 'failed') hide.add(e.id);
-    if (dim.has(e.source) && dim.has(e.target)) dim.add(e.id);
+    const [a, b] = [nodeOf(workspace, e.source), nodeOf(workspace, e.target)];
+    if (dim.has(a) && dim.has(b)) dim.add(e.id);
   }
   return { hide, dim, folded, kids };
 }
@@ -287,13 +256,14 @@ function ViewPanel({ view, setView, collapsed, setCollapsed, kids, shown, total,
   </div>`;
 }
 
-function edgeLabel(e, st) {
+function edgeLabel(e, st, reaction = null) {
   const parts = [];
   if (st.barrier != null) parts.push(`${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`);
   else if (st.barrierUnverified != null) parts.push(`≈${st.barrierUnverified.toFixed(1)}?`);
   else if (st.status === 'running') parts.push('running…');
   else if (st.status === 'queued') parts.push('queued');
   else if (st.status === 'failed') parts.push('failed');
+  else if (reaction?.delta_e_kcal != null) parts.push(`ΔE ${reaction.delta_e_kcal >= 0 ? '+' : ''}${reaction.delta_e_kcal.toFixed(1)}`);
   if (e.label && !/^Channel|IRC$/.test(e.label)) parts.unshift(e.label);
   return parts.join(' · ');
 }
@@ -367,17 +337,12 @@ export function Graph() {
         return;
       }
       if (evt.target.data('cx')) {          // a complex: its geometry (else, if it has none, its molecules)
-        const g = complexGeometries(state.workspace, id)[0];
-        select({ structures: g ? [g.sid] : [...new Set(evt.target.data('members'))] }, additive);
+        const g = complexNodes(state.workspace)[id]?.geometries[0];
+        select({ structures: g ? [g] : [...new Set(evt.target.data('members'))] }, additive);
         return;
       }
       if (evt.target.data('member')) {      // a member line: that molecule
         select({ structures: [evt.target.data('target')] }, additive);
-        return;
-      }
-      if (id.startsWith('rx:')) {           // a reaction without TS endpoints: open its card
-        const r = state.workspace.reactions?.[evt.target.data('rxn')];
-        if (r) openAnalyze({ reaction: r.id });
         return;
       }
       if (evt.target.isNode()) select({ structures: [id] }, additive);
@@ -436,7 +401,7 @@ export function Graph() {
     const extent = c.extent();
     c.batch(() => {
       for (const s of Object.values(structures)) {
-        if (isComplex(s)) continue;
+        if (isComplex(s)) continue;   // drawn as its complex node
         ids.add(s.id);
         const img = depictUrl(s.smiles, 200, 150);
         const data = { id: s.id, label: nodeLabel(s), img: img || '', noimg: !img };
@@ -444,7 +409,7 @@ export function Graph() {
         if (el.nonempty()) {
           if (el.data('label') !== data.label || el.data('img') !== data.img) el.data(data);
         } else {
-          const parent = !positions[s.id] && s.origin?.parent ? c.getElementById(s.origin.parent) : null;
+          const parent = !positions[s.id] && s.origin?.parent ? c.getElementById(nodeOf(workspace, s.origin.parent) || '') : null;
           if (parent && parent.nonempty()) {
             const to = spawnSpot(c, parent, spawned.map((n) => n.to));
             spawned.push({ id: s.id, to });
@@ -460,19 +425,7 @@ export function Graph() {
           c.add({ group: 'nodes', data, position: { ...p } });
         }
       }
-      for (const e of Object.values(edges)) {
-        if (isComplex(structures[e.source]) || isComplex(structures[e.target])) continue;
-        ids.add(e.id);
-        const st = edgeStatus(e, state.jobs);
-        const data = { id: e.id, source: e.source, target: e.target, status: st.status, label: edgeLabel(e, st) };
-        const el = c.getElementById(e.id);
-        if (el.nonempty() && (el.data('source') !== e.source || el.data('target') !== e.target)) el.remove();
-        const cur = c.getElementById(e.id);
-        if (cur.nonempty()) {
-          if (cur.data('status') !== data.status || cur.data('label') !== data.label) cur.data(data);
-        } else c.add({ group: 'edges', data });
-      }
-      const rg = reactionGraph(workspace, state.jobs);
+      const rg = complexGraph(workspace);
       for (const cx of rg.complexes) {
         ids.add(cx.id);
         const label = cx.members.map((m) => structures[m]?.name || '?').join(' + ');
@@ -490,7 +443,7 @@ export function Graph() {
         c.add({ group: 'nodes', classes: 'cx', data: { id: cx.id, cx: 1, members: cx.members, label: String(cx.members.length),
           title: label }, position: p });
       }
-      for (const el of [...rg.members, ...rg.rxEdges]) {
+      for (const el of rg.members) {
         ids.add(el.data.id);
         const cur = c.getElementById(el.data.id);
         if (cur.nonempty() && (cur.data('source') !== el.data.source || cur.data('target') !== el.data.target)) cur.remove();
@@ -498,6 +451,19 @@ export function Graph() {
         if (now.nonempty()) {
           if (now.data('label') !== el.data.label || now.data('status') !== el.data.status) now.data(el.data);
         } else c.add(el);
+      }
+      for (const e of Object.values(edges)) {
+        const source = nodeOf(workspace, e.source), target = nodeOf(workspace, e.target);
+        if (!source || !target || source === target) continue;
+        ids.add(e.id);
+        const st = edgeStatus(e, state.jobs);
+        const data = { id: e.id, source, target, status: st.status, label: edgeLabel(e, st, reactionOfEdge(workspace, e.id)) };
+        const el = c.getElementById(e.id);
+        if (el.nonempty() && (el.data('source') !== source || el.data('target') !== target)) el.remove();
+        const cur = c.getElementById(e.id);
+        if (cur.nonempty()) {
+          if (cur.data('status') !== data.status || cur.data('label') !== data.label) cur.data(data);
+        } else c.add({ group: 'edges', data });
       }
       c.elements().forEach((el) => { if (!ids.has(el.id())) el.remove(); });
     });
@@ -580,7 +546,7 @@ export function Graph() {
       c.elements().unselect();
       for (const id of [...selection.structures, ...selection.edges]) c.getElementById(id).select();
       for (const sid of selection.structures) {     // a complex's geometry: its circle
-        if (state.workspace.structures[sid]?.role !== 'complex') continue;
+        if (!isComplex(state.workspace.structures[sid])) continue;
         const cx = complexOfStructure(state.workspace, sid);
         if (cx) c.getElementById(cx.key).select();
       }
@@ -653,10 +619,9 @@ export function Graph() {
     const nodes = c.nodes().filter((n) => !n.data('cx') && !n.hasClass('vhidden'));
     const ids = nodes.map((n) => n.id());
     const have = new Set(ids);
-    const steps = [
-      ...Object.values(ws.reactions || {}).map((r) => [r.reactants, r.products]),
-      ...Object.values(ws.edges).filter((e) => have.has(e.source) && have.has(e.target)).map((e) => [[e.source], [e.target]]),
-    ].filter(([a, b]) => [...a, ...b].every((id) => have.has(id)));
+    const steps = Object.values(ws.edges).filter((e) => nodeOf(ws, e.source) && nodeOf(ws, e.target))
+      .map((e) => [sideOf(ws, e.source), sideOf(ws, e.target)])
+      .filter(([a, b]) => [...a, ...b].every((id) => have.has(id)));
     const inputs = new Set(Object.values(state.jobs).filter((j) => j.op === 'nanoreactor').flatMap((j) => j.targets.structures));
     let start = ids.filter((id) => inputs.has(id) || !['job', 'composed'].includes(ws.structures[id]?.origin?.kind));
     if (!start.length) {

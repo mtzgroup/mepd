@@ -901,6 +901,29 @@ def collect_optimize(out: Path, charge: int, multiplicity: int) -> dict:
                    [{"label": "Failed", "value": "; ".join(failed) or None}], warnings=failed)
 
 
+def collect_complex(out: Path, charge: int, multiplicity: int) -> dict:
+    """A `mepd complex` folder: the complex geometries it built, best first
+    (screening-level geometries; the workspace minimizes them)."""
+    s = _read_json(out / "summary.json") or {}
+    chain = _load_chain(out / "complexes.xyz", charge, multiplicity)
+    entries = [_entry(f"complex_{k}", f"Complex {k + 1}", [node], None, note=_smiles(node))
+               for k, node in enumerate(chain or [])]
+    method = s.get("method", "")
+    adopted = _read_json(out / "adopted.json") or {}
+    warnings = []
+    if adopted.get("reacted"):
+        warnings.append(f"{adopted['reacted']} of {adopted['total']} geometries were not added: their molecules bonded "
+                        "or fell apart on the way (they react with each other at the screening level).")
+    if adopted and not adopted.get("kept") and not adopted.get("reacted"):
+        warnings.append("Nothing new: Explore already has these geometries.")
+    return _result(f"{len(entries)} complex geometr{'y' if len(entries) == 1 else 'ies'}" + (f" ({method})" if method else ""),
+                   [_group("Complexes", "complexes", entries)],
+                   [{"label": "Method", "value": method or None}, {"label": "Time", "value": f"{s['seconds']} s" if s.get("seconds") is not None else None},
+                    {"label": "Added to Explore", "value": str(adopted["kept"]) if adopted else None},
+                    {"label": "Energies", "value": "at the workspace level once minimized (see Explore)"}],
+                   warnings=warnings)
+
+
 def collect_conformers(out: Path, charge: int, multiplicity: int) -> dict:
     """A `mepd conformers` folder: the minimized conformers (energies
     relative to the lowest), or -- without --minimize -- the backend's raw
@@ -1164,6 +1187,7 @@ COLLECTORS = {
     "design-optimize": collect_optimize,
     "design-tsopt": collect_tsopt,
     "conformers": collect_conformers,
+    "complex": collect_complex,
     "ts": collect_ts,
     "channels": collect_channels,
     # A "Sample more paths" follow-up writes into its source's folder: the same, extended, result.

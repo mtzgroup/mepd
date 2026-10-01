@@ -48,6 +48,18 @@ def new_id(prefix: str) -> str:
     return f"{prefix}{secrets.token_hex(4)}"
 
 
+def is_species(rec: Optional[dict]) -> bool:
+    """A molecule node: not a transition state, not a complex (several
+    molecules together, drawn as a complex node joined to its `members`)."""
+    return bool(rec) and rec.get("role") not in ("ts", "complex")
+
+
+def complex_name(members: list, structures: dict) -> str:
+    """'2 O=C=O + CC=O': a complex named by its molecules."""
+    names = Counter(structures[m]["name"] if m in structures else "?" for m in members)
+    return " + ".join(f"{n} {name}" if n > 1 else name for name, n in names.items())
+
+
 def _atomic_write(fp: Path, text: str) -> None:
     tmp = fp.with_suffix(fp.suffix + ".tmp")
     tmp.write_text(text)
@@ -223,6 +235,8 @@ class Workspace:
             self._save()   # an older workspace: each structure becomes its own first conformer
         if self._migrate_levels():
             self._save()
+        if any([self._tag_members(r) for r in self._data["reactions"].values()]):
+            self._save()   # complexes from before they recorded their molecules
 
     # ------------------------------------------------------------------ io
     def _save(self) -> None:
@@ -279,8 +293,29 @@ class Workspace:
         """Add a structure, or -- a minimum of a molecule already in the graph
         -- a conformer of that molecule's node. Returns {"rec", "conformer"
         (its id), "merged" (added to an existing node), "duplicate" (that
-        conformer was already there)}."""
+        conformer was already there)}.
+
+        A minimum holding several molecules becomes a complex: each molecule
+        is added (merged with a known one) and recorded as its `members`;
+        the geometry itself is kept exactly, as the complex's structure."""
         smiles = smiles or chem.perceive_smiles(structure)
+        members = None
+        if role == "minimum" and len(structure.symbols) > 1:
+            from mepd.web.compose import _fragments
+
+            frags = _fragments(structure)
+            if len(frags) > 1:
+                members = sorted(self.add_or_merge(f, origin={**origin, "label": f"{origin.get('label') or 'structure'} (molecule)"})["rec"]["id"]
+                                 for f in frags)
+                role, merge = "complex", False
+                # The same molecules in the same geometry again: the complex we have.
+                with self._lock:
+                    for rec in self._data["structures"].values():
+                        if rec.get("role") == "complex" and sorted(rec.get("members") or []) == members:
+                            self._ensure_conformers(rec)
+                            for conf in rec["conformers"]:
+                                if self._same_conformer(rec, conf, structure, energy, level):
+                                    return {"rec": rec, "conformer": conf["id"], "merged": True, "duplicate": True}
         with self._lock:
             match = self.find_molecule(smiles, int(structure.charge), int(structure.multiplicity)) \
                 if merge and role == "minimum" else None
@@ -309,6 +344,9 @@ class Workspace:
             "origin": origin,
             "created": time.time(),
         }
+        if members is not None:
+            rec["members"] = members
+            rec["name"] = name or complex_name(members, self._data["structures"])
         with self._lock:
             structure.save(str(self.structures_dir / f"{sid}.xyz"))
             self._data["structures"][sid] = rec
@@ -403,7 +441,7 @@ class Workspace:
             return None
         key = chem.canonical_key(smiles)
         for rec in self._data["structures"].values():
-            if (rec.get("role") not in ("ts", "complex") and rec.get("smiles") and rec["charge"] == charge
+            if (is_species(rec) and rec.get("smiles") and rec["charge"] == charge
                     and rec["multiplicity"] == multiplicity and not rec.get("reacted")
                     and chem.canonical_key(rec["smiles"]) == key):
                 return rec
@@ -528,7 +566,7 @@ class Workspace:
         with self._lock:
             groups: dict[tuple, list[dict]] = {}
             for rec in sorted(self._data["structures"].values(), key=lambda r: r.get("created", 0)):
-                if rec.get("role") in ("ts", "complex") or not rec.get("smiles") or rec.get("reacted"):
+                if not is_species(rec) or not rec.get("smiles") or rec.get("reacted"):
                     continue
                 key = (chem.canonical_key(rec["smiles"]), rec["charge"], rec["multiplicity"])
                 groups.setdefault(key, []).append(rec)
@@ -609,8 +647,26 @@ class Workspace:
             both = Counter(reactants) & Counter(products)
             rec.update(fields, reactants=list(reactants), products=list(products),
                        shuttles=sorted(both.elements()), origin=origin)
+            self._tag_members(rec)
             self._save()
             return rec
+
+    def _tag_members(self, reaction: dict) -> bool:
+        """Each complex of a reaction records its molecules (`members`, sorted,
+        repeated for 2 A): a complex is then known by itself, whichever way it
+        was made -- by a reaction (nanoreactor, Compose, Design) or from
+        species (compose.make_complex). Lock held."""
+        changed = False
+        for k, sid in enumerate((reaction.get("complexes") or [])[:2]):
+            rec = self._data["structures"].get(sid)
+            members = sorted(reaction["products"] if k else reaction["reactants"])
+            if rec is None or rec.get("role") != "complex":
+                continue
+            name = complex_name(members, self._data["structures"])
+            if rec.get("members") != members or rec["name"] != name:
+                rec["members"], rec["name"] = members, name
+                changed = True
+        return changed
 
     def _drop_reactions(self, rids: set, gone_s: list, gone_e: set) -> None:
         """Remove reactions and their hidden subsystem structures/edges (lock held)."""
@@ -619,7 +675,8 @@ class Workspace:
             self._data["positions"].pop(rid, None)
             if rec is None:
                 continue
-            for sid in rec.get("complexes") or []:
+            # A reaction recorded for an edge (add_edge) leaves its ends: nodes in their own right.
+            for sid in [] if (rec.get("origin") or {}).get("from_edge") else rec.get("complexes") or []:
                 if sid in self._data["structures"] and sid not in gone_s:
                     gone_s.append(sid)
             if rec.get("edge"):
@@ -642,7 +699,11 @@ class Workspace:
                 return rec
         return None
 
-    def add_edge(self, source: str, target: str, *, label: str = "", origin: Optional[dict] = None) -> dict:
+    def add_edge(self, source: str, target: str, *, label: str = "", origin: Optional[dict] = None,
+                 reaction: bool = True) -> dict:
+        """An edge (a step to search a TS on). With a complex at either end it
+        is a reaction between their molecules, recorded as one (`reaction`
+        False: the caller records it)."""
         if source == target:
             raise WorkspaceError("an edge needs two different structures")
         with self._lock:
@@ -665,6 +726,15 @@ class Workspace:
                 "created": time.time(),
             }
             self._data["edges"][eid] = rec
+            sides = [x["members"] if x.get("role") == "complex" and x.get("members") else [x["id"]] for x in (s, t)]
+            if reaction and "complex" in (s.get("role"), t.get("role")) and sorted(sides[0]) != sorted(sides[1]):
+                from mepd.web.nanoreactor import _label_of
+
+                names = {i: self._data["structures"][i]["name"] for i in sides[0] + sides[1] if i in self._data["structures"]}
+                self.put_reaction(reactants=sides[0], products=sides[1], label=label or _label_of(sides[0], sides[1], names),
+                                  origin={"job": None, **(origin or {"kind": "manual"}), "from_edge": True, "index": eid},
+                                  complexes=[source, target], edge=eid, count=0, reverse_count=0, delta_e_kcal=None,
+                                  events=[])
             self._save()
             return rec
 
@@ -698,6 +768,9 @@ class Workspace:
         with self._lock:
             edges = self._data["edges"]
             gone_s = [sid for sid in structure_ids if sid in self._data["structures"]]
+            # a complex the user built goes with any of its molecules
+            gone_s += [sid for sid, rec in self._data["structures"].items()
+                       if sid not in gone_s and set(rec.get("members") or []) & set(gone_s)]
             gone_e = {eid for eid in edge_ids if eid in edges}
             gone_r = {rid for rid in reaction_ids or [] if rid in self._data["reactions"]}
             gone_r |= {rid for rid, rec in self._data["reactions"].items()
@@ -714,6 +787,13 @@ class Workspace:
                 shutil.rmtree(self.structures_dir / sid, ignore_errors=True)
             self._save()
         return {"structures": gone_s, "edges": sorted(gone_e), "reactions": sorted(gone_r)}
+
+    def set_intact(self, sid: str, intact: Optional[bool]) -> None:
+        """Whether a complex's minimized geometry still holds exactly its
+        `members` (False: they reacted or fell apart, no minimum of them)."""
+        with self._lock:
+            self.structure(sid)["intact"] = intact
+            self._save()
 
     def set_status(self, sids: list[str], status: str, error: Optional[str] = None) -> None:
         with self._lock:

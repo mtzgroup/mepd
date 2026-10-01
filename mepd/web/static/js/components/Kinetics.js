@@ -6,7 +6,7 @@
 import { html, useMemo, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { set, state, useStore } from '../store.js';
-import { depictUrl } from '../util.js';
+import { depictUrl, isSpecies } from '../util.js';
 
 const fmtC = (x) => (x == null ? '—' : x === 0 ? '0' : Math.abs(x) >= 0.01 && Math.abs(x) < 1000 ? x.toPrecision(3) : x.toExponential(1));
 const UNITS = { s: 1, min: 60, h: 3600, d: 86400 };
@@ -116,7 +116,7 @@ export function KineticsView() {
   const reactions = useStore((s) => s.workspace.reactions || {});
   const species = useMemo(() => {
     const ids = new Set(Object.values(reactions).flatMap((r) => [...r.reactants, ...r.products]));
-    return Object.values(structures).filter((s) => s.role !== 'complex' && s.role !== 'ts' && (ids.has(s.id) || s.energy != null))
+    return Object.values(structures).filter((s) => isSpecies(s) && (ids.has(s.id) || s.energy != null))
       .sort((a, b) => (ids.has(b.id) - ids.has(a.id)) || a.name.localeCompare(b.name));
   }, [structures, reactions]);
   const saved = state.kinetics || {};

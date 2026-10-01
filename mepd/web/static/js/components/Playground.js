@@ -8,7 +8,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { deleteSelection } from '../api.js';
 import { clearSelection, confirmProfileEdits, openTab, prefs, select, set, state, useStore } from '../store.js';
-import { cls, levelStatus, playgroundFitMargins } from '../util.js';
+import { cls, isComplex, levelStatus, playgroundFitMargins } from '../util.js';
 import { Graph } from './Graph.js';
 import { Inspector } from './Inspector.js';
 import { JobView } from './JobView.js';
@@ -84,7 +84,7 @@ function TopRight() {
   const [open, setOpen] = useState(() => ({ level: false, structures: !window.matchMedia('(max-width: 720px)').matches }));
   const [q, setQ] = useState('');
   const toggle = (k) => setOpen({ ...open, [k]: !open[k] });
-  const all = Object.values(structures).filter((r) => r.role !== 'complex').sort((a, b) => b.created - a.created);
+  const all = Object.values(structures).filter((r) => !isComplex(r)).sort((a, b) => b.created - a.created);
   const list = q ? all.filter((r) => `${r.name} ${r.smiles} ${r.formula}`.toLowerCase().includes(q.toLowerCase())) : all;
   const pick = (e, r) => {
     select({ structures: [r.id] }, e.shiftKey || e.metaKey || e.ctrlKey);

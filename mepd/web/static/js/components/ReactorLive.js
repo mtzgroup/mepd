@@ -103,13 +103,19 @@ function useStage(host) {
     }
     v.render();
   };
-  // The piston wall: one translucent sphere, rebuilt only when it moves.
+  // The piston wall: a faint shell plus a wireframe cage (a translucent
+  // sphere alone is all but invisible), rebuilt only when it moves.
   const setWall = (r, color) => {
     const v = viewer.current;
-    if (!v || wall.current === r) return;
+    const key = `${r}|${color}`;
+    if (!v || wall.current === key) return;
     v.removeAllShapes();
-    if (r) v.addSphere({ center: { x: 0, y: 0, z: 0 }, radius: r, color, opacity: 0.07, resolution: 24 });
-    wall.current = r;
+    if (r) {
+      const center = { x: 0, y: 0, z: 0 };
+      v.addSphere({ center, radius: r, color, opacity: 0.12, resolution: 32 });
+      v.addSphere({ center, radius: r, color, opacity: 0.6, wireframe: true, linewidth: 1, resolution: 14 });
+    }
+    wall.current = key;
     v.render();
   };
   return { draw, setWall, viewer: () => viewer.current, refit: () => { fitted.current = false; wall.current = null; } };
@@ -240,6 +246,53 @@ function EventReplay({ jobId, ev, onClose }) {
 //  * theme colours are cached (no getComputedStyle per frame);
 //  * a late frame never makes playback jump ahead: it just runs slower.
 
+// Before the MD: the packed reactor, then its relaxation inside the wall,
+// played through by itself (the latest step is held while it runs; no
+// transport: there is nothing to scrub for).
+const PREP_TEXT = {
+  packed: 'Packed: the molecules placed at random in the wall',
+  relaxing: 'Relaxing the packed reactor inside the wall',
+  relaxed: 'Relaxed: starting the MD',
+};
+
+function PrepView({ prep, running }) {
+  const host = useRef(null);
+  const stage = useStage(host);
+  const p = usePlayer(prep.frames.length, { loop: !running });
+  const accent = cssVar('--accent', '#3868b8');
+  useEffect(() => {
+    const flat = prep.frames[p.i];
+    if (!flat) return;
+    stage.draw((v) => {
+      v.addModel(xyzText(prep.symbols, flat), 'xyz');
+      v.setStyle({}, FULL);
+    }, { extent: (prep.radius || 8) + 0.5, shapes: false });
+    stage.setWall(prep.radius || null, accent);
+  }, [prep, p.i]);
+  const e = prep.energy_kcal[p.i];
+  const step = prep.step[p.i];
+  return html`<div class="rx-live">
+    <div class="rx-main">
+      <div class="rx-stage-wrap">
+        <div class="rx-stage" ref=${host}></div>
+        ${prep.radius && html`<div class="rx-legend small"><span class="lg-wall">◯ wall</span></div>`}
+        <div class="rx-hud">${PREP_TEXT[prep.stage] || ''}${step ? ` · step ${step} of ${prep.steps}` : ''}${e != null && step ? ` · ${e.toFixed(1)} kcal/mol` : ''}${prep.radius ? ` · wall ${prep.radius.toFixed(1)} Å` : ''}${running ? ' · live' : ''}</div>
+      </div>
+    </div>
+    <aside class="rx-events">
+      <div class="section-title">Before the MD</div>
+      <p class="small muted">The molecules are packed at random into the wall, then relaxed inside it, so that strain from
+        the packing does not turn into heat and throw atoms out. The MD and its reaction events show here once it starts.</p>
+    </aside>
+  </div>`;
+}
+
+// The wide radius of the piston (the wall's resting size).
+function wallWide(d) {
+  if (d._wide === undefined) d._wide = Math.max(0, ...d.radius.filter(Boolean)) || null;
+  return d._wide;
+}
+
 function activeAt(events, raw) {
   return events.filter((e) => raw >= e.reactant_frame && raw <= e.product_frame);
 }
@@ -300,12 +353,14 @@ export function ReactorLive({ job }) {
       v.setStyle({}, act.length ? faded() : FULL);
       if (act.length) v.setStyle({ index: [...new Set(act.flatMap((e) => e.atoms))] }, FULL);
     }, { extent: reach(dd), shapes: false });
-    stage.setWall(dd.radius[i] || null, accent);
+    const wide = wallWide(dd);
+    const squeezed = dd.radius[i] && wide && dd.radius[i] < wide - 0.05;
+    stage.setWall(dd.radius[i] || null, squeezed ? cssVar('--warn', '#b7791f') : accent);
     // The clock and the playhead, without React.
     const tFs = raw * dd.dump_fs;
     if (hud.current) {
       const edge = runningRef.current && i >= dd.frames.length - 1;
-      hud.current.textContent = `${fmtPs(tFs)}${dd.radius[i] ? ` · wall ${dd.radius[i].toFixed(1)} Å` : ''}${runningRef.current ? (edge ? ' · live · waiting for the MD…' : ' · live') : ''}`;
+      hud.current.textContent = `${fmtPs(tFs)}${dd.radius[i] ? ` · wall ${dd.radius[i].toFixed(1)} Å${squeezed ? ' (squeezing)' : ''}` : ''}${runningRef.current ? (edge ? ' · live · waiting for the MD…' : ' · live') : ''}`;
     }
     if (headEl.current) headEl.current.style.left = `${Math.min(100, (100 * tFs) / Math.max(dd.total_ps * 1000, dd.n_frames * dd.dump_fs))}%`;
     setActiveIds((old) => (old === sel ? old : sel));
@@ -337,6 +392,7 @@ export function ReactorLive({ job }) {
   }, [playing, speed, open]);
 
   if (open) return html`<${EventReplay} jobId=${job.id} ev=${open} onClose=${() => { setOpen(null); stage.refit(); }} />`;
+  if (d && !d.frames.length && d.prep) return html`<${PrepView} prep=${d.prep} running=${running} />`;
   if (!d || !d.frames.length) {
     return html`<div class="empty-hint"><p>${running ? 'The reactor is being packed and relaxed; the MD shows here as it runs.' : 'No reactor trajectory in this output.'}</p></div>`;
   }
@@ -355,6 +411,8 @@ export function ReactorLive({ job }) {
       <div class="rx-stage-wrap">
         <div class="rx-stage" ref=${host}></div>
         <div class="rx-hud" ref=${hud}></div>
+        ${d.radius.some(Boolean) && html`<div class="rx-legend small" title="The piston: a soft spherical wall that keeps the molecules together, and periodically closes in to push them into each other">
+          <span class="lg-wall">◯ wall (wide)</span> <span class="lg-squeeze">◯ squeezing</span></div>`}
         ${active.length > 0 && html`<div class="rx-now">${active.map((e) => html`<div class=${`rx-eq ${e.tentative ? 'tentative' : ''}`} title=${e.label}>
           ${e.tentative ? 'analyzing: ' : ''}${short(e.label, 70)}</div>`)}</div>`}
       </div>
