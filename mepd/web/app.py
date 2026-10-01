@@ -285,6 +285,10 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 if await run_in_threadpool(adopt_nanoreactor, manager.ws, job, final=True):
                     manager._update(job)
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+                if job["status"] == "done" and not job.get("external"):
+                    from mepd.web.nanoreactor import spawn_ts_searches
+
+                    spawn_ts_searches(manager, job)
             if job["op"] == "graph-enumeration" and job["status"] == "done":
                 if await run_in_threadpool(adopt_expansion_steps, manager, job):
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
@@ -1330,13 +1334,35 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return {"job": J().get(jid), "progress": J().progress_snapshot(jid)}
 
     @app.get("/api/jobs/{jid}/route-ts", response_class=PlainTextResponse)
-    def job_route_ts(jid: str):
-        """The TS that sets a finished TS search's barrier (xyz)."""
-        J().get(jid)
+    def job_route_ts(jid: str, reaction: Optional[int] = None):
+        """The structure behind a job's barrier (xyz): its IRC-verified TS;
+        else its first optimized TS; else the highest point of its path (an
+        unverified barrier). A nanoreactor job: that reaction's own TS."""
+        job = J().get(jid)
         fp = J().job_dir(jid) / "route_ts.xyz"
-        if not fp.is_file():
-            raise HTTPException(404, "this job has no verified TS")
-        return PlainTextResponse(fp.read_text())
+        if fp.is_file():
+            return PlainTextResponse(fp.read_text())
+        if job["op"] == "nanoreactor":
+            from mepd.web.nanoreactor import _json, _read
+
+            data = _json(Path(job["output_dir"]) / "network.json") or {}
+            rx = next((r for r in data.get("reactions") or [] if r["id"] == reaction), None)
+            text = _read(Path(((rx or {}).get("ts") or {}).get("files", {}).get("ts") or "")) if rx else None
+            if text:
+                return PlainTextResponse(text)
+            raise HTTPException(404, "no TS for this reaction in the run")
+        result = collect_cached(job, J().job_dir(jid))
+        if (result.get("route_ts") or {}).get("xyz"):
+            return PlainTextResponse(result["route_ts"]["xyz"])
+        for kind in ("ts", "path"):
+            for g in result.get("groups") or []:
+                if g.get("kind") != kind or not g.get("entries"):
+                    continue
+                e = g["entries"][0]
+                k = e.get("ts_index") or 0 if kind == "path" else 0
+                if e.get("frames"):
+                    return PlainTextResponse(e["frames"][min(k, len(e["frames"]) - 1)]["xyz"])
+        raise HTTPException(404, "this job has no TS or path")
 
     @app.get("/api/jobs/{jid}/reactor")
     def job_reactor(jid: str, start: int = 0):

@@ -11,7 +11,7 @@ import { NetworkLive } from './NetworkLive.js';
 import { ChannelsMap } from './ChannelsMap.js';
 import { OptTree } from './OptTree.js';
 import { ReactorLive } from './ReactorLive.js';
-import { ReactionTable } from './Reactions.js';
+import { ReactionTable, SpawnedSearches } from './Reactions.js';
 import { Viewer3D } from './Viewer3D.js';
 
 // ------------------------------------------------------------ live
@@ -457,6 +457,7 @@ function ResultPanel({ job }) {
           <summary>${result.warnings.length} warning${result.warnings.length > 1 ? 's' : ''} reported by mepd — check before trusting every number</summary>
           <ul>${result.warnings.map((w) => html`<li class="mono">${w}</li>`)}</ul>
         </details>`}
+      ${job.op === 'nanoreactor' && html`<${SpawnedSearches} job=${job} />`}
       ${result.nanoreactor && html`<${ReactionTable} job=${job} reactions=${result.nanoreactor.reactions} />`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}

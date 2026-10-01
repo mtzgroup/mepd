@@ -102,3 +102,25 @@ def test_deleting_a_species_or_the_edge_removes_its_reactions(tmp_path, network)
     removed = ws.delete_many([water["id"]], [])
     assert len(removed["reactions"]) == 1 and ws.snapshot()["reactions"] == {}
     assert not [s for s in ws.snapshot()["structures"].values() if s["role"] == "complex"]
+
+
+def test_live_and_final_versions_of_a_reaction_are_one_reaction(tmp_path, network):
+    """--refine-live writes live_network.json during the MD; the final
+    network.json numbers species and reactions differently. They are
+    matched by identity, never doubled."""
+    data = json.loads((network / "network.json").read_text())
+    live = {"live": True, "species": [dict(sp, id=10 + sp["id"]) for sp in data["species"]],
+            "reactions": [dict(r, id=5, reactants=[10 + i for i in r["reactants"]],
+                               products=[10 + i for i in r["products"]]) for r in data["reactions"][:1]]}
+    (network / "network.json").rename(network / "network.final")
+    (network / "live_network.json").write_text(json.dumps(live))
+    ws = Workspace(tmp_path / "ws")
+    job = {"id": "j1", "op": "nanoreactor", "output_dir": str(network), "params": {"refine_live": True}, "level": None}
+    assert adopt_nanoreactor(ws, job)
+    assert len(ws.snapshot()["reactions"]) == 1
+    (network / "network.final").rename(network / "network.json")
+    adopt_nanoreactor(ws, job, final=True)
+    rx = ws.snapshot()["reactions"]
+    assert len(rx) == 2                                   # the live one plus the one only the final run has
+    assert sorted(r["label"] for r in rx.values()) == ["CC=O + O -> C=CO + O", "CC=O -> C=CO"]
+    assert len([s for s in ws.snapshot()["structures"].values() if s["role"] != "complex"]) == 3

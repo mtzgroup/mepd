@@ -115,6 +115,12 @@ def nanoreactor(
         True, "--refine/--no-refine",
         help="Optimize each species and each reaction's subsystem ends at the --inputs level."),
     instances: int = typer.Option(3, "--instances", help="Occurrences kept (and refined) per reaction and species."),
+    refine_live: bool = typer.Option(
+        False, "--refine-live/--no-refine-live",
+        help="Refine each reaction (its species and subsystem ends) as soon as its event has settled, while the MD "
+        "goes on, in --live-workers parallel workers; written to live_network.json as it goes (the web app shows "
+        "those reactions at once). The final pass reuses what is done."),
+    live_workers: int = typer.Option(2, "--live-workers", help="--refine-live: parallel refinement workers."),
     connect: bool = typer.Option(
         False, "--connect/--no-connect",
         help="Then find each reaction's TS: path search between its optimized subsystem ends, TS optimization "
@@ -181,8 +187,10 @@ def nanoreactor(
         now = time.time()
         if not force and now - live["wall"] < 5 * live["cost_s"]:
             return
+        ctx: dict = {}
         try:
-            data = nr.live_events(output / "md", total_charge=total_charge, detect=detect, dt_fs=dump_fs)
+            data = nr.live_events(output / "md", total_charge=total_charge, detect=detect, dt_fs=dump_fs,
+                                  charges_at=live.get("charges_at") if live.get("refiner") else None, context=ctx)
         except Exception as exc:   # the MD matters more than the preview
             typer.echo(f"(live events not updated: {type(exc).__name__}: {exc})")
             return
@@ -190,6 +198,11 @@ def nanoreactor(
         tmp.write_text(json.dumps(data, default=str))
         tmp.replace(output / "live_events.json")
         live["cost_s"], live["wall"] = time.time() - now, time.time()
+        if live.get("refiner") is not None and ctx:
+            n = live["refiner"].submit(ctx["symbols"], ctx["frames"], ctx["hist"], ctx["species"], ctx["reactions"],
+                                       ctx["settled"])
+            if n:
+                typer.echo(f"{n} new reaction(s) queued for refinement")
 
     def say(event, payload):
         if event == "md_segment" and payload["time_ps"] - live["at_ps"] >= 1.0 - 1e-9:
@@ -232,6 +245,52 @@ def nanoreactor(
     mult = multiplicity or (1 if electrons % 2 == 0 else 2)
     typer.echo(f"Reactor: {len(symbols)} atoms, charge {total_charge}, multiplicity {mult}"
                + (f", wall {settings.radius:.1f} -> {settings.radius * compress:.1f} A" if trajectory is None else ""))
+    # Partial charges only label the molecules (which charge each carries):
+    # an xtb single point does that whatever drove the MD, when xtb is there.
+    q_method, q_exe = (md_method, md_executable) if md_method != "level" else ("gfn2", None)
+    if md_method == "level" and nr.missing_programs("gfn2"):
+        q_method, q_exe = "gxtb", nr.engine_gxtb_executable(_open_run_inputs(inputs).engine)
+    try:
+        nr._xtb_command(q_method, q_exe)
+        q_ok = True
+    except RuntimeError:
+        q_ok = False
+    charges = ({"method": q_method, "executable": q_exe, "electronic_temperature": electronic_temperature,
+                "multiplicity": mult, "workdir": str(output / "partial_charges")} if partial_charges and q_ok
+               else None)
+
+    # --- refine as reactions appear (optional) -------------------------------
+    import threading
+
+    refiner = None
+    net_lock = threading.Lock()
+
+    def write_live_network() -> None:
+        with net_lock:
+            data = refiner.network()
+            tmp = output / "live_network.json.tmp"
+            tmp.write_text(json.dumps(data, default=str))
+            tmp.replace(output / "live_network.json")
+
+    q_cache: dict = {}
+
+    def live_charges(frame, coords):
+        if charges is None:
+            return None
+        if frame not in q_cache:
+            q_cache[frame] = nr.frame_partial_charges(
+                symbols, coords, charge=total_charge, multiplicity=mult, method=q_method,
+                electronic_temperature=electronic_temperature, workdir=output / "partial_charges" / "live",
+                executable=q_exe)
+        return q_cache[frame]
+
+    live["charges_at"] = live_charges
+    if refine_live and refine and trajectory is None:
+        refiner = nr.LiveRefiner(_open_run_inputs(inputs).engine, output, maxiter=maxiter, workers=live_workers,
+                                 on_change=write_live_network)
+        live["refiner"] = refiner
+        typer.echo(f"Refining reactions as they appear ({live_workers} workers).")
+
     if trajectory is None:
         if md_method != "level":
             try:
@@ -255,20 +314,9 @@ def nanoreactor(
         traj = trajectory
 
     # --- events -> species and reactions -------------------------------------
+    if refiner is not None:
+        write_live_events(force=True)   # the last settled reactions, too
     typer.echo("Finding reaction events in the trajectory...")
-    # Partial charges only label the molecules (which charge each carries):
-    # an xtb single point does that whatever drove the MD, when xtb is there.
-    q_method, q_exe = (md_method, md_executable) if md_method != "level" else ("gfn2", None)
-    if md_method == "level" and nr.missing_programs("gfn2"):
-        q_method, q_exe = "gxtb", nr.engine_gxtb_executable(_open_run_inputs(inputs).engine)
-    try:
-        nr._xtb_command(q_method, q_exe)
-        q_ok = True
-    except RuntimeError:
-        q_ok = False
-    charges = ({"method": q_method, "executable": q_exe, "electronic_temperature": electronic_temperature,
-                "multiplicity": mult, "workdir": str(output / "partial_charges")} if partial_charges and q_ok
-               else None)
     symbols, frames, hist, species, reactions, events = nr.analyze_trajectory(
         traj, total_charge=total_charge, detect=detect, dt_fs=dump_fs, max_instances=instances, charges=charges)
     typer.echo(f"{len(events)} events, {len(species)} species, {len(reactions)} distinct reactions.")
@@ -287,8 +335,11 @@ def nanoreactor(
     if refine and (species or reactions):
         run_inputs = _open_run_inputs(inputs)
         _echo_run_inputs_summary(run_inputs)
+        if refiner is not None:
+            typer.echo("Waiting for the live refinement to finish...")
+            refiner.close(wait=True)
         nr.refine(symbols, frames, hist, species, reactions, run_inputs.engine, output, maxiter=maxiter,
-                  on_event=say)
+                  on_event=say, cache=refiner)
         nr.write_network(result, output)
         if connect:
             by_id = {s.id: s for s in species}

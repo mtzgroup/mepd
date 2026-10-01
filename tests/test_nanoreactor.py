@@ -245,3 +245,22 @@ def test_automatic_md_choice_falls_back_to_gxtb_then_to_the_profile(monkeypatch)
         executable = __file__   # an existing path stands in for the program
     assert nr.pick_md_method(GXTBCalculator()) == ("gxtb", __file__)
     assert nr.pick_md_method(object()) == ("level", None)
+
+
+def test_open_shell_fragments_get_a_structure_not_a_code():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    m = Chem.AddHs(Chem.MolFromSmiles("Cn1cnc2c1c(=O)n(C)c(=O)n2C"))   # caffeine
+    AllChem.EmbedMolecule(m, randomSeed=1)
+    syms = [a.GetSymbol() for a in m.GetAtoms()]
+    bonds = nr.perceive_bonds(syms, m.GetConformer().GetPositions())
+    lab = nr.Labeler(syms)
+    assert lab.candidates(tuple(range(len(syms))), bonds)[0][2] == "Cn1c(=O)c2c(ncn2C)n(C)c1=O"
+    ring = next(r for r in m.GetRingInfo().AtomRings() if len(r) == 5)
+    cn = next((i, j) for i, j in bonds if i in ring and j in ring and {syms[i], syms[j]} == {"C", "N"}
+              and any(n.GetSymbol() == "H" for n in m.GetAtomWithIdx(i if syms[i] == "C" else j).GetNeighbors()))
+    opened = nr.Labeler(syms).candidates(tuple(range(len(syms))), bonds - {cn})
+    assert opened and not opened[0][2].startswith("?") and "unusual" not in opened[0][2]
+    assert Chem.MolFromSmiles(opened[0][2]) is not None
+    assert nr.Labeler(["C", "H", "H"]).candidates((0, 1, 2), {(0, 1), (0, 2)})[0][2] == "[CH2]"   # a carbene

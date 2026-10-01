@@ -581,10 +581,17 @@ class Workspace:
         except KeyError:
             raise WorkspaceError(f"unknown reaction {rid!r}") from None
 
-    def find_reaction(self, job: str, index: int) -> Optional[dict]:
+    def find_reaction(self, job: str, index, key: Optional[str] = None) -> Optional[dict]:
+        """A job's reaction: by identity `key` when given (records from before
+        keys were stored are matched by index)."""
         for rec in self._data["reactions"].values():
             o = rec.get("origin") or {}
-            if o.get("job") == job and o.get("index") == index:
+            if o.get("job") != job:
+                continue
+            if key is not None and o.get("key") is not None:
+                if o["key"] == key:
+                    return rec
+            elif o.get("index") == index:
                 return rec
         return None
 
@@ -595,7 +602,7 @@ class Workspace:
         with self._lock:
             for sid in [*reactants, *products]:
                 self.structure(sid)
-            rec = self.find_reaction(origin.get("job"), origin.get("index"))
+            rec = self.find_reaction(origin.get("job"), origin.get("index"), key=origin.get("key"))
             if rec is None:
                 rid = new_id("r_")
                 rec = self._data["reactions"][rid] = {"id": rid, "created": time.time()}

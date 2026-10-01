@@ -30,29 +30,62 @@ def _read(fp: Path) -> Optional[str]:
         return None
 
 
+def _sp_key(sp: dict) -> str:
+    return sp.get("key") or f"{sp['smiles']}|{sp['charge']}|{sp['multiplicity']}"
+
+
+def _rx_key(rx: dict, keys: dict) -> str:
+    """A reaction's identity, whichever way it is written (as the CLI's reaction_key)."""
+    if rx.get("key"):
+        return rx["key"]
+    a = "+".join(sorted(keys[i] for i in rx["reactants"]))
+    b = "+".join(sorted(keys[i] for i in rx["products"]))
+    return min(f"{a}>{b}", f"{b}>{a}")
+
+
 def adopt_nanoreactor(ws, job: dict, *, final: bool = False) -> bool:
-    """Bring the job's species and reactions into the workspace. Returns
-    True when the workspace changed."""
-    fp = Path(job.get("output_dir") or "") / "network.json"
-    try:
-        mtime = fp.stat().st_mtime
-    except OSError:
+    """Bring the job's species and reactions into the workspace: from
+    live_network.json (reactions refined while the MD runs, --refine-live)
+    and network.json (the run's analysis and final refinement). Species and
+    reactions are matched by identity (SMILES/charge/spin; reactant and
+    product sets), so the live and final versions of one reaction are one
+    workspace reaction. Returns True when the workspace changed."""
+    out = Path(job.get("output_dir") or "")
+    files = [out / "live_network.json", out / "network.json"]
+    stamps = []
+    for fp in files:
+        try:
+            stamps.append(fp.stat().st_mtime)
+        except OSError:
+            stamps.append(0.0)
+    if not any(stamps) or (stamps == list(job.get("nano_mtimes") or []) and not final):
         return False
-    if mtime == job.get("nano_mtime") and not final:
-        return False
-    try:
-        data = json.loads(fp.read_text())
-    except ValueError:
-        return False   # being written; next time
-    job["nano_mtime"] = mtime
+    datas = []
+    for fp, st in zip(files, stamps):
+        if not st:
+            continue
+        try:
+            datas.append((fp.name, json.loads(fp.read_text())))
+        except ValueError:
+            return False   # being written; next time
+    job["nano_mtimes"] = stamps
+    nodes: dict = dict(job.get("nano_keys") or {})          # species key -> structure id
+    refined: dict = dict(job.get("nano_refined_keys") or {})
+    changed = False
+    for name, data in datas:
+        changed |= _adopt_one(ws, job, data, nodes, refined, final=final and name == "network.json")
+    job["nano_keys"], job["nano_refined_keys"] = nodes, refined
+    return changed
+
+
+def _adopt_one(ws, job: dict, data: dict, nodes: dict, refined: dict, *, final: bool) -> bool:
     refine = (job.get("params") or {}).get("refine", True)
     level = job.get("level")
-    nodes: dict = dict(job.get("nano_nodes") or {})       # species id -> structure id
-    refined: dict = dict(job.get("nano_refined") or {})   # species id -> True once its minimum is in
     known = ws.snapshot()["structures"]
+    keys = {sp["id"]: _sp_key(sp) for sp in data.get("species") or []}
     changed = False
     for sp in data.get("species") or []:
-        k = str(sp["id"])
+        k = keys[sp["id"]]
         have = nodes.get(k) in known
         energy = sp.get("energy")
         if have and (refined.get(k) or energy is None):
@@ -66,11 +99,12 @@ def adopt_nanoreactor(ws, job: dict, *, final: bool = False) -> bool:
         if not text:
             continue
         (s,) = chem.structures_from_xyz_text(text, sp["charge"], sp["multiplicity"])
-        smiles = sp["smiles"] if not str(sp["smiles"]).startswith("?") else None
+        smiles = sp["smiles"] if not str(sp["smiles"]).startswith("?") and "unusual bonding" not in str(sp["smiles"]) \
+            else None
         res = ws.add_or_merge(
-            s, name=smiles or chem.formula(s), smiles=smiles, energy=energy, optimized=opt,
+            s, name=smiles or sp["smiles"] or chem.formula(s), smiles=smiles, energy=energy, optimized=opt,
             level=level if opt else None,
-            origin={"kind": "job", "job": job["id"], "entry": f"species_{k}", "label": f"Species {k}",
+            origin={"kind": "job", "job": job["id"], "entry": f"species_{sp['id']}", "label": f"Species {sp['id']}",
                     "nanoreactor": True})
         nodes[k], changed = res["rec"]["id"], True
         if opt:
@@ -78,20 +112,21 @@ def adopt_nanoreactor(ws, job: dict, *, final: bool = False) -> bool:
         known = ws.snapshot()["structures"]
     for rx in data.get("reactions") or []:
         ids = rx["reactants"] + rx["products"]
-        if not all(nodes.get(str(i)) in known for i in ids):
+        if not all(nodes.get(keys.get(i)) in known for i in ids):
             continue
-        existing = ws.find_reaction(job["id"], rx["id"])
+        rkey = _rx_key(rx, keys)
+        existing = ws.find_reaction(job["id"], rx["id"], key=rkey)
+        events = [inst.get("event") for inst in rx.get("instances") or [] if inst.get("event") is not None]
+        c = rx.get("complex") or {}
         fields = {"label": _label(rx, data), "count": rx.get("count", 0), "reverse_count": rx.get("reverse_count", 0),
                   "delta_e_kcal": rx.get("delta_e_kcal"), "first_fs": rx.get("first_fs"),
-                  "complex_delta_e_kcal": (rx.get("complex") or {}).get("delta_e_kcal"),
-                  "complex_error": (rx.get("complex") or {}).get("error"),
-                  "complex_reason": (rx.get("complex") or {}).get("reason"),
+                  "complex_delta_e_kcal": c.get("delta_e_kcal"), "complex_error": c.get("error"),
+                  "complex_reason": c.get("reason"),
                   "complexes": (existing or {}).get("complexes") or [], "edge": (existing or {}).get("edge"),
                   # For the reaction card: the MD events it was seen in (to replay), and the
                   # energy ladder on one scale, kcal/mol from the separated reactants.
-                  "events": [inst.get("event") for inst in rx.get("instances") or [] if inst.get("event") is not None],
-                  "ladder": _ladder(rx, data)}
-        c = rx.get("complex") or {}
+                  "events": events or (existing or {}).get("events") or [],
+                  "ladder": _ladder(rx, data), "live": bool(data.get("live"))}
         if c.get("reactant") and not (fields["edge"] and fields["edge"] in ws.snapshot()["edges"]):
             made = _complex_pair(ws, job, rx, c, level, fields["label"])
             if made:
@@ -100,12 +135,47 @@ def adopt_nanoreactor(ws, job: dict, *, final: bool = False) -> bool:
             _put_ts(ws, job, fields["edge"], rx)
         before = json.dumps({k: (existing or {}).get(k) for k in fields}, sort_keys=True, default=str)
         rec = ws.put_reaction(
-            reactants=[nodes[str(i)] for i in rx["reactants"]], products=[nodes[str(i)] for i in rx["products"]],
-            origin={"kind": "job", "job": job["id"], "index": rx["id"], "nanoreactor": True}, **fields)
+            reactants=[nodes[keys[i]] for i in rx["reactants"]], products=[nodes[keys[i]] for i in rx["products"]],
+            origin={"kind": "job", "job": job["id"], "index": rx["id"], "key": rkey, "nanoreactor": True}, **fields)
         if existing is None or json.dumps({k: rec.get(k) for k in fields}, sort_keys=True, default=str) != before:
             changed = True
-    job["nano_nodes"], job["nano_refined"] = nodes, refined
     return changed
+
+
+def spawn_ts_searches(manager, job: dict) -> list:
+    """With 'Find each reaction's TS': an ordinary TS search per reaction of
+    this run (on its subsystem edge), each its own job -- queued, watchable
+    live, its barrier landing on the reaction. Smallest subsystems first;
+    reactions that already have a search are skipped, so calling this
+    again (as more reactions arrive) starts nothing twice. Returns the new
+    job ids."""
+    import logging
+
+    params = job.get("params") or {}
+    if not params.get("connect"):
+        return []
+    snap = manager.ws.snapshot()
+    busy = {e for j in manager.jobs.values() if j["op"] in ("ts", "channels") for e in j["targets"]["edges"]}
+    mine = [r for r in snap.get("reactions", {}).values()
+            if r.get("origin", {}).get("job") == job["id"] and r.get("edge") in snap["edges"]]
+    spawned = list(job.get("spawned") or [])
+    room = int(params.get("max_connect") or 20) - len(spawned)
+    size = lambda r: snap["structures"].get((r.get("complexes") or [None])[0], {}).get("natoms", 999)
+    todo = [r for r in sorted(mine, key=size) if r["edge"] not in busy][:max(0, room)]
+    new = []
+    for r in todo:
+        try:
+            created = manager.submit("ts", structure_ids=[], edge_ids=[r["edge"]], params={},
+                                     profile=job.get("profile"), label=f"TS: {r['label']}")
+        except WorkspaceError as exc:
+            logging.getLogger(__name__).warning("could not start the TS search of %s: %s", r["label"], exc)
+            continue
+        for c in created:
+            manager._update(c, parent_job=job["id"])
+            new.append(c["id"])
+    if new:
+        manager._update(job, spawned=spawned + new)
+    return new
 
 
 def _ladder(rx: dict, data: dict) -> Optional[dict]:

@@ -1067,3 +1067,8 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 
 .rx-now .rx-eq.tentative { background: var(--warn); }
 .rx-analyzing { color: var(--warn); white-space: nowrap; }
+
+.rx-spawned { margin: 8px 0 12px; }
+.rx-spawned ul { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }
+.rx-spawned li { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.rx-spawned li a { font-family: var(--font-mono); font-size: 12px; }

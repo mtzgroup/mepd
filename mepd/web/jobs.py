@@ -611,6 +611,10 @@ class JobManager:
                 if adopt_nanoreactor(self.ws, job):
                     self._write(job)
                     self.bus.publish("workspace", self.ws.snapshot())
+                    if (job.get("params") or {}).get("refine_live"):   # reactions refined live: their TS now
+                        from mepd.web.nanoreactor import spawn_ts_searches
+
+                        spawn_ts_searches(self, job)
             except Exception:
                 log.exception("could not add the nanoreactor network of %s to the graph", job["id"])
 

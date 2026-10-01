@@ -866,10 +866,19 @@ class Labeler:
             mol = _lewis_mol(syms, edges, q, mult, allow_radicals=True, allow_zwitterions=True)
             if mol is None and mult == 2:
                 mol = _radical_mol(syms, edges, q)
+            if mol is None and mult == 1:   # e.g. a ring opened by one broken bond: a diradical
+                mol = _radical_mol(syms, edges, q, centres=2)
             if mol is not None:
                 out.append((q, sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms()), _smiles(mol)))
-        if not out:   # no Lewis structure: keep a connectivity label so the molecule still has an identity
-            out.append((0, electrons % 2, "?" + _formula(syms) + ":" + "-".join(f"{i}.{j}" for i, j in edges)))
+        if not out and not any(x in METAL_CHARGES for x in syms):
+            mol = _valence_mol(syms, edges)   # open shell (a broken ring, a carbene, ...): radicals where valence is left
+            if mol is not None:
+                out.append((0, sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms()), _smiles(mol)))
+        if not out:   # no structure at all: a readable name that still tells different bondings apart
+            import hashlib
+
+            tag = hashlib.sha1(repr(edges).encode()).hexdigest()[:4]
+            out.append((0, electrons % 2, f"{_formula(syms)} (unusual bonding #{tag})"))
         self._cache[key] = out
         return out
 
@@ -897,30 +906,85 @@ class Labeler:
         return labels
 
 
-def _radical_mol(syms, edges, q: int):
-    """A doublet with one radical centre: xyz2mol assigns closed shells
-    only, so take the closed-shell ion one electron away (charge q-1 or
-    q+1) and turn its charged atom into the radical centre (OH- -> OH.,
-    CH3+ -> CH3.). None if no such structure has normal valences."""
+_VALENCE = {"H": 1, "B": 3, "C": 4, "N": 3, "O": 2, "F": 1, "Si": 4, "P": 3, "S": 2, "Cl": 1, "Se": 2, "Br": 1, "I": 1}
+
+
+def _valence_mol(syms, edges):
+    """A neutral structure for any graph whose atoms are not over-bonded:
+    each atom gets its usual valence, multiple bonds go where neighbours
+    both have valence left (maximum matching, repeated for triple bonds),
+    and what is left is radical electrons. The last resort when no
+    closed-shell or one-radical structure exists."""
+    import networkx as nx
+    from rdkit import Chem
+
+    n = len(syms)
+    if any(s not in _VALENCE for s in syms):
+        return None
+    deg = [0] * n
+    for i, j in edges:
+        deg[i] += 1
+        deg[j] += 1
+    free = [_VALENCE[s] - d for s, d in zip(syms, deg)]
+    if any(f < 0 for f in free):
+        return None
+    order = {tuple(sorted(e)): 1 for e in edges}
+    for _ in range(2):   # double, then triple bonds
+        g = nx.Graph([(i, j) for i, j in order if free[i] > 0 and free[j] > 0 and order[(i, j)] < 3])
+        if g.number_of_edges() == 0:
+            break
+        for i, j in nx.max_weight_matching(g, maxcardinality=True):
+            key = tuple(sorted((i, j)))
+            order[key] += 1
+            free[i] -= 1
+            free[j] -= 1
+    rw = Chem.RWMol()
+    for s, f in zip(syms, free):
+        a = Chem.Atom(s)
+        a.SetNoImplicit(True)
+        a.SetNumRadicalElectrons(f)
+        rw.AddAtom(a)
+    kinds = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
+    for (i, j), k in order.items():
+        rw.AddBond(int(i), int(j), kinds[k])
+    try:
+        Chem.SanitizeMol(rw)
+    except Exception:
+        return None
+    return rw.GetMol()
+
+
+def _radical_mol(syms, edges, q: int, centres: int = 1):
+    """A structure with `centres` radical centres (1: a doublet, 2: a
+    singlet diradical): xyz2mol assigns closed shells only, so take the
+    closed-shell ion `centres` electrons away (charge q -/+ centres) and turn
+    its charged atoms into the radical centres (OH- -> OH., CH3+ -> CH3.,
+    a dianion with two carbanions -> a diradical). None if no such
+    structure has normal valences."""
+    import itertools
+
     from rdkit import Chem
 
     from mepd.discovery.network_expansion import _lewis_mol
 
-    for ion, sign in ((q - 1, -1), (q + 1, 1)):
+    for ion, sign in ((q - centres, -1), (q + centres, 1)):
         mol = _lewis_mol(syms, edges, ion, 1, allow_radicals=True, allow_zwitterions=True)
         if mol is None:
             continue
-        for atom in mol.GetAtoms():
-            if atom.GetFormalCharge() * sign > 0:
-                rw = Chem.RWMol(mol)
-                a = rw.GetAtomWithIdx(atom.GetIdx())
+        charged = [a.GetIdx() for a in mol.GetAtoms() if a.GetFormalCharge() * sign > 0]
+        for picks in itertools.islice(itertools.combinations(charged, centres), 50):
+            rw = Chem.RWMol(mol)
+            for k in picks:
+                a = rw.GetAtomWithIdx(k)
                 a.SetFormalCharge(a.GetFormalCharge() - sign)
                 a.SetNumRadicalElectrons(a.GetNumRadicalElectrons() + 1)
-                try:
-                    Chem.SanitizeMol(rw)
-                except Exception:
-                    continue
-                return rw.GetMol()
+            if sum(a.GetFormalCharge() for a in rw.GetAtoms()) != q:
+                continue
+            try:
+                Chem.SanitizeMol(rw)
+            except Exception:
+                continue
+            return rw.GetMol()
     return None
 
 
@@ -1114,101 +1178,277 @@ def _same_bonds(symbols, coords_a, bonds_expected: set[Pair]) -> bool:
     return perceive_bonds(symbols, coords_a) == bonds_expected
 
 
+def species_key(rec) -> str:
+    """A species' identity across analyses (live and final): SMILES, charge, spin."""
+    return f"{rec.smiles}|{rec.charge}|{rec.multiplicity}"
+
+
+def reaction_key(rxn, by_id: dict) -> str:
+    """A reaction's identity across analyses, whichever way it is written."""
+    def side(ids):
+        return "+".join(sorted(species_key(by_id[i]) for i in ids))
+    a, b = side(rxn.reactants), side(rxn.products)
+    return min(f"{a}>{b}", f"{b}>{a}")
+
+
+def _species_cuts(symbols, frames, hist: BondHistory, rec) -> list:
+    """(symbols, coords, bonds it must keep) per instance of a species."""
+    out = []
+    for frame, atoms in rec.instances:
+        syms, xyz = _cut(symbols, frames, frame, atoms)
+        local = {a: k for k, a in enumerate(atoms)}
+        out.append((syms, xyz, {(local[i], local[j]) for i, j in hist.bonds_at(frame) if i in local and j in local}))
+    return out
+
+
+def refine_species_one(rec, cuts: list, engine, sp_dir: Path, maxiter: int, name: Optional[str] = None) -> None:
+    """Optimize a species from each of its instances; keep the lowest whose
+    bonds stay as they were (else note why)."""
+    best = None
+    for syms, xyz, expect in cuts:
+        try:
+            node = _optimize_one(engine, _structure(syms, xyz, rec.charge, rec.multiplicity), maxiter)
+        except Exception as exc:
+            rec.note = f"optimization failed: {type(exc).__name__}: {exc}"[:300]
+            continue
+        opt_xyz = np.asarray(node.coords) / ANGSTROM_TO_BOHR
+        if len(syms) > 1 and not _same_bonds(syms, opt_xyz, expect):
+            rec.note = "bonds changed on optimization (not a minimum at this level)"
+            continue
+        if best is None or float(node.energy) < float(best[0].energy):
+            best = (node, syms, opt_xyz)
+    if best is not None:
+        rec.energy = float(best[0].energy)
+        rec.note = ""
+        fp = Path(sp_dir) / f"species_{name if name is not None else rec.id}.xyz"
+        _write_xyz(fp, best[1], best[2], f"{rec.smiles} charge={rec.charge} mult={rec.multiplicity} "
+                                         f"energy={rec.energy:.10f}")
+        rec.file = str(fp)
+
+
+def _reaction_cuts(symbols, frames, hist: BondHistory, rxn) -> list:
+    """Per instance, oriented as the reaction is written: the subsystem at its
+    reactant and product frames, its charge and spin, and their bonds."""
+    out = []
+    for k, inst in enumerate(rxn.instances):
+        atoms = inst["atoms"]
+        fr, fp_ = ((inst["reactant_frame"], inst["product_frame"]) if inst["direction"] == "forward"
+                   else (inst["product_frame"], inst["reactant_frame"]))
+        syms, xr = _cut(symbols, frames, fr, atoms)
+        _, xp = _cut(symbols, frames, fp_, atoms)
+        q = int(inst["charge"])
+        local = {a: m for m, a in enumerate(atoms)}
+        bonds = {n: {(local[i], local[j]) for i, j in hist.bonds_at(f) if i in local and j in local}
+                 for n, f in (("reactant", fr), ("product", fp_))}
+        out.append({"k": k, "syms": syms, "xr": xr, "xp": xp, "q": q, "mult": _complex_multiplicity(syms, q),
+                    "fr": fr, "fp": fp_, "bonds": bonds})
+    return out
+
+
+def refine_reaction_one(rxn, cuts: list, engine, d: Path, maxiter: int) -> None:
+    """Optimize a reaction's subsystem ends from each instance; the first
+    whose ends keep their bonds becomes `complex`, else the reason why none
+    did."""
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    for c in cuts:
+        k, syms, q, mult = c["k"], c["syms"], c["q"], c["mult"]
+        inst = rxn.instances[k]
+        _write_xyz(d / f"instance_{k}_reactant_frame.xyz", syms, c["xr"], f"frame {c['fr']}")
+        _write_xyz(d / f"instance_{k}_product_frame.xyz", syms, c["xp"], f"frame {c['fp']}")
+        ends = {}
+        for name, xyz in (("reactant", c["xr"]), ("product", c["xp"])):
+            expect = c["bonds"][name]
+            try:
+                node = _optimize_one(engine, _structure(syms, xyz, q, mult), maxiter)
+            except Exception as exc:
+                ends[name] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+                continue
+            oxyz = np.asarray(node.coords) / ANGSTROM_TO_BOHR
+            fp = d / f"instance_{k}_{name}_complex.xyz"
+            _write_xyz(fp, syms, oxyz, f"energy={float(node.energy):.10f} charge={q} mult={mult}")
+            got = perceive_bonds(syms, oxyz)
+            ends[name] = {"file": str(fp), "energy": float(node.energy), "bonds_kept": got == expect}
+            if got != expect:
+                ends[name]["verdict"] = _verdict(name, got, expect,
+                                                 c["bonds"]["product" if name == "reactant" else "reactant"], len(syms))
+        inst["complex"] = ends
+        r, p = ends.get("reactant", {}), ends.get("product", {})
+        if "energy" in r and "energy" in p:
+            inst["complex_delta_e_kcal"] = (p["energy"] - r["energy"]) * HARTREE_TO_KCAL_PER_MOL
+        if r.get("bonds_kept") and p.get("bonds_kept") and not rxn.complex:
+            rxn.complex = {"instance": k, "charge": q, "multiplicity": mult, "reactant": r["file"],
+                           "product": p["file"], "reactant_energy": r["energy"], "product_energy": p["energy"],
+                           "delta_e_kcal": inst["complex_delta_e_kcal"]}
+    if not rxn.complex:
+        verdicts = [v for inst in rxn.instances for v in
+                    ((inst.get("complex") or {}).get(side, {}).get("verdict") for side in ("reactant", "product")) if v]
+        v = verdicts[0] if verdicts else {"code": "failed", "text": "the optimizations of its ends failed",
+                                           "ts": False}
+        rxn.complex = {"error": v["text"], "reason": v["code"], "ts_makes_sense": v["ts"],
+                       "tried": len(rxn.instances)}
+
+
+def _set_delta_e(rxn, by_id: dict) -> None:
+    es = [by_id[i].energy for i in rxn.reactants], [by_id[i].energy for i in rxn.products]
+    if all(e is not None for e in es[0] + es[1]):
+        rxn.delta_e_kcal = (sum(es[1]) - sum(es[0])) * HARTREE_TO_KCAL_PER_MOL
+
+
 def refine(symbols, frames: np.ndarray, hist: BondHistory, species: list[SpeciesRecord],
            reactions: list[ReactionRecord], engine, output: Path, *, maxiter: int = 300,
-           on_event: OnEvent = None) -> None:
+           on_event: OnEvent = None, cache: Optional["LiveRefiner"] = None) -> None:
     """Optimize every species on its own (lowest instance kept) and every
     reaction's subsystem endpoints; fills energies, delta_e_kcal and
     `complex`. A structure whose bonds change while it is optimized is
     reported, not used (the molecule fell apart or reacted: not a minimum
-    of that species at this level)."""
+    of that species at this level). What `cache` (a LiveRefiner) already
+    refined while the MD ran is reused, by identity."""
     from mepd.chain import Chain  # noqa: F401  (engines import chains lazily)
 
     sp_dir, rx_dir = output / "species", output / "reactions"
     sp_dir.mkdir(parents=True, exist_ok=True)
     rx_dir.mkdir(parents=True, exist_ok=True)
+    done_sp, done_rx = cache.results() if cache is not None else ({}, {})
     for n, rec in enumerate(species):
+        prev = done_sp.get(species_key(rec))
+        if prev is not None:
+            rec.energy, rec.file, rec.note = prev.energy, prev.file, prev.note
+            continue
         _emit(on_event, "refine_species", index=n, total=len(species), smiles=rec.smiles)
-        best = None
-        for frame, atoms in rec.instances:
-            syms, xyz = _cut(symbols, frames, frame, atoms)
-            local = {a: k for k, a in enumerate(atoms)}
-            expect = {(local[i], local[j]) for i, j in hist.bonds_at(frame) if i in local and j in local}
-            try:
-                node = _optimize_one(engine, _structure(syms, xyz, rec.charge, rec.multiplicity), maxiter)
-            except Exception as exc:
-                rec.note = f"optimization failed: {type(exc).__name__}: {exc}"[:300]
-                continue
-            opt_xyz = np.asarray(node.coords) / ANGSTROM_TO_BOHR
-            if len(syms) > 1 and not _same_bonds(syms, opt_xyz, expect):
-                rec.note = "bonds changed on optimization (not a minimum at this level)"
-                continue
-            if best is None or float(node.energy) < float(best[0].energy):
-                best = (node, syms, opt_xyz)
-        if best is not None:
-            rec.energy = float(best[0].energy)
-            rec.note = ""
-            fp = sp_dir / f"species_{rec.id}.xyz"
-            _write_xyz(fp, best[1], best[2], f"{rec.smiles} charge={rec.charge} mult={rec.multiplicity} "
-                                             f"energy={rec.energy:.10f}")
-            rec.file = str(fp)
+        refine_species_one(rec, _species_cuts(symbols, frames, hist, rec), engine, sp_dir, maxiter)
     by_id = {r.id: r for r in species}
     for n, rxn in enumerate(reactions):
+        _set_delta_e(rxn, by_id)
+        prev = done_rx.get(reaction_key(rxn, by_id))
+        if prev is not None and prev.complex:
+            rxn.complex = dict(prev.complex)
+            if prev.complex.get("reactant") and \
+                    _side_key(prev.reactant_keys) != _side_key([species_key(by_id[i]) for i in rxn.reactants]):
+                # refined the other way round: swap the ends
+                c = rxn.complex
+                c["reactant"], c["product"] = c["product"], c["reactant"]
+                c["reactant_energy"], c["product_energy"] = c["product_energy"], c["reactant_energy"]
+                c["delta_e_kcal"] = -c["delta_e_kcal"]
+            continue
         _emit(on_event, "refine_reaction", index=n, total=len(reactions), label=rxn.label)
-        es = [by_id[i].energy for i in rxn.reactants], [by_id[i].energy for i in rxn.products]
-        if all(e is not None for e in es[0] + es[1]):
-            rxn.delta_e_kcal = (sum(es[1]) - sum(es[0])) * HARTREE_TO_KCAL_PER_MOL
-        d = rx_dir / f"reaction_{rxn.id}"
-        d.mkdir(exist_ok=True)
-        for inst in rxn.instances:
-            atoms = inst["atoms"]
-            # Orient every instance as the reaction is written.
-            fr, fp_ = ((inst["reactant_frame"], inst["product_frame"]) if inst["direction"] == "forward"
-                       else (inst["product_frame"], inst["reactant_frame"]))
-            syms, xr = _cut(symbols, frames, fr, atoms)
-            _, xp = _cut(symbols, frames, fp_, atoms)
-            q = int(inst["charge"])
-            mult = _complex_multiplicity(syms, q)
-            k = rxn.instances.index(inst)
-            _write_xyz(d / f"instance_{k}_reactant_frame.xyz", syms, xr, f"frame {fr}")
-            _write_xyz(d / f"instance_{k}_product_frame.xyz", syms, xp, f"frame {fp_}")
-            local = {a: m for m, a in enumerate(atoms)}
-            ends = {}
-            bonds_of = {n: {(local[i], local[j]) for i, j in hist.bonds_at(f) if i in local and j in local}
-                        for n, f in (("reactant", fr), ("product", fp_))}
-            for name, frame, xyz in (("reactant", fr, xr), ("product", fp_, xp)):
-                expect = bonds_of[name]
-                try:
-                    node = _optimize_one(engine, _structure(syms, xyz, q, mult), maxiter)
-                except Exception as exc:
-                    ends[name] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
-                    continue
-                oxyz = np.asarray(node.coords) / ANGSTROM_TO_BOHR
-                fp = d / f"instance_{k}_{name}_complex.xyz"
-                _write_xyz(fp, syms, oxyz, f"energy={float(node.energy):.10f} charge={q} mult={mult}")
-                got = perceive_bonds(syms, oxyz)
-                ends[name] = {"file": str(fp), "energy": float(node.energy), "bonds_kept": got == expect}
-                if got != expect:
-                    ends[name]["verdict"] = _verdict(name, got, expect,
-                                                     bonds_of["product" if name == "reactant" else "reactant"], len(syms))
-            inst["complex"] = ends
-            r, p = ends.get("reactant", {}), ends.get("product", {})
-            ok = r.get("bonds_kept") and p.get("bonds_kept")
-            if "energy" in r and "energy" in p:
-                inst["complex_delta_e_kcal"] = (p["energy"] - r["energy"]) * HARTREE_TO_KCAL_PER_MOL
-            # The reaction's representative subsystem: the first instance whose
-            # optimized ends are still the reactants and products.
-            if ok and not rxn.complex:
-                rxn.complex = {"instance": k, "charge": q, "multiplicity": mult, "reactant": r["file"],
-                               "product": p["file"], "reactant_energy": r["energy"], "product_energy": p["energy"],
-                               "delta_e_kcal": inst["complex_delta_e_kcal"]}
-        if not rxn.complex:
-            verdicts = [v for inst in rxn.instances for v in
-                        ((inst.get("complex") or {}).get(side, {}).get("verdict") for side in ("reactant", "product")) if v]
-            v = verdicts[0] if verdicts else {"code": "failed", "text": "the optimizations of its ends failed",
-                                               "ts": False}
-            rxn.complex = {"error": v["text"], "reason": v["code"], "ts_makes_sense": v["ts"],
-                           "tried": len(rxn.instances)}
+        refine_reaction_one(rxn, _reaction_cuts(symbols, frames, hist, rxn), engine, rx_dir / f"reaction_{rxn.id}",
+                            maxiter)
+
+
+class LiveRefiner:
+    """Refines reactions while the MD still runs: each reaction once its
+    event has settled, with its species, in a pool of `workers` threads (an
+    engine that is not known to be thread-safe is used one call at a time
+    by them; the MD itself is a separate process or holds its own engine).
+    `on_change()` is called after each piece, to write the live network."""
+
+    THREAD_SAFE = ("GXTBCalculator", "QCComputeEngine")
+
+    def __init__(self, engine, output: Path, *, maxiter: int = 300, workers: int = 2,
+                 on_change: Optional[Callable[[], None]] = None):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.engine, self.output, self.maxiter = engine, Path(output), maxiter
+        self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)), thread_name_prefix="refine")
+        self.lock = threading.Lock()
+        self.engine_lock = None if type(engine).__name__ in self.THREAD_SAFE else threading.Lock()
+        self.on_change = on_change or (lambda: None)
+        self.species: dict = {}        # key -> refined SpeciesRecord
+        self.reactions: dict = {}      # key -> refined ReactionRecord (with reactant_keys, product_keys)
+        self.submitted: set = set()
+        self.futures: list = []
+        self.n = 0
+
+    def _engine_call(self, fn, *args):
+        if self.engine_lock is None:
+            return fn(*args)
+        with self.engine_lock:
+            return fn(*args)
+
+    def submit(self, symbols, frames, hist: BondHistory, species: list, reactions: list, settled: set) -> int:
+        """Queue every settled reaction (and its species) not yet queued."""
+        import copy
+
+        by_id = {r.id: r for r in species}
+        queued = 0
+        wanted_sp = [r for r in species if r.initial]
+        for rxn in reactions:
+            if rxn.id not in settled:
+                continue
+            rk = reaction_key(rxn, by_id)
+            if rk in self.submitted:
+                continue
+            self.submitted.add(rk)
+            wanted_sp += [by_id[i] for i in rxn.reactants + rxn.products]
+            r2 = copy.deepcopy(rxn)
+            r2.reactant_keys = [species_key(by_id[i]) for i in rxn.reactants]
+            r2.product_keys = [species_key(by_id[i]) for i in rxn.products]
+            cuts = _reaction_cuts(symbols, frames, hist, rxn)
+            self.n += 1
+            d = self.output / "reactions" / f"live_{self.n}"
+            self.futures.append(self.pool.submit(self._run_reaction, rk, r2, cuts, d))
+            queued += 1
+        for rec in wanted_sp:
+            sk = species_key(rec)
+            if sk in self.submitted:
+                continue
+            self.submitted.add(sk)
+            s2 = copy.deepcopy(rec)
+            cuts = _species_cuts(symbols, frames, hist, rec)
+            self.n += 1
+            self.futures.append(self.pool.submit(self._run_species, sk, s2, cuts, f"live_{self.n}"))
+        return queued
+
+    def _run_species(self, key, rec, cuts, name):
+        (self.output / "species").mkdir(parents=True, exist_ok=True)
+        self._engine_call(refine_species_one, rec, cuts, self.engine, self.output / "species", self.maxiter, name)
+        with self.lock:
+            self.species[key] = rec
+        self.on_change()
+
+    def _run_reaction(self, key, rxn, cuts, d):
+        self._engine_call(refine_reaction_one, rxn, cuts, self.engine, d, self.maxiter)
+        with self.lock:
+            self.reactions[key] = rxn
+        self.on_change()
+
+    def results(self) -> tuple[dict, dict]:
+        with self.lock:
+            return dict(self.species), dict(self.reactions)
+
+    def network(self) -> dict:
+        """The refined species and reactions so far, as network.json writes them
+        (ids local to this file; adopted by key)."""
+        sp, rx = self.results()
+        keys = list(sp)
+        ids = {k: n for n, k in enumerate(keys)}
+        species = []
+        for k in keys:
+            d = asdict(sp[k])
+            d.update(id=ids[k], key=k)
+            species.append(d)
+        reactions = []
+        for n, (k, r) in enumerate(rx.items()):
+            if not all(x in ids for x in r.reactant_keys + r.product_keys):
+                continue   # a species still being optimized
+            d = asdict(r)
+            d.update(id=n, key=k, reactants=[ids[x] for x in r.reactant_keys],
+                     products=[ids[x] for x in r.product_keys],
+                     shuttles=sorted((Counter(ids[x] for x in r.reactant_keys)
+                                      & Counter(ids[x] for x in r.product_keys)).elements()))
+            es = [sp[x].energy for x in r.reactant_keys], [sp[x].energy for x in r.product_keys]
+            if all(e is not None for e in es[0] + es[1]):
+                d["delta_e_kcal"] = (sum(es[1]) - sum(es[0])) * HARTREE_TO_KCAL_PER_MOL
+            for x in ("reactant_keys", "product_keys"):
+                d.pop(x, None)
+            reactions.append(d)
+        return {"kind": "nanoreactor", "live": True, "species": species, "reactions": reactions,
+                "pending": max(0, len(self.submitted) - len(sp) - len(rx))}
+
+    def close(self, wait: bool = True) -> None:
+        self.pool.shutdown(wait=wait)
 
 
 # Why a reaction has no TS endpoints: what one of its optimized ends turned into.
@@ -1293,27 +1533,39 @@ def read_segments(md_dir: Path) -> tuple[list, np.ndarray]:
     return symbols, (np.concatenate(frames) if frames else np.zeros((0, len(symbols), 3)))
 
 
-def live_events(md_dir: Path, *, total_charge: int, detect: DetectSettings, dt_fs: float) -> dict:
-    """Events in the trajectory so far (molecules neutral where they can be:
-    no partial charges while the MD runs). Events that may still be
-    unfolding at the end of the trajectory are held back until they are
-    over, so the list only grows."""
+def live_events(md_dir: Path, *, total_charge: int, detect: DetectSettings, dt_fs: float,
+                charges_at: Optional[Callable[[int, np.ndarray], Optional[np.ndarray]]] = None,
+                context: Optional[dict] = None) -> dict:
+    """Events in the trajectory so far. Events that may still be unfolding
+    at the end of the trajectory are listed as tentative ("analyzing")
+    until they are over. `charges_at(frame, coords)` gives partial charges
+    for the molecules' charges (else neutral where they can be). If
+    `context` is a dict, it is filled with what a LiveRefiner needs
+    (symbols, frames, hist, species, reactions, settled reaction ids)."""
     symbols, frames = read_segments(md_dir)
     out = {"n_frames": int(len(frames)), "time_ps": len(frames) * dt_fs / 1000.0, "events": [], "final": False}
     if len(frames) < 2:
         return out
     hist = bond_history(symbols, frames, detect, dt_fs)
     events = detect_events(len(symbols), hist, detect, dt_fs)
-    # Events near the end may still be unfolding: listed as tentative
-    # ("analyzing") until they are over, then as found.
     settle = int(round((detect.merge_window_fs + detect.lag_fs + detect.min_lifetime_fs) / dt_fs))
     edge = len(frames) - 1 - settle
-    _, _, records = build_network(symbols, frames, hist, events, Labeler(symbols, max_charge=max(1, abs(int(total_charge)))), total_charge, dt_fs,
-                                  max_instances=1)
+    hint = (lambda f: charges_at(f, frames[f])) if charges_at is not None else None
+    species, reactions, records = build_network(
+        symbols, frames, hist, events, Labeler(symbols, max_charge=max(1, abs(int(total_charge)))), total_charge,
+        dt_fs, max_instances=1, charges_at=hint)
+    settled = set()
     for ev, rec in zip(events, records):
         if ev.end >= edge:
             rec["tentative"] = True
+        elif rec.get("reaction") is not None:
+            settled.add(rec["reaction"])
+    # A reaction counts as settled only if none of its sightings is still unfolding.
+    settled -= {rec["reaction"] for rec in records if rec.get("tentative") and rec.get("reaction") is not None}
     out["events"] = records
+    if context is not None:
+        context.update(symbols=symbols, frames=frames, hist=hist, species=species, reactions=reactions,
+                       settled=settled)
     return out
 
 

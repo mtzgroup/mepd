@@ -57,6 +57,35 @@ runs the exploration on the big system and extracts each reaction event as a sma
 8. **TS** (`--connect`): MSMEP between the optimized subsystem ends, then TS optimization and IRC. The
    lowest TS whose IRC connects the same bonds wins.
 
+## Refining as reactions appear (`--refine-live`)
+
+With this option (web: "Refine reactions as they appear"), each reaction is refined as soon as its event
+is over, while the MD goes on:
+- **Workers:** a `LiveRefiner` refines its species and subsystem ends in `--live-workers` parallel
+  threads (default 2). A g-xTB or QCOP engine runs in parallel; another engine is used one call at a
+  time by the workers, but still alongside the MD.
+- **Live results:** results go to `live_network.json` after each piece. The web app imports that file
+  as it changes, so the reaction appears in Explore and Analyze during the run. You can start its TS
+  search at once; with "Find each reaction's TS" on, it is started for you.
+- **Identity:** species and reactions are matched by identity (SMILES, charge and spin; reactant and
+  product sets). The live and final versions of a reaction are therefore one workspace reaction, and
+  the final pass reuses what was refined live. Partial charges are used during the run too, so labels
+  match the final ones.
+- **Trade-off:** a reaction refined live uses its first occurrence only, not the best of
+  `--instances`.
+- **Concurrency:** TS searches started during the run are ordinary jobs, limited by the server's
+  `--max-jobs` (default 2, of which the nanoreactor holds one). Raise it, or move to ChemCloud, for
+  more in parallel.
+
+## TS searches as their own jobs
+
+When the web app runs a nanoreactor with "Find each reaction's TS", the CLI does not search TSs
+itself (no `--connect`). Instead, each reaction gets an ordinary TS search job on its subsystem edge:
+- **When:** after the run ends, or as reactions appear with `--refine-live`. Smallest subsystems come
+  first, up to "Max TS searches".
+- **What you see:** each search has its own page and live view, and its barrier lands on the reaction.
+  The nanoreactor's results page lists them, and "running…" anywhere links to the live view.
+
 ## Live view and TS searches
 
 The job page's **Reactor** tab (the default while a nanoreactor job runs):

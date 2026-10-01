@@ -49,7 +49,10 @@ export function TsCell({ r, why = 'not in Explore (deleted?)' }) {
     return html`<span class="small muted" title=${noTsWhy(r)}>${NO_TS_SHORT[r.complex_reason] || 'no TS endpoints'}</span>`;
   }
   const st = edgeStatus(edges[r.edge], state.jobs);
-  if (st.status === 'running' || st.status === 'queued') return html`<span class="small">${st.status}…</span>`;
+  if (st.status === 'running' || st.status === 'queued') {
+    const j = Object.values(state.jobs).find((x) => x.targets.edges.includes(r.edge) && ['running', 'queued'].includes(x.status));
+    return html`<a href="#" class="small" title="Watch it live" onClick=${(e) => { e.preventDefault(); if (j) openJob(j.id, 'live'); }}>${st.status}…</a>`;
+  }
   const label = st.barrier != null ? `ΔE‡ ${fmtKcal(st.barrier)}` : st.barrierUnverified != null ? `≈${fmtKcal(st.barrierUnverified)}?` : null;
   return html`<span class="ts-cell">
     ${label && (st.barrierJob
@@ -59,6 +62,23 @@ export function TsCell({ r, why = 'not in Explore (deleted?)' }) {
     <button class="btn small" onClick=${() => findTs(r)} title="Path search, TS optimization and IRC on only this reaction’s molecules">
       ${label ? 'Search again' : 'Find TS'}</button>
   </span>`;
+}
+
+// The TS searches a nanoreactor run started (one job per reaction).
+export function SpawnedSearches({ job }) {
+  const jobs = useStore((s) => s.jobs);
+  const ids = job.spawned || [];
+  if (!ids.length) return null;
+  const list = ids.map((id) => jobs[id]).filter(Boolean);
+  const n = (st) => list.filter((j) => j.status === st).length;
+  return html`<div class="rx-spawned">
+    <div class="section-title">TS searches started by this run · ${n('done')} done${n('running') ? `, ${n('running')} running` : ''}${n('queued') ? `, ${n('queued')} queued` : ''}${n('failed') ? `, ${n('failed')} failed` : ''}</div>
+    <ul>${list.map((j) => html`<li>
+      <a href="#" onClick=${(e) => { e.preventDefault(); openJob(j.id, j.status === 'running' ? 'live' : undefined); }}>${j.title.replace(/^TS: /, '')}</a>
+      <span class=${`pill ${j.status}`}>${j.status}</span>
+      ${j.summary?.barrier_kcal != null && html`<span class="mono small">${j.summary.barrier_verified === false ? '≈' : 'ΔE‡ '}${fmtKcal(j.summary.barrier_kcal)}</span>`}
+    </li>`)}</ul>
+  </div>`;
 }
 
 // The reactions of one nanoreactor job, at the top of its results: click a
@@ -187,7 +207,10 @@ export function ReactionCard({ r, event = null, compact = false }) {
   const [rc, pc] = r.complexes || [];
   const xyzR = useText(view === 'rc' && rc ? `/api/structures/${rc}/xyz` : null);
   const xyzP = useText(view === 'pc' && pc ? `/api/structures/${pc}/xyz` : null);
-  const xyzTS = useText(view === 'ts' && st.barrierJob ? `/api/jobs/${st.barrierJob}/route-ts` : null);
+  // The structure behind the barrier: the verified TS, or (unverified) the path's highest point.
+  const tsUrl = st.barrierJob ? `/api/jobs/${st.barrierJob}/route-ts${r.origin?.job === st.barrierJob && r.origin?.index != null ? `?reaction=${r.origin.index}` : ''}` : null;
+  const xyzTS = useText(view === 'ts' ? tsUrl : null);
+  const verified = st.barrier != null;
   const job = r.origin?.job;
   const running = st.status === 'running' || st.status === 'queued';
   const runningJob = running ? Object.values(state.jobs).find((j) => j.targets.edges.includes(r.edge) && ['running', 'queued'].includes(j.status)) : null;
@@ -195,7 +218,7 @@ export function ReactionCard({ r, event = null, compact = false }) {
     ev != null && job && ['event', 'MD event'],
     rc && ['rc', 'Reactant complex'],
     pc && ['pc', 'Product complex'],
-    st.barrierJob && ['ts', 'TS'],
+    st.barrierJob && ['ts', verified ? 'TS' : 'Path max'],
   ].filter(Boolean);
   const height = compact ? 230 : 340;
   return html`<div class=${`reaction-card ${compact ? 'compact' : ''}`}>
@@ -209,7 +232,7 @@ export function ReactionCard({ r, event = null, compact = false }) {
       ${!edge ? html`<p class="small warn-box">${noTsWhy(r)}
           ${['barrierless', 'recombines'].includes(r.complex_reason) ? ' There is no barrier to find; its ΔE is the reaction energy.' : ''}</p>`
         : running ? html`<p class="small">TS search ${st.status}…
-            ${runningJob && html` <a href="#" onClick=${(e) => { e.preventDefault(); openJob(runningJob.id); }}>watch it</a>`}</p>`
+            ${runningJob && html` <a href="#" onClick=${(e) => { e.preventDefault(); openJob(runningJob.id, 'live'); }}>watch it live</a>`}</p>`
           : html`<div class="rc-ts-row">
             ${st.barrierJob ? html`<a href="#" class="rc-barrier" onClick=${(e) => { e.preventDefault(); openJob(st.barrierJob); }}
                 title="Its TS search: TS, IRC, energy profile, sample more paths">
@@ -233,7 +256,11 @@ export function ReactionCard({ r, event = null, compact = false }) {
         <p class="small muted">${r.origin?.kind === 'composed' ? 'The reactants placed side by side, then optimized together.'
           : 'Only the molecules this reaction needs, optimized together (from the MD frame before it).'}</p>`}
       ${view === 'pc' && html`<${Viewer3D} xyz=${xyzP} height=${height} />`}
-      ${view === 'ts' && html`<${Viewer3D} xyz=${xyzTS} height=${height} />`}
+      ${view === 'ts' && (xyzTS === ''
+        ? html`<p class="small muted">No geometry for this search's barrier (its output is gone or holds no path).</p>`
+        : html`<${Viewer3D} xyz=${xyzTS} height=${height} />
+          <p class="small muted">${verified ? 'The transition state (TS optimization, IRC-verified).'
+            : 'The highest point of the path: no TS optimization or IRC has confirmed it, so the barrier is approximate.'}</p>`)}
     </div>`}
   </div>`;
 }

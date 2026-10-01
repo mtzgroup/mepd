@@ -745,10 +745,20 @@ class NanoreactorParams(Params):
         "calculator. Every species, reaction and TS is then refined at the profile's level.", cli="--md-method",
         labels={"auto": "Automatic", "gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB", "gxtb": "g-xTB (slower)",
                 "level": "Your level of theory"})
-    connect: bool = P(False, "Find each reaction's TS", "Path search, TS optimization and IRC on every reaction's "
-                      "subsystem (only the molecules it needs). Or run a TS search later on any reaction you pick.",
-                      cli="--connect", kind="toggle")
-    max_connect: int = P(20, "Max TS searches", cli="--max-connect", ge=1, requires="connect")
+    # Not passed to the CLI: when the run ends, the web app queues one
+    # ordinary TS search per reaction (its own job, watchable live) instead.
+    connect: bool = P(False, "Find each reaction's TS", "When the run ends, start a TS search on every reaction's "
+                      "subsystem (only the molecules it needs): one calculation per reaction, each watchable live, "
+                      "whose barrier lands on its reaction. Or start them later on the reactions you pick.",
+                      kind="custom")
+    max_connect: int = P(20, "Max TS searches", "At most this many are started (fewest atoms first).", kind="custom",
+                         ge=1, requires="connect")
+    refine_live: bool = P(False, "Refine reactions as they appear", "Each reaction is refined (its species and "
+                          "subsystem) as soon as its event is over, in parallel with the MD, and joins Explore and "
+                          "Analyze at once: you can start its TS search while the MD goes on (and with 'Find each "
+                          "reaction's TS', it starts by itself).", cli="--refine-live", kind="toggle")
+    live_workers: int = P(2, "Refinement workers", "Reactions refined at the same time while the MD runs.",
+                          cli="--live-workers", ge=1, requires="refine_live", advanced=True, group="Advanced")
     period: float = P(1.0, "Piston period (ps)", cli="--period", gt=0, advanced=True, group="Reactor")
     duty: float = P(0.75, "Time wide", "Fraction of each period at the wide radius.", cli="--duty", gt=0, le=1,
                     advanced=True, group="Reactor")
@@ -763,8 +773,6 @@ class NanoreactorParams(Params):
                             advanced=True, group="Events")
     instances: int = P(3, "Occurrences refined", "Per reaction and species: more gives more chances of a clean "
                        "optimization.", cli="--instances", ge=1, advanced=True, group="Events")
-    workers: int = P(2, "Parallel TS searches", cli="--workers", ge=1, advanced=True, group="Advanced",
-                     requires="connect")
 
 
 def _parse_copies(text: str, recs: list[dict]) -> list[int]:
