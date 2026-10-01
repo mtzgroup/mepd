@@ -481,6 +481,13 @@ export function DesignView() {
   const toGraph = async () => {
     const rec = await attempt(() => api.post('/api/design/to-graph'));
     if (!rec) return;
+    if (rec.reaction) {
+      // Several molecules on a side: a reaction (its species, its two complexes and their edge).
+      const species = [...new Set(rec.species.flat())];
+      toast(rec.existing ? 'This reaction is already in Explore' : `Added the reaction and its ${species.length} species to Explore`, 'ok', 6000,
+        { label: 'Show', run: () => { select({ edges: [rec.edge] }); openTab('graph'); } });
+      return;
+    }
     if (rec.edge) {
       toast(`Added the reactant, the product and their edge to Explore${rec.new.length < 2 ? ' (as conformers of nodes already there)' : ''}`, 'ok', 6000,
         { label: 'Show', run: () => { select({ structures: [rec.reactant.id, rec.product.id] }); openTab('graph'); } });
