@@ -738,13 +738,14 @@ class NanoreactorParams(Params):
     time_ps: float = P(20.0, "Simulated time (ps)", cli="--time", gt=0)
     compress: float = P(0.6, "Piston squeeze", "Narrow wall radius as a fraction of the wide one: smaller pushes "
                         "the molecules harder together.", cli="--compress", gt=0, le=1)
-    md_method: Literal["auto", "gfn2", "gfn1", "gxtb", "level"] = P(
-        "auto", "MD level", "What drives the discovery MD. Automatic: GFN2-xTB if xtb is installed, else g-xTB, "
-        "else your level of theory. The xtb methods run xtb's own MD (fast). 'Your level of "
-        "theory' runs it on the compute profile below, with any calculator (MLIPs, ASE, g-xTB...): as fast as that "
-        "calculator. Every species, reaction and TS is then refined at the profile's level.", cli="--md-method",
-        labels={"auto": "Automatic", "gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB", "gxtb": "g-xTB (slower)",
-                "level": "Your level of theory"})
+    md_method: Literal["level", "auto", "gfn2", "gfn1", "gxtb"] = P(
+        "level", "MD level", "What drives the discovery MD. 'Your level of theory' (the default) runs it on the "
+        "compute profile below, with any calculator (MLIPs, ASE, g-xTB...): as fast as that calculator, and the "
+        "MD sees the same chemistry as the rest of your workspace. The xtb methods run xtb's own MD (fast), at a "
+        "different level. Automatic: GFN2-xTB if xtb is installed, else g-xTB, else your level of theory. Every "
+        "species, reaction and TS is then refined at the profile's level.", cli="--md-method",
+        labels={"level": "Your level of theory", "auto": "Automatic", "gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB",
+                "gxtb": "g-xTB (slower)"})
     # Not passed to the CLI: when the run ends, the web app queues one
     # ordinary TS search per reaction (its own job, watchable live) instead.
     connect: bool = P(False, "Find each reaction's TS", "When the run ends, start a TS search on every reaction's "
