@@ -1751,13 +1751,16 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
         if body.method not in METHODS:
             raise WorkspaceError(f"unknown method {body.method!r}")
+        members = complex_members(W(), body.counts)
+        if demo is not None:   # the complex is one structure: the demo's atom and structure limits apply
+            demo.check_op("complex", {"method": body.method, "keep": body.keep})
+            demo.check_structures(len(W().snapshot()["structures"]),
+                                  [sum(W().structure(sid)["natoms"] for sid in members)])
         if body.method not in INSTANT:
-            complex_members(W(), body.counts)
             if missing_programs(body.method):
                 raise WorkspaceError(f"{body.method} needs {', '.join(missing_programs(body.method))} on PATH")
             ids = [sid for sid, n in body.counts.items() if int(n) > 0]
             if demo is not None:
-                demo.check_op("complex", {"method": body.method})
                 demo.check_capacity(J().list())
             jobs = J().submit("complex", structure_ids=ids, edge_ids=[], profile=body.profile,
                               params={"method": body.method, "keep": body.keep,

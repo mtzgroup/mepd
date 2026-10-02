@@ -1325,3 +1325,36 @@ def test_a_complex_job_s_geometries_join_its_complex_node(tmp_path):
     recs = [ws.structure(sid) for sid in made]
     assert all(r["role"] == "complex" and r["members"] == sorted([h["id"], w["id"], w["id"]]) for r in recs)
     assert recs[0]["origin"]["label"] == "Complex 1 (dock)"
+
+
+def test_demo_complexes_obey_the_atom_and_geometry_limits(demo_app):
+    root, app = demo_app            # max_atoms=10
+    anon = TestClient(app, follow_redirects=False)
+    with anon:
+        v = _visitor(app)
+        try:
+            (w,) = v.post("/api/structures", json={"text": WATER_XYZ, "optimize": False}).json()
+            r = v.post("/api/complexes", json={"counts": {w["id"]: 3}, "method": "side"})
+            assert r.status_code == 200 and r.json()["complex"]["natoms"] == 9
+            r = v.post("/api/complexes", json={"counts": {w["id"]: 4}, "method": "packed"})
+            assert r.status_code == 400 and "10 atoms" in r.json()["detail"]
+            r = v.post("/api/complexes", json={"counts": {w["id"]: 2}, "method": "dock", "keep": 5})
+            assert r.status_code == 400 and "demo limit" in r.json()["detail"]
+        finally:
+            v.__exit__(None, None, None)
+
+
+def test_demo_retrosynthesis_runs_only_the_light_method():
+    from mepd.web.demo import DemoPolicy
+    from mepd.web.operations import OPERATIONS
+    from mepd.web.workspace import WorkspaceError
+
+    policy = DemoPolicy()
+    policy.check_op("retrosynthesis", {"method": "templates", "iterations": 100})
+    for bad in ({"method": "local-llm"}, {"method": "templates", "verify": "all"},
+                {"method": "templates", "stock_file": "/etc/passwd"}, {"method": "templates", "iterations": 500}):
+        with pytest.raises(WorkspaceError):
+            policy.check_op("retrosynthesis", bad)
+    desc = policy.adapt_operation(OPERATIONS["retrosynthesis"].describe())
+    assert [m["fixed"]["method"] for m in desc["methods"] if m["available"]] in (["templates"], [])
+    assert desc["schema"]["properties"]["verify"].get("enum", ["none"]) == ["none"]

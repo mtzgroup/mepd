@@ -13,6 +13,11 @@ deploy/demo/run.sh stop       # close the link and stop the demo
 deploy/demo/run.sh logs       # follow the server log
 ```
 
+**What code it serves.** `start` updates a clean git worktree of `origin/develop` (`~/mepd_demo_src`)
+and serves that: only pushed commits reach visitors, never work in progress in this checkout. To show
+a new feature, push it, then run `start` again (`DEMO_REF=<branch or commit>` serves something else).
+`docker restart mepd-demo` reruns the same code without updating it.
+
 `share` uses a Cloudflare quick tunnel (`cloudflared`, no account): the hostname is random and
 **changes every time you `share`**, so resend the link after a restart. Tailscale Funnel would give
 a stable `https://<machine>.<tailnet>.ts.net` instead, but on an organization tailnet it needs an

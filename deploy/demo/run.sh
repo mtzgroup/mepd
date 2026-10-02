@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Control the public mepd demo.
 #
-#   deploy/demo/run.sh start      # start (or restart) the demo container; prints the password
+#   deploy/demo/run.sh start      # start (or restart) the demo on the latest develop; prints the password
 #   deploy/demo/run.sh share      # open a public https://....trycloudflare.com tunnel to it
 #   deploy/demo/run.sh status     # what is running, and the public URL
 #   deploy/demo/run.sh unshare    # close the tunnel (demo keeps running, private again)
@@ -14,6 +14,10 @@
 #   DEMO_PORT   loopback port the container publishes            (default 8790)
 #   DEMO_CPUS   CPU cap for the whole demo                       (default 12)
 #   DEMO_MEM    memory cap                                       (default 32g)
+#   DEMO_SRC    the code the demo serves: a clean git worktree of DEMO_REF, updated
+#               on every `start` (default ~/mepd_demo_src), never this checkout's own
+#               working tree (other work in progress there must not reach visitors)
+#   DEMO_REF    what DEMO_SRC checks out                         (default origin/develop)
 #   MEPD_DEMO_PASSWORD  shared password for `start` (saved to $DEMO_DATA/root/.demo_password,
 #                       the single source of truth; default: generated once)
 set -euo pipefail
@@ -25,6 +29,8 @@ DEMO_DATA="${DEMO_DATA:-$HOME/mepd_demo}"
 DEMO_PORT="${DEMO_PORT:-8790}"
 DEMO_CPUS="${DEMO_CPUS:-12}"
 DEMO_MEM="${DEMO_MEM:-32g}"
+DEMO_SRC="${DEMO_SRC:-$HOME/mepd_demo_src}"
+DEMO_REF="${DEMO_REF:-origin/develop}"
 
 PW_FILE="$DEMO_DATA/root/.demo_password"
 
@@ -111,6 +117,18 @@ XTB="$(readlink -f "$(command -v xtb)")"                       # plain xtb: CRES
 GXTB="$(readlink -f "${GXTB_EXECUTABLE:-$OPT/gxtb-2.0.1/bin/xtb}")"
 GSM="$(readlink -f "${GSM_EXECUTABLE:-$OPT/gsm/bin/gsm}")"
 
+# The code: DEMO_REF as committed, in its own worktree (the venv's editable
+# install points at $REPO/mepd, so the container mounts it there).
+git -C "$REPO" fetch -q origin
+if [ -e "$DEMO_SRC/.git" ]; then
+  git -C "$DEMO_SRC" checkout -q --detach "$DEMO_REF"
+  git -C "$DEMO_SRC" reset -q --hard "$DEMO_REF"
+  git -C "$DEMO_SRC" clean -qfdx
+else
+  git -C "$REPO" worktree add -q --detach "$DEMO_SRC" "$DEMO_REF"
+fi
+echo "demo code: $(git -C "$DEMO_SRC" log -1 --format='%h %s')"
+
 mkdir -p "$DEMO_DATA/root" "$DEMO_DATA/home" "$DEMO_DATA/state"
 [ -n "${MEPD_DEMO_PASSWORD:-}" ] && save_password "$MEPD_DEMO_PASSWORD"
 docker build -q -t "$IMAGE" "$REPO/deploy/demo" >/dev/null
@@ -118,8 +136,9 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # (--mount, not -v src:dst:ro: the short form silently skipped some of these
 # binds on this Docker install.)
-# Only the package and its venv are mounted from the checkout -- not the rest
-# of the repo (workspaces, .git, ...), which visitors have no business seeing.
+# Only the package (from the clean DEMO_SRC worktree) and the venv are
+# mounted -- not the rest of the repo (workspaces, .git, ...), which visitors
+# have no business seeing.
 # /tmp must allow exec: GSM runs a ./grad.py helper from its temp workdir
 # (Docker mounts --tmpfs noexec by default, which silently broke GSM).
 # Hardening: non-root (your uid), read-only root fs and code mounts, no
@@ -133,7 +152,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --cap-drop ALL --security-opt no-new-privileges \
   --cpus "$DEMO_CPUS" --memory "$DEMO_MEM" --pids-limit 2048 \
   -p "127.0.0.1:$DEMO_PORT:$DEMO_PORT" \
-  --mount "type=bind,src=$REPO/mepd,dst=$REPO/mepd,readonly" \
+  --mount "type=bind,src=$DEMO_SRC/mepd,dst=$REPO/mepd,readonly" \
   --mount "type=bind,src=$REPO/.venv,dst=$REPO/.venv,readonly" \
   --mount "type=bind,src=$UV_PYTHONS,dst=$UV_PYTHONS,readonly" \
   --mount "type=bind,src=$OPT,dst=$OPT,readonly" \

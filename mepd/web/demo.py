@@ -54,11 +54,27 @@ class DemoPolicy:
         "graph-enumeration": {"rounds": 3, "max_products": 30, "n_break": 2, "n_form": 2, "max_pairs": 10,
                               "workers": 2, "maxiter": 500},
         "nanoreactor": {"time_ps": 10.0, "max_connect": 5, "workers": 2, "instances": 3},
+        # (a complex's atoms are capped by max_atoms, like any structure: /api/complexes)
+        "complex": {"keep": 3},
+        # A few seconds of one CPU at these values.
+        "retrosynthesis": {"iterations": 100, "time_limit": 60, "max_depth": 6, "routes": 5, "width": 10,
+                           "workers": 2},
+    })
+    # op -> field -> the only values allowed (text and choice fields). A
+    # method (family card) fixing a value outside them is shown unavailable.
+    allowed_values: dict = field(default_factory=lambda: {
+        "retrosynthesis": {
+            "method": ("templates",),            # the others need GBs of models, or call a URL the user picks
+            "verify": ("none",),                 # top/all: a path search + TS + IRC per step
+            "stock": ("auto", "paroutes"),       # zinc needs the AiZynthFinder setup
+            "stock_file": ("",),                 # a file path on the server
+            "llm_url": ("http://localhost:11434/v1",),
+        },
     })
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
                           "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor",
-                          "solvent")
+                          "solvent", "complex", "retrosynthesis")
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""
@@ -86,6 +102,22 @@ class DemoPolicy:
                     prop["default"] = cap
                 prop["description"] = (prop.get("description") or "") + f" (demo limit: {cap})"
             desc["schema"] = schema
+        allowed = self.allowed_values.get(desc["key"], {})
+        if allowed and desc.get("schema"):
+            schema = {**desc["schema"], "properties": {k: dict(v) for k, v in desc["schema"]["properties"].items()}}
+            for name, values in allowed.items():
+                prop = schema["properties"].get(name)
+                if prop is None:
+                    continue
+                if prop.get("enum"):
+                    prop["enum"] = [v for v in prop["enum"] if v in values]
+                if prop.get("default") not in values:
+                    prop["default"] = values[0]
+            desc["schema"] = schema
+        if allowed and desc.get("methods"):
+            desc["methods"] = [m if all(m.get("fixed", {}).get(k, v[0]) in v for k, v in allowed.items())
+                               else {**m, "available": False, "reason": "not available in the demo"}
+                               for m in desc["methods"]]
         return desc
 
     # ------------------------------------------------------------ checks
@@ -101,6 +133,16 @@ class DemoPolicy:
                     raise WorkspaceError(f"{name} is disabled in the demo")
             elif isinstance(value, (int, float)) and value > cap:
                 raise WorkspaceError(f"{name} = {value} is above the demo limit of {cap}")
+        allowed = self.allowed_values.get(op_key, {})
+        if allowed:   # unset fields run at their default: check that too
+            from mepd.web.operations import OPERATIONS
+
+            model = OPERATIONS[op_key].params_model if op_key in OPERATIONS else None
+            defaults = {k: f.default for k, f in model.model_fields.items()} if model else {}
+        for name, values in allowed.items():
+            value = (params or {}).get(name, defaults.get(name))
+            if value is not None and value not in values:
+                raise WorkspaceError(f"{name} = {value!r} is not available in the demo")
 
     def check_capacity(self, jobs: list[dict]) -> None:
         active = sum(1 for j in jobs if j["status"] in ("queued", "running"))
