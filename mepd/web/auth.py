@@ -110,7 +110,7 @@ class Auth:
         if not self._token_ok(candidate):
             self._fail(client)
             await asyncio.sleep(0.5)  # blunt online guessing further
-            return login_page("That token is not right.", status=401)
+            return login_page("That password or token is not right.", status=401)
         # Redirect so the token never stays in the address bar or history.
         return self._set_cookie(request, RedirectResponse("/", status_code=303))
 
@@ -238,7 +238,7 @@ def login_page(error: str = "", status: int = 200, demo: bool = False) -> HTMLRe
 </style></head><body>
 <form method="post" action="/login">
   <h1>mepd</h1>
-  <p>{"Enter the demo password you were given. You get your own private workspace." if demo else "Enter the access token printed by <code>mepd web --auth</code>."}</p>
+  <p>{"Enter the demo password you were given. You get your own private workspace." if demo else "Enter your password (<code>mepd web --password</code>), or the access token <code>mepd web --auth</code> printed."}</p>
   {msg}
   <input name="{"password" if demo else "token"}" type="password" autocomplete="current-password" autofocus placeholder="{"password" if demo else "access token"}" required>
   <button type="submit">Log in</button>

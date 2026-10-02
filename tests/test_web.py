@@ -576,6 +576,20 @@ def test_auth_token_login(tmp_path, monkeypatch):
         assert c.post("/login", data={"token": token}).status_code == 429
 
 
+def test_a_chosen_password_logs_in_like_a_token(tmp_path):
+    """`mepd web --password` (deploy/remote/): any length, the same login."""
+    ws = tmp_path / "ws_pw"
+    (ws / "profiles").mkdir(parents=True)
+    (ws / "profiles" / "default.toml").write_text("")
+    with TestClient(create_app(ws, auth_token="david"), follow_redirects=False) as c:
+        assert c.get("/api/state").status_code == 401
+        assert c.post("/login", data={"token": "davi"}).status_code == 401
+        r = c.post("/login", data={"token": "david"})
+        assert r.status_code == 303
+        c.cookies.set("mepd_session", r.cookies.get("mepd_session"))
+        assert c.get("/api/state").status_code == 200
+
+
 def test_token_file_is_private_and_persistent(tmp_path, monkeypatch):
     import stat
 

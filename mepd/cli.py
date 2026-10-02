@@ -1472,6 +1472,11 @@ def web(
         "explicitly when a proxy on this machine (e.g. `tailscale serve`) exposes the port.",
     ),
     new_token: bool = typer.Option(False, "--new-token", help="Rotate the access token (logs every device out)."),
+    password: Optional[str] = typer.Option(
+        None, "--password", envvar="MEPD_WEB_PASSWORD",
+        help="Log in with this password instead of the generated token (turns --auth on). The full app, "
+        "unrestricted: for your own remote access (deploy/remote/), not for sharing.",
+    ),
     demo: bool = typer.Option(
         False, "--demo",
         help="Public demo mode: WORKSPACE is the demo root; anyone with the shared password gets private "
@@ -1496,6 +1501,8 @@ def web(
     if demo:
         _serve_demo(workspace, host, port, max_jobs, demo_password)
         return
+    if password:
+        auth = True
     if auth is None:
         auth = not local_only
     if not auth and not local_only:
@@ -1506,10 +1513,13 @@ def web(
     if auth:
         from mepd.web.auth import load_or_create_token, token_path
 
-        token = load_or_create_token(rotate=new_token)
+        token = password or load_or_create_token(rotate=new_token)
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
     typer.echo(f"mepd web: workspace {workspace.resolve()} -> {url}")
-    if token:
+    if password:
+        typer.echo("Login required: the password you set (--password / MEPD_WEB_PASSWORD).")
+        url = f"{url}/login"
+    elif token:
         typer.echo(f"Login required. Token (also in {token_path()}): {token}")
         typer.echo(f"One-click login link: {url}/login?token={token}")
         ts_name = _tailscale_dns_name()
