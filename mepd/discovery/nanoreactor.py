@@ -48,6 +48,7 @@ import subprocess
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -1358,6 +1359,82 @@ def refine(symbols, frames: np.ndarray, hist: BondHistory, species: list[Species
         _emit(on_event, "refine_reaction", index=n, total=len(reactions), label=rxn.label)
         refine_reaction_one(rxn, _reaction_cuts(symbols, frames, hist, rxn), engine, rx_dir / f"reaction_{rxn.id}",
                             maxiter)
+
+
+class PreviousRefinement:
+    """What an earlier analysis of this run refined (its network.json), as a
+    cache for refine() when the run is extended: species and reactions are
+    matched by identity, so only new ones are optimized. Their files are
+    first copied to names of their own (output/previous/): the new analysis
+    numbers species and reactions afresh and writes by number, which would
+    overwrite them. A reaction's TS result is kept too (`ts(rxn, by_id)`)."""
+
+    def __init__(self, output: Path):
+        import hashlib
+
+        self.species, self.reactions, self._ts = {}, {}, {}
+        fp = Path(output) / "network.json"
+        try:
+            data = json.loads(fp.read_text())
+        except (OSError, ValueError):
+            return
+        keep = Path(output) / "previous"
+
+        def stash(path: Optional[str], tag: str) -> Optional[str]:
+            if not path or not Path(path).exists():
+                return path
+            keep.mkdir(parents=True, exist_ok=True)
+            dst = keep / f"{hashlib.sha1(tag.encode()).hexdigest()[:16]}_{Path(path).name}"
+            if not dst.exists():
+                shutil.copy(path, dst)
+            return str(dst)
+
+        sp = {d["id"]: d for d in data.get("species") or []}
+        keys = {i: f"{d['smiles']}|{d['charge']}|{d['multiplicity']}" for i, d in sp.items()}
+        for i, d in sp.items():
+            if d.get("energy") is None and not d.get("note"):
+                continue                           # never refined
+            self.species[keys[i]] = SimpleNamespace(energy=d.get("energy"), file=stash(d.get("file"), keys[i]),
+                                                     note=d.get("note") or "")
+        for r in data.get("reactions") or []:
+            if not all(i in keys for i in r["reactants"] + r["products"]):
+                continue
+            a = "+".join(sorted(keys[i] for i in r["reactants"]))
+            b = "+".join(sorted(keys[i] for i in r["products"]))
+            key = min(f"{a}>{b}", f"{b}>{a}")
+            c = dict(r.get("complex") or {})
+            for side in ("reactant", "product"):
+                c[side] = stash(c.get(side), f"{key}|{side}")
+            if c:
+                self.reactions[key] = SimpleNamespace(complex=c, reactant_keys=[keys[i] for i in r["reactants"]])
+            if (r.get("ts") or {}).get("barrier_kcal") is not None:
+                self._ts[key] = (r["ts"], tuple(sorted(keys[i] for i in r["reactants"])))
+
+    def results(self) -> tuple[dict, dict]:
+        return dict(self.species), dict(self.reactions)
+
+    def ts(self, rxn, by_id: dict) -> Optional[dict]:
+        """The TS found for this reaction before, if written the same way
+        round (its barrier is from that side); else None (search again)."""
+        hit = self._ts.get(reaction_key(rxn, by_id))
+        if hit is None or hit[1] != tuple(sorted(species_key(by_id[i]) for i in rxn.reactants)):
+            return None
+        return dict(hit[0])
+
+
+class _Caches:
+    """Several refine() caches as one (the earlier analysis, the live refiner)."""
+
+    def __init__(self, *caches):
+        self.caches = [c for c in caches if c is not None]
+
+    def results(self) -> tuple[dict, dict]:
+        sp, rx = {}, {}
+        for c in self.caches:
+            a, b = c.results()
+            sp.update(a)
+            rx.update(b)
+        return sp, rx
 
 
 class LiveRefiner:

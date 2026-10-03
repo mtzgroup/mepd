@@ -275,3 +275,36 @@ def test_an_event_keeps_only_bond_changes_inside_its_own_atoms():
     hist = _history(changes)
     for ev in nr.detect_events(len(SYMBOLS), hist, nr.DetectSettings(), DT):
         assert all(i in ev.atoms and j in ev.atoms for _, i, j, _ in ev.changes)
+
+
+def test_an_extended_run_reuses_what_it_refined_before(tmp_path):
+    """Run longer: species, reaction complexes and TSs from the earlier
+    network.json are reused by identity; their files are kept under names of
+    their own (the new analysis renumbers and would overwrite sp_0 etc.)."""
+    import json
+    from types import SimpleNamespace as NS
+
+    for name in ("sp_0.xyz", "sp_1.xyz", "rc.xyz", "pc.xyz"):
+        (tmp_path / name).write_text(f"1\n{name}\nH 0 0 0\n")
+    net = {"species": [
+        {"id": 0, "smiles": "CC=O", "charge": 0, "multiplicity": 1, "energy": -1.0, "file": str(tmp_path / "sp_0.xyz")},
+        {"id": 1, "smiles": "C=CO", "charge": 0, "multiplicity": 1, "energy": -0.9, "file": str(tmp_path / "sp_1.xyz")},
+        {"id": 2, "smiles": "O", "charge": 0, "multiplicity": 1, "energy": None, "note": ""}],     # never refined
+        "reactions": [{"id": 0, "reactants": [0], "products": [1],
+                       "complex": {"reactant": str(tmp_path / "rc.xyz"), "product": str(tmp_path / "pc.xyz")},
+                       "ts": {"barrier_kcal": 60.0}}]}
+    (tmp_path / "network.json").write_text(json.dumps(net))
+    prev = nr.PreviousRefinement(tmp_path)
+    sp, rx = prev.results()
+    assert set(sp) == {"CC=O|0|1", "C=CO|0|1"}
+    kept = sp["CC=O|0|1"].file
+    assert kept != str(tmp_path / "sp_0.xyz") and "previous" in kept
+    (tmp_path / "sp_0.xyz").write_text("1\noverwritten\nH 0 0 0\n")      # the new analysis reusing the name
+    assert "sp_0.xyz" in open(kept).read().splitlines()[1]
+    (rxn,) = rx.values()
+    assert "previous" in rxn.complex["reactant"]
+    # the same reaction, renumbered: its TS is reused...
+    by_id = {5: NS(smiles="CC=O", charge=0, multiplicity=1), 7: NS(smiles="C=CO", charge=0, multiplicity=1)}
+    assert prev.ts(NS(reactants=[5], products=[7]), by_id) == {"barrier_kcal": 60.0}
+    # ...but not when written the other way round (its barrier is from the other side)
+    assert prev.ts(NS(reactants=[7], products=[5]), by_id) is None

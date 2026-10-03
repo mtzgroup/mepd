@@ -319,16 +319,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if job["op"] == "design-optimize":
                 await run_in_threadpool(apply_design_optimization, manager.ws, job)
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
-            if job["op"] == "nanoreactor":
+            if job["op"] in ("nanoreactor", "nanoreactor-more"):
                 from mepd.web.nanoreactor import adopt_nanoreactor
 
-                if await run_in_threadpool(adopt_nanoreactor, manager.ws, job, final=True):
-                    manager._update(job)
+                base = manager.page_job(job)   # Run longer: its nanoreactor's reactions, updated in place
+                if await run_in_threadpool(adopt_nanoreactor, manager.ws, base, final=True):
+                    manager._update(base)
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
                 if job["status"] == "done" and not job.get("external"):
                     from mepd.web.nanoreactor import spawn_ts_searches
 
-                    spawn_ts_searches(manager, job)
+                    spawn_ts_searches(manager, base)
             if job["op"] == "retrosynthesis" and job["status"] == "done":
                 from mepd.web.retro import adopt_retro
 
@@ -1513,7 +1514,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web.nanoreactor import reactor_view
 
         job = J().get(jid)
-        if job.get("op") != "nanoreactor":
+        if job.get("op") not in ("nanoreactor", "nanoreactor-more"):
             raise HTTPException(404, "not a nanoreactor job")
         return reactor_view(Path(job["output_dir"]), start)
 

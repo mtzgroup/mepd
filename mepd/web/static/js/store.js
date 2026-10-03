@@ -116,7 +116,7 @@ export function toast(message, kind = 'info', ms = 4500, action = null) {
 // ---- navigation ---------------------------------------------------------
 // "Sample more paths" runs add to the run they start from and show on its
 // page (mepd/web/jobs.py: JobManager.page_job).
-function extendsJob(j) { return j?.extends || (j?.op === 'channels-more' ? j.source_job : null); }
+function extendsJob(j) { return j?.extends || (['channels-more', 'nanoreactor-more'].includes(j?.op) ? j.source_job : null); }
 export function pageJobId(id) {
   let j = state.jobs[id];
   const seen = new Set([id]);

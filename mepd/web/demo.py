@@ -54,6 +54,7 @@ class DemoPolicy:
         "graph-enumeration": {"rounds": 3, "max_products": 30, "n_break": 2, "n_form": 2, "max_pairs": 10,
                               "workers": 2, "maxiter": 500},
         "nanoreactor": {"time_ps": 10.0, "max_connect": 5, "workers": 2, "instances": 3},
+        "nanoreactor-more": {"more_ps": 10.0},
         # (a complex's atoms are capped by max_atoms, like any structure: /api/complexes)
         "complex": {"keep": 3},
         # A few seconds of one CPU at these values.
@@ -74,7 +75,7 @@ class DemoPolicy:
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
                           "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor",
-                          "solvent", "complex", "retrosynthesis")
+                          "solvent", "complex", "retrosynthesis", "nanoreactor-more")
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""

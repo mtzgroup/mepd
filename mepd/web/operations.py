@@ -914,6 +914,42 @@ def _build_complex(ctx: JobContext, p: ComplexParams) -> list[str]:
     return ["complex", *mols, *generic_flags(p), "--output", str(ctx.output_dir)]
 
 
+class NanoreactorMoreParams(Params):
+    more_ps: float = P(10.0, "More time (ps)", "Added to the MD, continuing from its last frame: the same reactor, "
+                       "piston and settings. Rounded up to whole piston periods.", kind="custom", gt=0)
+
+
+def _build_nanoreactor_more(ctx: JobContext, p: NanoreactorMoreParams) -> list[str]:
+    """Rerun a nanoreactor in its own folder with a longer --time: the MD
+    resumes from its last segment (finished segments are kept), then the
+    whole trajectory is analyzed again; species, reactions and TSs refined
+    before are reused (nanoreactor.PreviousRefinement), only new ones are
+    computed."""
+    import math
+
+    src = ctx.source
+    if src is None:
+        raise WorkspaceError("Run longer follows up on a finished nanoreactor run")
+    if src.get("external") or not src.get("argv"):
+        raise WorkspaceError("that run was read in place (not run here): there is no command to continue it with")
+    argv = list(src["argv"])
+    if "--trajectory" in argv:
+        raise WorkspaceError("that run analyzed an existing trajectory: there is no MD to continue")
+    out = Path(src["output_dir"])
+    try:
+        sched = json.loads((out / "md" / "schedule.json").read_text())
+        segments = sched["segments"]
+    except (OSError, ValueError, KeyError):
+        raise WorkspaceError("that run has no MD schedule (md/schedule.json) to continue") from None
+    now = float(sched.get("time_ps") or sum(d for d, _ in segments))
+    period = float(argv[argv.index("--period") + 1]) if "--period" in argv else 1.0
+    if abs(now / period - round(now / period)) > 1e-6:
+        raise WorkspaceError(f"that run ended partway through a piston period ({now:g} ps, period {period:g} ps): "
+                             "continuing it would change its last segment")
+    more = math.ceil(p.more_ps / period - 1e-9) * period
+    return _replace_flags(argv, {"--time": f"{now + more:g}", "--output": out})
+
+
 class VriParams(Params):
     branches: Literal["both", "forward", "reverse"] = P(
         "both", "IRC branches", "Which side(s) of TS1 to scan for a valley-ridge transition.", cli="--branches")
@@ -1366,6 +1402,11 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         "and running only the new pairs; the result then covers all of them. (`mepd channels`)",
         "job", PAIR, ChannelsMoreParams, _build_channels_more,
         source_ops=("channels",), cli_path=("channels",)),
+    Operation(
+        "nanoreactor-more", "Run longer", "Continue the reactor's MD from its last frame for more time: new "
+        "reactions join this page and Explore; everything refined before is reused. (`mepd discovery nanoreactor`)",
+        "job", "Reaction discovery", NanoreactorMoreParams, _build_nanoreactor_more,
+        source_ops=("nanoreactor",), cli_path=("discovery", "nanoreactor")),
     Operation(
         "vri-check", "Check the bifurcation", "Converge the exact VRI, test that sideways pushes off the IRC "
         "drain into both P1 and P2, and count trajectories into each. (`mepd discovery vri-check`)",

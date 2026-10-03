@@ -1398,6 +1398,7 @@ def collect_retro(out: Path, charge: int, multiplicity: int) -> dict:
 COLLECTORS = {
     "retrosynthesis": collect_retro,
     "nanoreactor": collect_nanoreactor,
+    "nanoreactor-more": collect_nanoreactor,   # Run longer: the same folder, the longer run
     "optimize": collect_optimize,
     "design-optimize": collect_optimize,
     "design-tsopt": collect_tsopt,

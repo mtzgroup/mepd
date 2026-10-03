@@ -469,6 +469,7 @@ function ResultPanel({ job }) {
       ${['ts', 'tsopt', 'design-tsopt', 'channels'].includes(job.op) && html`<${ConditionsFollowUps} job=${job} />`}
       ${result.vri && html`<${VriFollowUps} job=${job} vri=${result.vri} />`}
       ${job.op === 'channels' && html`<${ChannelsFollowUps} job=${job} />`}
+      ${job.op === 'nanoreactor' && html`<${NanoreactorFollowUps} job=${job} />`}
       ${job.op === 'ts' && html`<${TsFollowUps} job=${job} />`}
       ${result.groups.length > 0 && html`<div class="result-body">
         <div class="entries-col">
@@ -601,6 +602,26 @@ function ChannelsFollowUps({ job }) {
       <${FollowUpCard} op=${op} job=${job} runs=${runs.filter((r) => r.op === op.key)}
         initial=${{ pairs_per_mechanism: cap * 2 }}
         note=${`So far: the best ${cap} conformer pair${cap === 1 ? '' : 's'} per mechanism. Pairs already searched are skipped, and the result and path map then cover all of them.`} />
+    </section>`;
+}
+
+// A finished nanoreactor: more MD time, continuing from its last frame in its
+// own folder (the Reactor tab and this page then show the longer run).
+function NanoreactorFollowUps({ job }) {
+  const operations = useStore((s) => s.operations);
+  const runsKey = useStore((s) => Object.values(s.jobs).filter((j) => j.source_job === job.id)
+    .map((j) => `${j.id}:${j.status}`).sort().join('|'));
+  const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.source_job === job.id && j.op === 'nanoreactor-more')
+    .sort((a, b) => b.created - a.created), [runsKey]);
+  const op = operations.find((o) => o.key === 'nanoreactor-more' && o.available);
+  if (!op || job.external || job.params?.trajectory) return null;
+  if (job.status !== 'done' && !runs.length) return null;
+  const total = (job.params?.time_ps ?? 0) + runs.filter((r) => r.status === 'done').reduce((t, r) => t + (r.params?.more_ps ?? 0), 0);
+  return html`
+    <section class="followups">
+      <h3 class="section-title">Next steps</h3>
+      <${FollowUpCard} op=${op} job=${job} runs=${runs}
+        note=${`${total ? `So far ${total} ps of MD. ` : ''}The run continues from its last frame with the same reactor and piston; species, reactions and TSs it already refined are reused, and new reactions join this page and Explore.`} />
     </section>`;
 }
 
@@ -942,7 +963,8 @@ export function JobView({ jobId: openedId }) {
   const current = tab || (['done'].includes(run.status) || job.external ? 'result' : run.status === 'failed' ? 'log'
     : job.op === 'nanoreactor' ? 'reactor' : 'live');
   const targets = job.targets.structures.map((id) => ({ id, label: structureName(id) }));
-  const runLabel = (j, i) => (i === 0 ? (job.op === 'ts' ? 'First search' : 'First run') : `More paths ${i}`);
+  const runLabel = (j, i) => (i === 0 ? (job.op === 'ts' ? 'First search' : 'First run')
+    : j.op === 'nanoreactor-more' ? `+${j.params?.more_ps ?? '?'} ps` : `More paths ${i}`);
   return html`
     <div class="job-view">
       <div class="view-head">
@@ -984,7 +1006,7 @@ export function JobView({ jobId: openedId }) {
       <div class="tab-body">
         ${current === 'result' && html`<${ResultPanel} job=${page} />`}
         ${current === 'live' && (job.op === 'complex' ? html`<${ComplexLive} key=${run.id} job=${run} />` : html`<${LivePanel} key=${run.id} job=${run} />`)}
-        ${current === 'reactor' && html`<${ReactorLive} key=${run.id} job=${run} />`}
+        ${current === 'reactor' && html`<${ReactorLive} key=${page.id} job=${page} />`}
         ${current === 'map' && html`<${ChannelsMap} job=${page} />`}
         ${current === 'tree' && html`<${OptTree} job=${page} />`}
         ${current === 'log' && html`<${LogPanel} key=${run.id} job=${run} />`}

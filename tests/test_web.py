@@ -1048,6 +1048,21 @@ def _fake_finished_channels(client, tmp_path, a, b):
     return job
 
 
+def _fake_finished_nanoreactor(client, tmp_path, a, b):
+    """A finished nanoreactor to continue (Run longer): its real command and
+    the MD schedule the rerun extends."""
+    (cmd,) = client.post("/api/jobs", json={"op": "nanoreactor", "structures": [a, b], "profile": "default",
+                                           "dry_run": True, "params": {"time_ps": 2.0}}).json()
+    out = tmp_path / "nano_out"
+    (out / "md").mkdir(parents=True)
+    (out / "md" / "schedule.json").write_text(json.dumps({"time_ps": 2.0, "dump_fs": 2.0, "segments": [[0.75, 8.0]]}))
+    jobs = client.app.state.sessions.current.jobs
+    job = {**cmd, "id": "j_nanofake", "status": "done", "output_dir": str(out)}
+    jobs.jobs[job["id"]] = job
+    jobs._write(job)
+    return job
+
+
 def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     # The web UI drives mepd through its CLI; a renamed or removed flag
     # would otherwise only show up as a failed job (it happened: VRI's
@@ -1063,6 +1078,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     src = client.post("/api/jobs/import", json={"path": str(_vri_folder(tmp_path)), "op": "vri"}).json()
     client.post("/api/design/new", json={"smiles": "CCO"})   # so the Design tab's minimization can build
     chan = _fake_finished_channels(client, tmp_path, a["id"], b["id"])   # for "Sample more paths"
+    nano = _fake_finished_nanoreactor(client, tmp_path, a["id"], b["id"])   # for "Run longer"
     ops = client.get("/api/state").json()["operations"]
     checked = 0
     for op in ops:
@@ -1075,6 +1091,7 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
             body["structures"] = [a["id"], b["id"]]
         elif op["target"] == "job":
             body["source_job"] = chan["id"] if "channels" in op.get("source_ops", []) \
+                else nano["id"] if "nanoreactor" in op.get("source_ops", []) \
                 else ts_job if "ts" in op.get("source_ops", []) else src["id"]
         elif op["target"] == "design":
             pass

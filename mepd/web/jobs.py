@@ -35,10 +35,10 @@ TERMINAL = {"done", "failed", "cancelled", "interrupted"}
 
 
 def extends(job: dict) -> Optional[str]:
-    """The job a Sample more paths run adds to (its result shows there)."""
+    """The job a Sample more paths (or Run longer) run adds to (its result shows there)."""
     if job.get("extends"):
         return job["extends"]
-    return job.get("source_job") if job.get("op") == "channels-more" else None
+    return job.get("source_job") if job.get("op") in ("channels-more", "nanoreactor-more") else None
 
 
 EXIT_FILE = "exit_code"   # written by mepd.web.job_runner when the run ends
@@ -680,17 +680,19 @@ class JobManager:
             self._adopt_live_events(job)
         except Exception:   # a bad line must never stop the progress feed
             log.exception("could not add live results of %s to the graph", job["id"])
-        if job.get("op") == "nanoreactor":
+        if job.get("op") in ("nanoreactor", "nanoreactor-more"):
             from mepd.web.nanoreactor import adopt_nanoreactor
 
+            # A Run longer run writes into its nanoreactor's folder: adopted as that run (one set of reactions).
+            base = self.page_job(job)
             try:
-                if adopt_nanoreactor(self.ws, job):
-                    self._write(job)
+                if adopt_nanoreactor(self.ws, base):
+                    self._write(base)
                     self.bus.publish("workspace", self.ws.snapshot())
-                    if (job.get("params") or {}).get("refine_live"):   # reactions refined live: their TS now
+                    if (base.get("params") or {}).get("refine_live"):   # reactions refined live: their TS now
                         from mepd.web.nanoreactor import spawn_ts_searches
 
-                        spawn_ts_searches(self, job)
+                        spawn_ts_searches(self, base)
             except Exception:
                 log.exception("could not add the nanoreactor network of %s to the graph", job["id"])
 

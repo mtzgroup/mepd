@@ -264,6 +264,12 @@ def nanoreactor(
 
     refiner = None
     net_lock = threading.Lock()
+    # A run extended in its own folder (more time): what its earlier analysis
+    # refined is reused, by identity; only new species and reactions are optimized.
+    previous = nr.PreviousRefinement(output) if trajectory is None and (output / "network.json").exists() else None
+    if previous is not None:
+        sp, rx = previous.results()
+        typer.echo(f"Extending this run: {len(sp)} species and {len(rx)} reactions refined before are reused.")
 
     def write_live_network() -> None:
         with net_lock:
@@ -339,12 +345,16 @@ def nanoreactor(
             typer.echo("Waiting for the live refinement to finish...")
             refiner.close(wait=True)
         nr.refine(symbols, frames, hist, species, reactions, run_inputs.engine, output, maxiter=maxiter,
-                  on_event=say, cache=refiner)
+                  on_event=say, cache=nr._Caches(previous, refiner) if previous is not None else refiner)
         nr.write_network(result, output)
         if connect:
             by_id = {s.id: s for s in species}
             todo = [r for r in reactions if r.complex.get("reactant")][:max_connect]
             for n, rxn in enumerate(todo, start=1):
+                found_before = previous.ts(rxn, by_id) if previous is not None else None
+                if found_before is not None:      # searched before this run was extended
+                    rxn.ts = found_before
+                    continue
                 typer.echo(f"TS search {n}/{len(todo)}: {rxn.label}")
                 try:
                     rxn.ts = _ts_for_reaction(rxn, by_id, run_inputs, output, workers)
