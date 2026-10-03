@@ -34,8 +34,13 @@ def test_msreact_fragments_keep_the_atoms_in_order(tmp_path):
 
 def test_the_network_card_offers_five_methods_and_msreact_builds_its_command():
     methods = [(op, m) for op in OPERATIONS.values() if (op.family or {}).get("key") == "network" for m in op.methods]
-    labels = [m["label"] for _, m in sorted(methods, key=lambda x: x[1]["rank"])]
+    ordered = sorted(methods, key=lambda x: x[1]["rank"])
+    labels = [m["label"] for _, m in ordered if not m.get("group")]
     assert labels == ["Nanoreactor", "Bond rules", "CREST msreact", "Hessian sampling", "Basin hopping"]
+    # The retrosynthesis methods share the card, as their own group after these.
+    retro = [m["label"] for op, m in ordered if op.key == "retrosynthesis"]
+    assert retro == ["Templates", "ReactionT5", "Local LLM", "AiZynthFinder"]
+    assert all(m.get("group") for op, m in ordered if op.key == "retrosynthesis")
     assert (OPERATIONS["nanoreactor"].family or {}).get("key") == "network"   # its own operation, on the same card
     op = OPERATIONS["graph-enumeration"]
     p = op.parse_params({"generator": "crest-msreact", "msreact_mode": "isomers", "msreact_nshifts": 2})
