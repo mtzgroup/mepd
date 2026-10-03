@@ -404,3 +404,61 @@ def test_select_per_mechanism_returns_one_best_variant_per_mechanism():
     for c in choices:
         assert mechanism_key(start, c.winner.end_structure) == c.key
         assert c.n_variants > 1
+
+
+# A KAIST pair (12 atoms: Cl, S and a C=O move) for which SLAPMapper returns
+# two distinct minimal-cost correspondences. Angstrom.
+_KAIST_START = """
+Cl -2.384534 0.639125 1.072206
+C -0.631910 0.925017 1.234981
+C -0.151196 0.595778 2.607643
+Cl -0.305177 -1.062457 3.101279
+C 0.405963 1.455997 3.444777
+Cl 0.639359 3.139444 3.105578
+C 0.240972 0.161256 0.232729
+O 1.407871 0.417397 0.145635
+S -0.588545 -1.074590 -0.711840
+H -0.458772 1.984282 1.051943
+H 0.770309 1.154328 4.417790
+H 0.525049 -1.458812 -1.351796
+"""
+_KAIST_END = """
+Cl -1.055472 -2.273324 0.491636
+C -0.121403 -1.260031 -0.549694
+C -0.355023 0.023878 -0.774880
+Cl -1.653886 0.886369 -0.029713
+C 0.503172 0.810936 -1.705274
+Cl 1.504309 2.023320 -0.830947
+C -0.325003 -0.009849 3.059158
+O -1.417284 -0.225484 3.346249
+S 1.136904 0.280101 2.680148
+H 0.705873 -1.769776 -1.027570
+H -0.108576 1.362468 -2.419244
+H 1.186489 0.151192 -2.239868
+"""
+
+
+def _from_rows(text):
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    rows = [ln.split() for ln in text.strip().splitlines()]
+    return Structure(symbols=[r[0] for r in rows],
+                     geometry=np.array([[float(v) for v in r[1:4]] for r in rows]) * ANGSTROM_TO_BOHR,
+                     charge=0, multiplicity=1)
+
+
+def test_every_slapmapper_result_is_its_own_mechanism(monkeypatch):
+    """Distinct SLAPMapper results are never merged into one mechanism, even
+    when their coarse name (bonds broken and formed, by element and symmetry
+    class) is the same -- here forced to collide. Each keeps its own key, the
+    same however often it is computed (the keys group conformer pairs)."""
+    import mepd.atom_mapping as am
+
+    start, end = _from_rows(_KAIST_START), _from_rows(_KAIST_END)
+    honest = am.suggest_mechanism_candidates(start, end)
+    assert len(honest) == 2
+    monkeypatch.setattr(am, "mechanism_key", lambda a, b: "break X | form Y")
+    forced = am.suggest_mechanism_candidates(start, end)
+    assert len(forced) == 2 and all(k.startswith("break X | form Y [centre ") for k in forced)
+    assert sorted(len(v) for v in forced.values()) == sorted(len(v) for v in honest.values())
+    assert list(am.suggest_mechanism_candidates(start, end)) == list(forced)

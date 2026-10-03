@@ -460,7 +460,11 @@ def suggest_mechanism_candidates(
     mapper = SlapMapper(binary=binary)
     mapper.get_maps([lg_start, lg_end], break_sym_targets=list(range(len(lg_start.labels))))
 
-    groups: dict[str, list[AtomMapping]] = {}
+    # Each SLAPMapper result is a mechanism of its own, never merged with
+    # another: only its own symmetry variants (expand_mapping_fully) join it.
+    # A result that is one of an earlier result's variants is that same
+    # correspondence, and is skipped.
+    routes: list[tuple[AtomMapping, list[AtomMapping]]] = []
     seen: set[tuple[int, ...]] = set()
     for result in mapper.results:
         label2idxs_start = result["lgp"][0].label2idxs
@@ -473,16 +477,55 @@ def suggest_mechanism_candidates(
         base = AtomMapping(mapping=mapping, cost=result["val"], n_alternatives=len(mapper.results))
         if tuple(base.as_order()) in seen:
             continue
-        key = mechanism_key(struct_start, realign_end_to_start(base, struct_end))
-        group = groups.setdefault(key, [])
+        variants = []
         for variant in expand_mapping_fully(
             base, struct_start, struct_end, max_variants=max_variants_per_mechanism,
         ):
             order = tuple(variant.as_order())
-            if order not in seen and len(group) < max_variants_per_mechanism:
+            if order not in seen and len(variants) < max_variants_per_mechanism:
                 seen.add(order)
-                group.append(variant)
-    return groups
+                variants.append(variant)
+        routes.append((base, variants))
+    return dict(zip(_route_keys(struct_start, struct_end, [b for b, _ in routes]), (v for _, v in routes)))
+
+
+def _route_keys(struct_start: Structure, struct_end: Structure, bases: list["AtomMapping"]) -> list[str]:
+    """A distinct mechanism key per SLAPMapper result. `mechanism_key` (the
+    bonds broken and formed, atoms named by element and symmetry class) where
+    it is unique; results that share one are told apart by the shape of
+    their reaction centre (which changed bonds share which atoms), then, if
+    even that is the same, by an ordinal in a geometry-independent order --
+    so the same reaction gets the same keys for every conformer pair."""
+    aligned = [realign_end_to_start(b, struct_end) for b in bases]
+    coarse = [mechanism_key(struct_start, e) for e in aligned]
+    keys = list(coarse)
+    for key in set(coarse):
+        idx = [k for k, c in enumerate(coarse) if c == key]
+        if len(idx) < 2:
+            continue
+        sig = {k: _centre_signature(struct_start, aligned[k]) for k in idx}
+        for k in idx:
+            same = sorted((m for m in idx if sig[m] == sig[k]), key=lambda m: tuple(bases[m].as_order()))
+            keys[k] = f"{key} [centre {sig[k][:8]}" + (f" #{same.index(k) + 1}]" if len(same) > 1 else "]")
+    return keys
+
+
+def _centre_signature(start_structure: Structure, aligned_end_structure: Structure) -> str:
+    """Canonical hash of the reaction centre: the atoms whose bonds change
+    (element + symmetry class), joined by their broken and formed bonds."""
+    import networkx as nx
+
+    symbols = list(start_structure.symbols)
+    ranks = _symmetry_ranks(start_structure)
+    before = {tuple(sorted(e)) for e in structure_to_molecule(start_structure).edges()}
+    after = {tuple(sorted(e)) for e in structure_to_molecule(aligned_end_structure).edges()}
+    g = nx.Graph()
+    for edges, kind in ((before - after, "break"), (after - before, "form")):
+        for u, v in edges:
+            for a in (u, v):
+                g.add_node(a, label=f"{symbols[a]}{ranks[a]}")
+            g.add_edge(u, v, kind=kind)
+    return nx.weisfeiler_lehman_graph_hash(g, node_attr="label", edge_attr="kind")
 
 
 def check_atom_mapping(
