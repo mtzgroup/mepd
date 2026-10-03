@@ -353,6 +353,16 @@ def test_expand_mapping_fully_takes_the_cross_product_of_orbits():
     assert len(expand_mapping_fully(identity, propene, propene, max_variants=5)) == 5
 
 
+def test_expand_mapping_fully_does_not_enumerate_a_large_orbit_up_front(monkeypatch):
+    """A 13-atom orbit has 13! permutations; only max_variants are made."""
+    import mepd.atom_mapping as am
+
+    monkeypatch.setattr(am, "_symmetry_orbits", lambda s: [list(range(13))])
+    identity = AtomMapping(mapping={i: i for i in range(13)}, cost=0, n_alternatives=1)
+    variants = am.expand_mapping_fully(identity, None, None, max_variants=50)
+    assert len(variants) == 50 and len({tuple(v.as_order()) for v in variants}) == 50
+
+
 def test_suggest_mechanism_candidates_keeps_both_claisen_mechanisms_fully_expanded():
     from mepd.atom_mapping import mechanism_key, suggest_mechanism_candidates
 

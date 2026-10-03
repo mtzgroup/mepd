@@ -356,15 +356,26 @@ def expand_mapping_fully(
     start_orbits = _symmetry_orbits(start_structure)
     end_orbits = [set(o) for o in _symmetry_orbits(end_structure)]
 
-    free = []  # (sorted start orbit, list of permutations of its image)
+    free = []  # (sorted start orbit, its image)
     for orbit in start_orbits:
         image = sorted(atom_map.mapping[i] for i in orbit)
         if any(set(image) <= end_orbit for end_orbit in end_orbits):
-            free.append((sorted(orbit), list(itertools.permutations(image))))
+            free.append((sorted(orbit), image))
+
+    def product(k=0):
+        # itertools.product would materialize every orbit's permutations up
+        # front: 12! of them for a large orbit (an Ireland-Claisen substrate
+        # took 65 GB). Same order, generated lazily up to max_variants.
+        if k == len(free):
+            yield ()
+            return
+        for perm in itertools.permutations(free[k][1]):
+            for rest in product(k + 1):
+                yield (perm,) + rest
 
     variants = [atom_map]
     seen = {tuple(atom_map.as_order())}
-    for choice in itertools.product(*(perms for _, perms in free)):
+    for choice in product():
         if len(variants) >= max_variants:
             break
         mapping = dict(atom_map.mapping)
