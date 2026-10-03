@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -161,6 +162,17 @@ def restore_rigid_body_hessian(hessian: NDArray, coords, gradient) -> NDArray:
 
 
 _SETPRIV = shutil.which("setpriv")
+
+
+log = logging.getLogger(__name__)
+
+# Retries for an SCF that does not converge (tried in order): Fermi smearing
+# at a raised electronic temperature damps the charge oscillation.
+SCF_FALLBACKS = (("--etemp", "1000", "--iterations", "1000"), ("--etemp", "3000", "--iterations", "1000"))
+
+
+def _scf_not_converged(output: str) -> bool:
+    return bool(re.search(r"SCF not converged|did not converge|cannot be satisfied", output))
 
 
 def _run_gxtb_process(cmd: list[str], *, cwd: Path, env: dict, timeout_s: float,
@@ -382,9 +394,25 @@ class GXTBCalculator(Engine):
         # `watch` (a live viewer reading the optimizer's step log) is called
         # about twice a second while it runs.
         completed = _run_gxtb_process(cmd, cwd=cwd, env=env, timeout_s=self.timeout_s, watch=watch)
+        # An SCF that never settles (oscillating, e.g. on a stretched path
+        # image): retry with Fermi smearing, which damps it. One geometry's
+        # retry costs little; failing it would end the whole path search.
+        # Only g-xTB runs that set no electronic temperature themselves: GFN-xTB
+        # runs through this class (add_gxtb_flag off, e.g. solvation's gas /
+        # solvated pairs) choose theirs, which must match within a pair.
+        own_retries = SCF_FALLBACKS if self.add_gxtb_flag and "--etemp" not in cmd else ()
+        for retry in own_retries:
+            if completed.returncode == 0 or not _scf_not_converged(completed.stdout + completed.stderr):
+                break
+            (cwd / "xtbrestart").unlink(missing_ok=True)   # the failed run's charges
+            completed = _run_gxtb_process(cmd + list(retry), cwd=cwd, env=env, timeout_s=self.timeout_s, watch=watch)
+            if completed.returncode == 0:
+                log.warning("g-xTB SCF did not converge for %s; converged with %s", xyz_path.name, " ".join(retry))
         if completed.returncode != 0:
+            tried = "" if not (own_retries and _scf_not_converged(completed.stdout + completed.stderr)) else \
+                f" (SCF not converged, also with {'; '.join(' '.join(r) for r in SCF_FALLBACKS)})"
             raise ElectronicStructureError(
-                msg=f"g-xTB calculation failed with exit code {completed.returncode}.",
+                msg=f"g-xTB calculation failed with exit code {completed.returncode}{tried}.",
                 obj=completed.stdout + completed.stderr,
             )
         return completed
