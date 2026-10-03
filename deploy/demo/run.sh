@@ -119,7 +119,7 @@ GSM="$(readlink -f "${GSM_EXECUTABLE:-$OPT/gsm/bin/gsm}")"
 
 # The code: DEMO_REF as committed, in its own worktree (the venv's editable
 # install points at $REPO/mepd, so the container mounts it there).
-git -C "$REPO" fetch -q origin
+timeout 30 git -C "$REPO" fetch -q origin || echo "could not reach the remote (git fetch); using the origin refs fetched before"
 if [ -e "$DEMO_SRC/.git" ]; then
   git -C "$DEMO_SRC" checkout -q --detach "$DEMO_REF"
   git -C "$DEMO_SRC" reset -q --hard "$DEMO_REF"

@@ -84,7 +84,7 @@ esac
 [ -s "$PW_FILE" ] || { echo "set a password first: $0 password NEW_PASSWORD"; exit 1; }
 # The code: REMOTE_REF as committed, in its own worktree. PYTHONPATH puts it
 # ahead of the venv's editable install (jobs inherit it, so they run it too).
-git -C "$REPO" fetch -q origin
+timeout 30 git -C "$REPO" fetch -q origin || echo "could not reach the remote (git fetch); using the origin refs fetched before"
 if [ -e "$REMOTE_SRC/.git" ]; then
   git -C "$REMOTE_SRC" checkout -q --detach "$REMOTE_REF"
   git -C "$REMOTE_SRC" reset -q --hard "$REMOTE_REF"
