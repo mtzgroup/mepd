@@ -1,5 +1,5 @@
 """`mepd complex`: a complex (several molecules together, not bonded)
-built from its molecules -- side by side, packed, docked (xtb aISS), a CREST
+built from its molecules -- packed, docked (xtb aISS), a CREST
 NCI ensemble or a CREST QCG solvation shell (see mepd.complexes).
 
 Writes <output>/complexes.xyz (best first; the comment line holds the

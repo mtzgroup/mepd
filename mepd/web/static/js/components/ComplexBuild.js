@@ -2,7 +2,7 @@
 // form for every place that does it: "Combine into a complex" (species
 // picked, so many of each) and a complex node's Conformers card (other
 // arrangements of the molecules it has). Docked, an ensemble or a solvation
-// shell run as a job; packed / side by side are placed at once. Every
+// shell run as a job; packed is placed at once. Every
 // geometry joins the complex node and is minimized at the workspace level.
 import { html, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
@@ -15,7 +15,7 @@ export function ComplexMethodForm({ counts, exclude = [], runLabel, onDone }) {
   const pick = methods.find((m) => m.fixed.method === method) || methods.find((m) => m.available) || methods[0];
   const total = Object.values(counts).reduce((t, n) => t + n, 0);
   const make = () => attempt(() => api.post('/api/complexes', {
-    counts: Object.fromEntries(Object.entries(counts).filter(([, n]) => n > 0)), method: pick?.fixed.method || 'side',
+    counts: Object.fromEntries(Object.entries(counts).filter(([, n]) => n > 0)), method: pick?.fixed.method || 'packed',
   }), null).then((out) => {
     if (!out) return;
     onDone?.(out);

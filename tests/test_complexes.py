@@ -21,13 +21,13 @@ def _pieces(s):
     return sorted(chem.perceive_smiles(f) for f in _fragments(s))
 
 
-@pytest.mark.parametrize("method", ["side", "packed"])
-def test_instant_methods_keep_every_molecule_whole_and_apart(method):
-    (s,) = complexes.build(_mols(), method)
+def test_packing_keeps_every_molecule_whole_apart_and_in_input_order():
+    (s,) = complexes.build(_mols(), "packed")
     assert len(s.symbols) == 13 and s.charge == 0 and s.multiplicity == 1
     assert _pieces(s) == ["CC=O", "O", "O"]
     xyz = np.asarray(s.geometry).reshape(-1, 3)
     assert np.allclose(xyz.mean(axis=0), 0, atol=1e-6)
+    assert list(s.symbols) == [x for m in _mols() for x in m.symbols]
 
 
 def test_packing_is_compact_and_seeded():
@@ -35,14 +35,26 @@ def test_packing_is_compact_and_seeded():
     b, = complexes.build(_mols(), "packed", seed=1)
     c, = complexes.build(_mols(), "packed", seed=2)
     assert np.allclose(a.geometry, b.geometry) and not np.allclose(a.geometry, c.geometry)
-    side, = complexes.build(_mols(), "side")
-    span = lambda s: np.ptp(np.asarray(s.geometry).reshape(-1, 3), axis=0).max()
-    assert span(a) < span(side)                       # packed is rounder than a row
+    xyz = np.asarray(a.geometry).reshape(-1, 3) / 1.8897259886
+    extent = max(np.linalg.norm(m - m.mean(axis=0), axis=1).max()
+                 for m in (np.asarray(x.geometry).reshape(-1, 3) / 1.8897259886 for x in _mols()))
+    assert np.linalg.norm(xyz, axis=1).max() < 3 * (extent + 2.0)   # inside a sphere near the packing radius
+
+
+def test_a_smiles_of_several_molecules_is_packed_not_lined_up():
+    from mepd.cli_common import _load_structure_from_smiles_or_xyz
+
+    s = _load_structure_from_smiles_or_xyz("CC=O.O.O", None, None)
+    assert _pieces(s) == ["CC=O", "O", "O"]
+    assert list(s.symbols)[:3] == ["C", "C", "O"] and list(s.symbols).count("O") == 3
+    xyz = np.asarray(s.geometry).reshape(-1, 3)
+    spans = np.sort(np.ptp(xyz, axis=0))
+    assert spans[-1] < 2.5 * spans[0] + 4.0                        # a cluster, not a row along one axis
 
 
 def test_bad_requests_are_explained():
     with pytest.raises(ValueError, match="at least two"):
-        complexes.build(_mols()[:1], "side")
+        complexes.build(_mols()[:1], "packed")
     with pytest.raises(ValueError, match="one solute"):
         complexes.build(_mols()[:2], "qcg", workdir="/nonexistent")     # one of each: no solvent copies
     with pytest.raises(ValueError, match="unknown method"):
@@ -65,7 +77,7 @@ def test_the_cli_keeps_each_complex_s_charge_and_spin(tmp_path):
     (tmp_path / "oh.xyz").write_text("2\nqcdata_charge=-1 qcdata_multiplicity=1\nO 0 0 0\nH 0 0 0.97\n")
     (tmp_path / "ch3.xyz").write_text("4\nqcdata_charge=0 qcdata_multiplicity=2\nC 0 0 0\nH 1.08 0 0\nH -0.54 0.94 0\n"
                                       "H -0.54 -0.94 0\n")
-    res = CliRunner().invoke(app, ["complex", str(tmp_path / "oh.xyz"), str(tmp_path / "ch3.xyz"), "--method", "side",
+    res = CliRunner().invoke(app, ["complex", str(tmp_path / "oh.xyz"), str(tmp_path / "ch3.xyz"), "--method", "packed",
                                    "-o", str(tmp_path / "out")])
     assert res.exit_code == 0, res.output
     (s,) = chem.structures_from_xyz_text((tmp_path / "out" / "complexes.xyz").read_text())

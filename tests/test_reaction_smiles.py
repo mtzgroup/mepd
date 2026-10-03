@@ -76,6 +76,22 @@ def test_unbalanced_and_charge_mismatch_are_refused():
         reaction_pair("C1CC>>CCC")
 
 
+def test_several_molecules_on_one_side_are_packed_not_lined_up():
+    """'C=C.O.O': three molecules, whose centres a row would put on one line."""
+    import networkx as nx
+    import numpy as np
+
+    from mepd.nodes.node import StructureNode
+
+    start, *_ = reaction_structures("C=C.O.O>>CCO.O")
+    xyz = np.asarray(start.geometry).reshape(-1, 3)
+    frags = list(nx.connected_components(StructureNode(structure=start).graph))
+    assert sorted(len(f) for f in frags) == [3, 3, 6]
+    a, b, c = (xyz[sorted(f)].mean(axis=0) for f in frags)
+    area = np.linalg.norm(np.cross(b - a, c - a)) / 2
+    assert area > 0.5                                   # bohr^2: the centres are not collinear
+
+
 def test_structures_share_symbols_and_charge():
     start, end, pair = reaction_structures("C[O-].CBr>>COC.[Br-]")
     assert start.symbols == end.symbols and start.charge == end.charge == -1 == pair.charge

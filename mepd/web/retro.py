@@ -5,7 +5,7 @@ searches): species by SMILES with a 3D guess, and one reaction per distinct
 step of the routes it reports. Here each species becomes a node (a molecule
 already in the graph is reused, the target is the job's own node) and each
 step a workspace reaction: its reactants and its products (+ byproducts)
-side by side as two complexes joined by a 'proposed' edge, where "Find TS"
+packed as two complexes (mepd.complexes.packed) joined by a 'proposed' edge, where "Find TS"
 maps the atoms and runs, like on any composed reaction. A step the job
 path-searched itself (--verify) carries that barrier.
 """

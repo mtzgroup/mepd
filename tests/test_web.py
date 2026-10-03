@@ -1273,8 +1273,9 @@ def test_complex_built_from_species(tmp_path):
     cx = out["complex"]
     assert not out["existing"] and cx["role"] == "complex" and cx["members"] == [w["id"], w["id"]], cx
     assert cx["natoms"] == 6 and cx["name"] == "2 water"
-    assert complex_intact(ws, cx["id"]) is True              # two waters side by side, unbonded
-    assert make_complex(ws, {w["id"]: 2})["existing"]        # one per composition
+    assert complex_intact(ws, cx["id"]) is True              # two waters packed, unbonded
+    again = make_complex(ws, {w["id"]: 2})["complex"]        # packed: another arrangement each call
+    assert again["id"] != cx["id"] and again["members"] == cx["members"]
     with pytest.raises(WorkspaceError):
         make_complex(ws, {w["id"]: 1})
     ws.delete_many([w["id"]], [])                            # goes with its molecules
@@ -1346,7 +1347,7 @@ def test_a_complex_job_s_geometries_join_its_complex_node(tmp_path):
     h = ws.add_structure(hcn, name="hcn", origin={"kind": "test"})
     out = tmp_path / "out"
     out.mkdir()
-    one, two = place([hcn, water, water]), place([water, hcn, water], gap=3.0)
+    one, two = place([hcn, water, water]), place([water, hcn, water], seed=1)
     bonded = one.model_copy(update={"geometry": np.asarray(one.geometry) * 0.3})    # squashed: atoms bond
     (out / "complexes.xyz").write_text(one.to_xyz() + two.to_xyz() + one.to_xyz() + bonded.to_xyz())
     job = {"id": "j_cx", "output_dir": str(out), "targets": {"structures": [h["id"], w["id"]]},
@@ -1365,7 +1366,7 @@ def test_demo_complexes_obey_the_atom_and_geometry_limits(demo_app):
         v = _visitor(app)
         try:
             (w,) = v.post("/api/structures", json={"text": WATER_XYZ, "optimize": False}).json()
-            r = v.post("/api/complexes", json={"counts": {w["id"]: 3}, "method": "side"})
+            r = v.post("/api/complexes", json={"counts": {w["id"]: 3}, "method": "packed"})
             assert r.status_code == 200 and r.json()["complex"]["natoms"] == 9
             r = v.post("/api/complexes", json={"counts": {w["id"]: 4}, "method": "packed"})
             assert r.status_code == 400 and "10 atoms" in r.json()["detail"]

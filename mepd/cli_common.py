@@ -177,9 +177,10 @@ def _load_structure_from_smiles_or_xyz(
     """Load a Structure from an xyz file path, or -- if `value` isn't an
     existing file -- embed it in 3D from a SMILES string.
 
-    Tries qcinf's default RDKit backend first, then falls back to openbabel:
-    RDKit refuses multi-fragment SMILES (e.g. "C=C.O.O.O" for a solute plus
-    explicit waters), which openbabel embeds fine.
+    Tries qcinf's default RDKit backend first, then falls back to openbabel.
+    A SMILES of several molecules ("C=C.O.O.O") is embedded one molecule at a
+    time and the molecules packed together (mepd.complexes.packed: random
+    orientations in a small sphere), atoms in the order the SMILES lists them.
     """
     path = Path(value)
     if path.exists():
@@ -199,13 +200,31 @@ def _load_structure_from_smiles_or_xyz(
         kwargs["multiplicity"] = multiplicity
 
     errors = []
-    structure = None
-    for backend in ("rdkit", "openbabel"):
-        try:
-            structure = qcinf.smiles_to_structure(value, backend=backend, **kwargs)
-            break
-        except Exception as exc:
-            errors.append(f"{backend}: {type(exc).__name__}: {exc}")
+
+    def embed(smiles):
+        for backend in ("rdkit", "openbabel"):
+            try:
+                return qcinf.smiles_to_structure(smiles, backend=backend)
+            except Exception as exc:
+                errors.append(f"{backend}: {type(exc).__name__}: {exc}")
+        return None
+
+    pieces = [p for p in value.split(".") if p]
+    if len(pieces) > 1 and not path.suffix:
+        from mepd.complexes import packed
+
+        parts = [embed(p) for p in pieces]
+        structure = packed(parts) if all(parts) else None
+        if structure is not None and multiplicity is not None:
+            structure = structure.model_copy(update={"multiplicity": multiplicity})
+    else:
+        structure = None
+        for backend in ("rdkit", "openbabel"):
+            try:
+                structure = qcinf.smiles_to_structure(value, backend=backend, **kwargs)
+                break
+            except Exception as exc:
+                errors.append(f"{backend}: {type(exc).__name__}: {exc}")
 
     if structure is None:
         hint = ""

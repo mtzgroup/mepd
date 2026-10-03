@@ -900,9 +900,9 @@ def _build_nanoreactor(ctx: JobContext, p: NanoreactorParams) -> list[str]:
 
 
 class ComplexParams(Params):
-    method: Literal["dock", "nci", "qcg", "packed", "side"] = P(
+    method: Literal["dock", "nci", "qcg", "packed"] = P(
         "dock", "How", "dock: xtb's aISS docking; nci: a CREST ensemble of arrangements; qcg: a CREST solvation "
-        "shell (one solute, copies of one solvent); packed / side: placed without a search.", cli="--method")
+        "shell (one solute, copies of one solvent); packed: placed without a search.", cli="--method")
     counts: str = P("1", "How many of each", "One count per selected structure, in selection order.", kind="custom")
     keep: int = P(3, "Geometries kept", "dock and nci: the best few, each a geometry of the complex.",
                   cli="--keep", ge=1, le=10)
@@ -1316,9 +1316,7 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
              "install": "conda install -c conda-forge crest",
              "summary": "CREST grows the copies of one solvent around one solute. A minute or so."},
             {"label": "Packed", "rank": 3, "fixed": {"method": "packed"},
-             "summary": "Random orientations in a small sphere, like the nanoreactor (Packmol if installed). Instant."},
-            {"label": "Side by side", "rank": 4, "fixed": {"method": "side"},
-             "summary": "In a row, a few Å apart. Instant."})),
+             "summary": "Random orientations in a small sphere, like the nanoreactor (Packmol if installed). Instant."})),
     Operation(
         "tsopt", "Optimize TS from guess", "Treat the structure as a TS guess: saddle optimization, "
         "optionally followed by IRC. (`mepd ts`)",

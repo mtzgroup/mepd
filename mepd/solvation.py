@@ -135,6 +135,14 @@ class SolvationCorrection:
     fallbacks: list = field(default_factory=list, init=False, repr=False)
     _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
 
+    # GSM pickles its engine for the gradient helper; a lock cannot be pickled.
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if k != "_lock"}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def __post_init__(self):
         from mepd.engines.gxtb import GXTBCalculator
 

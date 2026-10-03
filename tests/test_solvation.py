@@ -98,6 +98,19 @@ def test_solvated_engine_adds_the_correction_once(monkeypatch):
     assert eng.compute_energies([m])[0] == pytest.approx(m.coords[1, 0] * 0.99)
 
 
+@pytest.mark.skipif(not (shutil.which("xtb") or os.getenv("XTB_EXECUTABLE")), reason="needs xtb")
+def test_a_solvated_engine_survives_pickling():
+    """GSM pickles its engine for the gradient helper."""
+    import pickle
+
+    import mepd.solvation as S
+
+    eng = pickle.loads(pickle.dumps(S.SolvatedEngine(_Base(), "water")))
+    with eng.correction._lock:
+        pass
+    assert eng.solvent == "water" and eng.correction.solvent == "water"
+
+
 def test_a_solvent_model_with_no_effect_is_refused(monkeypatch):
     import mepd.solvation as S
 

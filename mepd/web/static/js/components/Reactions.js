@@ -294,7 +294,7 @@ export function ReactionCard({ r, event = null, compact = false }) {
         ${events.map((e, i) => html`<button class=${`btn-link small ${e === ev ? 'on' : ''}`} onClick=${() => setEv(e)}>${i + 1}</button>`)}</div>`}
       ${view === 'event' && ev != null && job && html`<${EventPlayer} key=${`${job}:${ev}`} jobId=${job} event=${ev} height=${height} />`}
       ${view === 'rc' && html`<${Viewer3D} xyz=${xyzR} height=${height} />
-        <p class="small muted">${r.origin?.kind === 'composed' ? 'The reactants placed side by side, then optimized together.'
+        <p class="small muted">${r.origin?.kind === 'composed' ? 'The reactants packed together, then optimized together.'
           : 'Only the molecules this reaction needs, optimized together (from the MD frame before it).'}</p>`}
       ${view === 'pc' && html`<${Viewer3D} xyz=${xyzP} height=${height} />`}
       ${view === 'ts' && (xyzTS === ''

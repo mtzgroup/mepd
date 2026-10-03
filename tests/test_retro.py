@@ -145,6 +145,20 @@ def test_routes_join_explore_as_reactions(tmp_path):
     assert len(species) == 4                       # target, aniline, benzoyl chloride, HCl
     assert not adopt_retro(ws, job)                # again: nothing new
     assert len(ws.snapshot()["reactions"]) == 1
+    # Each side's complex is packed, never lined up: the old row put every
+    # molecule's centre on the x axis.
+    import networkx as nx
+    import numpy as np
+
+    from mepd.nodes.node import StructureNode
+
+    for cid in rx["complexes"]:
+        s = ws.load_structure(cid)
+        xyz = np.asarray(s.geometry).reshape(-1, 3)
+        frags = list(nx.connected_components(StructureNode(structure=s).graph))
+        assert len(frags) == 2
+        d = xyz[sorted(frags[0])].mean(axis=0) - xyz[sorted(frags[1])].mean(axis=0)
+        assert np.hypot(d[1], d[2]) > 0.2 * np.linalg.norm(d)
 
 
 def test_web_operation_builds_the_command(tmp_path):

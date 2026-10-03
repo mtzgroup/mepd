@@ -4,9 +4,9 @@ energies are a screening level's, so callers minimize them at their own
 level of theory before comparing anything.
 
 Methods:
-  side    side by side along x, closest contacts `gap` apart. Instant.
   packed  random orientations inside the smallest sphere they fit in
-          (the nanoreactor's packer; Packmol when it is installed). Instant.
+          (the nanoreactor's packer; Packmol when it is installed). Instant,
+          and the default: nothing to install.
   dock    xtb's aISS docking: interaction sites screened on a grid, then
           a genetic search and GFN2 optimizations of the best poses. Several
           molecules are added one at a time. Seconds to a minute.
@@ -34,8 +34,8 @@ from typing import Optional, Sequence
 import numpy as np
 from qcconst.constants import ANGSTROM_TO_BOHR
 
-METHODS = ("side", "packed", "dock", "nci", "qcg")
-INSTANT = ("side", "packed")
+METHODS = ("packed", "dock", "nci", "qcg")
+INSTANT = ("packed",)
 
 _Z = {"H": 1, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "Si": 14, "P": 15, "S": 16, "Cl": 17, "Br": 35, "I": 53}
 
@@ -52,26 +52,11 @@ def _structure(symbols, coords_angstrom, charge: int):
                      charge=int(charge), multiplicity=1 if electrons % 2 == 0 else 2)
 
 
-def side_by_side(structures: Sequence, gap: float = 2.6):
-    """One structure holding every molecule, side by side along x, each
-    centred, the closest contact between neighbours `gap` Angstrom."""
-    symbols, blocks, x_end = [], [], None
-    for s in structures:
-        xyz = _coords(s)
-        xyz = xyz - xyz.mean(axis=0)
-        if x_end is not None:
-            xyz[:, 0] += x_end - xyz[:, 0].min() + gap
-        x_end = xyz[:, 0].max()
-        symbols += list(s.symbols)
-        blocks.append(xyz)
-    coords = np.vstack(blocks)
-    return _structure(symbols, coords - coords.mean(axis=0), sum(int(s.charge) for s in structures))
-
-
 def packed(structures: Sequence, *, seed: int = 0, min_distance: float = 2.0):
     """Random orientations in the smallest sphere they fit in (grown 8% at
     a time from the largest molecule's size): Packmol when installed, else
-    the nanoreactor's packer."""
+    the nanoreactor's packer. Atoms come out in input order (the molecules
+    in the order given, each in its own order)."""
     from mepd.discovery.nanoreactor import pack_reactor
 
     charge = sum(int(s.charge) for s in structures)
@@ -82,8 +67,9 @@ def packed(structures: Sequence, *, seed: int = 0, min_distance: float = 2.0):
         try:
             if exe:
                 return _structure(*_packmol(structures, radius, seed, min_distance, exe), charge)
-            symbols, coords, _, _ = pack_reactor(structures, radius, seed=seed, min_distance=min_distance, tries=400)
-            return _structure(symbols, coords, charge)
+            symbols, coords, _, owner = pack_reactor(structures, radius, seed=seed, min_distance=min_distance, tries=400)
+            order = sorted(range(len(owner)), key=lambda i: (owner[i], i))   # back to input order
+            return _structure([symbols[i] for i in order], np.asarray(coords)[order], charge)
         except RuntimeError:
             radius *= 1.08
     raise RuntimeError("could not pack these molecules")
@@ -292,8 +278,6 @@ def build(structures: Sequence, method: str, workdir: Optional[Path] = None, *, 
         raise ValueError(f"unknown method {method!r} (one of {', '.join(METHODS)})")
     if len(structures) < 2:
         raise ValueError("a complex needs at least two molecules")
-    if method == "side":
-        return [side_by_side(structures)]
     if method == "packed":
         return [packed(structures, seed=seed)]
     if workdir is None:

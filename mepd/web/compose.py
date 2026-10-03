@@ -23,12 +23,12 @@ from mepd.web import chem
 from mepd.web.workspace import Workspace, WorkspaceError, is_species, new_id
 
 
-def place(structures: list, gap: float = 2.6):
-    """One structure holding every molecule, side by side along x (see
-    mepd.complexes, which has the other ways of building a complex)."""
-    from mepd.complexes import side_by_side
+def place(structures: list, seed: int = 0):
+    """One structure holding every molecule, packed (random orientations in
+    a small sphere; mepd.complexes has the other ways of building a complex)."""
+    from mepd.complexes import packed
 
-    return side_by_side(structures, gap)
+    return packed(structures, seed=seed)
 
 
 def _elements(structures) -> Counter:
@@ -154,19 +154,16 @@ def complex_members(ws: Workspace, counts: dict) -> list:
     return members
 
 
-def make_complex(ws: Workspace, counts: dict, method: str = "side") -> dict:
+def make_complex(ws: Workspace, counts: dict, method: str = "packed") -> dict:
     """A complex of species in the graph, `counts` {species id: how many},
-    built at once: "side" (side by side; the complex already built is
-    returned instead) or "packed" (random orientations in the smallest
-    sphere: each call another arrangement, a new geometry of the complex).
+    built at once by "packed" (random orientations in the smallest sphere:
+    each call another arrangement, a new geometry of the complex).
     Minimizing gathers them. Returns {"complex", "existing"}."""
     from mepd.complexes import build
 
     members = complex_members(ws, counts)
     have = [rec for rec in ws.snapshot()["structures"].values()
             if rec.get("role") == "complex" and sorted(rec.get("members") or []) == members]
-    if have and method == "side":
-        return {"complex": have[0], "existing": True}
     (s,) = build(species_structures(ws, members), method, seed=len(have))
     res = ws.add_or_merge(s, optimized=False, origin={"kind": "composed", "label": f"complex built from species ({method})"})
     if res["rec"].get("role") != "complex":

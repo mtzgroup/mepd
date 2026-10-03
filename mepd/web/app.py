@@ -217,7 +217,7 @@ class ComposeIn(BaseModel):
 
 class ComplexIn(BaseModel):
     counts: dict[str, int]            # species id -> how many
-    method: str = "side"              # mepd.complexes.METHODS: side/packed at once, the others as a job
+    method: str = "packed"            # mepd.complexes.METHODS: packed at once, the others as a job
     keep: int = 3
     profile: Optional[str] = None
 

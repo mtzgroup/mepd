@@ -105,7 +105,7 @@ export function ComplexLive({ job }) {
   }
   if (!hasFrames) {
     return html`<div class="empty-hint"><p>${data?.stage || 'Building the complex…'}
-      ${data?.method === 'packed' || data?.method === 'side' ? '' : ' The molecules show here as soon as the program places them.'}</p></div>`;
+      ${data?.method === 'packed' ? '' : ' The molecules show here as soon as the program places them.'}</p></div>`;
   }
   return html`<div class="rx-live">
     <div class="rx-main">

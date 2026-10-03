@@ -244,7 +244,7 @@ function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = 
     </div>
     ${cxWay === 'arrange'
       ? html`<p class="small muted">Other arrangements of its molecules; each becomes a geometry of this complex.</p>
-        <${ComplexMethodForm} counts=${memberCounts(cxRec.members)} exclude=${['side']} runLabel="Find arrangements" />`
+        <${ComplexMethodForm} counts=${memberCounts(cxRec.members)} runLabel="Find arrangements" />`
       : html`<p class="small muted">Samples the complex as one structure, as for a molecule: its conformers join this geometry.
         Plain CREST can let the molecules drift apart; Arrange › Ensemble (CREST's NCI mode) keeps them together.</p>${opBody}`}
   </div>`;
