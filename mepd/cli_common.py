@@ -477,17 +477,26 @@ def _check_endpoint_atom_mapping(
 
     metric = run_inputs.atom_mapping_inputs.metric
     n_other = sum(c.label != "identity" for c in candidates)
-    typer.echo(
-        f"Atom mapping: the start's and end's bonds already correspond (checked with SLAPMapper); comparing "
-        f"the current numbering with {n_other} relabeling(s) of its symmetric atoms, by {metric}..."
-        if atom_map.is_identity else
-        f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
-        f"current numbering with {n_other} other(s) found by SLAPMapper, by {metric} (lower is better)..."
-        if n_other < len(candidates) else
-        f"Atom mapping: the end's atoms are in a different element order from the start's, so its current "
-        f"numbering can't be used. Choosing among {n_other} numbering(s) found by SLAPMapper, by {metric} "
-        f"(lower is better)..."
-    )
+    if atom_map.is_identity:
+        typer.echo(
+            f"Atom mapping: the start's and end's bonds already correspond (checked with SLAPMapper); comparing "
+            f"the current numbering with {n_other} relabeling(s) of its symmetric atoms, by {metric}...")
+    else:
+        # What SLAPMapper found, and what was added: the budget (n_candidates)
+        # is filled with relabelings of symmetric atoms of its best mapping.
+        n_sym = sum(c.label != "identity" and c.atom_map.relabeling for c in candidates)
+        pool = f"{n_other - n_sym} numbering(s) from SLAPMapper"
+        if n_sym:
+            pool += f" and {n_sym} relabeling(s) of their symmetric atoms"
+        if len(atom_maps) >= n_candidates:
+            pool += f" (capped at {n_candidates})"
+        typer.echo(
+            f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
+            f"current numbering with {pool}, by {metric} (lower is better)..."
+            if n_other < len(candidates) else
+            f"Atom mapping: the end's atoms are in a different element order from the start's, so its current "
+            f"numbering can't be used. Choosing among {pool}, by {metric} (lower is better)..."
+        )
 
     debug_dump_dir = Path(output) / "realign_debug" if debug_dump and output is not None else None
     try:

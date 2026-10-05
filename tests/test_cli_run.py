@@ -762,6 +762,35 @@ def test_atom_mapping_reindexes_when_mapping_scores_better(monkeypatch, capsys):
     assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
 
 
+def test_atom_mapping_says_how_many_numberings_slapmapper_found(monkeypatch, capsys):
+    """The candidate budget (n_candidates) is filled with relabelings of
+    symmetric atoms: the log tells those apart from what SLAPMapper found,
+    instead of crediting SLAPMapper with the whole budget."""
+    pytest.importorskip("slapmapper")
+    import dataclasses
+    from itertools import permutations
+
+    import mepd.atom_mapping as am
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    _patch_candidate_scores(monkeypatch, identity=10.0, mapping=0.0)
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "geodesic-distance"
+    run_inputs.atom_mapping_inputs.n_candidates = 4
+    start = _propene_structure(range(9))
+    end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
+    (found,) = am.suggest_atom_mapping_candidates(start, end, max_candidates=1)
+    # SLAPMapper's mapping, then the methyl hydrogens (start atoms 6-8) swapped: the budget's other 3.
+    swaps = [dataclasses.replace(found, mapping={**found.mapping, **{a: found.mapping[b] for a, b in zip((6, 7, 8), p)}},
+                                 relabeling=True) for p in list(permutations((6, 7, 8)))[1:4]]
+    monkeypatch.setattr(am, "suggest_atom_mapping_candidates", lambda *a, **k: [found, *swaps])
+
+    with pytest.warns(UserWarning, match="disagrees"):
+        _check_endpoint_atom_mapping(start, end, True, run_inputs)
+    out = " ".join(capsys.readouterr().out.split())
+    assert "1 numbering(s) from SLAPMapper and 3 relabeling(s) of their symmetric atoms (capped at 4)" in out
+
+
 def test_atom_mapping_veto_margin_keeps_identity_on_small_improvement(monkeypatch):
     """--atom-mapping-veto-margin requires a non-identity candidate to beat
     identity by MORE than the margin -- a small improvement within the

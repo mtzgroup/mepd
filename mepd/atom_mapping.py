@@ -51,6 +51,9 @@ class AtomMapping:
     mapping: dict[int, int]
     cost: float
     n_alternatives: int
+    # A relabeling of symmetric atoms added to fill the candidate budget,
+    # not a mapping SLAPMapper itself returned.
+    relabeling: bool = False
 
     @property
     def is_identity(self) -> bool:
@@ -327,6 +330,7 @@ def suggest_atom_mapping_candidates(
             if order in seen_orders:
                 continue
             seen_orders.add(order)
+            expansion.relabeling = True
             candidates.append(expansion)
             if len(candidates) >= max_candidates:
                 break
