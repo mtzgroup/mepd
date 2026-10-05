@@ -111,6 +111,7 @@ mepd = "mepd.cli:app"
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "pytest-xdist>=3.6",
 ]
 # The full app, installed by a plain `uv sync` / `uv run` (default-groups),
 # so neither ever strips the extras the web app needs.
@@ -129,6 +130,10 @@ packages = ["mepd"]
 # Keep the numpy the rest of the project runs on instead of downgrading it.
 override-dependencies = ["numpy>=2.2.6,<2.6"]
 default-groups = ["dev", "app"]
+
+[tool.pytest.ini_options]
+# 4 workers (~2 min instead of ~5); `-n 0` runs one test in-process to debug.
+addopts = "-n 4"
 
 [tool.hatch.metadata]
 # The `aam` optional-dependency group pins slapmapper via a git URL

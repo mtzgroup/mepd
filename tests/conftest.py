@@ -12,6 +12,26 @@ def _private_web_state(tmp_path, monkeypatch):
     monkeypatch.setenv("MEPD_WEB_STATE_DIR", str(tmp_path / "_mepd_web_state"))
 
 
+@pytest.fixture(autouse=True)
+def _results_parsed_in_threads(monkeypatch):
+    """The web app reads job results in spawned worker processes (two per
+    app, each importing mepd and RDKit). Tests read them in threads: a
+    spawned pool per test cost seconds each and could leave pytest waiting
+    on a worker at exit."""
+    try:
+        from mepd.web.app import ResultParser
+    except ImportError:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _get(self):
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(self.workers)
+        return self._pool
+
+    monkeypatch.setattr(ResultParser, "_get", _get)
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "real_programs: use mepd.programs' real lookup (and allow its download)")
 

@@ -157,9 +157,12 @@ def end_live_stream(status: str = "done") -> None:
 def _atomic_json_write(path: Path, payload: dict) -> None:
     # Readers poll these files while they are rewritten every step: write a
     # temp file and rename, so a reader never sees half a JSON document.
+    # json.dumps, not json.dump: dump always uses the pure-Python encoder
+    # (~10x slower), and this runs several times per path-search step.
+    text = json.dumps(payload)
     tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
+        handle.write(text)
     os.replace(tmp, path)
 
 

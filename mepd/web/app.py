@@ -282,7 +282,13 @@ class ResultParser:
 
     def shutdown(self) -> None:
         if self._pool is not None:
+            procs = list((getattr(self._pool, "_processes", None) or {}).values())
             self._pool.shutdown(wait=False, cancel_futures=True)
+            # A worker still importing mepd (or stuck) would otherwise keep
+            # the exiting process waiting on it forever.
+            for p in procs:
+                p.terminate()
+            self._pool = None
 
 
 def _warm_worker() -> None:
