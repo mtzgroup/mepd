@@ -9,6 +9,7 @@ import { ReactionCard, reactionOf } from './Reactions.js';
 import { useStore } from '../store.js';
 
 const FPS = 30;   // reactor frames shown per second at 1x (a frame is ~10 fs)
+const POLL_S = 2.5;   // seconds between fetches of new frames while the MD runs
 
 // Theme colours, read once per theme: getComputedStyle inside the
 // animation loop forces a style/layout pass of the whole page every frame
@@ -306,6 +307,7 @@ export function ReactorLive({ job }) {
   const [speed, setSpeed] = useState(1);
   const [activeIds, setActiveIds] = useState('');   // events in progress (React renders on change only)
   const next = useRef(0);
+  const mdRate = useRef(0);                   // frames/s the MD delivers (smoothed), while it runs
   const dRef = useRef(null);
   const iRef = useRef(0);
   const hud = useRef(null);
@@ -318,17 +320,25 @@ export function ReactorLive({ job }) {
   useEffect(() => {
     let alive = true, timer;
     next.current = 0;
+    mdRate.current = 0;
     setD(null);
+    let at = 0;
     const pull = async () => {
       try {
         const r = await api.get(`/api/jobs/${job.id}/reactor?start=${next.current}`);
         if (!alive) return;
+        const now = performance.now();
+        if (at && r.start > 0) {
+          const rate = r.frames.length / ((now - at) / 1000);
+          mdRate.current = mdRate.current ? 0.7 * mdRate.current + 0.3 * rate : rate;
+        }
+        at = now;
         next.current = r.start + r.frames.length * r.stride;
         setD((old) => (old && old.stride === r.stride && r.start > 0
           ? { ...r, frames: old.frames.concat(r.frames), radius: old.radius.concat(r.radius) }
           : r));
       } catch (e) { /* not started yet */ }
-      if (alive && ['running', 'queued'].includes(job.status)) timer = setTimeout(pull, 2500);
+      if (alive && ['running', 'queued'].includes(job.status)) timer = setTimeout(pull, POLL_S * 1000);
     };
     pull();
     return () => { alive = false; clearTimeout(timer); };
@@ -373,12 +383,21 @@ export function ReactorLive({ job }) {
     if (!playing || open) return undefined;
     let raf, last = performance.now(), acc = 0;
     const tick = (now) => {
-      acc += ((now - last) / 1000) * FPS * speed;
+      const n = dRef.current ? dRef.current.frames.length : 0;
+      let rate = FPS * speed;
+      // Live, near the edge: play at the pace the MD makes frames, a poll
+      // or so behind it (faster when further back, slower when closer).
+      // At full speed the view caught up in a moment and then stood still
+      // until the next poll: start, stop, start.
+      if (runningRef.current && mdRate.current > 0) {
+        const lag = 1.5 * POLL_S * mdRate.current;
+        rate = Math.min(rate, mdRate.current * Math.max(0, n - 1 - iRef.current) / lag);
+      }
+      acc += ((now - last) / 1000) * rate;
       last = now;
       if (acc >= 1) {
         const step = Math.min(Math.floor(acc), 2 * Math.max(1, Math.round(speed)));
-        acc = 0;   // late frames are dropped, not caught up
-        const n = dRef.current ? dRef.current.frames.length : 0;
+        acc = Math.min(acc - step, 1);   // late frames are dropped, not caught up
         if (n) {
           let k = iRef.current + step;
           if (k >= n) k = runningRef.current ? n - 1 : 0;   // live: wait at the edge; done: loop
