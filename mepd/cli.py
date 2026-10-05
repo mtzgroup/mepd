@@ -233,6 +233,12 @@ def run(
         "surface) and off when both are already-provided xyz files "
         "(presumed already minimized). Pass explicitly to override either way.",
     ),
+    pair_from: str = typer.Option(
+        "both", "--pair-from",
+        help="both: use both endpoints as given. start: replace the end with one built in the start's frame "
+        "(each atom where it is in the start, the end's bonds pulled to length, minimized), so only what "
+        "reacts moves. end: the same the other way round. After the atom-mapping check.",
+    ),
     recursive: bool = typer.Option(
         False, "--recursive",
         help="Recursively autosplit the path (MSMEP) instead of running a single NEB.",
@@ -323,7 +329,7 @@ def run(
         "and consider (they're ties, not ranked by quality among themselves).",
     ),
     atom_mapping_metric: str = typer.Option(
-        "geodesic-distance", "--atom-mapping-metric",
+        "snap-gi-xtb", "--atom-mapping-metric",
         help="--atom-mapping: " + _MAPPING_HELP + " (One pair here, so rmsd-geodesic compares its "
         "candidates by GI path.) One of: " + ", ".join(_OFFERED_METRICS) + ".",
     ),
@@ -364,6 +370,10 @@ def run(
         raise typer.BadParameter(
             "--network-completion-mode must be 'linear' or 'all-to-all'."
         )
+    if not isinstance(pair_from, str):   # typer's OptionInfo when called directly
+        pair_from = "both"
+    if pair_from not in ("both", "start", "end"):
+        raise typer.BadParameter("--pair-from must be both, start or end.")
     if irc and not use_tsopt:
         raise typer.BadParameter("--irc requires --use-tsopt.")
     if same_pair_split_limit <= 0:
@@ -447,6 +457,21 @@ def run(
         )
         if realigned_end_structure is not end_node.structure:
             end_node = StructureNode(structure=realigned_end_structure)
+
+    if pair_from != "both":
+        from mepd.cli_channels import _build_partners
+
+        source, target = (start_node, end_node) if pair_from == "start" else (end_node, start_node)
+        built_name = "end" if pair_from == "start" else "start"
+        typer.echo(f"--pair-from {pair_from}: building the {built_name} in the {pair_from}'s frame...")
+        _, built = _build_partners([source], target, run_inputs)
+        if not built:
+            raise typer.BadParameter(f"--pair-from {pair_from}: the built {built_name} changed its bonds on "
+                                     "minimization (or could not be embedded).")
+        if pair_from == "start":
+            end_node = built[0]
+        else:
+            start_node = built[0]
 
     seed_chain = Chain.model_validate({
         "nodes": [start_node, end_node],

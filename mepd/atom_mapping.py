@@ -334,6 +334,77 @@ def suggest_atom_mapping_candidates(
     return candidates
 
 
+def _symmetry_colors(structure: Structure) -> list:
+    """Per atom, its element and RDKit symmetry class (`_symmetry_ranks`,
+    which tells diastereotopic groups apart: a bare graph automorphism could
+    swap them, inverting a stereocentre); the element alone where RDKit
+    can't perceive the bonds."""
+    ranks = _symmetry_ranks(structure)
+    if len(set(ranks)) == len(ranks) and ranks == list(range(len(ranks))):
+        return list(structure.symbols)
+    return [f"{x}{r}" for x, r in zip(structure.symbols, ranks)]
+
+
+def _automorphisms(structure: Structure):
+    """The bond graph's automorphisms that keep every bond and every atom's
+    `_symmetry_colors`, lazily, as arrays: sigma[i] is where atom i goes.
+    The graph is the one SLAPMapper sees (`structure_to_molecule`).
+    Identity alone if there is no symmetry or nauty can't be used."""
+    n = len(structure.symbols)
+    try:
+        import pynauty
+        from sympy.combinatorics import Permutation, PermutationGroup
+
+        adj = {i: [] for i in range(n)}
+        for u, v in structure_to_molecule(structure).edges():
+            adj[int(u)].append(int(v))
+            adj[int(v)].append(int(u))
+        by_color: dict = {}
+        for i, c in enumerate(_symmetry_colors(structure)):
+            by_color.setdefault(c, set()).add(i)
+        gens = pynauty.autgrp(pynauty.Graph(n, adjacency_dict=adj, vertex_coloring=list(by_color.values())))[0]
+    except Exception:
+        gens = []
+    if not gens:
+        return iter([list(range(n))])
+    return PermutationGroup([Permutation(g) for g in gens]).generate(af=True)
+
+
+# snap's search is greedy; which of its settings lands lowest varies from
+# molecule to molecule, and each run takes milliseconds, so all are kept.
+SNAP_SETTINGS = ({}, {"align_per_component": True}, {"factor_depth": 2},
+                 {"factor_depth": 2, "align_per_component": True})
+
+
+def _snap_variants(atom_map: "AtomMapping", start_structure: Structure, end_structure: Structure) -> list:
+    """Relabelings of `atom_map` by start-graph automorphisms that bring the
+    end close to the start (endpoint RMSD), found the way snap-RMSD does
+    (qcinf): the molecule is factored into a core and its symmetric groups,
+    and each group's own permutations are scored in turn, so even an
+    astronomically large symmetry group costs milliseconds. The end, put in
+    the start's atom order, is given the start's bond graph so the two are
+    isomorphic by construction. One per `SNAP_SETTINGS`; [] if snap can't be
+    used."""
+    try:
+        from qcinf.algorithms.snap import snap_rmsd_align_assign
+
+        conn = [(int(u), int(v), 1.0) for u, v in structure_to_molecule(start_structure).edges()]
+        colors = _symmetry_colors(start_structure)
+        aligned = realign_end_to_start(atom_map, end_structure)
+    except Exception:
+        return []
+    out = []
+    for settings in SNAP_SETTINGS:
+        try:
+            _, _, p = snap_rmsd_align_assign(start_structure, aligned, a_connectivity=conn, b_connectivity=conn,
+                                             a_coloring=colors, b_coloring=colors, **settings)
+        except Exception:
+            continue
+        out.append(AtomMapping(mapping={i: atom_map.mapping[int(p[i])] for i in range(len(p))},
+                               cost=atom_map.cost, n_alternatives=atom_map.n_alternatives))
+    return out
+
+
 def expand_mapping_fully(
     atom_map: "AtomMapping",
     start_structure: Structure,
@@ -341,53 +412,34 @@ def expand_mapping_fully(
     *,
     max_variants: int = 200,
 ) -> list["AtomMapping"]:
-    """`atom_map` itself plus every cost-preserving relabeling of it: for
-    each start-side symmetry orbit whose image lies inside one end-side
-    orbit (see `expand_mapping_by_symmetry`), every permutation of that
-    image, taken jointly across orbits (the full cross product), up to
-    `max_variants` in total (`atom_map` first).
+    """`atom_map` and its relabelings by the start graph's automorphisms,
+    up to `max_variants` (`atom_map` first, then those with the lowest
+    endpoint RMSD over the whole group: `_snap_variants`, then the group's
+    elements in turn).
 
-    These all describe the same mechanism, but not the same path: which of
-    a CH2's two hydrogens goes where decides whether the group has to
-    rotate on the way, so each variant needs its own geodesic score against
-    the actual pair of conformers."""
-    import itertools
-
-    start_orbits = _symmetry_orbits(start_structure)
-    end_orbits = [set(o) for o in _symmetry_orbits(end_structure)]
-
-    free = []  # (sorted start orbit, its image)
-    for orbit in start_orbits:
-        image = sorted(atom_map.mapping[i] for i in orbit)
-        if any(set(image) <= end_orbit for end_orbit in end_orbits):
-            free.append((sorted(orbit), image))
-
-    def product(k=0):
-        # itertools.product would materialize every orbit's permutations up
-        # front: 12! of them for a large orbit (an Ireland-Claisen substrate
-        # took 65 GB). Same order, generated lazily up to max_variants.
-        if k == len(free):
-            yield ()
-            return
-        for perm in itertools.permutations(free[k][1]):
-            for rest in product(k + 1):
-                yield (perm,) + rest
-
+    These all describe the same mechanism (a start automorphism maps the
+    broken and formed bonds onto symmetry-equivalent ones), but not the
+    same path: which of a CH2's two hydrogens goes where decides whether the
+    group has to rotate on the way, so each variant needs its own score
+    against the actual pair of conformers. Only automorphisms: permuting a
+    symmetry orbit freely would also swap hydrogens between the carbons of
+    different methyls, a different mechanism (and 9! relabelings of a
+    SiMe3's hydrogens where 1296 keep its bonds)."""
     variants = [atom_map]
     seen = {tuple(atom_map.as_order())}
-    for choice in product():
+
+    def add(mapping):
+        order = tuple(mapping[i] for i in range(len(mapping)))
+        if order not in seen and len(variants) < max_variants:
+            seen.add(order)
+            variants.append(AtomMapping(mapping=mapping, cost=atom_map.cost, n_alternatives=atom_map.n_alternatives))
+
+    for best in _snap_variants(atom_map, start_structure, end_structure):
+        add(best.mapping)
+    for sigma in _automorphisms(start_structure):
         if len(variants) >= max_variants:
             break
-        mapping = dict(atom_map.mapping)
-        for (orbit, _), perm in zip(free, choice):
-            mapping.update(zip(orbit, perm))
-        order = tuple(mapping[i] for i in range(len(mapping)))
-        if order in seen:
-            continue
-        seen.add(order)
-        variants.append(AtomMapping(
-            mapping=mapping, cost=atom_map.cost, n_alternatives=atom_map.n_alternatives,
-        ))
+        add({i: atom_map.mapping[int(sigma[i])] for i in range(len(sigma))})
     return variants
 
 

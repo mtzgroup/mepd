@@ -120,7 +120,7 @@ def test_score_candidate_returns_a_finite_scalar_for_every_metric(metric):
         score, chain = score_candidate(candidate, metric, start, run_inputs)
         assert isinstance(score, float)
         assert np.isfinite(score)
-        if metric == "endpoint-rmsd":
+        if metric in ("endpoint-rmsd", "snap", "snap-gi-xtb"):
             assert chain is None  # skips interpolation entirely -- that's the point
         else:
             assert len(chain) >= 2
@@ -220,8 +220,21 @@ def test_maybe_realign_pair_realigns_when_a_mapping_wins(monkeypatch):
 
     start = _propene()
     end = _scrambled_propene()
-    result, changed = maybe_realign_pair(start, end, _run_inputs_for_test())
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "geodesic-distance"
+    result, changed = maybe_realign_pair(start, end, run_inputs)
 
+    assert changed is True
+    assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
+
+
+def test_the_default_metric_finds_the_exact_renumbering():
+    """snap + GI + xtb: the scrambled end is the start renumbered, so the
+    winning correspondence must restore the start exactly (a hand-built
+    propene is not a minimum, so the wrong path also never rises above it:
+    the tie goes to the shorter path)."""
+    start = _propene()
+    result, changed = maybe_realign_pair(start, _scrambled_propene(), _run_inputs_for_test())
     assert changed is True
     assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry))
 

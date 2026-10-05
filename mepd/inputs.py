@@ -383,20 +383,21 @@ class AtomMappingInputs:
         `expand_mapping_by_symmetry`) to keep and consider (default: 200).
         These are ties, not ranked by quality among themselves.
 
-    `metric`: how each candidate (including "don't reindex") is scored from
-        its geodesic-interpolated path -- one of "geodesic-distance" (the
-        geodesic optimizer's own path length, free), "path-rmsd"
-        (cumulative per-frame RMSD along the path, free), or "gi-energy"
-        (highest QM energy along the path, most expensive). Default:
-        "geodesic-distance" -- free to evaluate even across many candidates,
-        unlike "gi-energy" (the metric the old single-candidate veto used).
+    `metric`: how the candidates (including "don't reindex") are compared;
+        `mepd.atom_mapping_metrics.HELP` describes the offered ones. Default
+        "snap-gi-xtb": snap's few picks (the lowest-endpoint-RMSD relabelings
+        by reactant symmetry), interpolated, the one whose xtb energy profile
+        peaks lowest, falling back to the shortest interpolation without
+        xtb, the lowest RMSD without interpolation, and endpoint RMSD over
+        every candidate without snap.
 
     `veto_margin`: a non-identity candidate must beat "don't reindex" by
         more than this (in the selected metric's own units) to be adopted;
         otherwise the original ordering is kept even if some candidate
         scored marginally better. Default: 0.0 (pure best-of-N, identity
         wins exact ties) -- unlike `metric`, there is no well-calibrated
-        nonzero default here yet for any of the three metrics.
+        nonzero default here yet for any of the three metrics. Not used by
+        "snap-gi-xtb", whose ranking is by path, not by one score.
 
     `recheck_on_split`: experimental. Also re-run this same selection at
         every new (reactant, product) pair MSMEP's recursive splitting
@@ -405,7 +406,7 @@ class AtomMappingInputs:
     """
 
     n_candidates: int = 200
-    metric: str = "geodesic-distance"
+    metric: str = "snap-gi-xtb"
     veto_margin: float = 0.0
     recheck_on_split: bool = False
     # metric "rmsd-geodesic": only candidates within this many standard

@@ -110,6 +110,7 @@ def _call_run(**overrides):
         charge=None,
         multiplicity=None,
         minimize_ends=False,
+        pair_from="both",
         recursive=False,
         parallel=False,
         parallel_workers=None,
@@ -689,17 +690,34 @@ def _patch_candidate_scores(monkeypatch, *, identity: float, mapping: float):
     monkeypatch.setattr(selection_module, "score_candidate", fake_score)
 
 
+def test_atom_mapping_relabels_symmetric_atoms_even_when_bonds_already_correspond():
+    """The methyl's three hydrogens have traded places: the bonds match the
+    start's already (SLAPMapper: identity), but the right numbering puts
+    every hydrogen back, so the end comes back as the start itself."""
+    pytest.importorskip("slapmapper")
+    from mepd.cli import _check_endpoint_atom_mapping
+
+    start = _propene_structure(range(9))
+    swapped = np.asarray(start.geometry).copy()
+    swapped[[6, 7, 8]] = swapped[[7, 8, 6]]
+    end = start.model_copy(update={"geometry": swapped})
+    result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+    assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry), atol=1e-6)
+
+
 def test_atom_mapping_keeps_identity_when_mapping_scores_much_worse(monkeypatch):
     pytest.importorskip("slapmapper")
     from mepd.cli import _check_endpoint_atom_mapping
 
     _patch_candidate_scores(monkeypatch, identity=0.0, mapping=60.0)
 
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "geodesic-distance"   # the score-based route
     start = _propene_structure(range(9))
     end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
 
     with pytest.warns(UserWarning, match="disagrees"):
-        result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+        result = _check_endpoint_atom_mapping(start, end, True, run_inputs)
 
     # identity scores better: keep --end's original atom ordering.
     assert np.allclose(np.asarray(result.geometry), np.asarray(end.geometry))
@@ -714,11 +732,13 @@ def test_atom_mapping_keeps_identity_even_when_mapping_only_slightly_worse(monke
 
     _patch_candidate_scores(monkeypatch, identity=0.0, mapping=10.0)
 
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "geodesic-distance"   # the score-based route
     start = _propene_structure(range(9))
     end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
 
     with pytest.warns(UserWarning, match="disagrees"):
-        result = _check_endpoint_atom_mapping(start, end, True, _run_inputs_for_test())
+        result = _check_endpoint_atom_mapping(start, end, True, run_inputs)
 
     out = capsys.readouterr().out
     assert "Keeping the end's current atom numbering" in out
@@ -755,6 +775,7 @@ def test_atom_mapping_veto_margin_keeps_identity_on_small_improvement(monkeypatc
     end = _propene_structure(_PROPENE_SCRAMBLED_ORDER)
 
     run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "geodesic-distance"   # the score-based route
     run_inputs.atom_mapping_inputs.veto_margin = 5.0
 
     with pytest.warns(UserWarning, match="disagrees"):
@@ -1048,3 +1069,36 @@ def test_cli_run_recursive_with_no_path_at_all_fails_and_says_why(tmp_path, monk
         _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, recursive=True, output=tmp_path / "out")
     assert exc.value.exit_code == 1
     assert "electronic_structure_error: the SCF did not converge" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("side", ["start", "end"])
+def test_cli_run_pair_from_replaces_the_other_endpoint_with_one_built_from_it(tmp_path, monkeypatch, side):
+    """--pair-from start/end: the other endpoint is the one built in this
+    side's frame (target = the given other endpoint), and the path runs to it."""
+    _install_fake_gxtb(monkeypatch)
+    import mepd.cli_channels as channels_module
+
+    seen = []
+    built = StructureNode(structure=_water(0.1))
+
+    def fake_build(sources, target, run_inputs):
+        seen.append((sources[0].structure.geometry.copy(), target.structure.geometry.copy()))
+        return sources, [built]
+
+    monkeypatch.setattr(channels_module, "_build_partners", fake_build)
+    start_fp, end_fp = tmp_path / "start.xyz", tmp_path / "end.xyz"
+    start_fp.write_text(_water().to_xyz())
+    end_fp.write_text(_water(0.3).to_xyz())
+    inputs_fp = tmp_path / "inputs.toml"
+    _run_inputs_for_test().save(inputs_fp)
+    out = tmp_path / "out"
+    _call_run(start=start_fp, end=end_fp, inputs=inputs_fp, output=out, pair_from=side, atom_mapping=False)
+
+    (source, target) = seen[0]
+    given = {"start": _water(), "end": _water(0.3)}
+    other = "end" if side == "start" else "start"
+    assert np.allclose(source, given[side].geometry) and np.allclose(target, given[other].geometry)
+    chain = Chain.from_xyz(out / "mep_output.xyz", parameters=RunInputs().chain_inputs)
+    replaced = chain[-1] if side == "start" else chain[0]
+    dmat = lambda x: np.linalg.norm(np.asarray(x)[:, None] - np.asarray(x)[None], axis=-1)
+    assert np.allclose(dmat(replaced.coords), dmat(built.coords), atol=1e-4)   # the output is aligned

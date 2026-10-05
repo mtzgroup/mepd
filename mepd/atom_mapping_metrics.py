@@ -13,18 +13,24 @@ spelling them out, so a new metric shows up everywhere at once.
 
 from __future__ import annotations
 
-METRICS = ("gi-energy", "geodesic-distance", "path-rmsd", "endpoint-rmsd", "rmsd-geodesic")
+METRICS = ("gi-energy", "geodesic-distance", "path-rmsd", "endpoint-rmsd", "rmsd-geodesic", "snap-gi-xtb", "snap")
 
-# The three offered to users (CLI help, web forms, profile form). The other
-# two stay accepted so older profiles and scripts still run.
-OFFERED = ("endpoint-rmsd", "geodesic-distance", "rmsd-geodesic")
+# The ones offered to users (CLI help, web forms, profile form). The others
+# stay accepted so older profiles and scripts still run ("snap" is also the
+# cheap first stage of snap-gi-xtb).
+OFFERED = ("snap-gi-xtb", "endpoint-rmsd", "geodesic-distance", "rmsd-geodesic")
 LABELS = {
+    "snap-gi-xtb": "Snap + GI + xtb",
     "endpoint-rmsd": "Endpoint RMSD",
     "geodesic-distance": "GI path",
     "rmsd-geodesic": "Filtered GI path",
 }
 HELP = (
-    "How atom mappings (and, in channels, conformer pairs) are compared. Endpoint RMSD (endpoint-rmsd): aligned "
+    "How atom mappings (and, in channels, conformer pairs) are compared. Snap + GI + xtb (snap-gi-xtb, the "
+    "channels default): conformer pairs ranked by the endpoint RMSD of snap's pick (the reactant's symmetric "
+    "groups permuted one at a time, as snap-RMSD does), then for the pairs kept, snap's few picks interpolated "
+    "(GI) and the one whose GFN2-xTB energy profile peaks lowest taken; without xtb the shortest interpolation, "
+    "without a working interpolation the lowest RMSD. Endpoint RMSD (endpoint-rmsd): aligned "
     "RMSD of the two ends, no path (fast, weakest). GI path (geodesic-distance): the length of each candidate's "
     "geodesic interpolation (slower, best). Filtered GI path (rmsd-geodesic): channels rank conformer pairs by "
     "endpoint RMSD first and compute GI paths only for those within --atom-mapping-rmsd-window standard "

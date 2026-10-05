@@ -40,6 +40,7 @@ class SelectionResult:
     winner: MappingCandidate
     scores: dict[str, float] = field(default_factory=dict)  # label -> score under the selection metric
     chains: dict[str, Chain] = field(default_factory=dict)  # label -> its geodesic-interpolated chain
+    quantity: str = ""   # what `scores` hold, when not the metric's own score (snap-gi-xtb: the rule that decided)
 
 
 def build_candidates(
@@ -156,7 +157,9 @@ def score_candidate(
     (`_aligned_rmsd`), a weaker signal -- untested at scale against the
     others before relying on it for something consequential; see
     docs/channels_candidates.md's open-problem note on mapping cost."""
-    if metric == "endpoint-rmsd":
+    if metric in ("endpoint-rmsd", "snap", "snap-gi-xtb"):
+        # The snap metrics choose among a mechanism's symmetry variants
+        # (`snap_choice`); anything else they score is scored by its ends.
         return _aligned_rmsd(start_structure, candidate.end_structure), None
 
     chain, smoother = _interpolate(candidate, start_structure, run_inputs)
@@ -190,6 +193,7 @@ def score_candidate_all_metrics(
         "endpoint-rmsd": _aligned_rmsd(start_structure, candidate.end_structure),
     }
     scores["rmsd-geodesic"] = scores["geodesic-distance"]   # a scored candidate is scored by its GI path
+    scores["snap"] = scores["snap-gi-xtb"] = scores["endpoint-rmsd"]   # see score_candidate
     return scores, chain
 
 
@@ -211,6 +215,13 @@ def select_best_candidate(
     scores: dict[str, float] = {}
     chains: dict[str, Chain] = {}
     identity = next((c for c in candidates if c.label == "identity"), None)
+    if metric in ("snap", "snap-gi-xtb"):
+        # Snap's picks from every candidate (each SLAPMapper mapping, and the
+        # current numbering), ranked together by GI + xtb.
+        picks = _distinct([p for c in candidates for p in _snap_picks(c, start_structure)])
+        _, best, _, scores, quantity = _rank_picks(picks, candidates, start_structure, run_inputs,
+                                                   use_path=metric == "snap-gi-xtb")
+        return SelectionResult(winner=best, scores=scores, chains=chains, quantity=quantity)
     if metric == "rmsd-geodesic":
         candidates = lowest_rmsd_variants(candidates, start_structure, run_inputs,
                                           always=(identity.label,) if identity else ())
@@ -275,6 +286,109 @@ class MechanismChoice:
     n_variants: int
 
 
+def _xtb_engine():
+    """GFN2-xTB from whatever xtb `mepd.programs` finds installed (no
+    download), to rank interpolations cheaply whatever the run's own level;
+    None if there is none."""
+    try:
+        from mepd.engines.gxtb import GXTBCalculator
+        from mepd.programs import xtb_executable
+
+        exe = xtb_executable(download=False)
+        return GXTBCalculator(executable=exe, add_gxtb_flag=False, n_parallel=1) if exe else None
+    except Exception:
+        return None
+
+
+KCAL_PER_HARTREE = 627.5094740631
+PEAK_TIE = 0.5   # kcal/mol
+
+
+def _snap_picks(candidate: MappingCandidate, start_structure: Structure) -> list[MappingCandidate]:
+    """Snap's picks for one candidate: its relabelings by reactant
+    automorphisms (`_snap_variants`, a few at most) that bring its end
+    closest to the start, as candidates with the same mechanism. A pick that
+    leaves the end's numbering as it was is labelled "identity"."""
+    from mepd.atom_mapping import AtomMapping, _snap_variants, realign_end_to_start
+
+    n = len(start_structure.symbols)
+    base = candidate.atom_map.mapping if candidate.atom_map is not None else {i: i for i in range(n)}
+    out = []
+    for k, s in enumerate(_snap_variants(AtomMapping(mapping={i: i for i in range(n)}, cost=0, n_alternatives=1),
+                                         start_structure, candidate.end_structure)):
+        mapping = {i: base[s.mapping[i]] for i in range(n)}
+        same = all(mapping[i] == i for i in range(n))
+        out.append(MappingCandidate(
+            label="identity" if same else f"{candidate.label} snap{k}",
+            end_structure=realign_end_to_start(s, candidate.end_structure),
+            atom_map=None if same else AtomMapping(
+                mapping=mapping, cost=getattr(candidate.atom_map, "cost", 0),
+                n_alternatives=getattr(candidate.atom_map, "n_alternatives", 1))))
+    return out
+
+
+def _distinct(cands: list[MappingCandidate]) -> list[MappingCandidate]:
+    seen, out = set(), []
+    for c in cands:
+        order = tuple(c.atom_map.as_order()) if c.atom_map is not None else ()
+        if order not in seen:
+            seen.add(order)
+            out.append(c)
+    return out
+
+
+def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inputs, use_path: bool = True):
+    """Snap + GI + xtb over `picks`: each interpolated (GI), the one whose
+    xtb energy profile peaks lowest; without xtb the shortest
+    interpolation; if interpolation fails (or `use_path` is off, the cheap
+    pair-ranking stage) the lowest endpoint RMSD among `picks`; with no
+    picks (snap unusable) the lowest endpoint RMSD over `fallback`.
+    Returns (endpoint RMSD of the choice, the choice, the rule that chose
+    it, {label: the quantity it compared}, what that quantity is)."""
+    pool, rule = (picks, "snap") if picks else (fallback, "endpoint-rmsd")
+    rmsd = [_aligned_rmsd(start_structure, c.end_structure) for c in pool]
+    k = min(range(len(pool)), key=rmsd.__getitem__)
+
+    def by_rmsd(why):
+        return (rmsd[k], pool[k], rule, {c.label: r for c, r in zip(pool, rmsd)},
+                f"endpoint RMSD, bohr ({rule}: {why})")
+    if not picks:
+        return by_rmsd("snap unavailable")
+    if not use_path or len(picks) == 1:
+        return by_rmsd("pair ranking" if not use_path else "one snap pick")
+    try:
+        paths = [_interpolate(c, start_structure, run_inputs) for c in picks]
+    except Exception:
+        return by_rmsd("interpolation failed")
+    length = [float(smoother.length) for _, smoother in paths]
+    engine = _xtb_engine()
+    if engine is not None:
+        try:
+            peaks = []
+            for chain, _ in paths:
+                energies = [float(e) for e in engine.compute_energies(chain)]
+                peaks.append((max(energies) - energies[0]) * KCAL_PER_HARTREE)
+            # Peaks within PEAK_TIE of the lowest are a tie (a path that only
+            # goes downhill peaks at 0, whatever it does): the shortest wins.
+            k = min(range(len(picks)), key=lambda i: (peaks[i] > min(peaks) + PEAK_TIE, length[i]))
+            return (rmsd[k], picks[k], "snap-gi-xtb", {c.label: p for c, p in zip(picks, peaks)},
+                    "xtb peak along the interpolation, kcal/mol (snap-gi-xtb)")
+        except Exception:
+            why = "xtb failed"
+    else:
+        why = "no xtb"
+    k = min(range(len(picks)), key=length.__getitem__)
+    return rmsd[k], picks[k], "snap-gi", {c.label: v for c, v in zip(picks, length)}, f"GI length (snap-gi: {why})"
+
+
+def snap_choice(candidates: list, start_structure: Structure, run_inputs,
+                *, use_path: bool = True) -> tuple[float, MappingCandidate, str]:
+    """One mechanism's symmetry variant by snap + GI + xtb (`_rank_picks`
+    over the snap picks of the mechanism's first candidate)."""
+    return _rank_picks(_distinct(_snap_picks(candidates[0], start_structure)), candidates,
+                       start_structure, run_inputs, use_path)[:3]
+
+
 def select_per_mechanism(
     start_structure: Structure, end_structure: Structure, metric: str, run_inputs,
     *, max_variants_per_mechanism: int = 200, only_keys: Optional[set] = None,
@@ -324,6 +438,10 @@ def select_per_mechanism(
     choices = []
     for key, cands in by_key.items():
         if only_keys is not None and key not in only_keys:
+            continue
+        if metric in ("snap", "snap-gi-xtb"):
+            score, best, _ = snap_choice(cands, start_structure, run_inputs, use_path=metric == "snap-gi-xtb")
+            choices.append(MechanismChoice(key=key, winner=best, score=score, n_variants=len(cands)))
             continue
         pool = lowest_rmsd_variants(cands, start_structure, run_inputs) if metric == "rmsd-geodesic" else cands
         scored = [(score_candidate(c, metric, start_structure, run_inputs)[0], c) for c in pool]

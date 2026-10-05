@@ -114,10 +114,16 @@ class TsParams(Params):
                            cli="--atom-mapping", kind="switch")
     endpoints: EndpointMode = P("auto", "Endpoint source", _ENDPOINTS_HELP, kind="custom",
                                 group="Endpoints", advanced=True)
+    pair_from: Literal["both", "start", "end"] = P(
+        "both", "Build endpoint", "Use both endpoints as given, or replace one with a geometry built in the "
+        "other's frame (each atom where it is, the new bonds pulled to length, minimized): only what reacts "
+        "moves.", cli="--pair-from", group="Endpoints", advanced=True,
+        labels={"both": "Both as given", "start": "Product built from reactant",
+                "end": "Reactant built from product"})
     atom_mapping_candidates: int = P(200, "Mapping candidates", cli="--atom-mapping-candidates",
                                      group="Atom mapping", advanced=True, ge=1, requires="atom_mapping")
     atom_mapping_metric: AtomMappingMetric = P(
-        "geodesic-distance", "Mapping metric", _MAPPING_METRIC_HELP,
+        "snap-gi-xtb", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
         requires="atom_mapping", labels=_MAPPING_LABELS)
     validate_minima_with_hessian: bool = P(
@@ -186,11 +192,18 @@ class ChannelsParams(Params):
                                "Take an endpoint's conformers from an earlier Reaction channels run on the same "
                                "molecule with the same sampler settings and level of theory, instead of "
                                "sampling and minimizing them again.", kind="custom", group="Conformers")
+    pair_from: Literal["both", "start", "end"] = P(
+        "both", "Pairs from", "Every reactant conformer with every product conformer, or sample one side only "
+        "and build each conformer's partner in its frame (each atom where it is, the new bonds pulled to "
+        "length, minimized): only what reacts moves, and the partner's geometries are sampled through the "
+        "conformer's.", cli="--pair-from", group="Pairs", advanced=True,
+        labels={"both": "Both sides sampled", "start": "Reactant conformers, products built",
+                "end": "Product conformers, reactants built"})
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
     atom_mapping_metric: AtomMappingMetric = P(
-        "rmsd-geodesic", "Mapping metric", _MAPPING_METRIC_HELP,
+        "snap-gi-xtb", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Pairs", advanced=True,
         requires="atom_mapping", labels=_MAPPING_LABELS)
     atom_mapping_rmsd_window: float = P(

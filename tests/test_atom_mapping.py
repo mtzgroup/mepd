@@ -353,14 +353,23 @@ def test_expand_mapping_fully_takes_the_cross_product_of_orbits():
     assert len(expand_mapping_fully(identity, propene, propene, max_variants=5)) == 5
 
 
-def test_expand_mapping_fully_does_not_enumerate_a_large_orbit_up_front(monkeypatch):
-    """A 13-atom orbit has 13! permutations; only max_variants are made."""
-    import mepd.atom_mapping as am
+def test_expand_mapping_fully_keeps_every_start_bond():
+    """Ethane's six hydrogens are one symmetry orbit: 720 free permutations,
+    but only 72 keep each hydrogen on a carbon of its own. Only those 72 are
+    the same mechanism, and the lowest-RMSD one comes first after the input."""
+    from mepd.atom_mapping import expand_mapping_fully
+    from mepd.qcdata_structure_helpers import structure_to_molecule
 
-    monkeypatch.setattr(am, "_symmetry_orbits", lambda s: [list(range(13))])
-    identity = AtomMapping(mapping={i: i for i in range(13)}, cost=0, n_alternatives=1)
-    variants = am.expand_mapping_fully(identity, None, None, max_variants=50)
-    assert len(variants) == 50 and len({tuple(v.as_order()) for v in variants}) == 50
+    xyz = np.array([[0, 0, 0.77], [0, 0, -0.77], [1.02, 0, 1.16], [-0.51, 0.88, 1.16], [-0.51, -0.88, 1.16],
+                    [-1.02, 0, -1.16], [0.51, 0.88, -1.16], [0.51, -0.88, -1.16]]) * 1.8897259886
+    ethane = Structure(symbols=["C", "C"] + ["H"] * 6, geometry=xyz, charge=0, multiplicity=1)
+    identity = AtomMapping(mapping={i: i for i in range(8)}, cost=0, n_alternatives=1)
+    variants = expand_mapping_fully(identity, ethane, ethane, max_variants=10_000)
+    assert len(variants) == 72
+    bonds = {frozenset(e) for e in structure_to_molecule(ethane).edges()}
+    for v in variants:
+        assert {frozenset((v.mapping[a], v.mapping[b])) for a, b in bonds} == bonds
+    assert len(expand_mapping_fully(identity, ethane, ethane, max_variants=5)) == 5
 
 
 def test_suggest_mechanism_candidates_keeps_both_claisen_mechanisms_fully_expanded():

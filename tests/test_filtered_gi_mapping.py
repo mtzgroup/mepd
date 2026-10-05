@@ -8,8 +8,8 @@ from mepd.atom_mapping_metrics import METRICS, OFFERED
 from mepd.atom_mapping_selection import near_lowest
 
 
-def test_three_offered_all_accepted():
-    assert OFFERED == ("endpoint-rmsd", "geodesic-distance", "rmsd-geodesic")
+def test_offered_metrics_all_accepted():
+    assert OFFERED == ("snap-gi-xtb", "endpoint-rmsd", "geodesic-distance", "rmsd-geodesic")
     assert set(OFFERED) <= set(METRICS) and {"path-rmsd", "gi-energy"} <= set(METRICS)   # older profiles still run
 
 
@@ -73,3 +73,66 @@ def test_gi_paths_only_for_the_lowest_rmsd_symmetry_variants(monkeypatch):
     scored.clear()
     S.select_best_candidate(cands, "geodesic-distance", start, RI())
     assert len(scored) == 30                              # the plain GI path is never capped
+
+
+PERMS = [{0: 0, 1: 1, 2: 2}, {0: 0, 1: 2, 2: 1}, {0: 1, 1: 0, 2: 2}]
+
+
+def _which(c):
+    """Which of PERMS a pick is (identity: no atom_map)."""
+    order = tuple(c.atom_map.as_order()) if c.atom_map is not None else (0, 1, 2)
+    return [tuple(p[i] for i in range(3)) for p in PERMS].index(order)
+
+
+def _snap_case(monkeypatch):
+    """Three snap picks whose RMSD, GI length and xtb peak disagree: RMSD
+    prefers pick 0, GI length pick 1, the xtb peak pick 2."""
+    import mepd.atom_mapping as am
+    import mepd.atom_mapping_selection as S
+    from qcdata import Structure
+
+    start = Structure(symbols=["O", "H", "H"], geometry=np.array([[0, 0, 0], [1.8, 0, 0], [-0.5, 1.7, 0]]),
+                      charge=0, multiplicity=1)
+    monkeypatch.setattr(am, "_snap_variants", lambda base, s, e: [am.AtomMapping(mapping=p, cost=0, n_alternatives=1)
+                                                                  for p in PERMS])
+    monkeypatch.setattr(am, "realign_end_to_start", lambda m, e: e)
+    monkeypatch.setattr(S, "_aligned_rmsd", lambda a, b: 0.1)
+    monkeypatch.setattr(S, "_interpolate", lambda c, s, r: (_which(c), type("P", (), {"length": (0.5, 0.1, 0.4)[_which(c)]})))
+
+    class Xtb:
+        def compute_energies(self, k):
+            return [0.0, (30.0, 20.0, 10.0)[k] / 627.5094740631, 0.0]
+    cands = [S.MappingCandidate(label="m", end_structure=start, atom_map=None)]
+    return S, am, start, cands, Xtb
+
+
+def test_snap_gi_xtb_and_its_fallbacks(monkeypatch):
+    S, am, start, cands, Xtb = _snap_case(monkeypatch)
+
+    monkeypatch.setattr(S, "_xtb_engine", lambda: Xtb())
+    _, pick, rule = S.snap_choice(cands, start, None)
+    assert (_which(pick), rule) == (2, "snap-gi-xtb")                 # lowest xtb peak
+
+    monkeypatch.setattr(S, "_xtb_engine", lambda: None)
+    _, pick, rule = S.snap_choice(cands, start, None)
+    assert (_which(pick), rule) == (1, "snap-gi")                     # no xtb: shortest interpolation
+
+    def broken(c, s, r):
+        raise RuntimeError("no geodesic")
+    monkeypatch.setattr(S, "_interpolate", broken)
+    _, pick, rule = S.snap_choice(cands, start, None)
+    assert rule == "snap"                                             # no interpolation: lowest RMSD
+
+    monkeypatch.setattr(am, "_snap_variants", lambda base, s, e: [])
+    _, pick, rule = S.snap_choice(cands, start, None)
+    assert (pick, rule) == (cands[0], "endpoint-rmsd")                # no snap: RMSD over every candidate
+
+
+def test_single_pair_selection_ranks_every_candidate_s_snap_picks(monkeypatch):
+    """`mepd run`/TS search: snap's picks from every candidate, ranked together."""
+    S, am, start, cands, Xtb = _snap_case(monkeypatch)
+    monkeypatch.setattr(S, "_xtb_engine", lambda: Xtb())
+    ident = S.MappingCandidate(label="identity", end_structure=start, atom_map=None)
+    res = S.select_best_candidate([ident], "snap-gi-xtb", start, None)
+    assert _which(res.winner) == 2 and "xtb peak" in res.quantity
+    assert res.scores[res.winner.label] == min(res.scores.values())       # the quantity that decided, not RMSD

@@ -439,7 +439,7 @@ def _check_endpoint_atom_mapping(
         )
         return end_structure
 
-    if atom_map.is_identity:
+    if atom_map.is_identity and not atom_mapping:
         typer.echo(
             "Atom mapping: the start's and end's atoms are already numbered the same way "
             "(checked with SLAPMapper), so nothing is renumbered."
@@ -449,14 +449,17 @@ def _check_endpoint_atom_mapping(
     if not atom_mapping:
         return end_structure
 
-    from mepd.atom_mapping import suggest_atom_mapping_candidates
+    from mepd.atom_mapping import expand_mapping_fully, suggest_atom_mapping_candidates
     from mepd.atom_mapping_selection import build_candidates, select_best_candidate
 
     n_candidates = run_inputs.atom_mapping_inputs.n_candidates
     try:
-        atom_maps = suggest_atom_mapping_candidates(
-            start_structure, end_structure, max_candidates=n_candidates
-        )
+        # Bonds that already correspond still leave the symmetric atoms (a
+        # methyl's hydrogens) to be matched: the current numbering competes
+        # with its symmetry relabelings.
+        atom_maps = (expand_mapping_fully(atom_map, start_structure, end_structure, max_variants=n_candidates)
+                     if atom_map.is_identity else
+                     suggest_atom_mapping_candidates(start_structure, end_structure, max_candidates=n_candidates))
     except Exception as exc:
         typer.echo(
             f"Could not enumerate --atom-mapping candidate mappings "
@@ -466,12 +469,18 @@ def _check_endpoint_atom_mapping(
 
     candidates = build_candidates(start_structure, end_structure, atom_maps)
     if [c.label for c in candidates] in ([], ["identity"]):
-        # Every candidate SLAPMapper returned was the identity mapping (or there were none).
+        # Nothing but the current numbering (no symmetric atoms to relabel).
+        if atom_map.is_identity:
+            typer.echo("Atom mapping: the start's and end's atoms are already numbered the same way "
+                       "(checked with SLAPMapper), so nothing is renumbered.")
         return end_structure
 
     metric = run_inputs.atom_mapping_inputs.metric
     n_other = sum(c.label != "identity" for c in candidates)
     typer.echo(
+        f"Atom mapping: the start's and end's bonds already correspond (checked with SLAPMapper); comparing "
+        f"the current numbering with {n_other} relabeling(s) of its symmetric atoms, by {metric}..."
+        if atom_map.is_identity else
         f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
         f"current numbering with {n_other} other(s) found by SLAPMapper, by {metric} (lower is better)..."
         if n_other < len(candidates) else
@@ -500,15 +509,19 @@ def _check_endpoint_atom_mapping(
 
     # The best numbering and the current one, not every candidate (there can be hundreds).
     scores = result.scores
-    ranked = sorted((c.label for c in candidates if c.label in scores), key=lambda k: scores[k])
+    what = result.quantity or metric
+    if result.quantity:
+        typer.echo(f"  compared by {result.quantity}:")
+    ranked = sorted(scores, key=scores.get)
     shown = [result.winner.label] + (["identity"] if result.winner.label != "identity" and "identity" in scores else [])
     for label in shown:
         role = "chosen" if label == result.winner.label else "current"
         name = "current numbering" if label == "identity" else label
-        typer.echo(f"  {role + ':':<10}{name:<20}{metric} = {scores[label]:.4f}")
+        typer.echo(f"  {role + ':':<10}{name:<20}{scores[label]:.4f}" + ("" if result.quantity else f"  ({metric})"))
     rest = [k for k in ranked if k not in shown]
     if rest:
-        typer.echo(f"  ({len(rest)} other(s), {metric} {scores[rest[0]]:.4f} to {scores[rest[-1]]:.4f})")
+        typer.echo(f"  ({len(rest)} other(s), {scores[rest[0]]:.4f} to {scores[rest[-1]]:.4f}"
+                   + ("" if result.quantity else f" {what}") + ")")
 
     if result.winner.label == "identity":
         typer.echo("Keeping the end's current atom numbering: no other fits clearly better.")

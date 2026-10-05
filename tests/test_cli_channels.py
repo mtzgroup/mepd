@@ -864,3 +864,32 @@ def test_channels_wires_atom_mapping_flags_into_run_inputs(tmp_path, monkeypatch
     assert atom_mapping_inputs.recheck_on_split is True
     assert atom_mapping_inputs.metric == "geodesic-distance"
     assert atom_mapping_inputs.veto_margin == 1.5
+
+
+def test_pair_from_builds_each_partner_in_its_conformer_s_frame():
+    """--pair-from: the partner of each conformer starts with every atom where
+    it is in that conformer and gets the target's bonds; with an optimizer
+    that leaves geometries as they are, a same-bonded target comes back on
+    top of its conformer, and each conformer keeps its own partner."""
+    from mepd.cli_channels import _build_partners
+    from mepd.nodes.node import StructureNode
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=2, randomSeed=1)
+    nodes = [StructureNode(structure=Structure(
+        symbols=[a.GetSymbol() for a in mol.GetAtoms()],
+        geometry=np.asarray(c.GetPositions()) * 1.8897259886, charge=0, multiplicity=1)) for c in mol.GetConformers()]
+
+    class Engine:
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+    class RI:
+        engine = Engine()
+        geometry_optimizer_kwds = {}
+
+    kept, built = _build_partners(nodes, nodes[0], RI())
+    assert len(kept) == len(built) == 2
+    dist = lambda a, b: float(np.abs(np.asarray(a.structure.geometry) - np.asarray(b.structure.geometry)).max())
+    for k in range(2):   # bonds are pulled to length, so near (not on) its own conformer, far from the other
+        assert dist(built[k], kept[k]) < 0.2 < dist(built[k], kept[1 - k])

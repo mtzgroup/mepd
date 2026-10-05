@@ -147,11 +147,11 @@ For each conformer pair (`select_per_mechanism`, parallel over `--workers`):
    symmetry class. Relabeled copies, and the same mechanism in another pair,
    therefore get the same key.
 3. Each mechanism is **fully expanded** into every relabeling of its
-   symmetry-equivalent atoms: the cross product over the equivalent-hydrogen
-   groups (`expand_mapping_fully`), capped at `--atom-mapping-candidates`
-   (200) per mechanism.
+   symmetry-equivalent atoms: its relabelings by the reactant's symmetries
+   (`expand_mapping_fully`; snap's picks first), capped at
+   `--atom-mapping-candidates` (200) per mechanism.
 4. Every variant is scored against **this pair's geometry** with
-   `--atom-mapping-metric` (default: geodesic path length). The best variant
+   `--atom-mapping-metric` (default: snap + GI + xtb, below). The best variant
    **within each mechanism** is kept. A bad hydrogen assignment can force a
    CH₂ to rotate along the path, so this is decided per pair. **Scores never
    choose between mechanisms.**
@@ -197,7 +197,37 @@ value of K has only been checked against the every-pair run on that one
 system. Raise K, or use 0 (every pair × every mechanism), when a missed
 low channel would matter.
 
-### Filtered GI path (the default, `--atom-mapping-metric rmsd-geodesic`)
+### Snap + GI + xtb (the default, `--atom-mapping-metric snap-gi-xtb`)
+
+A mechanism's symmetry variants are the relabelings of SLAPMapper's
+correspondence by the reactant's own symmetries (nauty, atoms colored by
+RDKit symmetry class): the ones that keep every reactant bond, so every
+variant is the same mechanism. Permuting a symmetry class freely instead
+would also swap hydrogens between different methyl carbons, implying bonds
+that break and form outside the mechanism.
+
+1. Each pair × mechanism is scored by snap's pick: the reactant is factored
+   into a core and its symmetric groups (a methyl's hydrogens, a CF3's
+   fluorines; depth 2 also whole substituents and rings), and each group's
+   own permutations are scored by endpoint RMSD in turn (qcinf's snap-RMSD,
+   with four settings). Milliseconds per pair, whatever the size of the
+   symmetry group. Pairs are ranked by that RMSD.
+2. For the `--pairs-per-mechanism` pairs kept, snap's few picks (one to
+   three, usually one) are each interpolated (GI) and given GFN2-xTB
+   single points; the pick whose profile peaks lowest is searched.
+
+Without xtb the shortest interpolation is taken, without a working
+interpolation the lowest RMSD among snap's picks, and without snap (no
+nauty) the lowest endpoint RMSD over all variants. A single pair
+(`mepd run`, TS search) pools snap's picks from every SLAPMapper candidate
+and the current numbering and ranks them the same way.
+
+On 16 mechanisms of 12 reactions (playgroud/results/mapping_bench), snap +
+GI + xtb gave the interpolation with the lowest highest point in 12, against
+7 for GI over every variant (the shortest path is not the least strained),
+at 2 s per mechanism against 83 s.
+
+### Filtered GI path (`--atom-mapping-metric rmsd-geodesic`)
 
 Scoring every pair × mechanism by GI path (geodesic interpolation length)
 is the expensive part of step 6. On KAIST rxn_186 (64 × 37 conformers,

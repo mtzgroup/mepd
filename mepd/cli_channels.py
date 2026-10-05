@@ -101,9 +101,10 @@ def _expand_pairs_by_mechanism(
     metric = run_inputs.atom_mapping_inputs.metric
     budget = run_inputs.atom_mapping_inputs.n_candidates
     # Filtered GI path: every pair by endpoint RMSD first (microseconds each),
-    # GI paths only for the pairs near each mechanism's lowest RMSD.
+    # GI paths only for the pairs near each mechanism's lowest RMSD. Snap +
+    # GI + xtb: every pair by snap's pick first, GI + xtb only for the pairs kept.
     filtered = metric == "rmsd-geodesic"
-    first = "endpoint-rmsd" if filtered else metric
+    first = "endpoint-rmsd" if filtered else "snap" if metric == "snap-gi-xtb" else metric
     typer.echo(
         f"Finding the mechanisms of the {len(candidates)} pair(s): every way the reactant's atoms can "
         f"become the product's, grouped by which bonds break and form (per mechanism, the atom "
@@ -147,6 +148,14 @@ def _expand_pairs_by_mechanism(
             mine.sort(key=lambda r: (r["score"] is None, r["score"] if r["score"] is not None else 0.0))
             kept += mine[:pairs_per_mechanism]
         rows = kept
+    if metric == "snap-gi-xtb":
+        todo = [r for r in rows if r["key"] != "unmapped"]
+        typer.echo(f"Choosing each kept pair's numbering among snap's picks by GI + xtb ({len(todo)} pair(s))...")
+        for r, (_, choices, _) in zip(todo, _fork_map(lambda r: _one((r["i"], r["j"]), "snap-gi-xtb", {r["key"]}),
+                                                     todo, workers)):
+            for key, score, _, end_structure, is_identity in choices or []:
+                if key == r["key"]:
+                    r["structure"] = None if is_identity else end_structure
 
     # A rerun into the same folder (e.g. sampling more pairs per mechanism)
     # must give every (reactant, product, mechanism) its earlier label: a
@@ -278,6 +287,49 @@ def _load_conformer_pool(fp: Path, endpoint, label: str, charge: int, multiplici
         typer.echo(f"  {len(pool) - len(kept)} of {len(pool)} saved {label} conformer(s) are numbered or bonded "
                    f"differently from this run's {label} endpoint; not used.")
     return kept
+
+
+def _build_partners(sources: list, target, run_inputs: RunInputs) -> tuple[list, list]:
+    """--pair-from: for each conformer in `sources`, the other endpoint built
+    in its frame -- every atom where it is in that conformer, the target's
+    bonds pulled to length (network_expansion.embed_product), then minimized
+    at the profile's level. A partner whose bonds change on minimization is
+    dropped with its source. `target` (same atom order as the sources) gives
+    the bonds, charge and spin. Returns (kept sources, their partners)."""
+    import numpy as np
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    from mepd.discovery.network_expansion import embed_product
+    from mepd.nodes.node import StructureNode
+
+    want = {tuple(sorted((int(u), int(v)))) for u, v in target.graph.edges()}
+    kept, guesses = [], []
+    for node in sources:
+        try:
+            xyz = embed_product(list(node.structure.symbols),
+                                np.asarray(node.structure.geometry) / ANGSTROM_TO_BOHR, want)
+        except Exception:
+            continue
+        kept.append(node)
+        guesses.append(StructureNode(structure=target.structure.model_copy(
+            update={"geometry": np.asarray(xyz) * ANGSTROM_TO_BOHR})))
+    keywords = _geometry_optimizer_keywords(run_inputs)
+    batch = getattr(run_inputs.engine, "compute_geometry_optimizations", None)
+    if callable(batch):
+        try:
+            trajectories = batch(guesses, keywords=keywords)
+        except TypeError:
+            trajectories = batch(guesses)
+    else:
+        trajectories = [run_inputs.engine.compute_geometry_optimization(g, keywords=keywords) for g in guesses]
+    pairs = []
+    for src, traj in zip(kept, trajectories):
+        if not traj:
+            continue
+        built = StructureNode(structure=traj[-1].structure)
+        if {tuple(sorted((int(u), int(v)))) for u, v in built.graph.edges()} == want:
+            pairs.append((src, built))
+    return [s for s, _ in pairs], [b for _, b in pairs]
 
 
 def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> list:
@@ -817,7 +869,7 @@ def channels(
         "and consider (they're ties, not ranked by quality among themselves).",
     ),
     atom_mapping_metric: str = typer.Option(
-        "rmsd-geodesic", "--atom-mapping-metric",
+        "snap-gi-xtb", "--atom-mapping-metric",
         help="--atom-mapping: " + _MAPPING_HELP + " One of: " + ", ".join(_OFFERED_METRICS) + ".",
     ),
     atom_mapping_rmsd_window: Optional[float] = typer.Option(
@@ -913,6 +965,14 @@ def channels(
         None, "--rdkit-ewin",
         help="--backend rdkit: keep only embeddings within this many kcal/mol "
         "(MMFF94) of the lowest -- the counterpart of --crest-ewin. Default: no window.",
+    ),
+    pair_from: str = typer.Option(
+        "both", "--pair-from",
+        help="both: sample both endpoints' conformers and pair every reactant conformer with every product "
+        "conformer. start: sample only the reactant's conformers and build each one's product in its frame "
+        "(each atom where it is, the product's bonds pulled to length, minimized), so the product geometries "
+        "are sampled through the reactant's and only what reacts moves; each conformer is searched with its "
+        "own product, under the endpoint-level atom mapping. end: the same from the product side.",
     ),
     rmsd_cutoff: float = typer.Option(
         0.1, "--rmsd-cutoff",
@@ -1058,6 +1118,10 @@ def channels(
         raise typer.BadParameter("--n-conformers must be a non-negative integer (0 = no cap).")
     if n_embed < 0:
         raise typer.BadParameter("--n-embed must be a non-negative integer (0 = auto).")
+    if not isinstance(pair_from, str):   # typer's OptionInfo when called directly
+        pair_from = "both"
+    if pair_from not in ("both", "start", "end"):
+        raise typer.BadParameter("--pair-from must be both, start or end.")
     if rmsd_cutoff <= 0:
         raise typer.BadParameter("--rmsd-cutoff must be a positive number.")
     if max_pairs < 0:
@@ -1226,7 +1290,7 @@ def channels(
     pools = {"start": start_confs, "end": end_confs}
     for label in ("start", "end"):
         side = stats["conformers"].setdefault(label, {})
-        if minimize_ends and label not in reused:
+        if minimize_ends and label not in reused and pair_from in ("both", label):
             side_name = "reactant" if label == "start" else "product"
             typer.echo(f"Minimizing the {len(pools[label])} {side_name} conformer(s) at the profile's "
                        "level of theory...")
@@ -1267,7 +1331,7 @@ def channels(
 
     (output / "conformers").mkdir(parents=True, exist_ok=True)
     for label in ("start", "end"):
-        if pools[label]:
+        if pools[label] and pair_from in ("both", label):   # a built side is never a sampled pool
             Chain.model_validate({"nodes": pools[label], "parameters": _ChainInputs()}).write_to_disk(
                 output / "conformers" / f"{label}_pool.xyz")
 
@@ -1295,6 +1359,17 @@ def channels(
     for label in pools:
         stats["conformers"][label]["n_mirror_images_merged"] = n_mirrors if label == mirror_side else 0
         stats["conformers"][label]["n_final"] = len(pools[label])
+    if pair_from != "both":
+        other = "end" if pair_from == "start" else "start"
+        side_name = "product" if other == "end" else "reactant"
+        typer.echo(f"--pair-from {pair_from}: building a {side_name} in the frame of each of the "
+                   f"{len(pools[pair_from])} {'reactant' if pair_from == 'start' else 'product'} conformer(s)...")
+        t0 = time.perf_counter()
+        pools[pair_from], pools[other] = _build_partners(
+            pools[pair_from], end_node if other == "end" else start_node, run_inputs)
+        stats["conformers"][other] = {"built_from": pair_from, "n_built": len(pools[other]),
+                                      "seconds": round(time.perf_counter() - t0, 3)}
+        typer.echo(f"  {len(pools[other])} built (each paired with the conformer it was built from).")
     start_confs, end_confs = pools["start"], pools["end"]
     _write_stats()
 
@@ -1321,7 +1396,7 @@ def channels(
     n_start = len(start_confs)
     candidates = [
         (i, n_start + j) for i in range(n_start) for j in range(len(end_confs))
-    ]
+    ] if pair_from == "both" else [(i, n_start + i) for i in range(n_start)]
     stats["n_pairs_possible"] = len(candidates)
 
     if max_pairs and len(candidates) > max_pairs:
@@ -1352,8 +1427,9 @@ def channels(
     # follow, and how its equivalent atoms are best labeled, depend on that
     # pair's own geometry. Map every pair, one path search per mechanism.
     t0 = time.perf_counter()
+    # --pair-from: each pair was built from one atom correspondence already.
     structures, candidates, mechanism_summary = _expand_pairs_by_mechanism(
-        structures, candidates, atom_mapping, run_inputs,
+        structures, candidates, atom_mapping and pair_from == "both", run_inputs,
         pairs_per_mechanism=pairs_per_mechanism, workers=workers, output=output,
     )
     stats["pair_atom_mapping_seconds"] = round(time.perf_counter() - t0, 3)
