@@ -1272,8 +1272,14 @@ def _reaction_cuts(symbols, frames, hist: BondHistory, rxn) -> list:
 
 def refine_reaction_one(rxn, cuts: list, engine, d: Path, maxiter: int) -> None:
     """Optimize a reaction's subsystem ends from each instance; the first
-    whose ends keep their bonds becomes `complex`, else the reason why none
-    did."""
+    whose ends keep their bonds becomes `complex`. If none does, the first
+    whose optimized ends still differ in their bonds becomes it anyway,
+    `complex["relaxed"]` saying what they are (e.g. two H radicals of the
+    product recombined into H2: the sampled reaction, relaxed, is a
+    dehydrogenation) -- the ends of a reaction that did happen, to search
+    a TS between. Only when the ends optimize into the same molecules
+    (products falling back to reactants, a barrierless reactant) is there
+    no reaction: then the reason why."""
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
     for c in cuts:
@@ -1306,12 +1312,54 @@ def refine_reaction_one(rxn, cuts: list, engine, d: Path, maxiter: int) -> None:
                            "product": p["file"], "reactant_energy": r["energy"], "product_energy": p["energy"],
                            "delta_e_kcal": inst["complex_delta_e_kcal"]}
     if not rxn.complex:
+        rxn.complex = relaxed_complex(rxn.instances) or {}
+    if not rxn.complex:
         verdicts = [v for inst in rxn.instances for v in
                     ((inst.get("complex") or {}).get(side, {}).get("verdict") for side in ("reactant", "product")) if v]
         v = verdicts[0] if verdicts else {"code": "failed", "text": "the optimizations of its ends failed",
                                            "ts": False}
         rxn.complex = {"error": v["text"], "reason": v["code"], "ts_makes_sense": v["ts"],
                        "tried": len(rxn.instances)}
+
+
+def relaxed_complex(instances: list) -> Optional[dict]:
+    """A reaction's ends when none kept its bonds on optimization: the first
+    instance whose two optimized ends (files and energies in its
+    `complex`) still differ in their bonds, as `complex` -- with
+    `relaxed` = {reactants, products: SMILES of what they are, label, why}.
+    None if every instance's ends optimized into the same molecules (or
+    failed). Works on a finished run's saved instances too."""
+    import re
+
+    for k, inst in enumerate(instances):
+        ends = inst.get("complex") or {}
+        r, p = ends.get("reactant") or {}, ends.get("product") or {}
+        if not (r.get("file") and p.get("file") and "energy" in r and "energy" in p):
+            continue
+        try:
+            syms, rx, rc = read_xyz_frames(Path(r["file"]))
+            _, px, _ = read_xyz_frames(Path(p["file"]))
+        except (OSError, ValueError, IndexError):
+            continue
+        m = re.search(r"charge=(-?\d+) mult=(\d+)", rc[0] if rc else "")
+        q, mult = (int(m.group(1)), int(m.group(2))) if m else (0, 1)
+        r_got, p_got = perceive_bonds(syms, rx[0]), perceive_bonds(syms, px[0])
+        if r_got == p_got:
+            continue
+        labeler = Labeler(syms, max_charge=max(1, abs(q)))
+        sides = [[lab.smiles for lab in labeler.assign(components(len(syms), got), got, q)] for got in (r_got, p_got)]
+        if Counter(sides[0]) == Counter(sides[1]):
+            continue                      # the same molecules, renumbered: no reaction
+
+        def side_text(smiles):
+            return " + ".join(f"{n} {x}" if n > 1 else x for x, n in Counter(smiles).items())
+        why = [v["text"] for v in (ends.get(s2, {}).get("verdict") for s2 in ("reactant", "product")) if v]
+        return {"instance": k, "charge": q, "multiplicity": mult, "reactant": r["file"], "product": p["file"],
+                "reactant_energy": r["energy"], "product_energy": p["energy"],
+                "delta_e_kcal": (p["energy"] - r["energy"]) * HARTREE_TO_KCAL_PER_MOL,
+                "relaxed": {"reactants": sides[0], "products": sides[1],
+                            "label": f"{side_text(sides[0])} -> {side_text(sides[1])}", "why": why}}
+    return None
 
 
 def _set_delta_e(rxn, by_id: dict) -> None:
@@ -1359,6 +1407,8 @@ def refine(symbols, frames: np.ndarray, hist: BondHistory, species: list[Species
         _emit(on_event, "refine_reaction", index=n, total=len(reactions), label=rxn.label)
         refine_reaction_one(rxn, _reaction_cuts(symbols, frames, hist, rxn), engine, rx_dir / f"reaction_{rxn.id}",
                             maxiter)
+        if (rxn.complex or {}).get("relaxed"):      # relabelled: its energy change is its relaxed ends'
+            rxn.delta_e_kcal = rxn.complex.get("delta_e_kcal")
 
 
 class PreviousRefinement:
@@ -1644,6 +1694,15 @@ def live_events(md_dir: Path, *, total_charge: int, detect: DetectSettings, dt_f
     `context` is a dict, it is filled with what a LiveRefiner needs
     (symbols, frames, hist, species, reactions, settled reaction ids)."""
     symbols, frames = read_segments(md_dir)
+    return events_in_frames(symbols, frames, total_charge=total_charge, detect=detect, dt_fs=dt_fs,
+                            charges_at=charges_at, context=context)
+
+
+def events_in_frames(symbols, frames: np.ndarray, *, total_charge: int, detect: DetectSettings, dt_fs: float,
+                     charges_at: Optional[Callable[[int, np.ndarray], Optional[np.ndarray]]] = None,
+                     context: Optional[dict] = None) -> dict:
+    """live_events on frames already in memory (Angstrom, `dt_fs` apart):
+    the interactive reactor's events come from here too."""
     out = {"n_frames": int(len(frames)), "time_ps": len(frames) * dt_fs / 1000.0, "events": [], "final": False}
     if len(frames) < 2:
         return out

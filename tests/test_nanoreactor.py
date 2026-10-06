@@ -308,3 +308,26 @@ def test_an_extended_run_reuses_what_it_refined_before(tmp_path):
     assert prev.ts(NS(reactants=[5], products=[7]), by_id) == {"barrier_kcal": 60.0}
     # ...but not when written the other way round (its barrier is from the other side)
     assert prev.ts(NS(reactants=[7], products=[5]), by_id) is None
+
+
+def test_ends_that_change_bonds_on_optimization_but_still_differ_are_kept(tmp_path):
+    """refine: when no instance keeps its bonds, the first whose optimized
+    ends still differ becomes the reaction's ends, relabelled to what they
+    are; ends that optimize into the same molecules give no reaction."""
+    def end(name, rows, energy):
+        fp = tmp_path / name
+        fp.write_text(f"{len(rows)}\nenergy={energy} charge=0 mult=1\n" + "".join(f"{s} {x} {y} {z}\n" for s, x, y, z in rows))
+        return {"file": str(fp), "energy": energy, "bonds_kept": False}
+
+    ch4 = [("C", 0, 0, 0), ("H", 0.63, 0.63, 0.63), ("H", -0.63, -0.63, 0.63), ("H", -0.63, 0.63, -0.63),
+           ("H", 0.63, -0.63, -0.63)]
+    # product: two H's left C and bonded to each other (as two H radicals recombining would)
+    ch2_h2 = ch4[:3] + [("H", -3.0, 3.0, 0.0), ("H", -3.0, 3.74, 0.0)]
+    inst = {"complex": {"reactant": end("r.xyz", ch4, -4.0), "product": end("p.xyz", ch2_h2, -3.9)}}
+    c = nr.relaxed_complex([inst])
+    assert c is not None and c["reactant"].endswith("r.xyz")
+    assert sorted(c["relaxed"]["products"]) == sorted(["[CH2]", "[H][H]"]) and c["relaxed"]["reactants"] == ["C"]
+    assert c["relaxed"]["label"].startswith("C -> ") and abs(c["delta_e_kcal"] - 0.1 * 627.509) < 0.1
+    # both ends optimized into methane: no reaction
+    same = {"complex": {"reactant": end("r2.xyz", ch4, -4.0), "product": end("p2.xyz", ch4, -4.0)}}
+    assert nr.relaxed_complex([same]) is None

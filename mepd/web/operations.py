@@ -889,6 +889,9 @@ class NanoreactorParams(Params):
                             advanced=True, group="Events")
     instances: int = P(3, "Occurrences refined", "Per reaction and species: more gives more chances of a clean "
                        "optimization.", cli="--instances", ge=1, advanced=True, group="Events")
+    # An interactive reactor's trajectory to analyze instead of running an MD (Sandbox › Stop & analyze).
+    trajectory: str = P("", "Trajectory", kind="custom", group="Hidden")
+    trajectory_start: str = P("", "Its first frame", kind="custom", group="Hidden")
 
 
 def _parse_copies(text: str, recs: list[dict]) -> list[int]:
@@ -941,6 +944,14 @@ def _retro_methods():
 
 
 def _build_nanoreactor(ctx: JobContext, p: NanoreactorParams) -> list[str]:
+    if p.trajectory:
+        # An interactive reactor's trajectory (frames 2 fs apart): analyzed and refined like an MD of our own.
+        # Its first frame stands for the molecules (its charge and spin are in its comment line).
+        flags = ctx.common_flags()
+        flags = flags[flags.index("--inputs"):flags.index("--inputs") + 2] if "--inputs" in flags else []
+        return ["discovery", "nanoreactor", p.trajectory_start, "--trajectory", p.trajectory, "--dump", "2.0",
+                *flags, "--instances", str(p.instances), "--min-lifetime", str(p.min_lifetime),
+                "--merge-window", str(p.merge_window), "--output", str(ctx.output_dir)]
     counts = _parse_copies(p.copies, ctx.structures)
     mols = [f"{ctx.snapshot_structure(r, f'molecule_{i}')}*{n}" for i, (r, n) in enumerate(zip(ctx.structures, counts))]
     flags = ctx.common_flags()

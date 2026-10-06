@@ -1210,3 +1210,10 @@ input.invalid { border-color: var(--danger); outline-color: var(--danger); }
 .retro-mol img { display: block; }
 .retro-card { grid-column: 1 / -1; }
 .method-group { color: var(--label); text-transform: uppercase; letter-spacing: .04em; font-size: 11px; margin: 10px 0 4px; }
+
+/* Interactive reactor (Sandbox.js) */
+.sandbox-stage { cursor: grab; }
+.sandbox-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-top: 8px; }
+.sandbox-controls label { display: flex; align-items: center; gap: 6px; }
+.sandbox-controls input[type=range] { width: 140px; }
+.sandbox-return { color: var(--accent); border-color: var(--accent); margin-right: 8px; }

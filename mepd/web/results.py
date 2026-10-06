@@ -1329,11 +1329,13 @@ def collect_nanoreactor(out: Path, charge: int, multiplicity: int) -> dict:
     if n_ts:
         headline += f" · {n_ts} TS{'s' * (n_ts != 1)}"
     summary = [
-        {"label": "Reactor", "value": ", ".join(st.get("molecules") or []) or None},
+        # (an interactive reactor's run names its saved first frame here: not worth showing)
+        {"label": "Reactor", "value": ", ".join(m for m in st.get("molecules") or [] if "first_frame.xyz" not in m) or None},
         {"label": "MD", "value": f"{st.get('method', '').upper()} at {st.get('temperature', 0):.0f} K, "
                                  f"{st.get('time_ps')} ps, wall {st['radius']:.1f} → "
                                  f"{st['radius'] * (st.get('compress') or 1):.1f} Å" if st.get("radius") else
-         f"an existing trajectory ({(data.get('n_frames') or 0) * (data.get('frame_fs') or 0) / 1000:.1f} ps)"},
+         (f"{'an interactive reactor' if '/sandbox/' in str(data.get('trajectory') or '') else 'an existing'} trajectory "
+          f"({(data.get('n_frames') or 0) * (data.get('frame_fs') or 0) / 1000:.1f} ps)")},
         {"label": "Energies", "value": "within one reaction only (different reactions have different atoms)"},
     ]
     groups = [_group("Reactions (optimized subsystem: reactants → products)", "path", rx_entries),

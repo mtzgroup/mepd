@@ -262,6 +262,8 @@ export function ReactionCard({ r, event = null, compact = false }) {
     <div class="small muted rc-meta">${r.origin?.kind === 'composed' ? 'composed by hand' : r.retro ? `retrosynthesis step · ${r.retro.method}${r.retro.reagents?.length ? ` · reagents ${r.retro.reagents.join(', ')}` : ''}` : html`seen ${r.count || 0}× in the MD${r.reverse_count ? `, reverse ${r.reverse_count}×` : ''}`}
       · energies over the same atoms, kcal/mol
       ${compact && html` · <a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ reaction: r.id }); }}>open in Analyze</a>`}</div>
+    ${r.relaxed_from && html`<p class="small muted rc-relaxed" title=${(r.relaxed_why || []).join(' ')}>
+      Sampled in the MD as ${r.relaxed_from}; its ends changed bonds when optimized, so this is the reaction between them.</p>`}
     <${Ladder} r=${r} st=${st} structures=${structures} />
 
     <div class="rc-ts">

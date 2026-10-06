@@ -215,6 +215,13 @@ class ComposeIn(BaseModel):
     proposal: Optional[dict] = None   # one of /api/reactions/propose's proposals, with its complex_xyz
 
 
+class SandboxIn(BaseModel):
+    counts: dict[str, int] = {}       # species id -> how many in the interactive reactor (packed)...
+    structure: Optional[str] = None   # ...or one structure's geometry as it is (a complex)
+    temperature: float = 800.0
+    radius: Optional[float] = None
+
+
 class ComplexIn(BaseModel):
     counts: dict[str, int]            # species id -> how many
     method: str = "packed"            # mepd.complexes.METHODS: packed at once, the others as a job
@@ -401,7 +408,10 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web.nanoreactor import adopt_nanoreactor
 
         nano = [j for j in manager.jobs.values() if j["op"] == "nanoreactor" and j["status"] == "done"
-                and any(r.get("origin", {}).get("job") == j["id"] and "ladder" not in r
+                and any(r.get("origin", {}).get("job") == j["id"]
+                        and ("ladder" not in r
+                             # ends that changed bonds on optimization, from before those were kept when they differ
+                             or (not r.get("edge") and r.get("complex_reason")))
                         for r in manager.ws.snapshot().get("reactions", {}).values())]
         for job in nano:
             try:
@@ -1745,6 +1755,130 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             pass
         publish_ws()
         return out["reaction"]
+
+    # ---------------------------------------------------- interactive reactor
+    def _sandbox(sid: str):
+        from mepd.web import sandbox
+
+        try:
+            return sandbox.get(sid)
+        except KeyError:
+            raise HTTPException(404, "this interactive reactor is not running (stopped, or the server restarted)")
+
+    @app.post("/api/sandbox")
+    def sandbox_start(body: SandboxIn):
+        """A live MD of these species (so many of each) to steer by hand (mepd.web.sandbox)."""
+        from mepd.web import sandbox
+        from mepd.web.compose import species_structures
+
+        if demo is not None:
+            raise WorkspaceError("the interactive reactor is not available in the demo")
+        if body.structure:
+            from mepd.web.workspace import new_id
+
+            rec = W().structure(body.structure)
+            if rec["natoms"] > 120:
+                raise WorkspaceError(f"{rec['natoms']} atoms is more than the interactive reactor keeps up with (at most 120)")
+            try:
+                box = sandbox.start_from(new_id("sb_"), W().load_structure(body.structure), temperature=body.temperature,
+                                         radius=body.radius, names=rec["name"], owner=str(W().root),
+                                         sources=[body.structure])
+            except ValueError as exc:
+                raise WorkspaceError(str(exc)) from None
+            return box.describe()
+        ids = [sid for sid, n in body.counts.items() if int(n) > 0]
+        mols = [s for s, n in zip(species_structures(W(), ids), [int(body.counts[i]) for i in ids]) for _ in range(n)]
+        if not mols:
+            raise WorkspaceError("pick at least one molecule")
+        natoms = sum(len(m.symbols) for m in mols)
+        if natoms > 120:
+            raise WorkspaceError(f"{natoms} atoms is more than the interactive reactor keeps up with (at most 120)")
+        names = " + ".join(f"{body.counts[i]} {W().structure(i)['name']}" if int(body.counts[i]) > 1
+                           else W().structure(i)["name"] for i in ids)
+        try:
+            from mepd.web.workspace import new_id
+
+            box = sandbox.start(new_id("sb_"), mols, temperature=body.temperature, radius=body.radius, names=names,
+                                owner=str(W().root), sources=ids)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from None
+        return box.describe()
+
+    @app.get("/api/sandboxes")
+    def sandboxes_running():
+        """The interactive reactors started from this workspace that still run."""
+        from mepd.web import sandbox
+
+        return sandbox.running(str(W().root))
+
+    @app.get("/api/sandbox/{sid}")
+    def sandbox_info(sid: str):
+        return _sandbox(sid).describe()
+
+    @app.get("/api/sandbox/{sid}/frame")
+    def sandbox_frame(sid: str, since: int = 0):
+        """The newest frame after `since` (waits briefly for one)."""
+        return _sandbox(sid).frame(since)
+
+    @app.get("/api/sandbox/{sid}/events")
+    def sandbox_events(sid: str):
+        """Its reaction events so far, found as the nanoreactor finds them."""
+        return _sandbox(sid).events_view()
+
+    @app.post("/api/sandbox/{sid}/command")
+    def sandbox_command(sid: str, body: dict):
+        """pull {atom, target [x,y,z] A, k kcal/mol/A^2} | release {atom} | release_all |
+        radius {value A} | temperature {value K} | pause {value}."""
+        if body.get("op") not in ("pull", "release", "release_all", "radius", "temperature", "pause"):
+            raise WorkspaceError(f"unknown command {body.get('op')!r}")
+        try:
+            _sandbox(sid).command(body)
+        except RuntimeError as exc:
+            raise WorkspaceError(str(exc)) from None
+        return {"ok": True}
+
+    @app.post("/api/sandbox/{sid}/snapshot")
+    def sandbox_snapshot(sid: str):
+        """The current frame into Explore (several molecules: a complex), not minimized."""
+        import numpy as np
+        from qcconst.constants import ANGSTROM_TO_BOHR
+        from qcdata import Structure
+
+        box = _sandbox(sid)
+        f = box.frame(0, wait=0)
+        if not f.get("pos"):
+            raise WorkspaceError("no frame yet")
+        s = Structure(symbols=box.symbols, geometry=np.asarray(f["pos"]) * ANGSTROM_TO_BOHR, charge=box.charge,
+                      multiplicity=box.multiplicity)
+        res = W().add_or_merge(s, optimized=False, origin={"kind": "sandbox", "label": f"interactive reactor, {f.get('t_fs', 0)} fs"})
+        publish_ws()
+        return res["rec"]
+
+    @app.post("/api/sandbox/{sid}/analyze")
+    def sandbox_analyze(sid: str):
+        """Stop it and analyze what it did like a nanoreactor run: its
+        trajectory saved in the workspace, then a nanoreactor job on it (the
+        same event detection; species and reaction complexes refined at the
+        workspace level; its result page, reactor replay, and Explore)."""
+        from mepd.web import sandbox
+
+        box = _sandbox(sid)
+        try:
+            traj, start = box.save(W().root / "sandbox" / sid)
+        except RuntimeError as exc:
+            raise WorkspaceError(str(exc)) from None
+        sandbox.forget(sid)
+        jobs = J().submit("nanoreactor", structure_ids=box.sources, edge_ids=[], profile=W().level_profile,
+                          params={"trajectory": str(traj), "trajectory_start": str(start)},
+                          label=f"Interactive reactor: {box.names}")
+        return {"job": jobs[0]["id"]}
+
+    @app.delete("/api/sandbox/{sid}")
+    def sandbox_stop(sid: str):
+        from mepd.web import sandbox
+
+        sandbox.stop(sid)
+        return {"ok": True}
 
     @app.post("/api/complexes")
     async def complexes_make(body: ComplexIn):

@@ -118,6 +118,11 @@ def _adopt_one(ws, job: dict, data: dict, nodes: dict, refined: dict, *, final: 
         existing = ws.find_reaction(job["id"], rx["id"], key=rkey)
         events = [inst.get("event") for inst in rx.get("instances") or [] if inst.get("event") is not None]
         c = rx.get("complex") or {}
+        if not c.get("reactant") and rx.get("instances"):
+            # refined before ends that changed bonds but still differ were kept: take them now
+            from mepd.discovery.nanoreactor import relaxed_complex
+
+            c = relaxed_complex(rx["instances"]) or c
         fields = {"label": _label(rx, data), "count": rx.get("count", 0), "reverse_count": rx.get("reverse_count", 0),
                   "delta_e_kcal": rx.get("delta_e_kcal"), "first_fs": rx.get("first_fs"),
                   "complex_delta_e_kcal": c.get("delta_e_kcal"), "complex_error": c.get("error"),
@@ -133,9 +138,20 @@ def _adopt_one(ws, job: dict, data: dict, nodes: dict, refined: dict, *, final: 
                 fields["complexes"], fields["edge"] = made
         if fields["edge"] and (rx.get("ts") or {}).get("barrier_kcal") is not None:
             _put_ts(ws, job, fields["edge"], rx)
+        r_ids, p_ids = [nodes[keys[i]] for i in rx["reactants"]], [nodes[keys[i]] for i in rx["products"]]
+        if c.get("relaxed") and c.get("reactant"):
+            # Its ends changed bonds on optimization but still differ: the reaction is what they are
+            # (its molecules from the relaxed ends), the sampled one kept as `relaxed_from`.
+            if existing and existing.get("relaxed_from"):
+                r_ids, p_ids = existing["reactants"], existing["products"]
+            else:
+                r_ids, p_ids = _relaxed_species(ws, job, c)
+            fields["label"] = c["relaxed"]["label"]
+            fields["relaxed_from"] = _label(rx, data)
+            fields["relaxed_why"] = c["relaxed"].get("why") or []
         before = json.dumps({k: (existing or {}).get(k) for k in fields}, sort_keys=True, default=str)
         rec = ws.put_reaction(
-            reactants=[nodes[keys[i]] for i in rx["reactants"]], products=[nodes[keys[i]] for i in rx["products"]],
+            reactants=r_ids, products=p_ids,
             origin={"kind": "job", "job": job["id"], "index": rx["id"], "key": rkey, "nanoreactor": True}, **fields)
         if existing is None or json.dumps({k: rec.get(k) for k in fields}, sort_keys=True, default=str) != before:
             changed = True
@@ -236,6 +252,24 @@ def _complex_pair(ws, job: dict, rx: dict, c: dict, level, label: str):
     except WorkspaceError:
         return None
     return sids, edge["id"]
+
+
+def _relaxed_species(ws, job: dict, c: dict) -> tuple[list, list]:
+    """The molecules of a reaction's relaxed ends (complex files), as
+    species (merged with known ones): its reactants and products."""
+    from mepd.web.compose import _fragments
+
+    out = []
+    for side in ("reactant", "product"):
+        text = _read(Path(c[side]))
+        if not text:
+            out.append([])
+            continue
+        (s,) = chem.structures_from_xyz_text(text, c["charge"], c["multiplicity"])
+        out.append([ws.add_or_merge(f, optimized=False, origin={
+            "kind": "job", "job": job["id"], "label": f"relaxed {side} end (molecule)", "nanoreactor": True})["rec"]["id"]
+                    for f in _fragments(s)])
+    return out[0], out[1]
 
 
 def _put_ts(ws, job: dict, eid: str, rx: dict) -> None:

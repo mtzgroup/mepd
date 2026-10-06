@@ -118,6 +118,7 @@ function ComplexDetail({ rec }) {
     <div class="row-actions">
       <button class="btn" onClick=${() => attempt(() => api.post('/api/design/load', { structure: rec.id }), 'Loaded into Design').then((d) => d && openTab('design'))}>Edit in Design</button>
     </div>
+    <${ComplexSandbox} key=${rec.id} rec=${rec} />
     ${built && html`<button class="btn-link danger small" onClick=${() => attempt(() => api.post('/api/delete', { structures: [rec.id] }), 'Complex removed').then(() => clearSelection())}>Remove complex</button>`}
     <div class="section-title">Reactions (${reactions.length})</div>
     <ul class="sel-list">${reactions.map((r) => html`<li><a href="#" onClick=${(e) => { e.preventDefault(); if (r.edge) select({ edges: [r.edge] }); else openAnalyze({ reaction: r.id }); }}>${r.label}</a></li>`)}</ul>
@@ -284,6 +285,57 @@ function usePhone() {
 
 // Species selected: so many of each, combined into one complex (a new
 // complex node, minimized at the workspace level).
+// A complex: a live MD from its geometry as it is (Sandbox.js).
+function ComplexSandbox({ rec }) {
+  const demo = useStore((s) => s.demo);
+  const [temperature, setTemperature] = useState(800);
+  const [busy, setBusy] = useState(false);
+  if (demo) return null;
+  const start = async () => {
+    setBusy(true);
+    const out = await attempt(() => api.post('/api/sandbox', { structure: rec.id, temperature }));
+    setBusy(false);
+    if (out) set({ view: { tab: 'sandbox', jobId: null, sandbox: out } });
+  };
+  return html`<div class="row-actions small">
+    <button class="btn" disabled=${busy || rec.natoms > 120} onClick=${start}
+      title="Live GFN2-xTB dynamics from this geometry: drag atoms, scroll to squeeze the wall">${busy ? 'Starting…' : 'Interactive reactor'}</button>
+    at <input type="number" class="tiny" min="0" max="3000" step="100" value=${temperature} onInput=${(e) => setTemperature(+e.target.value || 0)} /> K
+  </div>`;
+}
+
+// Species selected: a live MD of them to steer by hand (Sandbox.js).
+function SandboxLauncher({ sids }) {
+  const structures = useStore((s) => s.workspace.structures);
+  const demo = useStore((s) => s.demo);
+  const [open, setOpen] = useState(false);
+  const [counts, setCounts] = useState({});
+  const [temperature, setTemperature] = useState(800);
+  const [busy, setBusy] = useState(false);
+  if (demo) return null;
+  const n = (id) => counts[id] ?? (sids.length === 1 ? 6 : 3);
+  const atoms = sids.reduce((t, id) => t + n(id) * (structures[id]?.natoms || 0), 0);
+  if (!open) return html`<a href="#" onClick=${(e) => { e.preventDefault(); setOpen(true); }}>Interactive reactor →</a>`;
+  const start = async () => {
+    setBusy(true);
+    const out = await attempt(() => api.post('/api/sandbox', { counts: Object.fromEntries(sids.map((id) => [id, n(id)])), temperature }));
+    setBusy(false);
+    if (out) set({ view: { tab: 'sandbox', jobId: null, sandbox: out } });
+  };
+  return html`<div class="combine-cx">
+    <div class="small"><b>Interactive reactor</b>
+      <button class="btn-link small" style="float: right" onClick=${() => setOpen(false)}>Cancel</button></div>
+    ${sids.map((id) => html`<label class="combine-row small">
+      <input type="number" class="tiny" min="0" max="20" value=${n(id)}
+        onInput=${(e) => setCounts({ ...counts, [id]: Math.max(0, Math.min(20, +e.target.value || 0)) })} />
+      × ${structures[id]?.name}</label>`)}
+    <label class="combine-row small">Temperature <input type="number" class="tiny" min="0" max="3000" step="100" value=${temperature}
+      onInput=${(e) => setTemperature(+e.target.value || 0)} /> K</label>
+    <p class="small muted combine-help">Live GFN2-xTB dynamics you steer: drag atoms, scroll to squeeze the wall. ${atoms} atoms${atoms > 80 ? ' (slow beyond ~80)' : ''}.</p>
+    <div class="row-actions"><button class="btn primary" disabled=${busy || atoms === 0 || atoms > 120} onClick=${start}>${busy ? 'Starting…' : 'Start'}</button></div>
+  </div>`;
+}
+
 function CombineComplex({ sids }) {
   const structures = useStore((s) => s.workspace.structures);
   const [open, setOpen] = useState(false);
@@ -379,6 +431,7 @@ export function Inspector() {
       ${n > 0 && html`<a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ species: [...sel.structures], reaction: null }); }}>${n} reaction${n > 1 ? 's' : ''} of ${nS > 1 ? 'these' : 'this'} →</a>`}
       <a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ compose: true, composeReactants: [...sel.structures], reaction: null }); }}>New reaction with ${nS > 1 ? 'these' : 'this'} →</a>
       <${CombineComplex} key=${sel.structures.join(',')} sids=${sel.structures} />
+      <${SandboxLauncher} key=${'sb' + sel.structures.join(',')} sids=${sel.structures} />
     </div>${body}`;
   }
   return html`

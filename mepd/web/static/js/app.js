@@ -1,5 +1,5 @@
 import { html, render, useEffect } from './lib.js';
-import { connect, deleteSelection } from './api.js';
+import { api, connect, deleteSelection } from './api.js';
 import { clearSelection, openTab, set, state, useStore } from './store.js';
 import { Graph } from './components/Graph.js';
 import { Inspector } from './components/Inspector.js';
@@ -11,6 +11,7 @@ import { ProfilesView } from './components/Profiles.js';
 import { ReferencesView } from './components/References.js';
 import { DesignView } from './components/Design.js';
 import { AnalyzeView } from './components/Analyze.js';
+import { SandboxView } from './components/Sandbox.js';
 import { PlaygroundApp, layoutToggle } from './components/Playground.js';
 
 function TopBar() {
@@ -26,6 +27,16 @@ function TopBar() {
   const demo = useStore((s) => s.demo);
   const auth = useStore((s) => s.auth);
   const active = counts.running + counts.queued;
+  // Interactive reactors still running in this workspace: a way back to them.
+  const sandboxes = useStore((s) => s.sandboxes || []);
+  useEffect(() => {
+    if (demo) return undefined;
+    let alive = true;
+    const refresh = () => api.get('/api/sandboxes').then((list) => { if (alive) set({ sandboxes: list }); }).catch(() => {});
+    refresh();
+    const timer = setInterval(refresh, 10000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [demo, root, view.tab]);
   return html`
     <header class="topbar">
       <div class="brand">
@@ -39,6 +50,9 @@ function TopBar() {
         </button>`)}
       </nav>
       <span class="spacer"></span>
+      ${sandboxes.length > 0 && view.tab !== 'sandbox' && html`<button class="btn small sandbox-return"
+        title=${`Back to the interactive reactor: ${sandboxes[0].names}${sandboxes.length > 1 ? ` (and ${sandboxes.length - 1} more)` : ''}`}
+        onClick=${() => set({ view: { tab: 'sandbox', jobId: null, sandbox: sandboxes[0] } })}>◉ Interactive reactor</button>`}
       <button class="session-name" title=${`Session folder: ${root}\nSwitch, open or start a new session`}
         onClick=${() => set({ modal: { kind: 'sessions' } })}>
         <span class=${`conn ${connected ? 'on' : 'off'}`} title=${connected ? 'Connected' : 'Reconnecting…'}></span>
@@ -113,6 +127,7 @@ function App() {
         ${view.tab === 'refs' && html`<${ReferencesView} />`}
         ${view.tab === 'design' && html`<${DesignView} />`}
         ${view.tab === 'analyze' && html`<${AnalyzeView} />`}
+        ${view.tab === 'sandbox' && html`<${SandboxView} />`}
       </section>
       ${showInspector && html`<${Inspector} />`}
     </main>
