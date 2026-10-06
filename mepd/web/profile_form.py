@@ -206,6 +206,8 @@ HELP = {
                    "the lowest endpoint RMSD (mepd channels).",
     "metric": "How candidate atom mappings are scored.",
     "veto_margin": "A remapping must beat 'don't reindex' by more than this.",
+    "relax_top": "snap-gi-xtb: relax the paths of the best this many mechanisms (changing bonds held) and keep "
+                 "the lowest relaxed barrier; SLAPMapper's own mechanism is always included. 0 = raw peaks only.",
     "model": "Pretrained FAIR-Chem model name (e.g. uma-s-1p2p1, uma-m-1p1).",
     "task": "Which UMA head: omol for molecules (reads charge and multiplicity).",
     "checkpoint": "A local checkpoint file used instead of the named model.",

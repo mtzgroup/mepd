@@ -876,6 +876,10 @@ def channels(
         "scored like SLAPMapper's (snap + GI + xtb); ones in which a molecule takes part and is "
         "regenerated are labelled [catalytic: ...]. 0 = off.",
     ),
+    relax_mechanisms: Optional[int] = typer.Option(
+        None, "--relax-mechanisms",
+        help="snap-gi-xtb: relax the paths of the best this many mechanisms (by raw xtb peak; SLAPMapper's own mechanism always included) with their changing bonds held, and keep the lowest relaxed barrier. Default: the profile's atom_mapping_inputs.relax_top (4); 0 = raw peaks only.",
+    ),
     atom_mapping_metric: str = typer.Option(
         "snap-gi-xtb", "--atom-mapping-metric",
         help="--atom-mapping: " + _MAPPING_HELP + " One of: " + ", ".join(_OFFERED_METRICS) + ".",
@@ -1185,6 +1189,8 @@ def channels(
     run_inputs.atom_mapping_inputs.veto_margin = atom_mapping_veto_margin
     run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
     run_inputs.atom_mapping_inputs.explore_mechanisms = max(0, explore_mechanisms) if isinstance(explore_mechanisms, int) else 0
+    if isinstance(relax_mechanisms, int):
+        run_inputs.atom_mapping_inputs.relax_top = max(0, relax_mechanisms)
     _echo_run_inputs_summary(run_inputs)
 
     if reaction is not None:
