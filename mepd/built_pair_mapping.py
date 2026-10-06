@@ -218,7 +218,7 @@ def build_and_rank(start: Structure, end: Structure, atom_maps: list, pair_from:
 @dataclass
 class MechanismPair:
     key: str               # mechanism_key: which bonds break and form, by element and symmetry class
-    score: float           # xtb peak along its interpolated path, kcal/mol (else GI length)
+    score: float           # by --atom-mapping-metric (_path_score); lower is better
     start: Structure       # in the start's atom order
     end: Structure
 
@@ -226,8 +226,8 @@ class MechanismPair:
 def mechanism_pairs(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
                     echo: Callable[[str], None] = print) -> list[MechanismPair]:
     """Like `build_and_rank`, but every built pair instead of one: each with
-    its mechanism (which bonds break and form) and the xtb peak along its
-    interpolated path. A mechanism's variants -- which of the source's
+    its mechanism (which bonds break and form) and its score by
+    --atom-mapping-metric (`_path_score`). A mechanism's variants -- which of the source's
     symmetric atoms react -- are different built partners, so each is a pair
     of its own (`distinct` then drops the ones that minimized to the same
     geometry). For channels, where every mechanism gets its own searches."""
@@ -271,16 +271,23 @@ def distinct(pairs: list[MechanismPair], tol: float = 0.05) -> list[MechanismPai
 
 
 def _path_score(start: Structure, end: Structure, run_inputs) -> float:
-    """One number to compare a mechanism's pairs across conformers: the
-    xtb peak along the interpolated path (kcal/mol above its start), else
-    the path's length; inf if neither can be had."""
+    """One number to compare a mechanism's pairs across conformers, by
+    --atom-mapping-metric: snap-gi-xtb (default), the xtb peak along the
+    interpolated path (kcal/mol above its start), else the path's length;
+    snap and endpoint-rmsd, the aligned endpoint RMSD; any other metric, its
+    `score_candidate` score. inf if it can't be had."""
     import math
 
-    from mepd.atom_mapping_selection import KCAL_PER_HARTREE, MappingCandidate, _interpolate, _xtb_engine
+    from mepd.atom_mapping_selection import (KCAL_PER_HARTREE, MappingCandidate, _interpolate, _xtb_engine,
+                                             score_candidate)
 
+    metric = run_inputs.atom_mapping_inputs.metric
+    candidate = MappingCandidate(label="pair", end_structure=end, atom_map=None)
     try:
-        chain, smoother = _interpolate(MappingCandidate(label="pair", end_structure=end, atom_map=None), start,
-                                       run_inputs)
+        if metric != "snap-gi-xtb":
+            return float(score_candidate(candidate, "endpoint-rmsd" if metric == "snap" else metric, start,
+                                         run_inputs)[0])
+        chain, smoother = _interpolate(candidate, start, run_inputs)
     except Exception:
         return math.inf
     engine = _xtb_engine()

@@ -175,3 +175,23 @@ def test_each_variant_of_a_mechanism_is_its_own_search(monkeypatch):
     sigs = [bp._signature(a.structure, b.structure) for a, b in one_h]
     assert all(abs(x - y).max() > 0.05 for i, x in enumerate(sigs) for y in sigs[i + 1:])   # the repeat conformer adds none
     assert len(pairs) - len(one_h) == 3                # the double shift: its 3 best of more
+
+
+@pytest.mark.parametrize("metric", ["endpoint-rmsd", "geodesic-distance", "snap-gi-xtb"])
+def test_built_pairs_are_scored_by_the_atom_mapping_metric(monkeypatch, metric):
+    """channels' built pairs follow --atom-mapping-metric; snap-gi-xtb (the
+    default) is the xtb peak, falling back to the GI length without xtb."""
+    import mepd.atom_mapping_selection as sel
+    from mepd.built_pair_mapping import _path_score
+    from mepd.inputs import RunInputs
+
+    monkeypatch.setattr(sel, "_xtb_engine", lambda: None)
+    start, end = _acetone_and_enol()
+    ri = RunInputs(gi_inputs={"nimages": 6})
+    ri.atom_mapping_inputs.metric = metric
+    got = _path_score(start, end, ri)
+    if metric == "endpoint-rmsd":
+        assert got == pytest.approx(sel._aligned_rmsd(start, end))
+    else:   # geodesic-distance, and snap-gi-xtb without xtb: the GI length
+        cand = sel.MappingCandidate(label="pair", end_structure=end, atom_map=None)
+        assert got == pytest.approx(float(sel._interpolate(cand, start, ri)[1].length))
