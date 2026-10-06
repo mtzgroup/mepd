@@ -328,6 +328,14 @@ def run(
         "candidate mappings (plus their symmetry-orbit expansions) to keep "
         "and consider (they're ties, not ranked by quality among themselves).",
     ),
+    explore_mechanisms: int = typer.Option(
+        0, "--explore-mechanisms",
+        help="Also consider up to this many mechanisms beyond SLAPMapper's minimal-edit ones: relays and "
+        "exchanges through other molecules (catalyst, solvent), found by swapping same-element atoms or "
+        "groups with at most +2 bond edits per swap, with no rule about which atoms may move. Each is "
+        "scored like SLAPMapper's (snap + GI + xtb); ones in which a molecule takes part and is "
+        "regenerated are labelled [catalytic: ...]. 0 = off.",
+    ),
     atom_mapping_metric: str = typer.Option(
         "snap-gi-xtb", "--atom-mapping-metric",
         help="--atom-mapping: " + _MAPPING_HELP + " (One pair here, so rmsd-geodesic compares its "
@@ -397,6 +405,7 @@ def run(
     run_inputs.atom_mapping_inputs.metric = atom_mapping_metric
     run_inputs.atom_mapping_inputs.veto_margin = atom_mapping_veto_margin
     run_inputs.atom_mapping_inputs.recheck_on_split = atom_mapping_recheck_splits
+    run_inputs.atom_mapping_inputs.explore_mechanisms = max(0, explore_mechanisms) if isinstance(explore_mechanisms, int) else 0
     _echo_run_inputs_summary(run_inputs)
 
     # A --reaction pair is embedded from SMILES too, but is already one

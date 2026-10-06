@@ -471,3 +471,58 @@ def test_every_slapmapper_result_is_its_own_mechanism(monkeypatch):
     assert len(forced) == 2 and all(k.startswith("break X | form Y [centre ") for k in forced)
     assert sorted(len(v) for v in forced.values()) == sorted(len(v) for v in honest.values())
     assert list(am.suggest_mechanism_candidates(start, end)) == list(forced)
+
+
+# --- explored mechanisms (relays and exchanges beyond SLAPMapper's minimal-edit ones) ---
+
+_MAPPING_DATA = __import__("pathlib").Path(__file__).parent / "data" / "mapping"
+
+
+def _scrambled(name, seed=0):
+    start = Structure.open(_MAPPING_DATA / f"{name}_start.xyz")
+    end = Structure.open(_MAPPING_DATA / f"{name}_end.xyz")
+    perm = list(np.random.default_rng(seed).permutation(len(end.symbols)))
+    return start, reorder_structure(end, perm)
+
+
+def test_explore_finds_the_water_relay_and_calls_water_catalytic():
+    from mepd.atom_mapping import catalytic_participants, explore_mechanisms
+
+    start, end = _scrambled("keto_enol_1water")
+    base = suggest_atom_mapping(start, end)
+    explored = explore_mechanisms(start, end, [base], max_new=10)
+    assert explored
+    tags = [catalytic_participants(start, realign_end_to_start(m, end)) for m in explored]
+    assert ["H2O"] in tags  # the proton passes through the water, which is regenerated
+
+
+def test_explore_finds_the_methyl_relay_through_ch3i():
+    from mepd.atom_mapping import catalytic_participants, explore_mechanisms
+
+    start, end = _scrambled("methyl_relay")
+    explored = explore_mechanisms(start, end, [suggest_atom_mapping(start, end)], max_new=10)
+    assert any(catalytic_participants(start, realign_end_to_start(m, end)) == ["CH3I"] for m in explored)
+
+
+def test_suggest_mechanism_candidates_adds_explored_routes_only_when_asked():
+    from mepd.atom_mapping import suggest_mechanism_candidates
+
+    start, end = _scrambled("keto_enol_1water")
+    plain = suggest_mechanism_candidates(start, end)
+    explored = suggest_mechanism_candidates(start, end, explore=10)
+    assert not any(k.startswith("explored:") for k in plain)
+    new = [k for k in explored if k.startswith("explored:")]
+    assert new and set(plain) <= set(explored)
+    assert any("[catalytic: H2O]" in k for k in new)
+    # every explored mechanism is a different correspondence from SLAPMapper's
+    orders = [tuple(v.as_order()) for vs in explored.values() for v in vs]
+    assert len(orders) == len(set(orders))
+
+
+def test_catalytic_participants_ignores_spectators_and_changed_reactants():
+    from mepd.atom_mapping import catalytic_participants
+
+    start, end = _scrambled("keto_enol_1water")
+    direct = suggest_atom_mapping(start, end)
+    # SLAPMapper's direct transfer leaves the water out of it: nothing catalytic
+    assert catalytic_participants(start, realign_end_to_start(direct, end)) == []

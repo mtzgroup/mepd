@@ -403,12 +403,21 @@ class AtomMappingInputs:
         every new (reactant, product) pair MSMEP's recursive splitting
         discovers, not just the original --start/--end pair (default:
         False). Independent of --atom-mapping.
+
+    `explore_mechanisms`: also consider up to this many mechanisms beyond
+        SLAPMapper's minimal-edit ones (`mepd.atom_mapping.explore_mechanisms`):
+        relays and exchanges through other molecules, found without any rule
+        about which atoms may move. Each is scored like SLAPMapper's
+        (snap + GI + xtb) and, in channels, searched as its own mechanism;
+        those in which a molecule takes part and is regenerated are labelled
+        "[catalytic: ...]". Default 0 (off).
     """
 
     n_candidates: int = 200
     metric: str = "snap-gi-xtb"
     veto_margin: float = 0.0
     recheck_on_split: bool = False
+    explore_mechanisms: int = 0
     # metric "rmsd-geodesic": only candidates within this many standard
     # deviations of the lowest endpoint RMSD are scored by geodesic distance.
     rmsd_window: float = 1.0

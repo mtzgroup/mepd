@@ -460,6 +460,20 @@ def _check_endpoint_atom_mapping(
         atom_maps = (expand_mapping_fully(atom_map, start_structure, end_structure, max_variants=n_candidates)
                      if atom_map.is_identity else
                      suggest_atom_mapping_candidates(start_structure, end_structure, max_candidates=n_candidates))
+        n_explore = int(getattr(run_inputs.atom_mapping_inputs, "explore_mechanisms", 0) or 0)
+        if n_explore > 0:
+            # Mechanisms beyond SLAPMapper's minimal-edit ones compete too:
+            # relays and exchanges through other molecules (a catalyst, solvent).
+            from mepd.atom_mapping import (catalytic_participants, explore_mechanisms, mechanism_key,
+                                           realign_end_to_start)
+            explored = explore_mechanisms(start_structure, end_structure, atom_maps[:20], max_new=n_explore)
+            for m in explored:
+                aligned = realign_end_to_start(m, end_structure)
+                cats = catalytic_participants(start_structure, aligned)
+                typer.echo(f"Atom mapping: explored mechanism ({int(m.cost)} bond changes) "
+                           f"{mechanism_key(start_structure, aligned)}"
+                           + (f"  [catalytic: {', '.join(cats)}]" if cats else ""))
+            atom_maps = list(atom_maps) + explored
     except Exception as exc:
         typer.echo(
             f"Could not enumerate --atom-mapping candidate mappings "
@@ -484,10 +498,13 @@ def _check_endpoint_atom_mapping(
     else:
         # What SLAPMapper found, and what was added: the budget (n_candidates)
         # is filled with relabelings of symmetric atoms of its best mapping.
-        n_sym = sum(c.label != "identity" and c.atom_map.relabeling for c in candidates)
-        pool = f"{n_other - n_sym} numbering(s) from SLAPMapper"
+        n_sym = sum(c.label != "identity" and getattr(c.atom_map, "relabeling", False) for c in candidates)
+        n_exp = sum(c.label != "identity" and getattr(c.atom_map, "explored", False) for c in candidates)
+        pool = f"{n_other - n_sym - n_exp} numbering(s) from SLAPMapper"
         if n_sym:
             pool += f" and {n_sym} relabeling(s) of their symmetric atoms"
+        if n_exp:
+            pool += f", plus {n_exp} explored mechanism(s)"
         if len(atom_maps) >= n_candidates:
             pool += f" (capped at {n_candidates})"
         typer.echo(

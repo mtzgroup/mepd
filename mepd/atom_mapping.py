@@ -54,6 +54,7 @@ class AtomMapping:
     # A relabeling of symmetric atoms added to fill the candidate budget,
     # not a mapping SLAPMapper itself returned.
     relabeling: bool = False
+    explored: bool = False  # from `explore_mechanisms`, beyond SLAPMapper's minimal-edit mappings
 
     @property
     def is_identity(self) -> bool:
@@ -491,7 +492,7 @@ def mechanism_key(start_structure: Structure, aligned_end_structure: Structure) 
 
 def suggest_mechanism_candidates(
     struct_start: Structure, struct_end: Structure, *, binary: bool = True,
-    max_variants_per_mechanism: int = 200,
+    max_variants_per_mechanism: int = 200, explore: int = 0,
 ) -> dict[str, list["AtomMapping"]]:
     """SLAPMapper's equal-minimal-cost mappings, grouped by the mechanism
     they imply (`mechanism_key`), each fully expanded into its symmetry
@@ -502,6 +503,12 @@ def suggest_mechanism_candidates(
     apart -- and the relabelings it collapses are regenerated here for
     EVERY mechanism, so each can be scored against the specific pair's
     geometry rather than only whichever result SLAPMapper listed first.
+
+    `explore`: also add up to this many mechanisms found beyond SLAPMapper's
+    minimal-edit ones (`explore_mechanisms`: relays and exchanges through
+    other molecules), each expanded into its symmetry variants the same way.
+    Their keys start with "explored:", and name any molecule that takes
+    part but is regenerated ("[catalytic: H2O]").
 
     Returns {} when `suggest_atom_mapping_candidates` would return []."""
     _require_slapmapper()
@@ -542,7 +549,213 @@ def suggest_mechanism_candidates(
                 seen.add(order)
                 variants.append(variant)
         routes.append((base, variants))
-    return dict(zip(_route_keys(struct_start, struct_end, [b for b, _ in routes]), (v for _, v in routes)))
+    keys = _route_keys(struct_start, struct_end, [b for b, _ in routes])
+    out = dict(zip(keys, (v for _, v in routes)))
+    if explore > 0 and routes:
+        for base in explore_mechanisms(struct_start, struct_end, [b for b, _ in routes], max_new=explore):
+            aligned = realign_end_to_start(base, struct_end)
+            key = f"explored: {mechanism_key(struct_start, aligned)}"
+            cats = catalytic_participants(struct_start, aligned)
+            if cats:
+                key += f" [catalytic: {', '.join(cats)}]"
+            if key in out:  # same mechanism by symmetry class, through other atoms: its own route
+                key += f" [route {sum(1 for k in out if k.startswith(key)) + 1}]"
+            variants = [v for v in expand_mapping_fully(base, struct_start, struct_end,
+                                                         max_variants=max_variants_per_mechanism)
+                        if tuple(v.as_order()) not in seen]
+            seen.update(tuple(v.as_order()) for v in variants)
+            if variants:
+                out[key] = variants
+    return out
+
+
+class _EditCount:
+    """The exact number of bonds broken plus formed under a mapping, on the
+    bond graphs SLAPMapper sees (`structure_to_molecule`), with O(degree)
+    updates for a swap of two atoms' images."""
+
+    def __init__(self, struct_start: Structure, struct_end: Structure):
+        self.n = len(struct_start.symbols)
+        self.sym = [str(s) for s in struct_start.symbols]
+        g0, g1 = structure_to_molecule(struct_start), structure_to_molecule(struct_end)
+        self.adj0 = {i: {int(k) for k in g0.neighbors(i)} for i in range(self.n)}
+        self.adj1 = {j: {int(k) for k in g1.neighbors(j)} for j in range(self.n)}
+        # terminal neighbours by element: what a group swap carries along
+        self.terminal = {i: {} for i in range(self.n)}
+        for i in range(self.n):
+            for k in sorted(self.adj0[i]):
+                if len(self.adj0[k]) == 1:
+                    self.terminal[i].setdefault(self.sym[k], []).append(k)
+
+    def cost(self, order) -> int:
+        c = 0
+        for i in range(self.n):
+            for k in self.adj0[i]:
+                c += k > i and order[k] not in self.adj1[order[i]]
+        inv = {int(v): a for a, v in enumerate(order)}
+        for j in range(self.n):
+            for b in self.adj1[j]:
+                c += b > j and inv[b] not in self.adj0[inv[j]]
+        return c
+
+    def _local(self, order, inv, atoms) -> int:
+        c, seen = 0, set()
+        for i in atoms:
+            for k in self.adj0[i] | {inv[b] for b in self.adj1[order[i]]}:
+                pair = (min(i, k), max(i, k))
+                if pair not in seen:
+                    seen.add(pair)
+                    c += (k in self.adj0[i]) != (order[k] in self.adj1[order[i]])
+        return c
+
+    def swap_delta(self, order, inv, i, j) -> int:
+        before = self._local(order, inv, (i, j))
+        order[i], order[j] = order[j], order[i]
+        inv[order[i]], inv[order[j]] = i, j
+        after = self._local(order, inv, (i, j))
+        order[i], order[j] = order[j], order[i]
+        inv[order[i]], inv[order[j]] = i, j
+        return after - before
+
+    def route(self, order) -> tuple:
+        """The bonds broken and formed, atoms named by index except that a
+        terminal atom is named by the atom it starts on: routes through
+        different molecules stay apart (a wire through water 1 is not one
+        through water 4, however alike the waters), while which of a
+        group's equivalent atoms moves does not split a route."""
+        def name(i):
+            if len(self.adj0[i]) == 1:
+                (p,) = tuple(self.adj0[i])
+                return f"{self.sym[i]}@{p}"
+            return str(i)
+        inv = {int(v): a for a, v in enumerate(order)}
+        broken = sorted(tuple(sorted((name(i), name(k)))) for i in range(self.n) for k in self.adj0[i]
+                        if k > i and order[k] not in self.adj1[order[i]])
+        formed = sorted(tuple(sorted((name(inv[j]), name(inv[b])))) for j in range(self.n) for b in self.adj1[j]
+                        if b > j and inv[b] not in self.adj0[inv[j]])
+        return tuple(broken), tuple(formed)
+
+    def group_swaps(self, order):
+        """Two same-element atoms swapped together with their same-element
+        terminal neighbours (a CH3's three H, not its halide): one move for
+        a group handed from one atom to another, which atom-by-atom swaps
+        would only reach through high-cost intermediates."""
+        for i in range(self.n):
+            for j in range(i + 1, self.n):
+                if self.sym[i] != self.sym[j] or len(self.adj0[i]) == 1 or len(self.adj0[j]) == 1:
+                    continue
+                carried = [(a, b) for el, ti in self.terminal[i].items()
+                           if len(self.terminal[j].get(el, [])) == len(ti)
+                           for a, b in zip(ti, self.terminal[j][el])]
+                if not carried:
+                    continue
+                t = list(order)
+                t[i], t[j] = order[j], order[i]
+                for a, b in carried:
+                    t[a], t[b] = order[b], order[a]
+                yield tuple(t)
+
+
+def explore_mechanisms(
+    struct_start: Structure, struct_end: Structure, bases: list["AtomMapping"], *,
+    max_new: int = 20, rounds: int = 5, step: int = 2, per_round: int = 400,
+) -> list["AtomMapping"]:
+    """Mechanisms beyond SLAPMapper's minimal-edit ones, for an unbiased look
+    at routes that involve more atoms -- a proton or methyl relayed through
+    a catalyst or solvent, a group exchanged with another molecule.
+
+    Starting from `bases` (SLAPMapper's mappings), repeatedly swap the images
+    of two same-element atoms, or of two groups (an atom with its terminal
+    atoms). A swap is kept if it raises the exact bond-edit count by at most
+    `step`: one relay hop costs +2 (a bond broken and one formed), while
+    shuffling bystanders costs more, so the expansion follows shuttles and
+    exchanges at the reaction without any rule about which atoms may move.
+    `rounds` swaps deep, the `per_round` cheapest new mappings carried on per
+    round. Returns one mapping per new route (`_EditCount.route`: bonds
+    broken and formed, by atom, not among the bases'), lowest edit count
+    first, at most `max_new`. Which of them
+    are actually low in energy is for the caller's scoring to decide."""
+    if not bases or max_new <= 0:
+        return []
+    ec = _EditCount(struct_start, struct_end)
+    pairs = [(i, j) for i in range(ec.n) for j in range(i + 1, ec.n) if ec.sym[i] == ec.sym[j]]
+    seen = {}
+    frontier = []
+    for b in bases:
+        o = tuple(int(v) for v in b.as_order())
+        if o not in seen:
+            seen[o] = ec.cost(o)
+            frontier.append(o)
+    for _ in range(rounds):
+        new = {}
+        for st in frontier:
+            order = list(st)
+            inv = {v: a for a, v in enumerate(order)}
+            c = seen[st]
+            for i, j in pairs:
+                d = ec.swap_delta(order, inv, i, j)
+                if d > step:
+                    continue
+                t = list(order)
+                t[i], t[j] = t[j], t[i]
+                t = tuple(t)
+                if t not in seen and t not in new:
+                    new[t] = c + d
+            for t in ec.group_swaps(order):
+                if t not in seen and t not in new:
+                    ct = ec.cost(t)
+                    if ct - c <= step:
+                        new[t] = ct
+        kept = sorted(new.items(), key=lambda kv: kv[1])[:per_round]
+        seen.update(kept)
+        frontier = [t for t, _ in kept]
+        if not frontier:
+            break
+
+    known = {ec.route(tuple(int(v) for v in b.as_order())) for b in bases}
+    best: dict[tuple, tuple[int, tuple]] = {}
+    for order, c in seen.items():
+        key = ec.route(order)
+        if key not in known and (key not in best or c < best[key][0]):
+            best[key] = (c, order)
+    ranked = sorted(best.values(), key=lambda t: (t[0], t[1]))[:max_new]
+    return [AtomMapping(mapping=dict(enumerate(o)), cost=float(c), n_alternatives=len(best), explored=True)
+            for c, o in ranked]
+
+
+def catalytic_participants(struct_start: Structure, aligned_end_structure: Structure) -> list[str]:
+    """Molecules of the start that take part in the reaction yet are
+    regenerated: some bond touching them breaks or forms, and the end has a
+    molecule with the same bond graph (elements included) holding at least
+    one of their atoms -- possibly rebuilt from other atoms, as when a water
+    passes a proton on and takes another, or a CH3I hands over its methyl
+    and gains one. Formulas, e.g. ['H2O', 'C5H9NO2']: a catalyst, or solvent
+    acting as one."""
+    import networkx as nx
+
+    g0 = structure_to_molecule(struct_start)
+    g1 = structure_to_molecule(aligned_end_structure)
+    sym = [str(s) for s in struct_start.symbols]
+    nx.set_node_attributes(g0, {i: sym[i] for i in g0.nodes}, "el")
+    nx.set_node_attributes(g1, {i: sym[i] for i in g1.nodes}, "el")
+    ends = [set(c) for c in nx.connected_components(g1)]
+    out = []
+    for comp in nx.connected_components(g0):
+        comp = set(comp)
+        touched = any(g0.has_edge(i, k) != g1.has_edge(i, k)
+                      for i in comp for k in set(g0.neighbors(i)) | set(g1.neighbors(i)))
+        if not touched:
+            continue
+        h0 = g0.subgraph(comp)
+        if any(e & comp and len(e) == len(comp)
+               and nx.is_isomorphic(h0, g1.subgraph(e), node_match=lambda a, b: a["el"] == b["el"])
+               for e in ends):
+            counts = {}
+            for i in comp:
+                counts[sym[i]] = counts.get(sym[i], 0) + 1
+            order = sorted(counts, key=lambda e: (e != "C", e != "H", e))
+            out.append("".join(f"{e}{counts[e] if counts[e] > 1 else ''}" for e in order))
+    return sorted(out)
 
 
 def _route_keys(struct_start: Structure, struct_end: Structure, bases: list["AtomMapping"]) -> list[str]:

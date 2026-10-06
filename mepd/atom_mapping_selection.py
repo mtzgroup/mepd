@@ -412,6 +412,7 @@ def select_per_mechanism(
         return []
     groups = suggest_mechanism_candidates(
         start_structure, end_structure, max_variants_per_mechanism=max_variants_per_mechanism,
+        explore=int(getattr(getattr(run_inputs, "atom_mapping_inputs", None), "explore_mechanisms", 0) or 0),
     )
     if not groups:
         return []
