@@ -134,8 +134,17 @@ class TsParams(Params):
         "[catalytic: ...]. 0 = off; 20 is a reasonable start."),
         cli="--explore-mechanisms", group="Atom mapping", advanced=True, ge=0, requires="atom_mapping")
     relax_mechanisms: int = P(
-        4, "Relax best mechanisms", ("Atom mapping by snap-gi-xtb: the paths of the best this many mechanisms (by raw xtb peak along the interpolation, which is mostly atoms colliding) are relaxed with their breaking and forming bonds held, and the lowest relaxed barrier wins. SLAPMapper's own mechanism is always among them. A few seconds per mechanism; 0 = raw peaks only."),
+        4, "Rank mappings by relaxed path energy (top N)", ("Candidate atom mappings are compared by the energy "
+        "along their interpolated path. With N > 0, the N best by raw xtb peak (plus SLAPMapper's own minimal "
+        "mapping, always) are first relaxed -- everything except the bonds that break or form -- and compared by "
+        "that relaxed barrier. Only this way can a mapping with more bond changes (e.g. from Explore mechanisms) "
+        "win, and only by more than the margin below. 0 = raw interpolation peaks only."),
         cli="--relax-mechanisms", group="Atom mapping", advanced=True, ge=0, requires="atom_mapping")
+    relax_margin: float = P(
+        5.0, "Margin for extra bond changes (kcal/mol)", ("A mapping with more bond changes than SLAPMapper's minimal "
+        "one must beat its relaxed barrier by more than this, or SLAPMapper's mapping is kept. The log lists every "
+        "compared mechanism and says which rule decided."),
+        cli="--relax-margin", group="Atom mapping", advanced=True, ge=0, requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
         "have no imaginary frequency beyond the cutoff; a failing one is pushed along its unstable mode and re-optimized.",
@@ -224,8 +233,17 @@ class ChannelsParams(Params):
         "[catalytic: ...]. 0 = off; 20 is a reasonable start."),
         cli="--explore-mechanisms", group="Pairs", advanced=True, ge=0, requires="atom_mapping")
     relax_mechanisms: int = P(
-        4, "Relax best mechanisms", ("Atom mapping by snap-gi-xtb: the paths of the best this many mechanisms (by raw xtb peak along the interpolation, which is mostly atoms colliding) are relaxed with their breaking and forming bonds held, and the lowest relaxed barrier wins. SLAPMapper's own mechanism is always among them. A few seconds per mechanism; 0 = raw peaks only."),
+        4, "Rank mappings by relaxed path energy (top N)", ("Candidate atom mappings are compared by the energy "
+        "along their interpolated path. With N > 0, the N best by raw xtb peak (plus SLAPMapper's own minimal "
+        "mapping, always) are first relaxed -- everything except the bonds that break or form -- and compared by "
+        "that relaxed barrier. Only this way can a mapping with more bond changes (e.g. from Explore mechanisms) "
+        "win, and only by more than the margin below. 0 = raw interpolation peaks only."),
         cli="--relax-mechanisms", group="Pairs", advanced=True, ge=0, requires="atom_mapping")
+    relax_margin: float = P(
+        5.0, "Margin for extra bond changes (kcal/mol)", ("A mapping with more bond changes than SLAPMapper's minimal "
+        "one must beat its relaxed barrier by more than this, or SLAPMapper's mapping is kept. The log lists every "
+        "compared mechanism and says which rule decided."),
+        cli="--relax-margin", group="Pairs", advanced=True, ge=0, requires="atom_mapping")
     atom_mapping_rmsd_window: float = P(
         1.0, "RMSD window (σ)", "Filtered GI path: GI paths for the conformer pairs within this many standard "
         "deviations of each mechanism's lowest endpoint RMSD. On the KAIST set 1σ kept 6% of the pairs and 56% of "

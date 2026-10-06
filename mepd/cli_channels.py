@@ -878,7 +878,15 @@ def channels(
     ),
     relax_mechanisms: Optional[int] = typer.Option(
         None, "--relax-mechanisms",
-        help="snap-gi-xtb: relax the paths of the best this many mechanisms (by raw xtb peak; SLAPMapper's own mechanism always included) with their changing bonds held, and keep the lowest relaxed barrier. Default: the profile's atom_mapping_inputs.relax_top (4); 0 = raw peaks only.",
+        help="snap-gi-xtb: rank mappings by relaxed path energy. The N best by raw xtb peak (plus SLAPMapper's own "
+        "minimal mapping, always) have their interpolated paths relaxed except for the bonds that break or form, "
+        "and the lowest relaxed barrier wins; a mapping with more bond changes must beat SLAPMapper's by more than "
+        "--relax-margin. Default: the profile's atom_mapping_inputs.relax_top (4); 0 = raw peaks only.",
+    ),
+    relax_margin: Optional[float] = typer.Option(
+        None, "--relax-margin",
+        help="kcal/mol by which a mapping with more bond changes than SLAPMapper's minimal one must beat its relaxed "
+        "barrier (else SLAPMapper's is kept). Default: the profile's atom_mapping_inputs.relax_margin (5).",
     ),
     atom_mapping_metric: str = typer.Option(
         "snap-gi-xtb", "--atom-mapping-metric",
@@ -1191,6 +1199,8 @@ def channels(
     run_inputs.atom_mapping_inputs.explore_mechanisms = max(0, explore_mechanisms) if isinstance(explore_mechanisms, int) else 0
     if isinstance(relax_mechanisms, int):
         run_inputs.atom_mapping_inputs.relax_top = max(0, relax_mechanisms)
+    if isinstance(relax_margin, (int, float)):
+        run_inputs.atom_mapping_inputs.relax_margin = max(0.0, float(relax_margin))
     _echo_run_inputs_summary(run_inputs)
 
     if reaction is not None:

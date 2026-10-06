@@ -91,7 +91,8 @@ CHAIN_DEFAULTS = {"k": 0.1, "delta_k": 0.09, "do_parallel": True, "node_freezing
                   "node_rms_thre": 5.0, "node_ene_thre": 5.0, "frozen_atom_indices": ""}
 MAPPING_DEFAULTS = {"n_candidates": 200, "metric": "snap-gi-xtb", "rmsd_window": 1.0, "gi_variant_cap": 20,
                     "veto_margin": 0.0,
-                    "recheck_on_split": False, "explore_mechanisms": 0, "relax_top": 4}
+                    "recheck_on_split": False, "explore_mechanisms": 0, "relax_top": 4,
+                    "relax_margin": 5.0}
 TERACHEM_MODEL = {"method": "ub3lyp", "basis": "3-21g"}
 
 # Keys every path method reads.
@@ -206,8 +207,10 @@ HELP = {
                    "the lowest endpoint RMSD (mepd channels).",
     "metric": "How candidate atom mappings are scored.",
     "veto_margin": "A remapping must beat 'don't reindex' by more than this.",
-    "relax_top": "snap-gi-xtb: relax the paths of the best this many mechanisms (changing bonds held) and keep "
-                 "the lowest relaxed barrier; SLAPMapper's own mechanism is always included. 0 = raw peaks only.",
+    "relax_top": "Rank mappings by relaxed path energy: the N best by raw xtb peak (plus SLAPMapper's minimal "
+                 "mapping) relaxed except for their changing bonds, lowest relaxed barrier wins. 0 = raw peaks only.",
+    "relax_margin": "kcal/mol by which a mapping with more bond changes than SLAPMapper's must beat it when ranked "
+                    "by relaxed path energy, or SLAPMapper's is kept.",
     "model": "Pretrained FAIR-Chem model name (e.g. uma-s-1p2p1, uma-m-1p1).",
     "task": "Which UMA head: omol for molecules (reads charge and multiplicity).",
     "checkpoint": "A local checkpoint file used instead of the named model.",

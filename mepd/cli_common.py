@@ -538,6 +538,8 @@ def _check_endpoint_atom_mapping(
     what = result.quantity or metric
     if result.quantity:
         typer.echo(f"  compared by {result.quantity}:")
+    for line in getattr(result, "notes", None) or []:
+        typer.echo(f"  {line}")
     ranked = sorted(scores, key=scores.get)
     shown = [result.winner.label] + (["identity"] if result.winner.label != "identity" and "identity" in scores else [])
     for label in shown:

@@ -422,6 +422,9 @@ class AtomMappingInputs:
     # peak) with their changing bonds held, and keep the lowest relaxed barrier
     # (raw interpolation peaks are mostly atoms colliding mid-path). 0 = off.
     relax_top: int = 4
+    # ...a mapping with more bond changes than SLAPMapper's minimal one must
+    # beat its relaxed barrier by more than this (kcal/mol), or SLAPMapper's is kept.
+    relax_margin: float = 5.0
     # metric "rmsd-geodesic": only candidates within this many standard
     # deviations of the lowest endpoint RMSD are scored by geodesic distance.
     rmsd_window: float = 1.0

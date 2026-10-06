@@ -44,6 +44,7 @@ class SelectionResult:
     scores: dict[str, float] = field(default_factory=dict)  # label -> score under the selection metric
     chains: dict[str, Chain] = field(default_factory=dict)  # label -> its geodesic-interpolated chain
     quantity: str = ""   # what `scores` hold, when not the metric's own score (snap-gi-xtb: the rule that decided)
+    notes: list = field(default_factory=list)   # lines explaining the choice (snap-gi-xtb relaxed: per mechanism)
 
 
 def build_candidates(
@@ -222,9 +223,9 @@ def select_best_candidate(
         # Snap's picks from every candidate (each SLAPMapper mapping, and the
         # current numbering), ranked together by GI + xtb.
         picks = _distinct([p for c in candidates for p in _snap_picks(c, start_structure)])
-        _, best, _, scores, quantity = _rank_picks(picks, candidates, start_structure, run_inputs,
-                                                   use_path=metric == "snap-gi-xtb")
-        return SelectionResult(winner=best, scores=scores, chains=chains, quantity=quantity)
+        _, best, _, scores, quantity, notes = _rank_picks(picks, candidates, start_structure, run_inputs,
+                                                          use_path=metric == "snap-gi-xtb")
+        return SelectionResult(winner=best, scores=scores, chains=chains, quantity=quantity, notes=notes)
     if metric == "rmsd-geodesic":
         candidates = lowest_rmsd_variants(candidates, start_structure, run_inputs,
                                           always=(identity.label,) if identity else ())
@@ -308,11 +309,28 @@ def _mechanism(label: str) -> str:
     return label.split(" snap")[0]
 
 
-def _relaxed_choice(picks: list, paths: list, peaks: list, top_frame: list, start_structure: Structure, top: int):
+def _bond_changes(start_structure: Structure, end_structure: Structure) -> int:
+    """How many bonds break or form between start and end (same atom order)."""
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    from mepd.discovery.nanoreactor import perceive_bonds
+
+    symbols = list(start_structure.symbols)
+    a = np.asarray(start_structure.geometry).reshape(-1, 3) / ANGSTROM_TO_BOHR
+    b = np.asarray(end_structure.geometry).reshape(-1, 3) / ANGSTROM_TO_BOHR
+    return len(set(perceive_bonds(symbols, a)) ^ set(perceive_bonds(symbols, b)))
+
+
+def _relaxed_choice(picks: list, paths: list, peaks: list, top_frame: list, start_structure: Structure, top: int,
+                    margin: float = 5.0):
     """Stage 2 of snap-gi-xtb: the best variant of each of the `top` best
-    mechanisms (by raw peak) has its path relaxed (`_relaxed_barrier`) and
-    the lowest barrier wins. Returns (index into picks, {label: barrier},
-    how many were relaxed), or None (no xtb, or none could be relaxed)."""
+    mechanisms (by raw peak), plus SLAPMapper's own minimal-edit mechanism
+    always, has its path relaxed (`_relaxed_barrier`). The lowest relaxed
+    barrier wins -- but a mapping with more bond changes than SLAPMapper's
+    (an explored relay) must beat SLAPMapper's barrier by more than
+    `margin` kcal/mol, or SLAPMapper's is kept. Returns (index into picks,
+    {label: barrier}, how many were relaxed, lines explaining the choice),
+    or None (no xtb, or none could be relaxed)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from mepd.programs import xtb_executable
@@ -327,8 +345,6 @@ def _relaxed_choice(picks: list, paths: list, peaks: list, top_frame: list, star
             if m not in best or p < peaks[best[m]]:
                 best[m] = i
     chosen = sorted(best.values(), key=peaks.__getitem__)[:top]
-    # SLAPMapper's own (minimal-edit) mechanism is always among them: an
-    # explored relay has to beat it relaxed, not just raw.
     minimal = [i for i in best.values() if not getattr(picks[i].atom_map, "explored", False)]
     if minimal and not set(minimal) & set(chosen):
         chosen.append(min(minimal, key=peaks.__getitem__))
@@ -338,8 +354,31 @@ def _relaxed_choice(picks: list, paths: list, peaks: list, top_frame: list, star
     ok = [(b, i) for b, i in zip(barriers, chosen) if b is not None and math.isfinite(b)]
     if not ok:
         return None
+    changes = {i: _bond_changes(start_structure, picks[i].end_structure) for i in chosen}
     k = min(ok)[1]
-    return k, {picks[i].label: (b if b is not None else math.inf) for b, i in zip(barriers, chosen)}, len(chosen)
+    ref = [(b, i) for b, i in ok if not getattr(picks[i].atom_map, "explored", False)]
+    reason = "the lowest relaxed barrier"
+    if ref:
+        b_ref, i_ref = min(ref)
+        b_win = dict((i, b) for b, i in ok)[k]
+        if k != i_ref and changes[k] > changes[i_ref]:
+            if b_ref - b_win > margin:
+                reason = (f"{_mechanism(picks[k].label)} ({changes[k]} bond changes) beats SLAPMapper's "
+                          f"{_mechanism(picks[i_ref].label)} ({changes[i_ref]}) by {b_ref - b_win:.1f} kcal/mol, "
+                          f"more than the {margin:g} kcal/mol margin")
+            else:
+                reason = (f"kept SLAPMapper's {_mechanism(picks[i_ref].label)} ({changes[i_ref]} bond changes): "
+                          f"{_mechanism(picks[k].label)} ({changes[k]}) is only {b_ref - b_win:.1f} kcal/mol lower, "
+                          f"within the {margin:g} kcal/mol margin")
+                k = i_ref
+    notes = ["  mechanism                bond changes   raw peak   relaxed barrier (kcal/mol)"]
+    for b, i in sorted(zip(barriers, chosen), key=lambda x: (x[0] is None, x[0] if x[0] is not None else 0)):
+        tag = "" if not getattr(picks[i].atom_map, "explored", False) else "  (explored)"
+        mark = "  <- chosen" if i == k else ""
+        notes.append(f"  {picks[i].label:<24} {changes[i]:>12}   {peaks[i]:>8.1f}   "
+                     f"{('%.1f' % b) if b is not None else 'failed':>15}{tag}{mark}")
+    notes.append(f"Decided by {reason}.")
+    return k, {picks[i].label: (b if b is not None else math.inf) for b, i in zip(barriers, chosen)}, len(chosen), notes
 
 
 def _relaxed_barrier(chain: Chain, start_structure: Structure, end_structure: Structure, exe: str,
@@ -467,7 +506,7 @@ def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inp
 
     def by_rmsd(why):
         return (rmsd[k], pool[k], rule, {c.label: r for c, r in zip(pool, rmsd)},
-                f"endpoint RMSD, bohr ({rule}: {why})")
+                f"endpoint RMSD, bohr ({rule}: {why})", [])
     if not picks:
         return by_rmsd("snap unavailable")
     if not use_path or len(picks) == 1:
@@ -495,16 +534,19 @@ def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inp
                 top_frame.append(None)
                 failed.append((c.label, _short_error(exc)))
         scored = [p for p in peaks if math.isfinite(p)]
-        top = int(getattr(getattr(run_inputs, "atom_mapping_inputs", None), "relax_top", 0) or 0)
+        ami = getattr(run_inputs, "atom_mapping_inputs", None)
+        top = int(getattr(ami, "relax_top", 0) or 0)
         if top > 0 and len(scored) > 1:
-            relaxed = _relaxed_choice(picks, paths, peaks, top_frame, start_structure, top)
+            margin = float(getattr(ami, "relax_margin", 5.0) or 0.0)
+            relaxed = _relaxed_choice(picks, paths, peaks, top_frame, start_structure, top, margin)
             if relaxed is not None:
-                k, barriers, n = relaxed
-                note = (f"; {len(failed)} path(s) xtb could not evaluate, e.g. {failed[0][0]}: {failed[0][1]}"
-                        if failed else "")
+                k, barriers, n, notes = relaxed
+                if failed:
+                    notes.append(f"{len(failed)} interpolation(s) xtb could not evaluate (ranked last), e.g. "
+                                 f"{failed[0][0]}: {failed[0][1]}")
                 return (rmsd[k], picks[k], "snap-gi-xtb-relaxed", barriers,
-                        f"xtb barrier along the path after relaxing all but its changing bonds, kcal/mol, for the "
-                        f"best {n} mechanism(s) by raw peak (snap-gi-xtb, relax_top {top}{note})")
+                        f"relaxed path energy, kcal/mol: the {n} best mechanism(s) by raw xtb peak, each path "
+                        f"relaxed except for its changing bonds (relax_top {top}, margin {margin:g})", notes)
         if scored:
             low = min(scored)
             # Peaks within PEAK_TIE of the lowest are a tie (a path that only
@@ -513,12 +555,13 @@ def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inp
             note = (f"; {len(failed)} of {len(picks)} not evaluated by xtb, ranked last (e.g. {failed[0][0]}: "
                     f"{failed[0][1]})") if failed else ""
             return (rmsd[k], picks[k], "snap-gi-xtb", {c.label: p for c, p in zip(picks, peaks)},
-                    f"xtb peak along the interpolation, kcal/mol (snap-gi-xtb{note})")
+                    f"xtb peak along the interpolation, kcal/mol (snap-gi-xtb{note})", [])
         why = f"xtb failed on every interpolation, e.g. {failed[0][0]}: {failed[0][1]}"
     else:
         why = "no xtb"
     k = min(range(len(picks)), key=length.__getitem__)
-    return rmsd[k], picks[k], "snap-gi", {c.label: v for c, v in zip(picks, length)}, f"GI length (snap-gi: {why})"
+    return (rmsd[k], picks[k], "snap-gi", {c.label: v for c, v in zip(picks, length)}, f"GI length (snap-gi: {why})",
+            [])
 
 
 def snap_choice(candidates: list, start_structure: Structure, run_inputs,

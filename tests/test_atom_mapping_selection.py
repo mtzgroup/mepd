@@ -282,12 +282,12 @@ def test_one_path_xtb_cannot_evaluate_ranks_last_instead_of_dropping_xtb(monkeyp
             return [0.0, peaks[chain], 0.0]
 
     monkeypatch.setattr(sel, "_xtb_engine", lambda: Engine({"a"}))
-    _, best, rule, scores, quantity = sel._rank_picks(picks, picks, "start", None)
+    _, best, rule, scores, quantity, _ = sel._rank_picks(picks, picks, "start", None)
     assert best.label == "c" and rule == "snap-gi-xtb"
     assert scores["a"] == float("inf") and "1 of 3 not evaluated by xtb" in quantity and "exit code 128" in quantity
 
     monkeypatch.setattr(sel, "_xtb_engine", lambda: Engine({"a", "b", "c"}))
-    _, best, rule, _, quantity = sel._rank_picks(picks, picks, "start", None)
+    _, best, rule, _, quantity, _ = sel._rank_picks(picks, picks, "start", None)
     assert best.label == "a" and rule == "snap-gi" and "xtb failed on every interpolation" in quantity
 
 
@@ -312,8 +312,33 @@ def test_relaxed_stage_keeps_the_lowest_barrier_and_always_tries_the_minimal_mec
         tried.append(end)
         return relaxed[end]
     monkeypatch.setattr(sel, "_relaxed_barrier", fake)
+    monkeypatch.setattr(sel, "_bond_changes", lambda start, end: 3 if end.startswith("mapping_0") else 5)
     monkeypatch.setattr(programs, "xtb_executable", lambda download=False: "/bin/xtb")
-    k, barriers, n = sel._relaxed_choice(picks, [(p.label, None) for p in picks], raw, [None] * 4, "start", top=1)
+    k, barriers, n, notes = sel._relaxed_choice(picks, [(p.label, None) for p in picks], raw, [None] * 4, "start", top=1)
     assert picks[k].label == "mapping_0 snap0"            # relaxed, the minimal mechanism wins
     assert sorted(tried) == ["mapping_0 snap0", "mapping_5 snap0"] and n == 2   # top 1 (one variant) + the minimal
     assert "mapping_5 snap1" not in barriers
+
+
+def test_a_mapping_with_more_bond_changes_must_beat_the_minimal_one_by_the_margin(monkeypatch):
+    """relax_margin: an explored relay (more bond changes) only replaces
+    SLAPMapper's minimal mapping when its relaxed barrier is lower by more
+    than the margin; the notes say which rule decided."""
+    from types import SimpleNamespace as NS
+
+    import mepd.atom_mapping_selection as sel
+    import mepd.programs as programs
+
+    picks = [NS(label="mapping_0 snap0", end_structure="direct", atom_map=NS(explored=False)),
+             NS(label="mapping_9 snap0", end_structure="relay", atom_map=NS(explored=True))]
+    raw = [700.0, 500.0]
+    monkeypatch.setattr(sel, "_bond_changes", lambda start, end: 3 if end == "direct" else 5)
+    monkeypatch.setattr(programs, "xtb_executable", lambda download=False: "/bin/xtb")
+    paths = [(p.label, None) for p in picks]
+    for relay, expect in ((112.0, "mapping_0 snap0"), (100.0, "mapping_9 snap0")):     # direct at 114
+        monkeypatch.setattr(sel, "_relaxed_barrier", lambda chain, start, end, exe, peak_frame=None, r=relay:
+                            114.0 if end == "direct" else r)
+        k, _, _, notes = sel._relaxed_choice(picks, paths, raw, [None, None], "start", top=2, margin=5.0)
+        assert picks[k].label == expect
+        assert notes[-1].startswith("Decided by") and ("within the 5 kcal/mol margin" in notes[-1]) == (relay == 112.0)
+        assert any("<- chosen" in line and expect in line for line in notes)
