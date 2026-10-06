@@ -1020,6 +1020,8 @@ input.invalid { border-color: var(--danger); outline-color: var(--danger); }
 .rx-live-pill { color: var(--accent); font-weight: 600; }
 .rx-transport { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .rx-transport input[type=range] { flex: 1; }
+.rx-more { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.rx-more input { width: 64px; }
 .rx-timeline { position: relative; flex: 1; height: 22px; background: var(--panel-2); border-radius: 3px; cursor: pointer; }
 .rx-done { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent-soft); border-radius: 3px; }
 .rx-tick { position: absolute; top: 3px; bottom: 3px; width: 3px; margin-left: -1px; background: var(--ok); border-radius: 1px; }

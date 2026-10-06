@@ -140,3 +140,19 @@ def test_endpoint_options_are_either_a_pair_or_a_reaction(tmp_path, call):
         call(start="CCO", output=tmp_path / "out")
     with pytest.raises(typer.BadParameter, match="not balanced"):
         call(reaction="CC>>CCC", minimize_ends=False, output=tmp_path / "out")
+
+
+def test_several_molecules_keep_their_places_across_the_reaction():
+    """The product is built where its atoms are among the reactants: a
+    spectator stays put, and nothing has to cross the reactor (two
+    independently packed sides made paths drag molecules through each other)."""
+    import numpy as np
+
+    from mepd.reaction_smiles import reaction_pair
+
+    pr = reaction_pair("CC=O.O.N>>CC(O)O.N")
+    X, Y = pr.reactant.GetConformer().GetPositions(), pr.product.GetConformer().GetPositions()
+    n = [a.GetIdx() for a in pr.reactant.GetAtoms() if a.GetSymbol() == "N"]
+    assert np.linalg.norm(X[n] - Y[n], axis=1).max() < 1.0          # the ammonia spectator barely moves
+    assert np.linalg.norm(X - Y, axis=1).max() < 4.0                  # and no atom travels across the system
+    assert not pr.notes

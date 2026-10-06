@@ -247,8 +247,8 @@ class Workspace:
             self._save()   # an older workspace: each structure becomes its own first conformer
         if self._migrate_levels():
             self._save()
-        if any([self._tag_members(r) for r in self._data["reactions"].values()]):
-            self._save()   # complexes from before they recorded their molecules
+        if any([self._tag_members(r) for r in self._data["reactions"].values()]) | self._flatten_nested():
+            self._save()   # complexes from before they recorded (flat) molecules
 
     # ------------------------------------------------------------------ io
     def _save(self) -> None:
@@ -312,13 +312,17 @@ class Workspace:
         the geometry itself is kept exactly, as the complex's structure."""
         smiles = smiles or chem.perceive_smiles(structure)
         members = None
-        if role == "minimum" and len(structure.symbols) > 1:
+        # Several molecules by its bonds *and* by its SMILES: a hot MD snapshot
+        # can stretch one bond past the bond cutoff of _fragments while it is
+        # still one molecule (one SMILES): that stays a molecule.
+        if role == "minimum" and len(structure.symbols) > 1 and (not smiles or "." in smiles):
             from mepd.web.compose import _fragments
 
             frags = _fragments(structure)
             if len(frags) > 1:
-                members = sorted(self.add_or_merge(f, origin={**origin, "label": f"{origin.get('label') or 'structure'} (molecule)"})["rec"]["id"]
-                                 for f in frags)
+                parts = [self.add_or_merge(f, origin={**origin, "label": f"{origin.get('label') or 'structure'} (molecule)"})["rec"]["id"]
+                         for f in frags]
+                members = sorted(self._flat_members(parts))
                 role, merge = "complex", False
                 # The same molecules in the same geometry again: the complex we have.
                 with self._lock:
@@ -663,6 +667,33 @@ class Workspace:
             self._save()
             return rec
 
+    def _flat_members(self, ids) -> list:
+        """Species ids, a complex among them replaced by its members (a
+        complex's members are always molecules, never complexes)."""
+        out, todo, seen = [], list(ids), 0
+        while todo and seen < 10000:
+            sid = todo.pop(0)
+            seen += 1
+            rec = self._data["structures"].get(sid)
+            if rec is not None and rec.get("role") == "complex" and rec.get("members") and sid not in rec["members"]:
+                todo = list(rec["members"]) + todo
+            else:
+                out.append(sid)
+        return out
+
+    def _flatten_nested(self) -> bool:
+        """Complexes from before members were kept flat: flattened (lock held)."""
+        changed = False
+        for rec in self._data["structures"].values():
+            m = rec.get("members")
+            if rec.get("role") == "complex" and m:
+                flat = sorted(self._flat_members(m))
+                if flat != sorted(m):
+                    rec["members"] = flat
+                    rec["name"] = complex_name(flat, self._data["structures"]) if len(flat) > 1 else rec["name"]
+                    changed = True
+        return changed
+
     def _tag_members(self, reaction: dict) -> bool:
         """Each complex of a reaction records its molecules (`members`, sorted,
         repeated for 2 A): a complex is then known by itself, whichever way it
@@ -671,7 +702,7 @@ class Workspace:
         changed = False
         for k, sid in enumerate((reaction.get("complexes") or [])[:2]):
             rec = self._data["structures"].get(sid)
-            members = sorted(reaction["products"] if k else reaction["reactants"])
+            members = sorted(self._flat_members(reaction["products"] if k else reaction["reactants"]))
             if rec is None or rec.get("role") != "complex":
                 continue
             name = complex_name(members, self._data["structures"])

@@ -71,7 +71,6 @@ def adopt_retro(ws, job: dict) -> bool:
 
 
 def _put_step(ws, job: dict, rx: dict, r_ids: list, p_ids: list) -> bool:
-    from mepd.web.compose import place, species_structures
     from mepd.web.nanoreactor import _label_of
 
     existing = ws.find_reaction(job["id"], rx["key"], key=rx["key"])
@@ -94,8 +93,7 @@ def _put_step(ws, job: dict, rx: dict, r_ids: list, p_ids: list) -> bool:
         else:
             sids = []
             try:
-                for side, ids in (("reactant", r_ids), ("product", p_ids)):
-                    s = place(species_structures(ws, ids))
+                for side, s in zip(("reactant", "product"), _step_ends(ws, r_ids, p_ids)):
                     sids.append(ws.add_structure(
                         s, name=f"{label} [{side}s]", smiles=chem.perceive_smiles(s), optimized=False,
                         role="complex", merge=False,
@@ -112,6 +110,25 @@ def _put_step(ws, job: dict, rx: dict, r_ids: list, p_ids: list) -> bool:
                           origin={"kind": "job", "job": job["id"], "index": rx["key"], "key": rx["key"],
                                   "retro": True}, **fields)
     return existing is None or json.dumps({k: rec.get(k) for k in fields}, sort_keys=True, default=str) != before
+
+
+def _step_ends(ws, r_ids: list, p_ids: list) -> list:
+    """A step's two complexes, from one mapped reaction of the species'
+    SMILES (mepd.reaction_smiles): the same atoms in the same order, the
+    products built where their atoms are among the reactants, so a path
+    search moves only what reacts. Placing each side on its own put the
+    molecules in unrelated spots (interpolations that look atomized)."""
+    from mepd.reaction_smiles import ReactionSmilesError, mol_to_structure, reaction_pair
+    from mepd.web.compose import place, species_structures
+
+    smiles = [ws.structure(i).get("smiles") for i in r_ids], [ws.structure(i).get("smiles") for i in p_ids]
+    if all(smiles[0]) and all(smiles[1]):
+        try:
+            pair = reaction_pair(f"{'.'.join(smiles[0])}>>{'.'.join(smiles[1])}")
+            return [mol_to_structure(pair.reactant), mol_to_structure(pair.product)]
+        except (ReactionSmilesError, ValueError, RuntimeError):
+            pass
+    return [place(species_structures(ws, ids)) for ids in (r_ids, p_ids)]
 
 
 def _edge_origin(job: dict, rx: dict) -> dict:

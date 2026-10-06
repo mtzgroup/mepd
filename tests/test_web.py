@@ -1390,3 +1390,37 @@ def test_demo_retrosynthesis_runs_only_the_light_method():
     desc = policy.adapt_operation(OPERATIONS["retrosynthesis"].describe())
     assert [m["fixed"]["method"] for m in desc["methods"] if m["available"]] in (["templates"], [])
     assert desc["schema"]["properties"]["verify"].get("enum", ["none"]) == ["none"]
+
+
+def test_complex_members_are_always_molecules(tmp_path):
+    """A complex's members are flat: a complex among a reaction's species,
+    or nested members from older workspaces, become their molecules. A
+    geometry whose SMILES is one molecule stays a molecule even if its bonds
+    look broken (a hot MD snapshot)."""
+    import json as _json
+
+    from mepd.web import chem
+    from mepd.web.compose import place
+    from mepd.web.workspace import Workspace
+
+    ws = Workspace(tmp_path / "flat")
+    (water,) = chem.structures_from_xyz_text(WATER_XYZ)
+    (bent,) = chem.structures_from_xyz_text(WATER_BENT_XYZ)
+    stretched = ws.add_or_merge(bent, smiles="O", origin={"kind": "test"})["rec"]
+    assert stretched["role"] == "minimum"                       # one SMILES: one molecule
+    w = ws.add_structure(water, name="water", origin={"kind": "test"})
+    (hcn,) = chem.structures_from_xyz_text(HCN_XYZ)
+    h = ws.add_structure(hcn, name="hcn", origin={"kind": "test"})
+    inner = ws.add_structure(place([water, water]), origin={"kind": "test"})          # a complex: 2 water
+    assert inner["role"] == "complex"
+    cx = ws.add_structure(place([water, water, hcn]), role="complex", merge=False, origin={"kind": "test"})
+    ws.put_reaction(reactants=[inner["id"], h["id"]], products=[h["id"], inner["id"]],
+                    origin={"kind": "test", "job": None, "index": 1}, complexes=[cx["id"]])
+    assert sorted(ws.structure(cx["id"])["members"]) == sorted([w["id"], w["id"], h["id"]])
+    # an older workspace with nested members is repaired on load
+    data = _json.loads((tmp_path / "flat" / "workspace.json").read_text())
+    data["reactions"] = {}
+    data["structures"][cx["id"]]["members"] = sorted([inner["id"], h["id"]])
+    (tmp_path / "flat" / "workspace.json").write_text(_json.dumps(data))
+    st = Workspace(tmp_path / "flat").snapshot()["structures"]
+    assert sorted(st[cx["id"]]["members"]) == sorted([w["id"], w["id"], h["id"]])

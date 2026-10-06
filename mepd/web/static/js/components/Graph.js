@@ -647,6 +647,12 @@ export function Graph() {
           title: label }, position: p });
       }
       for (const el of rg.members) {
+        // A member that is not drawn (e.g. a complex listed inside another
+        // complex) must not take the whole graph down: skip its line.
+        if (c.getElementById(el.data.target).empty() || c.getElementById(el.data.source).empty()) {
+          console.warn(`complex ${el.data.source}: member ${el.data.target} is not a drawn molecule; line skipped`);
+          continue;
+        }
         ids.add(el.data.id);
         const cur = c.getElementById(el.data.id);
         if (cur.nonempty() && (cur.data('source') !== el.data.source || cur.data('target') !== el.data.target)) cur.remove();

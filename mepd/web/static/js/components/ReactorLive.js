@@ -4,9 +4,9 @@
 // event with only its molecules and the bonds that form (green) and break
 // (red).
 import { html, useEffect, useRef, useState } from '../lib.js';
-import { api } from '../api.js';
+import { api, attempt } from '../api.js';
 import { ReactionCard, reactionOf } from './Reactions.js';
-import { useStore } from '../store.js';
+import { prefs, useStore } from '../store.js';
 
 const FPS = 30;   // reactor frames shown per second at 1x (a frame is ~10 fs)
 const POLL_S = 2.5;   // seconds between fetches of new frames while the MD runs
@@ -294,6 +294,27 @@ function wallWide(d) {
   return d._wide;
 }
 
+// More MD for a finished run, from its last frame (the "Run longer"
+// follow-up, also on the Results tab): the reactor then shows the longer run.
+function RunLonger({ job }) {
+  const op = useStore((s) => s.operations.find((o) => o.key === 'nanoreactor-more' && o.available));
+  const [ps, setPs] = useState(() => prefs.get('params:nanoreactor-more', {}).more_ps ?? 10);
+  const [busy, setBusy] = useState(false);
+  if (!op) return null;
+  const run = async () => {
+    setBusy(true);
+    prefs.set('params:nanoreactor-more', { more_ps: ps });
+    await attempt(() => api.post('/api/jobs', { op: 'nanoreactor-more', params: { more_ps: ps }, source_job: job.id }),
+      (js) => `Queued: ${js[0].title}`);
+    setBusy(false);
+  };
+  return html`<div class="rx-more small" title=${op.summary.replace(/\s*\(`[^`]*`\)\s*$/, '')}>
+    Run longer: <input type="number" class="tiny" min="1" step="1" value=${ps} onInput=${(e) => setPs(Math.max(1, +e.target.value || 1))} /> ps
+    <button class="btn small" disabled=${busy} onClick=${run}>${busy ? 'Queuing…' : 'Run'}</button>
+    <span class="muted">continues from the last frame; what was refined is reused</span>
+  </div>`;
+}
+
 function activeAt(events, raw) {
   return events.filter((e) => raw >= e.reactant_frame && raw <= e.product_frame);
 }
@@ -447,6 +468,7 @@ export function ReactorLive({ job }) {
           <div class="rx-head" ref=${headEl}></div>
         </div>
       </div>
+      ${!running && !job.external && html`<${RunLonger} job=${job} />`}
     </div>
     <aside class="rx-events">
       <div class="section-title">Reaction events · ${shown.length}${d.final ? '' : ' so far'}</div>

@@ -207,6 +207,44 @@ def _match(r, p, strict: bool = True) -> tuple[list[int], float]:
     return order, rmsd
 
 
+def _in_reactant_frame(r, p) -> bool:
+    """Rebuild the product's geometry (atoms already in the reactant's
+    order) from the reactant's: each atom starts where it is in the
+    reactant, the product's bonds are pulled to length
+    (network_expansion.embed_product), then a short force-field relaxation.
+    With several molecules on a side, two independently packed sides put the
+    molecules in unrelated places: a path between them drags whole molecules
+    through each other (interpolations that look atomized), however good the
+    atom mapping. True if the rebuilt product has exactly its own bonds."""
+    from rdkit.Chem import AllChem
+
+    from mepd.discovery.network_expansion import _perceived_edges, embed_product
+
+    symbols = [a.GetSymbol() for a in r.GetAtoms()]
+    want = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in p.GetBonds()}
+    try:
+        xyz = embed_product(symbols, r.GetConformer().GetPositions(), want)
+    except Exception:
+        return False
+    trial = _chem().Mol(p)
+    conf = trial.GetConformer()
+    for i, x in enumerate(xyz):
+        conf.SetAtomPosition(i, [float(v) for v in x])
+    try:
+        if AllChem.MMFFHasAllMoleculeParams(trial):
+            AllChem.MMFFOptimizeMolecule(trial, maxIters=200)
+        else:
+            AllChem.UFFOptimizeMolecule(trial, maxIters=200)
+    except Exception:
+        pass
+    got = {tuple(sorted(e)) for e in _perceived_edges(symbols, trial.GetConformer().GetPositions())}
+    if got != want:
+        return False
+    p.RemoveAllConformers()
+    p.AddConformer(trial.GetConformer(), assignId=True)
+    return True
+
+
 def _reordered(mol, order: list[int]):
     Chem = _chem()
     return Chem.RenumberAtoms(mol, order)
@@ -260,6 +298,12 @@ def reaction_pair(text: str, seed: int = 11) -> ReactionPair:
             best = (rmsd, r, _reordered(p, order), rxn)
     rmsd, r, p, rxn = best
     Chem = _chem()
+    if len(Chem.GetMolFrags(r)) > 1 or len(Chem.GetMolFrags(p)) > 1:
+        if _in_reactant_frame(r, p):
+            rmsd = _rmsd(p.GetConformer().GetPositions(), r.GetConformer().GetPositions())
+        else:
+            notes.append("The product could not be rebuilt in the reactants' arrangement; its molecules are placed "
+                         "independently, so a path search must also move them into place.")
     if Chem.GetFormalCharge(r) != Chem.GetFormalCharge(p):
         raise ReactionSmilesError(f"the two sides have different charges ({Chem.GetFormalCharge(r):+d} and "
                                   f"{Chem.GetFormalCharge(p):+d})")
