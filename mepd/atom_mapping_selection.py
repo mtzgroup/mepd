@@ -18,6 +18,7 @@ real runs double as comparative data.
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -300,6 +301,12 @@ def _xtb_engine():
         return None
 
 
+def _short_error(exc: Exception) -> str:
+    """An exception as one short line (an xtb failure's last words)."""
+    text = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {text[-1][:160]}" if text else type(exc).__name__
+
+
 KCAL_PER_HARTREE = 627.5094740631
 PEAK_TIE = 0.5   # kcal/mol
 
@@ -363,18 +370,30 @@ def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inp
     length = [float(smoother.length) for _, smoother in paths]
     engine = _xtb_engine()
     if engine is not None:
-        try:
-            peaks = []
-            for chain, _ in paths:
+        # Each path on its own: one xtb cannot evaluate (an SCF that fails on
+        # a distorted frame, e.g. a relay dragging an H past other atoms)
+        # ranks last instead of costing every path its xtb score.
+        peaks, failed = [], []
+        for c, (chain, _) in zip(picks, paths):
+            try:
                 energies = [float(e) for e in engine.compute_energies(chain)]
+                if not energies or not all(math.isfinite(e) for e in energies):
+                    raise ValueError("non-finite energies")
                 peaks.append((max(energies) - energies[0]) * KCAL_PER_HARTREE)
+            except Exception as exc:
+                peaks.append(math.inf)
+                failed.append((c.label, _short_error(exc)))
+        scored = [p for p in peaks if math.isfinite(p)]
+        if scored:
+            low = min(scored)
             # Peaks within PEAK_TIE of the lowest are a tie (a path that only
             # goes downhill peaks at 0, whatever it does): the shortest wins.
-            k = min(range(len(picks)), key=lambda i: (peaks[i] > min(peaks) + PEAK_TIE, length[i]))
+            k = min(range(len(picks)), key=lambda i: (not math.isfinite(peaks[i]), peaks[i] > low + PEAK_TIE, length[i]))
+            note = (f"; {len(failed)} of {len(picks)} not evaluated by xtb, ranked last (e.g. {failed[0][0]}: "
+                    f"{failed[0][1]})") if failed else ""
             return (rmsd[k], picks[k], "snap-gi-xtb", {c.label: p for c, p in zip(picks, peaks)},
-                    "xtb peak along the interpolation, kcal/mol (snap-gi-xtb)")
-        except Exception:
-            why = "xtb failed"
+                    f"xtb peak along the interpolation, kcal/mol (snap-gi-xtb{note})")
+        why = f"xtb failed on every interpolation, e.g. {failed[0][0]}: {failed[0][1]}"
     else:
         why = "no xtb"
     k = min(range(len(picks)), key=length.__getitem__)

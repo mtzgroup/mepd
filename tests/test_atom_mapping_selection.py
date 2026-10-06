@@ -256,3 +256,36 @@ def test_score_candidate_endpoint_rmsd_matches_aligned_rmsd_and_skips_interpolat
         score, chain = score_candidate(candidate, "endpoint-rmsd", start, run_inputs)
         assert chain is None
         assert score == pytest.approx(_aligned_rmsd(start, candidate.end_structure))
+
+
+def test_one_path_xtb_cannot_evaluate_ranks_last_instead_of_dropping_xtb(monkeypatch):
+    """snap-gi-xtb: an interpolation xtb fails on (a distorted frame) ranks
+    last; the others are still compared by their xtb peak. Only when xtb
+    fails on all of them does the GI length decide, saying why."""
+    from types import SimpleNamespace as NS
+
+    import mepd.atom_mapping_selection as sel
+
+    picks = [NS(label=x, end_structure=x) for x in ("a", "b", "c")]
+    peaks = {"a": None, "b": 0.02, "c": 0.01}           # Hartree above the start; a: xtb fails
+    length = {"a": 1.0, "b": 3.0, "c": 2.0}
+    monkeypatch.setattr(sel, "_aligned_rmsd", lambda s, e: 0.1)
+    monkeypatch.setattr(sel, "_interpolate", lambda c, s, r: (c.label, NS(length=length[c.label])))
+
+    class Engine:
+        def __init__(self, broken):
+            self.broken = broken
+
+        def compute_energies(self, chain):
+            if chain in self.broken:
+                raise RuntimeError("g-xTB calculation failed with exit code 128.")
+            return [0.0, peaks[chain], 0.0]
+
+    monkeypatch.setattr(sel, "_xtb_engine", lambda: Engine({"a"}))
+    _, best, rule, scores, quantity = sel._rank_picks(picks, picks, "start", None)
+    assert best.label == "c" and rule == "snap-gi-xtb"
+    assert scores["a"] == float("inf") and "1 of 3 not evaluated by xtb" in quantity and "exit code 128" in quantity
+
+    monkeypatch.setattr(sel, "_xtb_engine", lambda: Engine({"a", "b", "c"}))
+    _, best, rule, _, quantity = sel._rank_picks(picks, picks, "start", None)
+    assert best.label == "a" and rule == "snap-gi" and "xtb failed on every interpolation" in quantity
