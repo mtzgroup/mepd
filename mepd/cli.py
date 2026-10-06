@@ -32,6 +32,7 @@ from mepd.cli_substituents import substituents
 from mepd.cli_complex import complex_
 from mepd.cli_common import (
     _check_endpoint_atom_mapping,
+    _map_and_build_pair,
     _collect_ts_guess_tasks,
     _completed_tree_dirs,
     _connectivity_matches,
@@ -475,7 +476,15 @@ def run(
     # minimization (rather than on the raw SMILES embedding) so that
     # comparison reflects real minima, not embedding artifacts/strain that
     # can otherwise dominate the energy delta the veto decision is based on.
-    if not both_smiles_pair:
+    # A built endpoint depends on the mapping: each candidate's partner is
+    # built and minimized, and the mapping is chosen by the paths to them.
+    built_pair = None
+    if pair_from != "both" and atom_mapping and not both_smiles_pair:
+        built_pair = _map_and_build_pair(start_node.structure, end_node.structure, pair_from, run_inputs)
+        if built_pair is not None:
+            start_node, end_node = (StructureNode(structure=s) for s in built_pair)
+
+    if not both_smiles_pair and built_pair is None:
         realigned_end_structure = _check_endpoint_atom_mapping(
             start_node.structure, end_node.structure, atom_mapping, run_inputs,
             debug_dump=debug_dump, output=output,
@@ -483,7 +492,7 @@ def run(
         if realigned_end_structure is not end_node.structure:
             end_node = StructureNode(structure=realigned_end_structure)
 
-    if pair_from != "both":
+    if pair_from != "both" and built_pair is None:
         from mepd.discovery.network_expansion import build_partners
 
         source, target = (start_node, end_node) if pair_from == "start" else (end_node, start_node)

@@ -83,16 +83,12 @@ def _minimize(guesses: list[Structure], run_inputs) -> list[Optional[Structure]]
     return [traj[-1].structure if traj else None for traj in trajectories]
 
 
-def build_and_rank(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
-                   echo: Callable[[str], None] = print) -> Optional[BuiltPair]:
-    """`pair_from` "start": the end is built in the start's frame (the start
-    is kept); "end": the start in the end's frame. `atom_maps`: the
-    candidate mappings (start atom i -> end atom mapping[i]); the current
-    numbering competes too when the elements are in the same order. Returns
-    the chosen pair in the start's atom order, or None if no partner kept
-    its bonds and stereochemistry."""
+def _build(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs, echo) -> tuple:
+    """Every candidate's partner built and minimized: (jobs, kept). jobs:
+    (label, mapping, source, target, bonds) per distinct bond set; kept:
+    (label, mapping, source, built) for those whose bonds and
+    stereochemistry survived minimization."""
     from mepd.atom_mapping import AtomMapping, _automorphisms, realign_end_to_start
-    from mepd.atom_mapping_selection import MappingCandidate, _rank_picks, score_candidate
     from mepd.discovery.network_expansion import embed_product
     from mepd.nodes.node import StructureNode
     from mepd.nodes.nodehelpers import _is_connectivity_identical
@@ -162,10 +158,14 @@ def build_and_rank(start: Structure, end: Structure, atom_maps: list, pair_from:
             continue   # stereochemistry changed
         kept.append((label, m, source, s))
     echo(f"  {len(kept)} of {len(jobs)} kept their bonds and stereochemistry on minimization.")
-    if not kept:
-        return None
+    return jobs, kept
 
-    # Ranked as paths from the source (shared by all) to each built partner.
+
+def _rank(kept: list, start: Structure, pair_from: str, run_inputs) -> tuple:
+    """`kept` (from `_build`) ranked as paths from the source (shared by
+    all) to each built partner: (best label, scores, quantity, notes)."""
+    from mepd.atom_mapping_selection import MappingCandidate, _rank_picks, score_candidate
+
     picks = [MappingCandidate(label=label, end_structure=s, atom_map=None if label == "identity" else m)
              for label, m, _, s in kept]
     source = kept[0][2] if pair_from == "end" else start
@@ -178,17 +178,95 @@ def build_and_rank(start: Structure, end: Structure, atom_maps: list, pair_from:
         best, quantity, notes = min(picks, key=lambda c: scores[c.label]), metric, []
     if pair_from == "end" and quantity:
         quantity += ", from the product"
-    label, m, _, built = next(k for k in kept if k[0] == best.label)
+    return best.label, scores, quantity, notes
+
+
+def _pair(pair_from: str, start: Structure, end: Structure, m, built: Structure) -> tuple:
+    """(start, end) of a built pair, in the start's atom order."""
+    from mepd.atom_mapping import realign_end_to_start
+
+    if pair_from == "start":
+        return start, built
+    # the built start and the end are both in the end's order
+    return realign_end_to_start(m, built), realign_end_to_start(m, end)
+
+
+def build_and_rank(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
+                   echo: Callable[[str], None] = print) -> Optional[BuiltPair]:
+    """`pair_from` "start": the end is built in the start's frame (the start
+    is kept); "end": the start in the end's frame. `atom_maps`: the
+    candidate mappings (start atom i -> end atom mapping[i]); the current
+    numbering competes too when the elements are in the same order. Returns
+    the chosen pair in the start's atom order, or None if no partner kept
+    its bonds and stereochemistry."""
+    jobs, kept = _build(start, end, atom_maps, pair_from, run_inputs, echo)
+    if not kept:
+        return None
+    best, scores, quantity, notes = _rank(kept, start, pair_from, run_inputs)
+    label, m, _, built = next(k for k in kept if k[0] == best)
     changes = {job[0]: len(_edges(job[2]) ^ job[4]) for job in jobs}
     fewest = min(changes.values())
     if changes[label] > fewest:
-        echo(f"WARNING: no {built_name} with the fewest bond changes ({fewest}) survived minimization with its "
-             f"bonds and stereochemistry; the chosen one has {changes[label]}.")
-
-    if pair_from == "start":
-        pair_start, pair_end = start, built
-    else:   # built start and the end, both in the end's order: back to the start's
-        pair_start = realign_end_to_start(m, built)
-        pair_end = realign_end_to_start(m, end)
+        echo(f"WARNING: no {'product' if pair_from == 'start' else 'reactant'} with the fewest bond changes "
+             f"({fewest}) survived minimization with its bonds and stereochemistry; the chosen one has "
+             f"{changes[label]}.")
+    pair_start, pair_end = _pair(pair_from, start, end, m, built)
     return BuiltPair(start=pair_start, end=pair_end, label=label, scores=scores, quantity=quantity, notes=notes,
                      n_bond_sets=len(jobs), n_kept=len(kept))
+
+
+@dataclass
+class MechanismPair:
+    key: str               # mechanism_key: which bonds break and form, by element and symmetry class
+    score: float           # xtb peak along its interpolated path, kcal/mol (else GI length)
+    start: Structure       # in the start's atom order
+    end: Structure
+    n_variants: int        # built variants of this mechanism compared
+
+
+def best_per_mechanism(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
+                       echo: Callable[[str], None] = print) -> list[MechanismPair]:
+    """Like `build_and_rank`, but one pair per mechanism instead of one in
+    all: the built partners grouped by which bonds break and form, and each
+    group's variants (which symmetric atoms react) ranked on their own.
+    For channels, where every mechanism gets its own path searches."""
+    from mepd.atom_mapping import mechanism_key
+
+    _, kept = _build(start, end, atom_maps, pair_from, run_inputs, echo)
+    groups: dict = {}
+    for k in kept:
+        label, m, _, built = k
+        a, b = _pair(pair_from, start, end, m, built)
+        groups.setdefault(mechanism_key(a, b), []).append(k)
+    out = []
+    for key, members in groups.items():
+        best, _, _, _ = _rank(members, start, pair_from, run_inputs) if len(members) > 1 else (members[0][0],) * 4
+        label, m, _, built = next(k for k in members if k[0] == best)
+        a, b = _pair(pair_from, start, end, m, built)
+        out.append(MechanismPair(key=key, score=_path_score(a, b, run_inputs), start=a, end=b,
+                                 n_variants=len(members)))
+    return out
+
+
+def _path_score(start: Structure, end: Structure, run_inputs) -> float:
+    """One number to compare a mechanism's pairs across conformers: the
+    xtb peak along the interpolated path (kcal/mol above its start), else
+    the path's length; inf if neither can be had."""
+    import math
+
+    from mepd.atom_mapping_selection import KCAL_PER_HARTREE, MappingCandidate, _interpolate, _xtb_engine
+
+    try:
+        chain, smoother = _interpolate(MappingCandidate(label="pair", end_structure=end, atom_map=None), start,
+                                       run_inputs)
+    except Exception:
+        return math.inf
+    engine = _xtb_engine()
+    if engine is not None:
+        try:
+            e = [float(x) for x in engine.compute_energies(chain)]
+            if e and all(math.isfinite(x) for x in e):
+                return (max(e) - e[0]) * KCAL_PER_HARTREE
+        except Exception:
+            pass
+    return float(smoother.length)

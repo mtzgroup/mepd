@@ -289,6 +289,58 @@ def _load_conformer_pool(fp: Path, endpoint, label: str, charge: int, multiplici
     return kept
 
 
+def _built_pairs_by_mechanism(sources: list, src: str, start_node, end_node, run_inputs: RunInputs, *,
+                              pairs_per_mechanism: int = 0, workers: int = 1) -> tuple[list, list]:
+    """--pair-from with --atom-mapping: for each conformer in `sources` (the
+    `src` side), the other endpoint built for every candidate mapping (each
+    distinct bond set, with swaps of the conformer's symmetric atoms),
+    minimized, dropped if its bonds or stereochemistry change, and the best
+    of each mechanism kept (mepd.built_pair_mapping.best_per_mechanism).
+    `pairs_per_mechanism` > 0 keeps each mechanism's best pairs across the
+    conformers (by the xtb peak along the pair's interpolated path).
+    Returns (sources, built partners) like network_expansion.build_partners,
+    a conformer repeated once per mechanism kept for it -- both in the
+    start's atom order."""
+    from mepd.atom_mapping import check_atom_mapping
+    from mepd.built_pair_mapping import best_per_mechanism
+    from mepd.cli_common import _candidate_atom_maps
+    from mepd.nodes.node import StructureNode
+
+    pair_from = "start" if src == "start" else "end"
+    atom_map = check_atom_mapping(start_node.structure, end_node.structure)
+    if atom_map is None:
+        return [], []
+    maps = _candidate_atom_maps(start_node.structure, end_node.structure, atom_map, run_inputs)
+    typer.echo(f"  per conformer: each of the candidate mappings' {'products' if src == 'start' else 'reactants'} "
+               "built and minimized, the best of each mechanism kept...")
+
+    def one(node):
+        a, b = (node.structure, end_node.structure) if src == "start" else (start_node.structure, node.structure)
+        try:
+            return best_per_mechanism(a, b, maps, pair_from, run_inputs, echo=lambda _: None), None
+        except Exception as exc:
+            return [], f"{type(exc).__name__}: {exc}"
+
+    rows = []
+    for k, (found, error) in enumerate(_fork_map(one, list(sources), workers)):
+        if error:
+            typer.echo(f"  conformer {k}: {error}")
+        rows += found
+    by_key: dict = {}
+    for r in rows:
+        by_key.setdefault(r.key, []).append(r)
+    kept = []
+    for key in sorted(by_key):
+        mine = sorted(by_key[key], key=lambda r: r.score)
+        kept += mine[:pairs_per_mechanism] if pairs_per_mechanism > 0 else mine
+        typer.echo(f"  {_describe_mechanism(key)}: {len(by_key[key])} conformer(s)"
+                   + (f", the {min(len(mine), pairs_per_mechanism)} lowest path peak(s) kept"
+                      if 0 < pairs_per_mechanism < len(mine) else ""))
+    a = [StructureNode(structure=r.start) for r in kept]
+    b = [StructureNode(structure=r.end) for r in kept]
+    return (a, b) if src == "start" else (b, a)
+
+
 def _minimize_conformer_pool(nodes: list, label: str, run_inputs: RunInputs) -> list:
     """Optimize every node in a conformer pool with the QM engine, dropping
     (with a warning) any conformer that fails to converge or produces an
@@ -1201,12 +1253,15 @@ def channels(
     # minimization (rather than on the raw SMILES embedding) so that
     # comparison reflects real minima, not embedding artifacts/strain that
     # can otherwise dominate the energy delta the veto decision is based on.
-    realigned_end_structure = _check_endpoint_atom_mapping(
-        start_node.structure, end_node.structure, atom_mapping, run_inputs,
-        debug_dump=debug_dump, output=output,
-    )
-    if realigned_end_structure is not end_node.structure:
-        end_node = StructureNode(structure=realigned_end_structure)
+    # With an endpoint built from the other (--pair-from), the mapping is
+    # chosen per conformer by the built pairs (_built_pairs_by_mechanism).
+    if not (atom_mapping and pair_from != "both"):
+        realigned_end_structure = _check_endpoint_atom_mapping(
+            start_node.structure, end_node.structure, atom_mapping, run_inputs,
+            debug_dump=debug_dump, output=output,
+        )
+        if realigned_end_structure is not end_node.structure:
+            end_node = StructureNode(structure=realigned_end_structure)
 
     conformer_inputs = ConformerInputs(
         backend=backend,
@@ -1356,7 +1411,10 @@ def channels(
             typer.echo(f"--pair-from {pair_from}: building a {'product' if other == 'end' else 'reactant'} in the "
                        f"frame of each of the {len(pools[src])} {'reactant' if src == 'start' else 'product'} "
                        "conformer(s)...")
-            kept, built = build_partners(pools[src], end_node if other == "end" else start_node, run_inputs)
+            kept, built = (_built_pairs_by_mechanism(pools[src], src, start_node, end_node, run_inputs,
+                                                     pairs_per_mechanism=pairs_per_mechanism, workers=max(1, workers))
+                           if atom_mapping else
+                           build_partners(pools[src], end_node if other == "end" else start_node, run_inputs))
             pairs += list(zip(kept, built)) if src == "start" else list(zip(built, kept))
             n_built[src] = len(built)
             typer.echo(f"  {len(built)} built (each paired with the conformer it was built from).")

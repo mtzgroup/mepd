@@ -119,3 +119,31 @@ def test_partners_whose_bonds_change_are_dropped_with_a_warning(monkeypatch):
                             echo=lines.append)
     assert out is not None and out.n_kept < out.n_bond_sets
     assert any("fewest bond changes (2)" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("src", ["start", "end"])
+def test_channels_keeps_one_built_pair_per_mechanism(monkeypatch, src):
+    """channels --pair-from with --atom-mapping: every conformer's partners
+    are built for each candidate mapping and the best of each mechanism is
+    kept; --pairs-per-mechanism caps each mechanism across conformers. The
+    pairs come back in the start's atom order, the sources first like
+    build_partners."""
+    import mepd.built_pair_mapping as bp
+    from mepd.atom_mapping_selection import _bond_changes
+    from mepd.cli_channels import _built_pairs_by_mechanism
+    from mepd.inputs import RunInputs
+    from mepd.nodes.node import StructureNode
+
+    _no_optimizer(monkeypatch)
+    _rank_by_bond_changes(monkeypatch, [])
+    monkeypatch.setattr(bp, "_path_score", lambda a, b, ri: float(_bond_changes(a, b)))
+    start, end = _acetone_and_enol()
+    conformers = [StructureNode(structure=start if src == "start" else end)] * 2
+    sources, built = _built_pairs_by_mechanism(conformers, src, StructureNode(structure=start),
+                                               StructureNode(structure=end), RunInputs(engine_name="gxtb"),
+                                               pairs_per_mechanism=1)
+    pairs = list(zip(sources, built)) if src == "start" else list(zip(built, sources))
+    changes = sorted(_bond_changes(a.structure, b.structure) for a, b in pairs)
+    assert changes[0] == 2                     # the one-H transfer is among them
+    assert len(pairs) == len(set(changes))     # one pair per mechanism (capped at 1 across the 2 conformers)
+    assert all(list(a.structure.symbols) == list(start.symbols) for a, _ in pairs)
