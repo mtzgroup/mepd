@@ -418,6 +418,10 @@ class AtomMappingInputs:
     veto_margin: float = 0.0
     recheck_on_split: bool = False
     explore_mechanisms: int = 0
+    # snap-gi-xtb: relax the paths of the best this many mechanisms (by raw xtb
+    # peak) with their changing bonds held, and keep the lowest relaxed barrier
+    # (raw interpolation peaks are mostly atoms colliding mid-path). 0 = off.
+    relax_top: int = 4
     # metric "rmsd-geodesic": only candidates within this many standard
     # deviations of the lowest endpoint RMSD are scored by geodesic distance.
     rmsd_window: float = 1.0

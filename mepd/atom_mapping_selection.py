@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 from qcdata.models.structure import Structure
 
 from mepd.atom_mapping import AtomMapping, realign_end_to_start
@@ -301,6 +303,112 @@ def _xtb_engine():
         return None
 
 
+def _mechanism(label: str) -> str:
+    """'mapping_15 snap2' -> 'mapping_15': the symmetric variants of one mechanism."""
+    return label.split(" snap")[0]
+
+
+def _relaxed_choice(picks: list, paths: list, peaks: list, top_frame: list, start_structure: Structure, top: int):
+    """Stage 2 of snap-gi-xtb: the best variant of each of the `top` best
+    mechanisms (by raw peak) has its path relaxed (`_relaxed_barrier`) and
+    the lowest barrier wins. Returns (index into picks, {label: barrier},
+    how many were relaxed), or None (no xtb, or none could be relaxed)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mepd.programs import xtb_executable
+
+    exe = xtb_executable(download=False)
+    if exe is None:
+        return None
+    best = {}
+    for i, p in enumerate(peaks):
+        if math.isfinite(p):
+            m = _mechanism(picks[i].label)
+            if m not in best or p < peaks[best[m]]:
+                best[m] = i
+    chosen = sorted(best.values(), key=peaks.__getitem__)[:top]
+    # SLAPMapper's own (minimal-edit) mechanism is always among them: an
+    # explored relay has to beat it relaxed, not just raw.
+    minimal = [i for i in best.values() if not getattr(picks[i].atom_map, "explored", False)]
+    if minimal and not set(minimal) & set(chosen):
+        chosen.append(min(minimal, key=peaks.__getitem__))
+    with ThreadPoolExecutor(max_workers=min(4, len(chosen))) as pool:
+        barriers = list(pool.map(lambda i: _relaxed_barrier(paths[i][0], start_structure, picks[i].end_structure,
+                                                            exe, peak_frame=top_frame[i]), chosen))
+    ok = [(b, i) for b, i in zip(barriers, chosen) if b is not None and math.isfinite(b)]
+    if not ok:
+        return None
+    k = min(ok)[1]
+    return k, {picks[i].label: (b if b is not None else math.inf) for b, i in zip(barriers, chosen)}, len(chosen)
+
+
+def _relaxed_barrier(chain: Chain, start_structure: Structure, end_structure: Structure, exe: str,
+                     *, stride: int = 2, peak_frame: Optional[int] = None, timeout: float = 300.0) -> Optional[float]:
+    """The highest energy along `chain` (kcal/mol above its first frame)
+    once each interior frame (every `stride`-th, and the raw maximum) is
+    optimized by xtb (GFN2, crude) with the distances of the bonds that
+    change between start and end held at that frame's values: the reaction
+    stays where the interpolation put it, the clashes relax away. None if
+    xtb fails on every frame."""
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    from mepd.discovery.nanoreactor import perceive_bonds
+
+    symbols = list(start_structure.symbols)
+    xyz = [np.asarray(n.coords, dtype=float).reshape(-1, 3) / ANGSTROM_TO_BOHR for n in chain.nodes]
+    a = np.asarray(start_structure.geometry).reshape(-1, 3) / ANGSTROM_TO_BOHR
+    b = np.asarray(end_structure.geometry).reshape(-1, 3) / ANGSTROM_TO_BOHR
+    changed = sorted(set(perceive_bonds(symbols, a)) ^ set(perceive_bonds(symbols, b)))
+    interior = list(range(1, len(xyz) - 1))
+    if not interior:
+        return None
+    frames = set(interior[::stride])
+    if peak_frame is not None:
+        frames.add(peak_frame)
+    charge, uhf = int(start_structure.charge), int(start_structure.multiplicity) - 1
+    env = {**os.environ, "OMP_NUM_THREADS": "1", "OMP_STACKSIZE": os.environ.get("OMP_STACKSIZE", "1G")}
+
+    def energy(coords, constrain) -> Optional[float]:
+        tmp = Path(tempfile.mkdtemp(prefix="mepd_relax_"))
+        try:
+            (tmp / "f.xyz").write_text(f"{len(symbols)}\n\n" + "".join(
+                f"{s} {x:.8f} {y:.8f} {z:.8f}\n" for s, (x, y, z) in zip(symbols, coords)))
+            argv = [exe, "f.xyz", "--gfn", "2", "--chrg", str(charge)] + (["--uhf", str(uhf)] if uhf else [])
+            if constrain:
+                (tmp / "c.inp").write_text("$constrain\n   force constant=1.0\n" + "".join(
+                    f"   distance: {i + 1}, {j + 1}, auto\n" for i, j in changed) + "$end\n")
+                argv += ["--opt", "crude", "--input", "c.inp"]
+            cmd = "ulimit -s unlimited 2>/dev/null; exec " + " ".join(f"'{x}'" for x in argv)
+            done = subprocess.run(["bash", "-c", cmd], cwd=tmp, env=env, capture_output=True, text=True,
+                                  timeout=timeout)
+            if done.returncode != 0:
+                return None
+            if constrain:
+                head = (tmp / "xtbopt.xyz").read_text().splitlines()[1]
+                return float(head.split("energy:")[1].split()[0])
+            for line in done.stdout.splitlines():
+                if "TOTAL ENERGY" in line:
+                    return float(line.split()[3])
+            return None
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    e0 = energy(xyz[0], constrain=False)
+    if e0 is None:
+        return None
+    found = [e for e in (energy(xyz[f], constrain=True) for f in sorted(frames)) if e is not None]
+    if not found:
+        return None
+    return (max(found) - e0) * KCAL_PER_HARTREE
+
+
 def _short_error(exc: Exception) -> str:
     """An exception as one short line (an xtb failure's last words)."""
     text = str(exc).strip().splitlines()
@@ -330,7 +438,8 @@ def _snap_picks(candidate: MappingCandidate, start_structure: Structure) -> list
             end_structure=realign_end_to_start(s, candidate.end_structure),
             atom_map=None if same else AtomMapping(
                 mapping=mapping, cost=getattr(candidate.atom_map, "cost", 0),
-                n_alternatives=getattr(candidate.atom_map, "n_alternatives", 1))))
+                n_alternatives=getattr(candidate.atom_map, "n_alternatives", 1),
+                explored=getattr(candidate.atom_map, "explored", False))))
     return out
 
 
@@ -373,17 +482,29 @@ def _rank_picks(picks: list, fallback: list, start_structure: Structure, run_inp
         # Each path on its own: one xtb cannot evaluate (an SCF that fails on
         # a distorted frame, e.g. a relay dragging an H past other atoms)
         # ranks last instead of costing every path its xtb score.
-        peaks, failed = [], []
+        peaks, failed, top_frame = [], [], []
         for c, (chain, _) in zip(picks, paths):
             try:
                 energies = [float(e) for e in engine.compute_energies(chain)]
                 if not energies or not all(math.isfinite(e) for e in energies):
                     raise ValueError("non-finite energies")
                 peaks.append((max(energies) - energies[0]) * KCAL_PER_HARTREE)
+                top_frame.append(max(range(1, len(energies) - 1), key=energies.__getitem__) if len(energies) > 2 else None)
             except Exception as exc:
                 peaks.append(math.inf)
+                top_frame.append(None)
                 failed.append((c.label, _short_error(exc)))
         scored = [p for p in peaks if math.isfinite(p)]
+        top = int(getattr(getattr(run_inputs, "atom_mapping_inputs", None), "relax_top", 0) or 0)
+        if top > 0 and len(scored) > 1:
+            relaxed = _relaxed_choice(picks, paths, peaks, top_frame, start_structure, top)
+            if relaxed is not None:
+                k, barriers, n = relaxed
+                note = (f"; {len(failed)} path(s) xtb could not evaluate, e.g. {failed[0][0]}: {failed[0][1]}"
+                        if failed else "")
+                return (rmsd[k], picks[k], "snap-gi-xtb-relaxed", barriers,
+                        f"xtb barrier along the path after relaxing all but its changing bonds, kcal/mol, for the "
+                        f"best {n} mechanism(s) by raw peak (snap-gi-xtb, relax_top {top}{note})")
         if scored:
             low = min(scored)
             # Peaks within PEAK_TIE of the lowest are a tie (a path that only

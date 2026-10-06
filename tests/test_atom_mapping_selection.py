@@ -289,3 +289,31 @@ def test_one_path_xtb_cannot_evaluate_ranks_last_instead_of_dropping_xtb(monkeyp
     monkeypatch.setattr(sel, "_xtb_engine", lambda: Engine({"a", "b", "c"}))
     _, best, rule, _, quantity = sel._rank_picks(picks, picks, "start", None)
     assert best.label == "a" and rule == "snap-gi" and "xtb failed on every interpolation" in quantity
+
+
+def test_relaxed_stage_keeps_the_lowest_barrier_and_always_tries_the_minimal_mechanism(monkeypatch):
+    """snap-gi-xtb, relax_top: the best mechanisms by raw peak (one variant
+    each) are relaxed and the lowest relaxed barrier wins, even against a
+    lower raw peak; SLAPMapper's own mechanism is always relaxed too."""
+    from types import SimpleNamespace as NS
+
+    import mepd.atom_mapping_selection as sel
+    import mepd.programs as programs
+
+    def pick(label, explored):
+        return NS(label=label, end_structure=label, atom_map=NS(explored=explored))
+    picks = [pick("mapping_0 snap0", False), pick("mapping_5 snap0", True), pick("mapping_5 snap1", True),
+             pick("mapping_6 snap0", True)]
+    raw = [900.0, 500.0, 520.0, 600.0]                    # kcal/mol: the minimal one looks worst raw
+    relaxed = {"mapping_0 snap0": 80.0, "mapping_5 snap0": 95.0, "mapping_6 snap0": 120.0}
+    tried = []
+
+    def fake(chain, start, end, exe, peak_frame=None):
+        tried.append(end)
+        return relaxed[end]
+    monkeypatch.setattr(sel, "_relaxed_barrier", fake)
+    monkeypatch.setattr(programs, "xtb_executable", lambda download=False: "/bin/xtb")
+    k, barriers, n = sel._relaxed_choice(picks, [(p.label, None) for p in picks], raw, [None] * 4, "start", top=1)
+    assert picks[k].label == "mapping_0 snap0"            # relaxed, the minimal mechanism wins
+    assert sorted(tried) == ["mapping_0 snap0", "mapping_5 snap0"] and n == 2   # top 1 (one variant) + the minimal
+    assert "mapping_5 snap1" not in barriers
