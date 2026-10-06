@@ -383,6 +383,46 @@ def embed_product(symbols: Sequence[str], coords_angstrom: np.ndarray, product_e
     return best[0]
 
 
+def build_partners(sources: list, target, run_inputs) -> tuple[list, list]:
+    """For each node in `sources`, `target` built in its frame: every atom
+    where it is in that node, the target's bonds pulled to length
+    (`embed_product`), then minimized with the run's engine. A partner whose
+    bonds or stereochemistry come out different from `target`'s is dropped
+    with its source. `target` (same atom order as the sources) also gives
+    the charge and spin. Returns (kept sources, their partners)."""
+    from mepd.nodes.nodehelpers import _is_connectivity_identical
+
+    want = {_edge(int(u), int(v)) for u, v in target.graph.edges()}
+    kept, guesses = [], []
+    for node in sources:
+        try:
+            xyz = embed_product(list(node.structure.symbols),
+                                np.asarray(node.structure.geometry) / ANGSTROM_TO_BOHR, want)
+        except Exception:
+            continue
+        kept.append(node)
+        guesses.append(StructureNode(structure=target.structure.model_copy(
+            update={"geometry": np.asarray(xyz) * ANGSTROM_TO_BOHR})))
+    keywords = {"coordsys": "cart", "maxit": 500, **(getattr(run_inputs, "geometry_optimizer_kwds", None) or {})}
+    batch = getattr(run_inputs.engine, "compute_geometry_optimizations", None)
+    if callable(batch):
+        try:
+            trajectories = batch(guesses, keywords=keywords)
+        except TypeError:
+            trajectories = batch(guesses)
+    else:
+        trajectories = [run_inputs.engine.compute_geometry_optimization(g, keywords=keywords) for g in guesses]
+    pairs = []
+    for src, traj in zip(kept, trajectories):
+        if not traj:
+            continue
+        built = StructureNode(structure=traj[-1].structure)
+        if {_edge(int(u), int(v)) for u, v in built.graph.edges()} == want and _is_connectivity_identical(
+                built, target, verbose=False, collect_comparison=False):
+            pairs.append((src, built))
+    return [s for s, _ in pairs], [b for _, b in pairs]
+
+
 def _perceived_edges(symbols, coords_angstrom) -> set[Edge]:
     """Bonds as mepd perceives them (openbabel, as StructureNode.graph)."""
     from qcdata import Structure

@@ -871,7 +871,7 @@ def test_pair_from_builds_each_partner_in_its_conformer_s_frame():
     it is in that conformer and gets the target's bonds; with an optimizer
     that leaves geometries as they are, a same-bonded target comes back on
     top of its conformer, and each conformer keeps its own partner."""
-    from mepd.cli_channels import _build_partners
+    from mepd.discovery.network_expansion import build_partners
     from mepd.nodes.node import StructureNode
 
     mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
@@ -888,7 +888,7 @@ def test_pair_from_builds_each_partner_in_its_conformer_s_frame():
         engine = Engine()
         geometry_optimizer_kwds = {}
 
-    kept, built = _build_partners(nodes, nodes[0], RI())
+    kept, built = build_partners(nodes, nodes[0], RI())
     assert len(kept) == len(built) == 2
     dist = lambda a, b: float(np.abs(np.asarray(a.structure.geometry) - np.asarray(b.structure.geometry)).max())
     for k in range(2):   # bonds are pulled to length, so near (not on) its own conformer, far from the other

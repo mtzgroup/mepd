@@ -484,12 +484,12 @@ def run(
             end_node = StructureNode(structure=realigned_end_structure)
 
     if pair_from != "both":
-        from mepd.cli_channels import _build_partners
+        from mepd.discovery.network_expansion import build_partners
 
         source, target = (start_node, end_node) if pair_from == "start" else (end_node, start_node)
         built_name = "end" if pair_from == "start" else "start"
         typer.echo(f"--pair-from {pair_from}: building the {built_name} in the {pair_from}'s frame...")
-        _, built = _build_partners([source], target, run_inputs)
+        _, built = build_partners([source], target, run_inputs)
         if not built:
             raise typer.BadParameter(f"--pair-from {pair_from}: the built {built_name} changed its bonds on "
                                      "minimization (or could not be embedded).")

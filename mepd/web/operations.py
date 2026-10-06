@@ -211,13 +211,14 @@ class ChannelsParams(Params):
                                "Take an endpoint's conformers from an earlier Reaction channels run on the same "
                                "molecule with the same sampler settings and level of theory, instead of "
                                "sampling and minimizing them again.", kind="custom", group="Conformers")
-    pair_from: Literal["both", "start", "end"] = P(
+    pair_from: Literal["both", "start", "end", "start+end"] = P(
         "both", "Pairs from", "Every reactant conformer with every product conformer, or sample one side only "
         "and build each conformer's partner in its frame (each atom where it is, the new bonds pulled to "
         "length, minimized): only what reacts moves, and the partner's geometries are sampled through the "
         "conformer's.", cli="--pair-from", group="Pairs", advanced=True,
         labels={"both": "Both sides sampled", "start": "Reactant conformers, products built",
-                "end": "Product conformers, reactants built"})
+                "end": "Product conformers, reactants built",
+                "start+end": "Each side's conformers, partners built"})
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)

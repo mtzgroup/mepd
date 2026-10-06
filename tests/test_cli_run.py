@@ -1105,7 +1105,7 @@ def test_cli_run_pair_from_replaces_the_other_endpoint_with_one_built_from_it(tm
     """--pair-from start/end: the other endpoint is the one built in this
     side's frame (target = the given other endpoint), and the path runs to it."""
     _install_fake_gxtb(monkeypatch)
-    import mepd.cli_channels as channels_module
+    import mepd.discovery.network_expansion as expansion_module
 
     seen = []
     built = StructureNode(structure=_water(0.1))
@@ -1114,7 +1114,7 @@ def test_cli_run_pair_from_replaces_the_other_endpoint_with_one_built_from_it(tm
         seen.append((sources[0].structure.geometry.copy(), target.structure.geometry.copy()))
         return sources, [built]
 
-    monkeypatch.setattr(channels_module, "_build_partners", fake_build)
+    monkeypatch.setattr(expansion_module, "build_partners", fake_build)
     start_fp, end_fp = tmp_path / "start.xyz", tmp_path / "end.xyz"
     start_fp.write_text(_water().to_xyz())
     end_fp.write_text(_water(0.3).to_xyz())
