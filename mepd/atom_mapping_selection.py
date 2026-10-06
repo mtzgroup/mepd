@@ -305,8 +305,9 @@ def _xtb_engine():
 
 
 def _mechanism(label: str) -> str:
-    """'mapping_15 snap2' -> 'mapping_15': the symmetric variants of one mechanism."""
-    return label.split(" snap")[0]
+    """'mapping_15 snap2' (or ' sym2', a built pair's) -> 'mapping_15': the
+    symmetric variants of one mechanism."""
+    return label.split(" snap")[0].split(" sym")[0]
 
 
 def _bond_changes(start_structure: Structure, end_structure: Structure) -> int:

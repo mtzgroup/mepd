@@ -127,27 +127,35 @@ def suggest_atom_mapping(
     if sorted(_atomic_numbers(mol_start)) != sorted(_atomic_numbers(mol_end)):
         return None
 
-    lg_start = molecule_to_labeled_graph(mol_start)
-    lg_end = molecule_to_labeled_graph(mol_end)
-
-    mapper = SlapMapper(binary=binary)
-    mapper.get_maps([lg_start, lg_end])
-    if not mapper.results:
+    # With symmetry broken (suggest_atom_mapping_candidates), each label
+    # class is one atom. An unbranched pass leaves classes of equivalent
+    # atoms (e.g. acetone's six methyl H) paired by index order, which need
+    # not be the cost-minimal pairing: acetone -> its enol came out as the
+    # current numbering, a double H shift (4 bond changes, not 2).
+    found = suggest_atom_mapping_candidates(struct_start, struct_end, binary=binary, max_candidates=1)
+    if not found:
         return None
+    best = found[0]
+    n = len(best.mapping)
+    if not best.is_identity and list(struct_start.symbols) == list(struct_end.symbols):
+        identity = {i: i for i in range(n)}
+        if _bond_changes_under(struct_start, struct_end, identity) <= _bond_changes_under(
+                struct_start, struct_end, best.mapping):
+            # The current numbering is as good: the bonds already correspond.
+            return AtomMapping(mapping=identity, cost=best.cost, n_alternatives=best.n_alternatives)
+    return best
 
-    result = mapper.results[0]
-    label2idxs_start = result["lgp"][0].label2idxs
-    label2idxs_end = result["lgp"][1].label2idxs
 
-    mapping: dict[int, int] = {}
-    for label, idxs_start in label2idxs_start.items():
-        idxs_end = label2idxs_end[label]
-        for a, b in zip(sorted(idxs_start), sorted(idxs_end)):
-            mapping[a] = b
+def _bond_changes_under(struct_start: Structure, struct_end: Structure, mapping: dict[int, int]) -> int:
+    """Bonds broken plus formed when start atom i becomes end atom mapping[i]."""
+    from mepd.nodes.node import StructureNode
 
-    return AtomMapping(
-        mapping=mapping, cost=result["val"], n_alternatives=len(mapper.results)
-    )
+    def edges(s):
+        return {tuple(sorted((int(u), int(v)))) for u, v in StructureNode(structure=s).graph.edges()}
+
+    inverse = {j: i for i, j in mapping.items()}
+    end_in_start = {tuple(sorted((inverse[u], inverse[v]))) for u, v in edges(struct_end)}
+    return len(edges(struct_start) ^ end_in_start)
 
 
 def _symmetry_orbits(structure: Structure) -> list[list[int]]:

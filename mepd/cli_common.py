@@ -380,6 +380,80 @@ def _dump_atom_mapping_candidates(
     )
 
 
+def _candidate_atom_maps(start_structure: Structure, end_structure: Structure, atom_map, run_inputs) -> list:
+    """The candidate mappings the --atom-mapping check compares: SLAPMapper's
+    (the budget filled with relabelings of symmetric atoms), or, when the
+    bonds already correspond (`atom_map` is the identity), the current
+    numbering's relabelings; plus --explore-mechanisms' mechanisms."""
+    from mepd.atom_mapping import expand_mapping_fully, suggest_atom_mapping_candidates
+
+    n_candidates = run_inputs.atom_mapping_inputs.n_candidates
+    # Bonds that already correspond still leave the symmetric atoms (a
+    # methyl's hydrogens) to be matched: the current numbering competes
+    # with its symmetry relabelings.
+    atom_maps = (expand_mapping_fully(atom_map, start_structure, end_structure, max_variants=n_candidates)
+                 if atom_map.is_identity else
+                 suggest_atom_mapping_candidates(start_structure, end_structure, max_candidates=n_candidates))
+    n_explore = int(getattr(run_inputs.atom_mapping_inputs, "explore_mechanisms", 0) or 0)
+    if n_explore > 0:
+        # Mechanisms beyond SLAPMapper's minimal-edit ones compete too:
+        # relays and exchanges through other molecules (a catalyst, solvent).
+        from mepd.atom_mapping import catalytic_participants, explore_mechanisms, mechanism_key, realign_end_to_start
+        explored = explore_mechanisms(start_structure, end_structure, atom_maps[:20], max_new=n_explore)
+        for m in explored:
+            aligned = realign_end_to_start(m, end_structure)
+            cats = catalytic_participants(start_structure, aligned)
+            typer.echo(f"Atom mapping: explored mechanism ({int(m.cost)} bond changes) "
+                       f"{mechanism_key(start_structure, aligned)}"
+                       + (f"  [catalytic: {', '.join(cats)}]" if cats else ""))
+        atom_maps = list(atom_maps) + explored
+    return atom_maps
+
+
+def _map_and_build_pair(start_structure: Structure, end_structure: Structure, pair_from: str, run_inputs):
+    """--pair-from start/end with --atom-mapping: the built endpoint depends
+    on the mapping, so each candidate mapping's partner is built, minimized
+    and its path compared (mepd.built_pair_mapping), rather than the mapping
+    being chosen against the given geometry first. Returns the chosen pair
+    (start, end) in the start's atom order, or None when the mapping cannot
+    be checked (the caller then builds from the current numbering)."""
+    if len(start_structure.symbols) != len(end_structure.symbols) or getattr(run_inputs, "qmmm", None):
+        return None
+    from mepd.atom_mapping import HAS_SLAPMAPPER, check_atom_mapping
+
+    if not HAS_SLAPMAPPER:
+        return None
+    try:
+        atom_map = check_atom_mapping(start_structure, end_structure)
+        if atom_map is None:
+            return None
+        atom_maps = _candidate_atom_maps(start_structure, end_structure, atom_map, run_inputs)
+    except Exception as exc:
+        typer.echo(f"Could not enumerate candidate atom mappings ({type(exc).__name__}: {exc}); "
+                   "building from the current numbering.")
+        return None
+    from mepd.built_pair_mapping import build_and_rank
+
+    result = build_and_rank(start_structure, end_structure, atom_maps, pair_from, run_inputs, echo=typer.echo)
+    if result is None:
+        return None
+    scores = result.scores
+    if len(scores) > 1:
+        typer.echo(f"  compared by {result.quantity}:")
+        ranked = sorted(scores, key=scores.get)
+        for label in ranked[:5]:
+            mark = "  <- chosen" if label == result.label else ""
+            name = "current numbering" if label == "identity" else label
+            typer.echo(f"    {name:<22}{scores[label]:.4f}{mark}")
+        if len(ranked) > 5:
+            typer.echo(f"    ({len(ranked) - 5} more, up to {scores[ranked[-1]]:.4f})")
+    for line in result.notes:
+        typer.echo(line)
+    typer.echo("Keeping the current numbering." if result.label == "identity" else
+               f"Renumbering the end's atoms ({result.label}) so they match the start's.")
+    return result.start, result.end
+
+
 def _check_endpoint_atom_mapping(
     start_structure: Structure,
     end_structure: Structure,
@@ -449,31 +523,11 @@ def _check_endpoint_atom_mapping(
     if not atom_mapping:
         return end_structure
 
-    from mepd.atom_mapping import expand_mapping_fully, suggest_atom_mapping_candidates
     from mepd.atom_mapping_selection import build_candidates, select_best_candidate
 
     n_candidates = run_inputs.atom_mapping_inputs.n_candidates
     try:
-        # Bonds that already correspond still leave the symmetric atoms (a
-        # methyl's hydrogens) to be matched: the current numbering competes
-        # with its symmetry relabelings.
-        atom_maps = (expand_mapping_fully(atom_map, start_structure, end_structure, max_variants=n_candidates)
-                     if atom_map.is_identity else
-                     suggest_atom_mapping_candidates(start_structure, end_structure, max_candidates=n_candidates))
-        n_explore = int(getattr(run_inputs.atom_mapping_inputs, "explore_mechanisms", 0) or 0)
-        if n_explore > 0:
-            # Mechanisms beyond SLAPMapper's minimal-edit ones compete too:
-            # relays and exchanges through other molecules (a catalyst, solvent).
-            from mepd.atom_mapping import (catalytic_participants, explore_mechanisms, mechanism_key,
-                                           realign_end_to_start)
-            explored = explore_mechanisms(start_structure, end_structure, atom_maps[:20], max_new=n_explore)
-            for m in explored:
-                aligned = realign_end_to_start(m, end_structure)
-                cats = catalytic_participants(start_structure, aligned)
-                typer.echo(f"Atom mapping: explored mechanism ({int(m.cost)} bond changes) "
-                           f"{mechanism_key(start_structure, aligned)}"
-                           + (f"  [catalytic: {', '.join(cats)}]" if cats else ""))
-            atom_maps = list(atom_maps) + explored
+        atom_maps = _candidate_atom_maps(start_structure, end_structure, atom_map, run_inputs)
     except Exception as exc:
         typer.echo(
             f"Could not enumerate --atom-mapping candidate mappings "
