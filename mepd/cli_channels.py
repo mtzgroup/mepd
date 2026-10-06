@@ -294,17 +294,15 @@ def _built_pairs_by_mechanism(sources: list, src: str, start_node, end_node, run
     """--pair-from with --atom-mapping: for each conformer in `sources` (the
     `src` side), the other endpoint built for every candidate mapping (each
     distinct bond set, with swaps of the conformer's symmetric atoms),
-    minimized and dropped if its bonds or stereochemistry change
-    (mepd.built_pair_mapping.mechanism_pairs). Each built partner is a pair
-    of its own -- a mechanism's variants (which symmetric atoms react) build
-    different partners -- less those that minimized to the same geometry.
-    `pairs_per_mechanism` > 0 keeps each mechanism's best pairs over every
-    conformer and variant (by the xtb peak along the interpolated path).
+    minimized, dropped if its bonds or stereochemistry change, and the best
+    of each mechanism kept (mepd.built_pair_mapping.best_per_mechanism).
+    `pairs_per_mechanism` > 0 keeps each mechanism's best pairs across the
+    conformers (by the xtb peak along the pair's interpolated path).
     Returns (sources, built partners) like network_expansion.build_partners,
-    a conformer repeated once per pair kept for it -- both in the
+    a conformer repeated once per mechanism kept for it -- both in the
     start's atom order."""
     from mepd.atom_mapping import check_atom_mapping
-    from mepd.built_pair_mapping import distinct, mechanism_pairs
+    from mepd.built_pair_mapping import best_per_mechanism
     from mepd.cli_common import _candidate_atom_maps
     from mepd.nodes.node import StructureNode
 
@@ -313,13 +311,13 @@ def _built_pairs_by_mechanism(sources: list, src: str, start_node, end_node, run
     if atom_map is None:
         return [], []
     maps = _candidate_atom_maps(start_node.structure, end_node.structure, atom_map, run_inputs)
-    typer.echo(f"  per conformer: the {'product' if src == 'start' else 'reactant'} of each candidate mapping "
-               "built and minimized, each a pair of its own...")
+    typer.echo(f"  per conformer: each of the candidate mappings' {'products' if src == 'start' else 'reactants'} "
+               "built and minimized, the best of each mechanism kept...")
 
     def one(node):
         a, b = (node.structure, end_node.structure) if src == "start" else (start_node.structure, node.structure)
         try:
-            return mechanism_pairs(a, b, maps, pair_from, run_inputs, echo=lambda _: None), None
+            return best_per_mechanism(a, b, maps, pair_from, run_inputs, echo=lambda _: None), None
         except Exception as exc:
             return [], f"{type(exc).__name__}: {exc}"
 
@@ -328,10 +326,6 @@ def _built_pairs_by_mechanism(sources: list, src: str, start_node, end_node, run
         if error:
             typer.echo(f"  conformer {k}: {error}")
         rows += found
-    n_built = len(rows)
-    rows = distinct(rows)
-    if len(rows) < n_built:
-        typer.echo(f"  {n_built - len(rows)} built pair(s) were the same path as another (up to atom numbering or a mirror image); dropped.")
     by_key: dict = {}
     for r in rows:
         by_key.setdefault(r.key, []).append(r)
