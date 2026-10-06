@@ -126,6 +126,13 @@ class TsParams(Params):
         "snap-gi-xtb", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Atom mapping", advanced=True,
         requires="atom_mapping", labels=_MAPPING_LABELS)
+    explore_mechanisms: int = P(
+        0, "Explore mechanisms", ("Also consider up to this many mechanisms beyond SLAPMapper's minimal-edit ones: relays and exchanges "
+        "through other molecules (a catalyst, solvent), found by swapping same-element atoms or groups at most "
+        "+2 bond edits per swap, with no rule about which atoms may move. Each is scored like SLAPMapper's "
+        "(snap + GI + xtb); ones in which a molecule takes part and is regenerated are labelled "
+        "[catalytic: ...]. 0 = off; 20 is a reasonable start."),
+        cli="--explore-mechanisms", group="Atom mapping", advanced=True, ge=0, requires="atom_mapping")
     validate_minima_with_hessian: bool = P(
         True, "Validate minima with Hessian", "Every intermediate minimum a recursive split proposes must "
         "have no imaginary frequency beyond the cutoff; a failing one is pushed along its unstable mode and re-optimized.",
@@ -206,6 +213,13 @@ class ChannelsParams(Params):
         "snap-gi-xtb", "Mapping metric", _MAPPING_METRIC_HELP,
         cli="--atom-mapping-metric", group="Pairs", advanced=True,
         requires="atom_mapping", labels=_MAPPING_LABELS)
+    explore_mechanisms: int = P(
+        0, "Explore mechanisms", ("Also consider up to this many mechanisms beyond SLAPMapper's minimal-edit ones: relays and exchanges "
+        "through other molecules (a catalyst, solvent), found by swapping same-element atoms or groups at most "
+        "+2 bond edits per swap, with no rule about which atoms may move. Each is scored like SLAPMapper's "
+        "(snap + GI + xtb); ones in which a molecule takes part and is regenerated are labelled "
+        "[catalytic: ...]. 0 = off; 20 is a reasonable start."),
+        cli="--explore-mechanisms", group="Pairs", advanced=True, ge=0, requires="atom_mapping")
     atom_mapping_rmsd_window: float = P(
         1.0, "RMSD window (σ)", "Filtered GI path: GI paths for the conformer pairs within this many standard "
         "deviations of each mechanism's lowest endpoint RMSD. On the KAIST set 1σ kept 6% of the pairs and 56% of "

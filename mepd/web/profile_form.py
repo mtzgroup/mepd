@@ -91,7 +91,7 @@ CHAIN_DEFAULTS = {"k": 0.1, "delta_k": 0.09, "do_parallel": True, "node_freezing
                   "node_rms_thre": 5.0, "node_ene_thre": 5.0, "frozen_atom_indices": ""}
 MAPPING_DEFAULTS = {"n_candidates": 200, "metric": "snap-gi-xtb", "rmsd_window": 1.0, "gi_variant_cap": 20,
                     "veto_margin": 0.0,
-                    "recheck_on_split": False}
+                    "recheck_on_split": False, "explore_mechanisms": 0}
 TERACHEM_MODEL = {"method": "ub3lyp", "basis": "3-21g"}
 
 # Keys every path method reads.
