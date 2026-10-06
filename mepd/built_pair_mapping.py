@@ -221,31 +221,53 @@ class MechanismPair:
     score: float           # xtb peak along its interpolated path, kcal/mol (else GI length)
     start: Structure       # in the start's atom order
     end: Structure
-    n_variants: int        # built variants of this mechanism compared
 
 
-def best_per_mechanism(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
-                       echo: Callable[[str], None] = print) -> list[MechanismPair]:
-    """Like `build_and_rank`, but one pair per mechanism instead of one in
-    all: the built partners grouped by which bonds break and form, and each
-    group's variants (which symmetric atoms react) ranked on their own.
-    For channels, where every mechanism gets its own path searches."""
+def mechanism_pairs(start: Structure, end: Structure, atom_maps: list, pair_from: str, run_inputs,
+                    echo: Callable[[str], None] = print) -> list[MechanismPair]:
+    """Like `build_and_rank`, but every built pair instead of one: each with
+    its mechanism (which bonds break and form) and the xtb peak along its
+    interpolated path. A mechanism's variants -- which of the source's
+    symmetric atoms react -- are different built partners, so each is a pair
+    of its own (`distinct` then drops the ones that minimized to the same
+    geometry). For channels, where every mechanism gets its own searches."""
     from mepd.atom_mapping import mechanism_key
 
     _, kept = _build(start, end, atom_maps, pair_from, run_inputs, echo)
-    groups: dict = {}
-    for k in kept:
-        label, m, _, built = k
-        a, b = _pair(pair_from, start, end, m, built)
-        groups.setdefault(mechanism_key(a, b), []).append(k)
     out = []
-    for key, members in groups.items():
-        best, _, _, _ = _rank(members, start, pair_from, run_inputs) if len(members) > 1 else (members[0][0],) * 4
-        label, m, _, built = next(k for k in members if k[0] == best)
+    for label, m, _, built in kept:
         a, b = _pair(pair_from, start, end, m, built)
-        out.append(MechanismPair(key=key, score=_path_score(a, b, run_inputs), start=a, end=b,
-                                 n_variants=len(members)))
+        out.append(MechanismPair(key=mechanism_key(a, b), score=_path_score(a, b, run_inputs), start=a, end=b))
     return out
+
+
+def _signature(start: Structure, end: Structure) -> np.ndarray:
+    """Each atom pair's distance in the start and in the end (bohr), sorted:
+    the same for two pairs that one renumbering of the atoms turns into each
+    other on both ends at once (mirror images too), different when the same
+    two geometries are joined by a different correspondence (which H moves)."""
+    x = np.asarray(start.geometry, dtype=float).reshape(-1, 3)
+    y = np.asarray(end.geometry, dtype=float).reshape(-1, 3)
+    iu = np.triu_indices(len(x), 1)
+    d = np.stack([np.linalg.norm(x[iu[0]] - x[iu[1]], axis=1), np.linalg.norm(y[iu[0]] - y[iu[1]], axis=1)], axis=1)
+    r = np.round(d, 1)   # coarse keys, so near-equal distances sort alike
+    return d[np.lexsort((r[:, 1], r[:, 0]))]
+
+
+def distinct(pairs: list[MechanismPair], tol: float = 0.05) -> list[MechanismPair]:
+    """`pairs` (best score first) without repeats: two pairs of one
+    mechanism that are the same path up to atom numbering (`_signature`:
+    e.g. the same conformer built twice, or mirror-image variants) are one
+    search; the lower-scoring is dropped. The same product reached by a
+    different atom moving is kept."""
+    kept, seen = [], []
+    for p in sorted(pairs, key=lambda q: q.score):
+        sig = _signature(p.start, p.end)
+        if any(k == p.key and np.max(np.abs(sig - s)) < tol for k, s in seen):
+            continue
+        seen.append((p.key, sig))
+        kept.append(p)
+    return kept
 
 
 def _path_score(start: Structure, end: Structure, run_inputs) -> float:
