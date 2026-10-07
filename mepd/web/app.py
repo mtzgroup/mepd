@@ -919,7 +919,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                                               body.get("mm") or "amber", body.get("active_radius"))
                 sid = out["structure"]
             else:
-                out = await run_in_threadpool(web_qmmm.create, W(), body.get("structure", ""), body)
+                out = await run_in_threadpool(web_qmmm.create, W(), body.get("structure", ""), body,
+                                              demo.qmmm_limits() if demo is not None else None)
                 sid = body.get("structure")
         except ValueError as exc:
             raise WorkspaceError(str(exc)) from None
@@ -939,12 +940,15 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         raw = await file.read(demo.max_upload_bytes + 1 if demo is not None else -1)
         if demo is not None and len(raw) > demo.max_upload_bytes:
             raise WorkspaceError("file too large for the demo")
+        if demo is not None:      # (its atoms: qmmm_limits, below)
+            demo.check_structures(len(W().snapshot()["structures"]), [0])
         body = {"qm_atoms": qm_atoms, "charge": charge, "multiplicity": multiplicity,
                 "qm_charge": qm_charge if qm_charge is not None else charge, "active_radius": active_radius or None,
                 "mm": mm, "qm_multiplicity": multiplicity}
         try:
             out = await run_in_threadpool(web_qmmm.from_upload, W(), raw.decode("utf-8", "replace"),
-                                          file.filename or "system.xyz", body)
+                                          file.filename or "system.xyz", body,
+                                          demo.qmmm_limits() if demo is not None else None)
         except ValueError as exc:
             raise WorkspaceError(str(exc)) from None
         if optimize:
@@ -958,7 +962,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import qmmm as web_qmmm
 
         try:
-            out = await run_in_threadpool(web_qmmm.update, W(), sysid, body)
+            out = await run_in_threadpool(web_qmmm.update, W(), sysid, body,
+                                          demo.qmmm_limits() if demo is not None else None)
         except ValueError as exc:
             raise WorkspaceError(str(exc)) from None
         publish_ws()

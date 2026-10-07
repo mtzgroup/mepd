@@ -55,6 +55,22 @@ def _region_args(body: dict, region: Optional[QMMMRegion] = None) -> dict:
     return out
 
 
+def check_limits(region: QMMMRegion, limits: Optional[dict]) -> None:
+    """The public demo's bounds on a system ({"max_qm", "max_atoms",
+    "max_active_radius"}; None: no bounds), so one visitor's system stays a
+    few CPU-minutes per calculation."""
+    if not limits:
+        return
+    if len(region.qm_atoms) > limits["max_qm"]:
+        raise ValueError(f"the demo allows at most {limits['max_qm']} QM atoms (got {len(region.qm_atoms)})")
+    if region.natoms > limits["max_atoms"]:
+        raise ValueError(f"the demo allows QM/MM systems of at most {limits['max_atoms']} atoms "
+                         f"(got {region.natoms})")
+    if region.active_radius is None or region.active_radius > limits["max_active_radius"]:
+        raise ValueError(f"the demo needs a moving shell of at most {limits['max_active_radius']} Å "
+                         "(the rest of the environment frozen)")
+
+
 def preview(ws: Workspace, sid: str, body: dict) -> dict:
     """The region `body` describes on structure `sid`, not saved."""
     s = ws.load_structure(sid)
@@ -78,21 +94,22 @@ def _level_problems(ws: Workspace, region: QMMMRegion) -> list[str]:
             "system, or pick a GFN-FF environment (mechanical embedding)."]
 
 
-def create(ws: Workspace, sid: str, body: dict) -> dict:
+def create(ws: Workspace, sid: str, body: dict, limits: Optional[dict] = None) -> dict:
     """Make structure `sid` (and every structure with its atoms) a QM/MM
     system with the region in `body`."""
     s = ws.load_structure(sid)
     rec = ws.structure(sid)
     if rec.get("qmmm"):
-        return update(ws, rec["qmmm"], body)
+        return update(ws, rec["qmmm"], body, limits)
     region = QMMMRegion.build(s, body.get("qm_atoms") or "", **_region_args(body),
                               name=body.get("name") or f"{rec['name']} (QM/MM)")
+    check_limits(region, limits)
     sysrec = ws.put_qmmm_system(region, name=region.name)
     retag(ws, sysrec["id"])
     return sysrec
 
 
-def update(ws: Workspace, sysid: str, body: dict) -> dict:
+def update(ws: Workspace, sysid: str, body: dict, limits: Optional[dict] = None) -> dict:
     """Change a system's region (QM atoms, charge, moving shell, low level).
     Energies computed with the old region keep their old level key, so they
     are never compared with the new ones."""
@@ -101,6 +118,7 @@ def update(ws: Workspace, sysid: str, body: dict) -> dict:
     qm = body.get("qm_atoms") if body.get("qm_atoms") not in (None, "") else old.qm_atoms
     extra = {k: getattr(old, k) for k in ("prmtop", "pdb", "forcefield", "tcin")}
     region = QMMMRegion.build(ref, qm, **_region_args(body, old), name=body.get("name") or old.name, **extra)
+    check_limits(region, limits)
     sysrec = ws.put_qmmm_system(region, name=region.name, sysid=sysid)
     retag(ws, sysid)
     return sysrec
@@ -165,7 +183,7 @@ def from_terachem(ws: Workspace, path: str, mm: str = "amber", active_radius: Op
     return {"system": sysrec, "structure": res["rec"]["id"], "terachem_method": qm}
 
 
-def from_upload(ws: Workspace, text: str, filename: str, body: dict) -> dict:
+def from_upload(ws: Workspace, text: str, filename: str, body: dict, limits: Optional[dict] = None) -> dict:
     """An uploaded XYZ/PDB of a whole system with a region on it."""
     import tempfile
 
@@ -178,6 +196,7 @@ def from_upload(ws: Workspace, text: str, filename: str, body: dict) -> dict:
         s = _load_system(str(fp), body.get("charge"), body.get("multiplicity"))
     region = QMMMRegion.build(s, body.get("qm_atoms") or "", **_region_args(body),
                               name=body.get("name") or Path(filename).stem)
+    check_limits(region, limits)
     sysrec = ws.put_qmmm_system(region, name=region.name)
     res = ws.add_or_merge(s, optimized=False, origin={"kind": "qmmm", "input": filename,
                                                       "label": f"uploaded {filename}"})

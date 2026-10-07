@@ -285,3 +285,34 @@ def test_electrostatic_system_at_a_level_without_point_charges_is_refused_before
     (tmp_path / "ws" / "profiles" / "gfn2.toml").write_text('engine_name = "xtb"\n')
     p = client.post("/api/qmmm/preview", json={"structure": sid, "qm_atoms": "0-5", "mm": "tip3p"}).json()
     assert not any("Psi4" in x for x in p["problems"])
+
+
+def test_demo_visitors_get_qmmm_within_limits(tmp_path):
+    from mepd.web.demo import DemoPolicy
+
+    root = tmp_path / "demo"
+    (root / "profiles").mkdir(parents=True)
+    (root / "profiles" / "default.toml").write_text('engine_name = "gxtb"\n')
+    policy = DemoPolicy(max_atoms=10, qmmm={"max_atoms": 14, "max_active_radius": 6.0})
+    with TestClient(create_app(root, demo=policy, demo_password="pw"), follow_redirects=False) as c:
+        r = c.post("/login", data={"password": "pw"})
+        c.cookies.set("mepd_visitor", r.cookies.get("mepd_visitor"))
+        ops = {o["key"]: o for o in c.get("/api/state").json()["operations"]}
+        assert all(ops[k]["available"] for k in ("qmmm-build", "qmmm-reaction", "qmmm-embed"))
+
+        def upload(text=SYSTEM, qm="0-5", radius="3.0"):
+            return c.post("/api/qmmm/upload", files={"file": ("cluster.xyz", text)},
+                          data={"qm_atoms": qm, "charge": "0", "active_radius": radius, "optimize": "false"})
+
+        r = upload()                                                     # 15 atoms > 14
+        assert r.status_code == 400 and "at most 14 atoms" in r.json()["detail"]
+        small = "\n".join(SYSTEM.splitlines()[:2] + SYSTEM.splitlines()[2:14]).replace("15", "12", 1) + "\n"
+        assert upload(small, qm="0-11").status_code == 400               # 12 QM atoms > max_atoms 10
+        assert upload(small, radius="0").status_code == 400              # everything moving
+        sysrec = upload(small)
+        assert sysrec.status_code == 200, sysrec.text
+        sysid = sysrec.json()["system"]["id"]
+        r = c.put(f"/api/qmmm/systems/{sysid}", json={"qm_atoms": "0-11"})
+        assert r.status_code == 400 and "QM atoms" in r.json()["detail"]
+        r = c.post("/api/qmmm/systems", json={"terachem": "/etc/hosts"})
+        assert r.status_code == 403

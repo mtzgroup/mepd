@@ -57,6 +57,9 @@ class DemoPolicy:
         "nanoreactor-more": {"more_ps": 10.0},
         # (a complex's atoms are capped by max_atoms, like any structure: /api/complexes)
         "complex": {"keep": 3},
+        # A 6 A shell around a demo-sized molecule: a few hundred solvent atoms.
+        "qmmm-build": {"shell": 6.0, "active_radius": 6.0},
+        "qmmm-reaction": {"shell": 6.0, "active_radius": 6.0},
         # A few seconds of one CPU at these values.
         "retrosynthesis": {"iterations": 100, "time_limit": 60, "max_depth": 6, "routes": 5, "width": 10,
                            "workers": 2},
@@ -78,10 +81,17 @@ class DemoPolicy:
     # Interactive reactors (mepd.web.sandbox): each holds a CPU while it runs.
     sandbox: dict = field(default_factory=lambda: {"total": 2, "per_owner": 1, "idle_s": 180.0,
                                                    "max_s": 15 * 60.0})
+    # QM/MM systems (mepd.web.qmmm.check_limits): the QM region is capped
+    # like any structure (max_atoms), the whole system by max_atoms here.
+    qmmm: dict = field(default_factory=lambda: {"max_atoms": 800, "max_active_radius": 6.0})
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
                           "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor",
-                          "solvent", "complex", "retrosynthesis", "nanoreactor-more")
+                          "solvent", "complex", "retrosynthesis", "nanoreactor-more", "qmmm-build", "qmmm-reaction",
+                          "qmmm-embed", "qmmm-inspect")
+
+    def qmmm_limits(self) -> dict:
+        return {"max_qm": self.max_atoms, **self.qmmm}
 
     def public(self) -> dict:
         """What the UI shows (and uses to hide admin-only controls)."""
