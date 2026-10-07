@@ -4,7 +4,7 @@ import { html, useEffect, useRef, useState } from '../lib.js';
 import cytoscape from '../../vendor/cytoscape.esm.min.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, state, useStore } from '../store.js';
-import { complexNodes, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, isComplex, nodeOf, playgroundFitMargins, reactionOfEdge } from '../util.js';
+import { complexNodes, complexOfStructure, depictUrl, edgeStatus, edgeStatusKey, isComplex, levelBarrierText, nodeOf, playgroundFitMargins, reactionOfEdge } from '../util.js';
 import { uploadFiles } from './Library.js';
 import { SetupPanel, activeSetup, edgeUnderSetup, setupEdgeLabel, setupKey } from './Setups.js';
 
@@ -451,6 +451,12 @@ function ViewPanel({ view, setView, collapsed, setCollapsed, kids, shown, total,
 
 function edgeLabel(e, st, reaction = null) {
   const parts = [];
+  // Barriers at several levels of theory: each level's own lowest, side by side.
+  if (st.levels?.length > 1) {
+    parts.push(`${st.warning ? '⚠ ' : ''}${st.levels.map((l) => levelBarrierText(l)).join(' · ')}`);
+    if (e.label && !/^Channel|IRC$/.test(e.label)) parts.unshift(e.label);
+    return parts.join(' · ');
+  }
   if (st.routeSteps > 1) parts.push(`${st.routeSteps} steps`);
   if (st.barrier != null) parts.push(`${st.warning ? '⚠ ' : ''}${st.barrier.toFixed(1)}`);
   else if (st.barrierUnverified != null) parts.push(`≈${st.barrierUnverified.toFixed(1)}?`);

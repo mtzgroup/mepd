@@ -2,7 +2,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt, deleteSelection } from '../api.js';
 import { clearSelection, openJob, openTab, prefs, select, set, useStore } from '../store.js';
-import { complexNodes, complexOfStructure, conformerLabel, conformerRows, depictUrl, edgeStatus, fmtAgo, fmtKcal, isComplex, isSpecies, lastLine, levelStatus, PHONE_QUERY, reactionOfEdge, reactionsOfComplex, STATUS_LABEL } from '../util.js';
+import { complexNodes, complexOfStructure, conformerLabel, conformerRows, depictUrl, edgeStatus, fmtAgo, fmtKcal, isComplex, isSpecies, lastLine, levelBarrierText, levelStatus, PHONE_QUERY, reactionOfEdge, reactionsOfComplex, STATUS_LABEL } from '../util.js';
 
 export { conformerLabel, conformerRows };
 import { ActionPanel } from './Actions.js';
@@ -251,6 +251,8 @@ function EdgeDetail({ edge }) {
             : st.barrier == null && st.barrierUnverified != null ? 'path max, not IRC-verified' : 'best ΔE‡ (kcal/mol)'}</span></div>
         <div class="stat"><span class="stat-v">${st.count}</span><span class="stat-l">calculations</span></div>
       </div>
+      ${st.levels?.length > 1 && html`<p class="small muted" title="Barriers at different levels of theory are not comparable: each level's own lowest">
+        By level of theory: ${st.levels.map((l) => levelBarrierText(l)).join(' · ')}</p>`}
       ${[a, b].some((r) => (r?.conformers || []).length > 1) && html`<div class="conf-picks">
         ${[['start', a], ['end', b]].map(([role, r]) => r && html`<label class="field">
           <span class="field-label">${role} conformer · ${r.name}</span>

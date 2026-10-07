@@ -10,7 +10,7 @@
 import { html, useMemo, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, select, set, state, useStore } from '../store.js';
-import { depictUrl, edgeStatus, fmtKcal, isSpecies } from '../util.js';
+import { depictUrl, edgeStatus, fmtKcal, isSpecies, levelBarrierText } from '../util.js';
 import { NO_TS_SHORT, ReactionCard, findTs, noTsWhy } from './Reactions.js';
 import { KineticsView } from './Kinetics.js';
 
@@ -46,6 +46,10 @@ function tsState(r, edges, jobs) {
   if (!edge) return { kind: 'none', text: NO_TS_SHORT[r.complex_reason] || 'no TS endpoints', title: noTsWhy(r) };
   const st = edgeStatus(edge, jobs);
   if (st.status === 'running' || st.status === 'queued') return { kind: 'busy', text: `${st.status}…` };
+  if (st.levels?.length > 1) {   // each level of theory its own lowest; sorted by the workspace level's
+    return { kind: st.barrier != null ? 'ts' : 'unverified', text: st.levels.map((l) => levelBarrierText(l)).join(' · '),
+      v: st.barrier ?? st.barrierUnverified, title: 'Lowest barrier at each level of theory (not comparable across levels)' };
+  }
   if (st.barrier != null) return { kind: 'ts', text: `ΔE‡ ${fmtKcal(st.barrier)}`, v: st.barrier };
   if (st.barrierUnverified != null) return { kind: 'unverified', text: `≈${fmtKcal(st.barrierUnverified)}?`, v: st.barrierUnverified, title: 'path maximum; no TS/IRC confirmed it' };
   if (edge.origin?.qmmm_ts) return { kind: 'busy', text: 'TS, barrier pending', title: edge.origin.headline || '' };

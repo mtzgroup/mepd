@@ -41,6 +41,20 @@ export function jobsFor({ structure, edge }) {
 
 // What an edge "knows": the most urgent job state plus the best barrier any
 // finished job (or the result it was imported from) reported for it.
+// A level of theory's name from its key (profiles' levels, else a job run at it).
+function levelLabel(key, jobs) {
+  return Object.values(state.levels || {}).find((l) => l?.key === key)?.label
+    ?? Object.values(jobs).find((j) => j.level?.key === key)?.level?.label
+    ?? (String(key).includes('+qmmm') ? 'QM/MM' : 'level unknown');
+}
+
+// One level's barrier as edges and lists write it: "gxtb 31.2", "GFN2-xTB ≈25.0?", "gxtb 2 steps 30.1".
+export function levelBarrierText(l, withLabel = true) {
+  const v = l.barrier != null ? l.barrier.toFixed(1) : l.barrierUnverified != null ? `≈${l.barrierUnverified.toFixed(1)}?` : '—';
+  const name = l.label.length > 18 ? `${l.label.slice(0, 17)}…` : l.label;
+  return `${withLabel ? `${name} ` : ''}${l.routeSteps > 1 ? `${l.routeSteps} steps ` : ''}${v}`;
+}
+
 export function edgeStatus(edge, jobs = state.jobs) {
   const related = Object.values(jobs).filter((j) => j.targets.edges.includes(edge.id));
   const has = (st) => related.some((j) => j.status === st);
@@ -50,29 +64,49 @@ export function edgeStatus(edge, jobs = state.jobs) {
   // The edge shows the lowest verified direct barrier, else the lowest
   // unverified direct one; with no direct path at all, it is only a route
   // (drawn dotted) and shows the lowest route barrier the same way.
-  const found = [];   // {value, verified, steps, job}
+  // Barriers from different levels of theory cannot be compared: each level
+  // keeps its own lowest (Explore shows them side by side), and the one
+  // number other views use is the workspace level's, when the edge has it.
+  const levelOfJob = (j) => j?.level || null;
+  const found = [];   // {value, verified, steps, job, level: {key, label} | null}
   for (const j of done) {
     const s = j.summary;
     const ok = s.barrier_verified !== false;
     const steps = s.n_steps ?? 1;   // results from before steps were counted: as before, one step
-    if (s.direct_barrier_kcal != null) found.push({ value: s.direct_barrier_kcal, verified: true, steps: 1, job: j.id });
-    if (steps > 1 || s.direct_barrier_kcal == null) found.push({ value: s.barrier_kcal, verified: ok, steps, job: j.id });
+    const level = levelOfJob(j);
+    if (s.direct_barrier_kcal != null) found.push({ value: s.direct_barrier_kcal, verified: true, steps: 1, job: j.id, level });
+    if (steps > 1 || s.direct_barrier_kcal == null) found.push({ value: s.barrier_kcal, verified: ok, steps, job: j.id, level });
   }
   if (edge.origin?.barrier_kcal != null) {
-    found.push({ value: edge.origin.barrier_kcal, verified: edge.origin.barrier_verified !== false, steps: 1,
-      job: edge.origin.job ?? null });
+    const o = edge.origin;
+    const key = o.level?.key ?? levelOfJob(jobs[o.job])?.key ?? o.qmmm_ts?.level ?? null;
+    found.push({ value: o.barrier_kcal, verified: o.barrier_verified !== false, steps: 1, job: o.job ?? null,
+      level: key == null ? null : { key, label: o.level?.label ?? levelOfJob(jobs[o.job])?.label ?? levelLabel(key, jobs) } });
   }
   const lowest = (xs) => (xs.length ? xs.reduce((a, b) => (b.value < a.value ? b : a)) : null);
-  const direct = found.filter((f) => f.steps <= 1);
-  const pool = direct.length ? direct : found;
-  const best = lowest(pool.filter((f) => f.verified)) ?? lowest(pool);
-  const barrier = best?.verified ? best.value : null;
-  const barrierUnverified = best && !best.verified ? best.value : null;
+  const pick = (xs) => {   // the barrier one level shows (verified direct first; a route only without a direct step)
+    const direct = xs.filter((f) => f.steps <= 1);
+    const pool = direct.length ? direct : xs;
+    const best = lowest(pool.filter((f) => f.verified)) ?? lowest(pool);
+    return best && { key: best.level?.key ?? null, label: best.level?.label ?? 'level unknown',
+      barrier: best.verified ? best.value : null, barrierUnverified: best.verified ? null : best.value,
+      routeSteps: !direct.length ? best.steps : null, job: best.job ?? null };
+  };
+  const groups = {};
+  for (const f of found) (groups[f.level?.key ?? ''] ||= []).push(f);
+  const wsKey = state.levels?.[state.levelProfile ?? '']?.key;
+  const levels = Object.values(groups).map(pick).filter(Boolean)
+    .sort((a, b) => (b.key === wsKey) - (a.key === wsKey) || (a.barrier ?? a.barrierUnverified) - (b.barrier ?? b.barrierUnverified));
+  const main = levels.find((l) => l.key === wsKey)
+    ?? lowest(levels.filter((l) => l.barrier != null).map((l) => ({ ...l, value: l.barrier })))
+    ?? levels[0] ?? null;
+  const barrier = main?.barrier ?? null;
+  const barrierUnverified = main?.barrierUnverified ?? null;
   // Only a route through intermediates: no single step joins the two ends.
-  const routeSteps = best && !direct.length ? best.steps : null;
+  const routeSteps = main?.routeSteps ?? null;
   // The calculation that set the barrier shown (its page has the TS and IRC,
   // and Sample more paths).
-  const barrierJob = best?.job ?? null;
+  const barrierJob = main?.job ?? null;
   let status = 'idle';
   if (has('running')) status = 'running';
   else if (has('queued')) status = 'queued';
@@ -83,7 +117,7 @@ export function edgeStatus(edge, jobs = state.jobs) {
   // A negative barrier is a problem to see, not a small number: say why.
   const warning = edge.origin?.barrier_warning || done.map((j) => j.summary?.barrier_warning).find(Boolean)
     || (barrier != null && barrier < -0.1 ? `Negative barrier (${barrier.toFixed(1)} kcal/mol): the TS lies below an endpoint. With one level of theory, minimized endpoints and a dense enough path this cannot happen: check the endpoints' minimization and level, and the path's density.` : null);
-  return { status, barrier, barrierUnverified, routeSteps, barrierJob, count: related.length, warning };
+  return { status, barrier, barrierUnverified, routeSteps, barrierJob, levels, count: related.length, warning };
 }
 
 // Complexes. A complex structure (role 'complex': several molecules
@@ -152,7 +186,7 @@ export function lastLine(job, progress = state.progress) {
 export function edgeStatusKey(jobs) {
   return Object.values(jobs)
     .filter((j) => j.targets.edges.length)
-    .map((j) => `${j.id}:${j.status}:${j.summary?.barrier_kcal ?? ''}:${j.summary?.barrier_verified}:${j.summary?.n_steps}:${j.summary?.direct_barrier_kcal}:${j.targets.edges.join(',')}`)
+    .map((j) => `${j.id}:${j.status}:${j.summary?.barrier_kcal ?? ''}:${j.summary?.barrier_verified}:${j.summary?.n_steps}:${j.summary?.direct_barrier_kcal}:${j.level?.key}:${j.targets.edges.join(',')}`)
     .sort()
     .join('|');
 }
