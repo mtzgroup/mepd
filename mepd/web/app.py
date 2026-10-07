@@ -421,7 +421,18 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     manager._update(job)
             except Exception:
                 logging.getLogger(__name__).exception("could not refresh the reactions of %s", job["id"])
-        if nano:
+        # ...and each finished run's reactions with the MD events that are them
+        # (adopted before events carried their reaction's key, a card could
+        # play another reaction's event).
+        from mepd.web.nanoreactor import _sync_events
+
+        synced = False
+        for job in [j for j in manager.jobs.values() if j["op"] == "nanoreactor" and j["status"] == "done"]:
+            try:
+                synced |= _sync_events(manager.ws, job, Path(job.get("output_dir") or ""))
+            except Exception:
+                logging.getLogger(__name__).exception("could not match the MD events of %s", job["id"])
+        if nano or synced:
             bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
         stale = [j for j in manager.jobs.values()
                  if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
