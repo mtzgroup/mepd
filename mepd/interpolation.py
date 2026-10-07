@@ -274,6 +274,43 @@ def _free_mask(natoms: int, frozen) -> np.ndarray:
     return mask
 
 
+# Frozen atoms of the run (set from the profile by RunInputs): applied to
+# every path this process builds, including those whose callers pass bare
+# node lists without chain inputs (growing strings, tangents, checks).
+_GLOBAL_FROZEN: Optional[tuple] = None
+
+
+def set_global_frozen_atoms(indices, natoms: Optional[int] = None) -> None:
+    global _GLOBAL_FROZEN
+    idx = sorted({int(i) for i in (indices or [])})
+    _GLOBAL_FROZEN = (tuple(idx), natoms) if idx else None
+
+
+def frozen_for(chain_inputs, natoms: int) -> np.ndarray:
+    """The frozen atoms of a path over `natoms` atoms: its chain inputs'
+    plus the run's (when they fit this system)."""
+    out = set(_frozen_indices(chain_inputs).tolist()) if chain_inputs is not None else set()
+    if _GLOBAL_FROZEN is not None:
+        idx, n = _GLOBAL_FROZEN
+        if (n is None or n == natoms) and (not idx or max(idx) < natoms):
+            out.update(idx)
+    return np.array(sorted(i for i in out if i < natoms), dtype=int)
+
+
+def hold_frozen(path: np.ndarray, frozen) -> np.ndarray:
+    """Put frozen atoms back on the straight line between the path's ends
+    (where both ends agree, that is: exactly where they are). In place."""
+    if frozen is None or not len(frozen) or len(path) < 2:
+        return path
+    frozen = np.asarray(frozen, dtype=int)
+    a, b = np.array(path[0][frozen]), np.array(path[-1][frozen])
+    n = len(path)
+    for k in range(n):
+        t = k / (n - 1)
+        path[k][frozen] = (1 - t) * a + t * b
+    return path
+
+
 def _frozen_indices(chain_inputs, natoms: Optional[int] = None) -> np.ndarray:
     raw = getattr(chain_inputs, "frozen_atom_indices", None)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -305,6 +342,8 @@ def initial_chain(seed_chain, chain_inputs, gi_inputs, *, nimages: Optional[int]
     method = interpolation_method(chain_inputs)
     natoms = len(getattr(getattr(seed_chain[0], "structure", None), "symbols", None) or []) or None
     frozen = _frozen_indices(chain_inputs, natoms)
+    if natoms:
+        frozen = frozen_for(chain_inputs, natoms)
     if int(nimages) < 2:
         raise ValueError(f"an interpolated path needs at least 2 images (got {nimages})")
     if method == "geodesic":

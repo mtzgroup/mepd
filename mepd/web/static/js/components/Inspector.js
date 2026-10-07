@@ -11,6 +11,7 @@ import { LevelChip } from './Library.js';
 import { ReactionCard, TsCell } from './Reactions.js';
 import { openAnalyze } from './Analyze.js';
 import { ComplexMethodForm } from './ComplexBuild.js';
+import { DefineQmmm, QmmmStructure } from './QMMM.js';
 
 function useXyz(sid, conformer = null, version = '') {
   const [xyz, setXyz] = useState(null);
@@ -143,12 +144,15 @@ function StructureDetail({ rec }) {
     <section>
       <${Editable} className="title-input" value=${rec.name} onSave=${(name) => patch({ name })} />
       ${rec.smiles && rec.smiles !== rec.name && html`<div class="smiles" title="Connectivity perceived from the geometry">${rec.smiles}</div>`}
-      <${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />
+      ${rec.qmmm
+        ? html`<${QmmmStructure} rec=${rec} xyz=${xyz} labels=${labels} shownConformer=${shown} />`
+        : html`<${Viewer3D} xyz=${xyz} labels=${labels} height=${240} />`}
       <div class="viewer-tools">
         <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
         <a class="small" href=${`/api/structures/${rec.id}/xyz${shown ? `?conformer=${shown}` : ''}`} download=${`${rec.name}.xyz`}>Download xyz</a>
         ${shown && html`<span class="small muted">viewing conformer #${(rec.conformers || []).findIndex((c) => c.id === shown) + 1}</span>`}
       </div>
+      ${!rec.qmmm && rec.role !== 'ts' && xyz && html`<div class="small"><${DefineQmmm} key=${rec.id} rec=${rec} xyz=${xyz} /></div>`}
       <${Conformers} rec=${rec} viewing=${shown} onView=${setViewing} />
       <dl class="props">
         <dt>Formula</dt><dd>${rec.formula} (${rec.natoms} atoms)</dd>
@@ -429,7 +433,7 @@ export function Inspector() {
   }
   if (sel.structures.some((id) => !structures[id]) || sel.edges.some((id) => !edges[id])) return null;
   // Species selected: their reactions, or a new one with them, in Analyze.
-  if (nS > 0 && !nE && sel.structures.every((id) => isSpecies(structures[id]))) {
+  if (nS > 0 && !nE && sel.structures.every((id) => isSpecies(structures[id]) && !structures[id].qmmm)) {
     const n = Object.values(workspace.reactions || {}).filter((r) => sel.structures.every((id) => [...r.reactants, ...r.products].includes(id))).length;
     body = html`<div class="an-links small">
       ${n > 0 && html`<a href="#" onClick=${(e) => { e.preventDefault(); openAnalyze({ species: [...sel.structures], reaction: null }); }}>${n} reaction${n > 1 ? 's' : ''} of ${nS > 1 ? 'these' : 'this'} →</a>`}

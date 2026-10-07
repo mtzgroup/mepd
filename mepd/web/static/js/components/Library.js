@@ -4,6 +4,7 @@ import { html, useState } from '../lib.js';
 import { api, attempt, refreshState } from '../api.js';
 import { openTab, prefs, select, state, useStore } from '../store.js';
 import { cls, depictUrl, isComplex, isSpecies, levelStatus } from '../util.js';
+import { QmmmAdd } from './QMMM.js';
 
 // "Added 2 structures · 1 new conformer of CCO · 1 already there"
 function addedSummary(list) {
@@ -71,6 +72,10 @@ export function AddBox({ onDone }) {
         <input type="checkbox" checked=${optimize} onChange=${(e) => { setOptimize(e.target.checked); prefs.set('optimizeOnAdd', e.target.checked); }} />
         <span>Minimize at the level of theory first${validate ? ', then check with a Hessian' : ''}</span>
       </label>
+      <details class="qmmm-add">
+        <summary class="small">QM/MM system (a protein or solvated system with a QM region)…</summary>
+        <${QmmmAdd} onDone=${(sid) => { if (sid) select({ structures: [sid] }); onDone?.(); }} />
+      </details>
     </div>`;
 }
 
@@ -174,7 +179,7 @@ export function Library() {
   let dupes = 0;
   for (const r of Object.values(structures)) {
     if (!isSpecies(r) || !r.smiles || r.reacted) continue;
-    const k = `${r.smiles}|${r.charge}|${r.multiplicity}`;
+    const k = `${r.smiles}|${r.charge}|${r.multiplicity}|${r.qmmm || ''}`;   // a QM/MM system is its own world
     if (seen[k]) dupes += 1; else seen[k] = true;
   }
   return html`

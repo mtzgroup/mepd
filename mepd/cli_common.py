@@ -501,6 +501,9 @@ def _check_endpoint_atom_mapping(
             "(--start and --end have different atom counts)."
         )
         return end_structure
+    if getattr(run_inputs, "qmmm", None):
+        typer.echo("Note: QM/MM system: --start and --end keep the system's atom order (no atom mapping).")
+        return end_structure
 
     from mepd.atom_mapping import HAS_SLAPMAPPER
 
@@ -920,6 +923,7 @@ def _optimize_ts_and_irc(
     *,
     run_irc: bool,
     label: str = "ts",
+    direction=None,
 ) -> Optional["TsIrcResult"]:
     """Optimize a TS-guess node with the engine and, if requested, follow up
     with an IRC -- writes <label>.xyz (and <label>_irc.xyz) into `output`.
@@ -944,7 +948,13 @@ def _optimize_ts_and_irc(
         return None
     typer.echo(f"Optimizing transition state ({label})...")
     try:
-        ts_node = compute_ts(node=ts_guess_node)
+        from mepd.engines.frozen import FrozenAtomsEngine
+
+        if isinstance(engine, FrozenAtomsEngine):
+            # A QM/MM search climbs along the given direction (a path's tangent).
+            ts_node = compute_ts(node=ts_guess_node, keywords={"v0": direction, "echo": typer.echo})
+        else:
+            ts_node = compute_ts(node=ts_guess_node)
     except Exception as exc:
         typer.echo(f"Transition-state optimization failed ({label}): {type(exc).__name__}: {exc}")
         return None
@@ -968,7 +978,10 @@ def _optimize_ts_and_irc(
     failed_fp = output / ("irc_failed.txt" if label == "ts" else f"{label}_irc_failed.txt")
     try:
         irc_fn = getattr(engine, "compute_irc_chain", None)
-        irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
+        if callable(irc_fn) and isinstance(engine, FrozenAtomsEngine):
+            irc_chain = irc_fn(ts_node, keywords={"echo": typer.echo})
+        else:
+            irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
     except Exception as exc:
         typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
         failed_fp.write_text(f"{type(exc).__name__}: {exc}\n")

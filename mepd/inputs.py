@@ -472,11 +472,20 @@ class RunInputs:
         lists them -- see mepd/engines/mlip.py), "fairchem" (FAIR-Chem models
         with their own `fairchem_engine_kwds`), or "ase" (any ASE calculator:
         `ase_engine_kwds.calculator = "package.module:ClassName"` with its
-        keyword arguments in `ase_engine_kwds.calculator_kwds`).
+        keyword arguments in `ase_engine_kwds.calculator_kwds`), "xtb"
+        (GFN2-/GFN1-xTB run directly, `xtb_engine_kwds.method`; takes point
+        charges, so it can be the QM level in TIP3P water), or "psi4".
     `solvation`: optional implicit solvent for whichever engine, e.g.
         {solvent = "water", model = "alpb", method = "auto"} -- GFN2-xTB's own
         model when the engine is GFN2-xTB, otherwise its solvation free energy
         added to the engine's energies and gradients (see mepd/solvation.py).
+    `qmmm`: optional QM/MM partition (see mepd/qmmm.py): the engine above
+        becomes the QM level of the atoms in `qm_atoms`, embedded in a low
+        level (`mm` = "gfnff" (default), "gfn2", "gfn1", "amber" through
+        OpenMM, or "terachem" for TeraChem's own QM/MM), e.g.
+        {file = "region.json"} or {reference = "system.xyz",
+        qm_atoms = "0-11", qm_charge = 0, active_radius = 6.0}. Environment
+        atoms outside `active_radius` (Å) of the QM region are frozen.
     """
 
     engine_name: str = "gxtb"
@@ -496,11 +505,14 @@ class RunInputs:
     program_kwds: ProgramArgs = None
     ase_engine_kwds: dict = None
     gxtb_engine_kwds: dict = None
+    xtb_engine_kwds: dict = None
     fairchem_engine_kwds: dict = None
     mlip_engine_kwds: dict = None
+    psi4_engine_kwds: dict = None
     geometry_optimizer_kwds: dict = None
     optimizer_kwds: dict = None
     solvation: dict = None
+    qmmm: dict = None
 
     def __post_init__(self):
         disable_molecular_graphs = False
@@ -690,7 +702,7 @@ class RunInputs:
             self.program_kwds = None
 
         if self.program_kwds is None:
-            if self.engine_name in {"gxtb", "ase", "fairchem", "mlip"}:
+            if self.engine_name in {"gxtb", "ase", "fairchem", "mlip", "psi4", "xtb"}:
                 # Neither engine uses the qccompute/chemcloud ProgramArgs/qcdata
                 # input construct -- gxtb shells out directly, and ASEEngine
                 # takes an already-constructed ase.Calculator.
@@ -737,6 +749,8 @@ class RunInputs:
 
         self.fairchem_engine_kwds = dict(self.fairchem_engine_kwds or {})
         self.mlip_engine_kwds = dict(self.mlip_engine_kwds or {})
+        self.psi4_engine_kwds = dict(self.psi4_engine_kwds or {})
+        self.xtb_engine_kwds = dict(self.xtb_engine_kwds or {})
 
         if self.geometry_optimizer_kwds is None:
             self.geometry_optimizer_kwds = {}
@@ -819,6 +833,14 @@ class RunInputs:
                     "engine_name='ase' needs ase_engine_kwds.calculator "
                     "(\"package.module:ClassName\") or program='omol25'."
                 )
+        elif self.engine_name == 'xtb':
+            from mepd.engines.gfnff import XTBEngine
+
+            eng = XTBEngine(**dict(self.xtb_engine_kwds or {}))
+        elif self.engine_name == 'psi4':
+            from mepd.engines.psi4 import Psi4Engine
+
+            eng = Psi4Engine(**dict(self.psi4_engine_kwds or {}))
         elif self.engine_name == 'gxtb':
             try:
                 from mepd.engines.gxtb import GXTBCalculator
@@ -840,6 +862,8 @@ class RunInputs:
             self.solvation = dict(self.solvation)
             eng = solvate_engine(eng, self.solvation)
             setattr(eng, "disable_molecular_graphs", disable_molecular_graphs)
+        eng = self._embed_and_freeze(eng)
+        setattr(eng, "disable_molecular_graphs", disable_molecular_graphs)
         self.engine = eng
         optimizer_kwds = dict(self.optimizer_kwds)
         optimizer_name = optimizer_kwds.pop("name").lower()
@@ -864,12 +888,75 @@ class RunInputs:
             raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Supported values: {available}")
         self.optimizer = optimizer_map[optimizer_name](**optimizer_kwds)
 
+    def _embed_and_freeze(self, eng):
+        """QM/MM embedding ([qmmm]) and frozen atoms (chain_inputs.
+        frozen_atom_indices, plus a QM/MM region's frozen environment)."""
+        from mepd.nodes.node import StructureNode
+
+        from mepd.interpolation import set_global_frozen_atoms
+
+        frozen = [int(i) for i in (self.chain_inputs.frozen_atom_indices or [])]
+        StructureNode.set_global_graph_atoms(None)
+        set_global_frozen_atoms(frozen)
+        if self.qmmm:
+            from mepd.engines.frozen import FrozenAtomsEngine
+            from mepd.qmmm import region_from_inputs
+
+            self.qmmm = dict(self.qmmm)
+            region = region_from_inputs(self.qmmm)
+            from mepd.errors import InputsError
+            from mepd.qmmm import embedding_problem
+
+            problem = embedding_problem(region.embedding, self.engine_name)
+            if problem and region.mm != "terachem":
+                raise InputsError(problem)
+            if self.solvation:
+                raise ValueError("[qmmm] and [solvation] cannot be combined: put explicit solvent in the MM region.")
+            if region.mm == "terachem":
+                from mepd.engines.terachem_qmmm import TeraChemQMMMEngine
+
+                eng = TeraChemQMMMEngine.from_region(region, program_args=self.program_kwds,
+                                                     compute_program=self.engine_name
+                                                     if self.engine_name in ("qccompute", "chemcloud") else "chemcloud",
+                                                     chemcloud_queue=self.chemcloud_queue)
+            else:
+                from mepd.engines.qmmm import QMMMEngine
+
+                eng = QMMMEngine(base=eng, region=region, base_dir=self.qmmm.get("base_dir"))
+            frozen = sorted(set(frozen) | set(region.frozen_atoms))
+            self.chain_inputs.frozen_atom_indices = frozen
+            if self.chain_inputs.node_ene_thre == ChainInputs.node_ene_thre:
+                # A minimum's QM/MM energy depends on how its environment
+                # relaxed (solvent rearranges): two minima of the same QM
+                # species differ by several kcal/mol, so the energy test would
+                # split every path on a solvent rearrangement. Species are
+                # told apart by the QM region's graph and geometry instead
+                # (unless node_ene_thre was set to something else).
+                self.chain_inputs.node_ene_thre = 1e9
+            StructureNode.set_global_graph_atoms(region.qm_atoms, region.natoms)
+            set_global_frozen_atoms(frozen, region.natoms)
+            return FrozenAtomsEngine(base=eng, frozen=frozen, hessian_atoms=list(region.qm_atoms))
+        if frozen and self.engine_name not in ("qccompute", "chemcloud"):   # TeraChem freezes natively
+            from mepd.engines.frozen import FrozenAtomsEngine
+
+            return FrozenAtomsEngine(base=eng, frozen=frozen)
+        return eng
+
     @classmethod
     def open(cls, fp):
 
         fp = Path(fp)
         with open(fp, 'rb') as f:
             data = tomli.load(f)
+        if isinstance(data.get("qmmm"), dict):
+            # Files named in [qmmm] are relative to the profile.
+            q = data["qmmm"] = dict(data["qmmm"])
+            for key in ("file", "reference", "prmtop", "pdb", "tcin"):
+                val = q.get(key)
+                if isinstance(val, str) and "\n" not in val and not Path(val).is_absolute() \
+                        and (fp.parent / val).exists():
+                    q[key] = str((fp.parent / val).resolve())
+            q.setdefault("base_dir", str(fp.parent.resolve()))
 
         obj = cls(**data)
         if hasattr(obj.program_kwds, 'files') and obj.program_kwds.files is not None:

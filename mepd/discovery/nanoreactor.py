@@ -388,6 +388,11 @@ def run_reactor_md(symbols, coords_angstrom, *, charge: int, multiplicity: int, 
             raise RuntimeError(f"xtb MD wrote no trajectory in segment {k}: {done.stdout[-800:]}")
         if "did not converge" in done.stdout:
             _emit(on_event, "warning", message=f"SCC did not converge somewhere in MD segment {k}")
+        if "MD is unstable" in done.stdout:
+            # xtb stopped the segment early (atoms too fast): the next segment
+            # restarts from wherever it stopped, so the trajectory has a gap.
+            _emit(on_event, "warning", message=f"xtb stopped MD segment {k} early (\"MD is unstable\"): "
+                                               "the temperature is too high for this time step")
         shutil.move(workdir / "xtb.trj", seg)
         shutil.copy(workdir / "mdrestart", restart_fp)
         t_done += dur

@@ -129,9 +129,16 @@ def _min(values: Iterable[Optional[float]]) -> Optional[float]:
     return min(vals) if vals else None
 
 
+# The QM/MM region of the job being read (see `collect`): its structures
+# are named and compared by their QM region only.
+_REGION = None
+
+
 def _smiles(node) -> str:
     from mepd.web.chem import perceive_smiles
 
+    if _REGION is not None and len(node.structure.symbols) == _REGION.natoms:
+        return perceive_smiles(_REGION.model_structure(node.structure)) or ""
     return perceive_smiles(node.structure) or ""
 
 
@@ -1466,7 +1473,61 @@ def collect_retro(out: Path, charge: int, multiplicity: int) -> dict:
     return out_
 
 
+def collect_qmmm_build(out: Path, charge: int, multiplicity: int) -> dict:
+    """A `mepd qmmm build` folder: the molecule in its solvent shell (a new
+    QM/MM system; the workspace minimizes it embedded)."""
+    s = _read_json(out / "summary.json") or {}
+    chain = _load_chain(out / "system.xyz", charge, multiplicity)
+    entries = [_entry("system", "Molecule in solvent", [chain[0]], None)] if chain else []
+    return _result(f"{s.get('qm_atoms', '?')} QM atoms in {s.get('solvent', 'solvent')}: {s.get('natoms', '?')} atoms",
+                   [_group("QM/MM system", "qmmm", entries)],
+                   [{"label": "QM atoms", "value": s.get("qm_atoms")},
+                    {"label": "Moving environment atoms", "value": s.get("active_mm_atoms")},
+                    {"label": "Frozen environment atoms", "value": s.get("frozen_atoms")},
+                    {"label": "Environment level", "value": s.get("mm")},
+                    {"label": "Added to Explore", "value": "as a QM/MM node, minimized embedded"}],
+                   warnings=list(s.get("problems") or []))
+
+
+def collect_qmmm_reaction(out: Path, charge: int, multiplicity: int) -> dict:
+    """A `mepd qmmm reaction` / `mepd qmmm embed` folder: the structures put
+    into the solvent (starting geometries: the workspace minimizes them, and
+    re-optimizes a TS, embedded)."""
+    s = _read_json(out / "summary.json") or {}
+    entries = []
+    for fname, label in (("system.xyz", "Start in solvent"), ("product.xyz", "End in solvent"),
+                         ("ts.xyz", "TS in solvent (to re-optimize)")):
+        chain = _load_chain(out / fname, charge, multiplicity)
+        if chain:
+            entries.append(_entry(fname.split(".")[0], label, [chain[0]], None))
+    for k, rec in enumerate(s.get("embedded") or []):
+        if rec.get("name", "").startswith("embedded_"):
+            chain = _load_chain(out / f"{rec['name']}.xyz", charge, multiplicity)
+            if chain:
+                entries.append(_entry(rec["name"], "Put into the system", [chain[0]], None))
+    contacts = [r.get("closest_contact") for r in s.get("embedded") or [] if r.get("closest_contact") is not None]
+    warnings = list(s.get("problems") or []) + [w for r in s.get("embedded") or [] for w in r.get("warnings") or []]
+    return _result(f"{len(entries)} structure(s) in {s.get('solvent', 'the solvent')}",
+                   [_group("QM/MM structures", "qmmm", entries)],
+                   [{"label": "Closest contact after placing", "value": f"{min(contacts):.2f} Å" if contacts else None},
+                    {"label": "Added to Explore", "value": "as QM/MM nodes, minimized embedded (a TS re-optimized)"}],
+                   warnings=warnings)
+
+
+def collect_qmmm_inspect(out: Path, charge: int, multiplicity: int) -> dict:
+    """A QM/MM energy split: shown on its source job's result page."""
+    rep = _read_json(out / "report.json")
+    if not rep:
+        return _result("No energy split yet", [], [])
+    return _result(f"Energy split of {len(rep.get('frames') or [])} frame(s): see the source job's QM/MM checks",
+                   [], [], warnings=list(rep.get("warnings") or []))
+
+
 COLLECTORS = {
+    "qmmm-build": collect_qmmm_build,
+    "qmmm-inspect": collect_qmmm_inspect,
+    "qmmm-reaction": collect_qmmm_reaction,
+    "qmmm-embed": collect_qmmm_reaction,
     "retrosynthesis": collect_retro,
     "nanoreactor": collect_nanoreactor,
     "nanoreactor-more": collect_nanoreactor,   # Run longer: the same folder, the longer run
@@ -1495,6 +1556,27 @@ COLLECTORS = {
 
 
 def collect(job: dict, job_dir: Optional[Path] = None) -> dict:
+    """A job's result. A QM/MM job's structures are named and compared by
+    their QM region (the region the job ran with, from its inputs)."""
+    global _REGION
+    from mepd.nodes.node import StructureNode
+
+    region_fp = Path(job_dir) / "inputs" / "qmmm_region.json" if job_dir is not None and job.get("qmmm") else None
+    if region_fp is None and job.get("qmmm") and job.get("source_job"):
+        region_fp = Path(job_dir).parent / job["source_job"] / "inputs" / "qmmm_region.json" if job_dir else None
+    if region_fp is not None and region_fp.exists():
+        from mepd.qmmm import QMMMRegion
+
+        _REGION = QMMMRegion.open(region_fp)
+        StructureNode.set_global_graph_atoms(_REGION.qm_atoms, _REGION.natoms)
+    try:
+        return _collect(job, job_dir)
+    finally:
+        _REGION = None
+        StructureNode.set_global_graph_atoms(None)
+
+
+def _collect(job: dict, job_dir: Optional[Path] = None) -> dict:
     out = Path(job["output_dir"])
     if not out.exists() and job_dir is not None and (Path(job_dir) / "output").exists() and not job.get("external"):
         # The session folder was moved or copied (e.g. out of the demo's
@@ -1579,7 +1661,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 25
+RESULT_VERSION = 28
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

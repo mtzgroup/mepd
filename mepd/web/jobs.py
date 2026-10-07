@@ -25,6 +25,7 @@ import shlex
 import signal
 import sys
 import time
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -70,6 +71,17 @@ def _find_run(jdir: Path) -> Optional[int]:
             return int(d.name)
     return None
 
+
+
+def _profile_engine(ws, profile: Optional[str]) -> str:
+    """A profile's engine_name (the default, g-xTB, without one)."""
+    import tomli
+
+    try:
+        data = tomli.loads(ws.read_profile(profile)) if profile else {}
+    except Exception:
+        data = {}
+    return str(data.get("engine_name") or "gxtb")
 
 class _Adopted:
     """A run started by an earlier server (not our child): the
@@ -436,6 +448,23 @@ class JobManager:
                         raise WorkspaceError(f"{', '.join(busy)} is still being optimized; run this once it is done")
                 ctx = JobContext(self.ws, jdir, jdir / "output", recs, profile, source=source,
                                  edge_ids=list(eids), jobs=self.jobs)
+                from mepd.web.operations import QMMM_OPS
+
+                from mepd.web.operations import QMMM_MIXED_OPS, _qmmm_embed_pair
+
+                if op.key in QMMM_MIXED_OPS:
+                    qmmm = _qmmm_embed_pair(ctx)[0]["qmmm"]
+                else:
+                    qmmm = ctx.qmmm if op.target != "design" else None
+                if qmmm and op.key not in QMMM_OPS:
+                    raise WorkspaceError(f"{op.title} does not run on QM/MM systems (it needs whole molecules)")
+                if qmmm:
+                    from mepd.qmmm import embedding_problem
+
+                    problem = embedding_problem(self.ws.qmmm_region(qmmm).embedding,
+                                                _profile_engine(self.ws, profile))
+                    if problem:
+                        raise WorkspaceError(problem)
                 argv = op.build(ctx, parsed)  # raises on invalid combinations
                 names = " → ".join(r["name"] for r in recs) if op.target == "pair" else ", ".join(r["name"] for r in recs)
                 if source is not None:
@@ -456,6 +485,7 @@ class JobManager:
                     # What was submitted, to go back to if a TS search fails.
                     "design_snapshot": dict(design) if design is not None else None,
                     "params": parsed.model_dump(), "profile": profile, "level": ctx.level(), "batch": batch,
+                    "qmmm": qmmm,
                     "output_dir": source["output_dir"] if source is not None and not op.own_output
                     else str(jdir / "output"),
                     "external": False, "source_job": source["id"] if source is not None else None,
@@ -478,8 +508,75 @@ class JobManager:
         self._wake.set()
         return created
 
+    def _qmmm_of_output(self, path: Path) -> Optional[str]:
+        """The workspace's QM/MM system an output folder's structures belong
+        to (by their atoms), if any."""
+        from qcdata import Structure
+
+        files = [path] if path.is_file() else sorted(path.glob("*.xyz")) + sorted(path.glob("*/*.xyz"))
+        for fp in files[:20]:
+            try:
+                text = fp.read_text()
+                n = int(text.split("\n", 1)[0])
+                s = Structure.from_xyz("\n".join(text.splitlines()[:n + 2]))
+            except Exception:
+                continue
+            sysid = self.ws.qmmm_system_of(s)
+            if sysid:
+                return sysid
+        return None
+
+    def _profile_of_output(self, path: Path) -> Optional[Path]:
+        """The profile an output was computed with, if one was kept with it:
+        a .toml with an engine_name in the output folder or the one above
+        it, or a web job's inputs/profile.toml."""
+        base = path if path.is_dir() else path.parent
+        for fp in [base.parent / "inputs" / "profile.toml", *sorted(base.glob("*.toml")),
+                   *sorted(base.parent.glob("*.toml"))]:
+            try:
+                if fp.is_file() and "engine_name" in fp.read_text():
+                    return fp
+            except OSError:
+                continue
+        return None
+
+    def _import_level(self, path: Path, profile: Optional[str], qmmm: Optional[str]) -> Optional[dict]:
+        """The level of theory of an imported output: a workspace profile
+        chosen for it, else the profile kept with it; None if unknown (its
+        structures then sit at no level and never merge into results at one)."""
+        import tomli
+
+        from mepd.web.workspace import level_key, level_label
+
+        if profile:
+            text, source = self.ws.read_profile(profile), None
+        else:
+            fp = self._profile_of_output(path)
+            if fp is None:
+                return None
+            text, source = fp.read_text(), str(fp)
+        level = {"profile": profile or None, "key": level_key(text), "label": level_label(text)}
+        if source:
+            level["source"] = source
+        if qmmm:
+            sig = self.ws.snapshot()["qmmm_systems"][qmmm]["sig"]
+            label = f"{level['label']} / QM/MM"
+            try:   # the region the output was computed with, if its profile names one
+                from mepd.qmmm import region_from_inputs
+
+                table = dict(tomli.loads(text).get("qmmm") or {})
+                if source and table.get("file") and not Path(table["file"]).is_absolute():
+                    table["file"] = str(Path(source).parent / table["file"])
+                region = region_from_inputs(table)
+                if region is not None and region.signature() != sig:
+                    sig, label = region.signature(), f"{label} (another region)"
+            except Exception:
+                pass
+            level = {**level, "key": f"{level['key']}+qmmm:{sig}", "label": label, "qmmm": qmmm}
+        return level
+
     def import_external(self, path: Path, *, op_key: Optional[str], charge: int, multiplicity: int,
-                        title: str = "") -> dict:
+                        title: str = "", profile: Optional[str] = None) -> dict:
         from mepd.web.results import detect_operation
 
         path = path.expanduser().resolve()
@@ -497,6 +594,16 @@ class JobManager:
             "charge": charge, "multiplicity": multiplicity, "params": {}, "profile": None, "batch": None,
             "output_dir": str(path), "external": True, "error": None, "last_line": "", "summary": None,
         }
+        job["qmmm"] = self._qmmm_of_output(path)
+        job["level"] = self._import_level(path, profile, job["qmmm"])
+        if job["level"]:
+            job["profile"] = profile or None
+        if job["qmmm"]:
+            # So results read QM/MM structures by their QM region, and the
+            # energy-split follow-up finds the region.
+            inputs = self.job_dir(jid) / "inputs"
+            inputs.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.ws.qmmm_region_path(job["qmmm"]), inputs / "qmmm_region.json")
         _bump_rev(job)
         self.jobs[jid] = job
         self._write(job)

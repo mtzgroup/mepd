@@ -13,6 +13,15 @@ from mepd.chain import Chain
 from mepd.discovery.cli import _progress, _validation_kwargs, discovery_app
 
 
+def _generator_options(generator: str, values: List[str], output: Path) -> dict:
+    """--generator-option values; the nanoreactor's MD goes into
+    <output>/reactor/run_kk (the web UI's Reactor view reads it there)."""
+    out = _parse_options(values)
+    if str(generator).strip().lower() == "nanoreactor":
+        out.setdefault("workdir", str((Path(output) / "reactor").resolve()))
+    return out
+
+
 def _parse_options(values: List[str]) -> dict:
     out = {}
     for item in values or []:
@@ -242,7 +251,7 @@ def expand(
         try:
             result = expand_network(
                 seed, run_inputs.engine, rounds=rounds, energy_window_kcal=energy_window, generator=generator,
-                generator_options=_parse_options(generator_option), products_file=str(products) if products else None,
+                generator_options=_generator_options(generator, generator_option, output), products_file=str(products) if products else None,
                 maxiter=maxiter, n_break=n_break, n_form=n_form, form_distance=form_distance,
                 max_products=max_products, allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions,
                 max_species=max_species, workers=workers, on_event=on_event, steer=steer,

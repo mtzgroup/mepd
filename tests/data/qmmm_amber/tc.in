@@ -1,0 +1,15 @@
+# Five TIP3P waters; the first two are QM (TeraChem QM/MM input).
+prmtop five.prmtop
+coordinates five.rst7
+qmindices qmindices.dat
+method b3lyp
+basis 6-31gs
+charge 0
+spinmult 1
+run gradient
+scrdir ./scr
+$constraints
+atom 13
+atom 14
+atom 15
+$end

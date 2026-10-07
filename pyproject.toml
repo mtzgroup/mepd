@@ -43,7 +43,7 @@ discovery = [
 # just works: `pip install "mepd[web] @ git+..."` or, in a checkout, a plain
 # `uv sync` (the `app` group below makes it the default).
 web = [
-    "mepd[server,viz,discovery,ase,gxtb,aam,mlip,retro,retro-ml]",
+    "mepd[server,viz,discovery,ase,gxtb,aam,mlip,retro,retro-ml,qmmm]",
 ]
 # The web server alone (an Orb or MACE environment, which cannot hold `mlip`).
 server = [
@@ -99,6 +99,12 @@ mlip = [
 retro = [
     "onnxruntime>=1.20",
     "rdchiral>=1.1",
+]
+# QM/MM with an AMBER environment (`[qmmm] mm = "amber"`: a prmtop, or a PDB
+# of standard residues) through OpenMM. The default GFN-FF environment needs
+# only the xtb program. See docs/qmmm.md.
+qmmm = [
+    "openmm>=8.1",
 ]
 # `mepd retro --method reactiont5`: local ReactionT5 models (also needs torch).
 retro-ml = [

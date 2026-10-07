@@ -38,6 +38,23 @@ def _state_dir() -> Path:
     return Path(base)
 
 
+
+def _output_hint(path: Path, visitor) -> str:
+    """For a folder a calculation wrote (not a workspace): how to open it."""
+    if visitor is not None or not path.is_dir():
+        return ""
+    try:
+        from mepd.web.results import detect_operation
+
+        if detect_operation(path) is None:
+            return ""
+    except Exception:
+        return ""
+    ws = next((p for p in path.parents if (p / "workspace.json").exists()), None)
+    where = f"open the workspace {ws} " if ws else "open a workspace "
+    return (f". It is the output of an mepd calculation: {where}and add it with "
+            "Calculations → Open existing output…")
+
 class _SessionBus:
     """A session's handle on the broadcaster: tags its events with its key."""
 
@@ -202,7 +219,7 @@ class Sessions:
         if must_be_new and exists:
             raise WorkspaceError(f"{shown} already holds a workspace; open it instead")
         if not exists and not create:
-            raise WorkspaceError(f"{shown} is not an mepd workspace (no workspace.json)")
+            raise WorkspaceError(f"{shown} is not an mepd workspace (no workspace.json)" + _output_hint(path, visitor))
         if must_be_new and path.exists() and not exists and any(path.iterdir()):
             raise WorkspaceError(f"{shown} exists and is not empty; pick a new or empty directory")
         if visitor is not None and not exists and self.demo:

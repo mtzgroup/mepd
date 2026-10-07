@@ -647,6 +647,15 @@ def project_rigid_body_forces(R, F, masses=None):
         Forces with rigid translations and rotations removed.
     """
     N = R.shape[0]
+    from mepd.interpolation import frozen_for
+
+    frozen = frozen_for(None, N)
+    if len(frozen):
+        # Frozen atoms pin the frame: there is no free rigid motion to
+        # remove, and they must not move.
+        F = np.array(F, dtype=float, copy=True)
+        F[frozen] = 0.0
+        return F
     if masses is None:
         masses = np.ones(N)
     M = masses.sum()

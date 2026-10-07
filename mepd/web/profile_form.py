@@ -52,7 +52,13 @@ ENGINES = [
     ("fairchem", "FAIR-Chem model (e.g. UMA)", "A FAIR-Chem machine-learned potential such as UMA, with all of "
                                                "FAIR-Chem's settings."),
     ("ase", "ASE calculator", "An ASE calculator: MACE, tblite (xTB), Psi4, ORCA, … or your own, by import path."),
+    ("xtb", "xTB (local)", "GFN2-xTB (or GFN1) from the xtb program. It takes point charges: the cheapest QM level "
+                           "for electrostatically embedded QM/MM (e.g. in TIP3P water)."),
+    ("psi4", "Psi4 (local)", "Psi4 (DFT, HF, MP2, …) in its own environment. It takes point charges: the QM level for "
+                             "electrostatically embedded QM/MM."),
 ]
+XTB_DEFAULTS = {"method": "gfn2", "n_parallel": 4}
+PSI4_DEFAULTS = {"method": "b3lyp", "basis": "def2-svp", "threads": 4, "memory": "4 GB"}
 MLIP_DEFAULTS = {"device": "", "checkpoint": None, "family": "", "geometry_optimizer": "LBFGSLineSearch"}
 MLIP_PACKAGES = {"aimnet2": "aimnet", "orb": "orb_models", "ani": "torchani", "mace": "mace", "fairchem": "fairchem"}
 PROGRAMS = ["xtb", "terachem", "psi4", "pyscf", "orca", "crest"]
@@ -141,6 +147,7 @@ MINIMUMS = {"nimages": 3, "max_steps": 1, "nnodes": 3, "n_candidates": 1, "n_thr
             "nstep": 1, "adaptive_max_images": 2, "history_size": 1, "n_min": 1, "fire_conv_window": 1}
 
 OPTIONS = {
+    "xtb_engine_kwds.method": [("gfn2", "GFN2-xTB"), ("gfn1", "GFN1-xTB")],
     "path_min_inputs.tangent": [("geodesic", "geodesic"), ("linear", "linear")],
     "path_min_inputs.distance_metric": [("GEODESIC", "geodesic"), ("RMSD", "RMSD"), ("LINEAR", "linear")],
     "path_min_inputs.new_minimizer": [("no", "no"), ("yes", "yes")],
@@ -622,6 +629,17 @@ def form(text: str) -> dict:
         groups.append({"id": "engine", "title": f"{'ChemCloud' if engine == 'chemcloud' else 'QCCompute'} and geomeTRIC",
                        "note": "Program keywords (e.g. TeraChem settings) go in [program_kwds.keywords] on the TOML tab.",
                        "fields": fields})
+    elif engine == "xtb":
+        groups.append({"id": "engine", "title": "xTB", "fields": [
+            _field(data, "xtb_engine_kwds.method", "gfn2", key=True),
+            _field(data, "xtb_engine_kwds.n_parallel", 4, help="xtb runs at once (one core each).")]})
+    elif engine == "psi4":
+        from mepd.engines.psi4 import INSTALL, psi4_python
+
+        if not psi4_python():
+            issues.append(INSTALL)
+        groups.append({"id": "engine", "title": "Psi4", "fields": [
+            _field(data, f"psi4_engine_kwds.{k}", v, key=k in ("method", "basis")) for k, v in PSI4_DEFAULTS.items()]})
     elif engine == "fairchem":
         groups.append({"id": "engine", "title": "FAIR-Chem model", "fields": [
             _field(data, f"fairchem_engine_kwds.{k}", v, key=k in ("model", "task", "device"))
@@ -659,7 +677,7 @@ def form(text: str) -> dict:
     unused = sorted(k for k in _table(data, "path_min_inputs")
                     if _known_method(method) and k not in _used_path_keys(method))
     idle = [s for s, owner in (("gxtb_engine_kwds", {"gxtb"}), ("fairchem_engine_kwds", {"fairchem"}),
-                               ("mlip_engine_kwds", {"mlip"}),
+                               ("mlip_engine_kwds", {"mlip"}), ("psi4_engine_kwds", {"psi4"}), ("xtb_engine_kwds", {"xtb"}),
                                ("ase_engine_kwds", {"ase"}), ("program_kwds", {"qccompute", "chemcloud", "ase"}))
             if _table(data, s) and engine not in owner]
     if idle:

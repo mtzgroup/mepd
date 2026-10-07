@@ -64,7 +64,18 @@ def _teardown_live_display(*_args, **_kwargs) -> None:
     stop_status()
 
 
-app = typer.Typer(
+class _MepdApp(typer.Typer):
+    def __call__(self, *args, **kwargs):
+        from mepd.errors import InputsError
+
+        try:
+            return super().__call__(*args, **kwargs)
+        except InputsError as exc:      # says what to change: no traceback
+            typer.echo(f"Error: {exc}", err=True)
+            raise SystemExit(2)
+
+
+app = _MepdApp(
     help="mepd: minimum-energy-path discovery tools.",
     result_callback=_teardown_live_display,
 )
@@ -210,6 +221,24 @@ def _run_network_completion(
         f"Wrote completed network to {network_path} "
         f"({pot.number_of_nodes} nodes, {pot.graph.number_of_edges()} edges)"
     )
+
+
+def _ts_guess(chain, run_inputs):
+    """The TS guess of a converged path: its highest image, or, for a QM/MM
+    system, the interpolated maximum with the path's tangent there as the
+    direction to climb (an unguided TS search in a solvent cage slides off
+    into soft solvent and conformer modes)."""
+    if getattr(run_inputs, "qmmm", None):
+        from mepd.nodes.node import StructureNode
+        from mepd.qmmm_path import peak_guess
+
+        try:
+            structure, tangent = peak_guess(list(chain.nodes))
+        except Exception:
+            structure = None
+        if structure is not None:
+            return StructureNode(structure=structure), tangent
+    return chain.get_ts_node(), None
 
 
 @app.command("run")
@@ -515,6 +544,16 @@ def run(
         else:
             start_node = built[0]
 
+    # A QM/MM system: the solvent must correspond between the ends and move
+    # continuously along the path (mepd.qmmm_path).
+    qmmm_images = None
+    if getattr(run_inputs, "qmmm", None):
+        from mepd.qmmm_path import prepare
+
+        prepared = prepare(run_inputs, start_node, end_node, int(run_inputs.gi_inputs.nimages), echo=typer.echo)
+        if prepared is not None:
+            start_node, end_node, qmmm_images = prepared
+
     seed_chain = Chain.model_validate({
         "nodes": [start_node, end_node],
         "parameters": copy.deepcopy(run_inputs.chain_inputs),
@@ -522,8 +561,14 @@ def run(
 
     from mepd.interpolation import initial_chain as _initial_chain, interpolation_method
 
-    typer.echo(f"Building initial path via {interpolation_method(run_inputs.chain_inputs)} interpolation...")
-    initial_chain = _initial_chain(seed_chain, run_inputs.chain_inputs, run_inputs.gi_inputs)
+    if qmmm_images is not None:
+        typer.echo("Initial path: the QM region interpolated, the solvent marched along it.")
+        initial_chain = Chain.model_validate({
+            "nodes": [start_node.update_coords(x) for x in qmmm_images],
+            "parameters": copy.deepcopy(run_inputs.chain_inputs)})
+    else:
+        typer.echo(f"Building initial path via {interpolation_method(run_inputs.chain_inputs)} interpolation...")
+        initial_chain = _initial_chain(seed_chain, run_inputs.chain_inputs, run_inputs.gi_inputs)
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -588,12 +633,14 @@ def run(
             for leaf in history.ordered_leaves:
                 if not leaf.data or not leaf.data.chain_trajectory:
                     continue
+                guess, direction = _ts_guess(leaf.data.chain_trajectory[-1], run_inputs)
                 _optimize_ts_and_irc(
-                    leaf.data.chain_trajectory[-1].get_ts_node(),
+                    guess,
                     run_inputs,
                     output,
                     run_irc=irc,
                     label=f"ts_leaf_{leaf.index}",
+                    direction=direction,
                 )
         return
 
@@ -614,7 +661,8 @@ def run(
     typer.echo(f"Wrote optimized path to {out_path}")
 
     if use_tsopt:
-        _optimize_ts_and_irc(final_chain.get_ts_node(), run_inputs, output, run_irc=irc, label="ts")
+        guess, direction = _ts_guess(final_chain, run_inputs)
+        _optimize_ts_and_irc(guess, run_inputs, output, run_irc=irc, label="ts", direction=direction)
 
 
 @app.command("ts")
@@ -670,6 +718,35 @@ def ts(
 
     output.mkdir(parents=True, exist_ok=True)
 
+    directions = {}
+    if len(tasks) == 1 and guess.is_file() and guess.suffix == ".xyz":
+        # A whole path (several frames, with its .energies): start from its
+        # interpolated maximum, climbing along its tangent there.
+        from qcdata import Structure
+
+        from mepd.nodes.node import StructureNode
+
+        energies_fp = guess.with_suffix(".energies")
+        try:
+            frames = Structure.open_multi(str(guess))
+        except Exception:
+            frames = []
+        if len(frames) > 2 and energies_fp.exists():
+            import numpy as _np
+
+            from mepd.qmmm_path import peak_guess
+
+            e = _np.loadtxt(energies_fp).ravel()
+            if len(e) == len(frames):
+                st, tangent = peak_guess(frames, e)
+                if st is not None:
+                    st = st.model_copy(update={"charge": tasks[0][1].structure.charge,
+                                               "multiplicity": tasks[0][1].structure.multiplicity})
+                    typer.echo(f"{guess.name} is a path of {len(frames)} frames: starting from its interpolated "
+                               "energy maximum, along its tangent.")
+                    tasks = [(tasks[0][0], StructureNode(structure=st))]
+                    directions[tasks[0][0]] = tangent
+
     n_done = n_skipped = n_failed = 0
     for label, guess_node in tasks:
         ts_path = output / f"{label}.xyz"
@@ -677,7 +754,8 @@ def ts(
             typer.echo(f"Skipping {label}: already optimized ({ts_path}).")
             n_skipped += 1
             continue
-        result = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label=label)
+        result = _optimize_ts_and_irc(guess_node, run_inputs, output, run_irc=irc, label=label,
+                                      direction=directions.get(label))
         if result is None:
             n_failed += 1
         else:
@@ -1655,6 +1733,10 @@ def _tailscale_dns_name() -> Optional[str]:
 from mepd.cli_retro import retro_app  # noqa: E402
 
 app.add_typer(retro_app, name="retro")
+
+from mepd.cli_qmmm import qmmm_app  # noqa: E402
+
+app.add_typer(qmmm_app, name="qmmm")
 
 try:
     from mepd.discovery.cli import discovery_app  # noqa: E402

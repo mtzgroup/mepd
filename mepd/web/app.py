@@ -174,6 +174,7 @@ class ImportIn(BaseModel):
     charge: int = 0
     multiplicity: int = 1
     title: str = ""
+    profile: Optional[str] = None     # the workspace profile it was computed at (else the one kept with it)
 
 
 class EntriesImportIn(BaseModel):
@@ -328,7 +329,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         async def attach() -> None:
             if job["op"] == "optimize" and not job.get("external"):
                 await run_in_threadpool(apply_optimization, manager.ws, job)
+                if job.get("qmmm"):
+                    from mepd.web import qmmm as web_qmmm
+
+                    await run_in_threadpool(web_qmmm.refresh_edges_of, manager.ws, manager.jobs,
+                                            job["targets"]["structures"])
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "tsopt" and job.get("qmmm") and job["status"] == "done" and not job.get("external"):
+                from mepd.web import qmmm as web_qmmm
+
+                if await run_in_threadpool(web_qmmm.attach_ts, manager.ws, job, manager.jobs):
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "design-optimize":
                 await run_in_threadpool(apply_design_optimization, manager.ws, job)
                 bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
@@ -359,6 +370,33 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     except WorkspaceError:
                         pass
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] == "qmmm-build" and job["status"] == "done" and not job.get("external"):
+                from mepd.web import qmmm as web_qmmm
+
+                sid = await run_in_threadpool(web_qmmm.adopt_build, manager.ws, job)
+                if sid:
+                    try:
+                        queue_optimization([sid])
+                    except WorkspaceError:
+                        pass
+                    bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+            if job["op"] in ("qmmm-reaction", "qmmm-embed") and job["status"] == "done" and not job.get("external"):
+                from mepd.web import qmmm as web_qmmm
+
+                adopt = web_qmmm.adopt_reaction if job["op"] == "qmmm-reaction" else web_qmmm.adopt_embed
+                made = await run_in_threadpool(adopt, manager.ws, job)
+                minima = [made.get(k) for k in ("start", "end") if made.get(k)]
+                if made.get("role") == "minimum" and made.get("structure"):
+                    minima.append(made["structure"])
+                ts = made.get("ts") or (made.get("structure") if made.get("role") == "ts" else None)
+                with contextlib.suppress(WorkspaceError):
+                    if minima:
+                        queue_optimization(minima)
+                with contextlib.suppress(WorkspaceError):
+                    if ts:   # the gas-phase TS, re-optimized as a TS in the solvent, with its IRC
+                        manager.submit("tsopt", structure_ids=[ts], edge_ids=[], params={"irc": True},
+                                       profile=manager.ws.level_profile, label="Re-optimize the TS in solvent")
+                bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "graph-enumeration" and job["status"] == "done":
                 if await run_in_threadpool(adopt_expansion_steps, manager, job):
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
@@ -433,6 +471,29 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             except Exception:
                 logging.getLogger(__name__).exception("could not match the MD events of %s", job["id"])
         if nano or synced:
+            bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
+        # QM/MM TSs re-optimized before their edges learned their barriers.
+        from mepd.web import qmmm as web_qmmm
+
+        edges = manager.ws.snapshot()["edges"].values()
+        known = {(e.get("origin") or {}).get("qmmm_ts", {}).get("job") for e in edges}
+        attached = False
+        for job in [j for j in manager.jobs.values() if j["op"] == "tsopt" and j.get("qmmm")
+                    and j["status"] == "done" and j["id"] not in known]:
+            try:
+                attached |= bool(web_qmmm.attach_ts(manager.ws, job, manager.jobs))
+            except Exception:
+                logging.getLogger(__name__).exception("could not attach the QM/MM TS of %s", job["id"])
+        # ...and QM/MM edges with a TS but no barrier yet (their ends may have
+        # gained energies at its level since, e.g. IRC ends added from a result).
+        pending = [eid for eid, e in manager.ws.snapshot()["edges"].items()
+                   if (e.get("origin") or {}).get("qmmm_ts") and (e.get("origin") or {}).get("barrier_kcal") is None]
+        for eid in pending:
+            try:
+                attached |= web_qmmm.edge_barrier(manager.ws, manager.jobs, eid) is not None
+            except Exception:
+                logging.getLogger(__name__).exception("could not compute the QM/MM barrier of %s", eid)
+        if attached:
             bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
         stale = [j for j in manager.jobs.values()
                  if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
@@ -745,7 +806,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if is_ts(rec):
                 continue  # minimizing a saddle point would destroy it
             cid = conformers[i] if conformers and i < len(conformers) else None
-            groups.setdefault((rec["charge"], rec["multiplicity"]), []).append((sid, cid))
+            groups.setdefault((rec["charge"], rec["multiplicity"], rec.get("qmmm")), []).append((sid, cid))
         if not groups:
             raise WorkspaceError("nothing to optimize: transition-state structures are never minimized")
         created = []
@@ -823,6 +884,119 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     @app.get("/api/structures/{sid}/xyz", response_class=PlainTextResponse)
     def structure_xyz(sid: str, conformer: Optional[str] = None):
         return (W().conformer_path(sid, conformer) if conformer else W().structure_path(sid)).read_text()
+
+    # ------------------------------------------------------------ QM/MM
+    @app.get("/api/qmmm/systems/{sysid}")
+    def qmmm_system(sysid: str):
+        from mepd.web.qmmm import region_view
+
+        ws = W()
+        sysrec = ws.snapshot()["qmmm_systems"].get(sysid)
+        if sysrec is None:
+            raise HTTPException(404, f"no QM/MM system {sysid!r}")
+        return region_view(ws.qmmm_region(sysid), sysrec)
+
+    @app.post("/api/qmmm/preview")
+    async def qmmm_preview(body: dict):
+        from mepd.web import qmmm as web_qmmm
+
+        try:
+            return await run_in_threadpool(web_qmmm.preview, W(), body.get("structure", ""), body)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from None
+
+    @app.post("/api/qmmm/systems")
+    async def qmmm_create(body: dict):
+        """A QM/MM system: from a structure in the graph (body.structure),
+        or a TeraChem input on this machine (body.terachem)."""
+        from mepd.web import qmmm as web_qmmm
+
+        if body.get("terachem"):
+            deny_in_demo("Reading files on the server")
+        try:
+            if body.get("terachem"):
+                out = await run_in_threadpool(web_qmmm.from_terachem, W(), body["terachem"],
+                                              body.get("mm") or "amber", body.get("active_radius"))
+                sid = out["structure"]
+            else:
+                out = await run_in_threadpool(web_qmmm.create, W(), body.get("structure", ""), body)
+                sid = body.get("structure")
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from None
+        if body.get("optimize") and sid:
+            with contextlib.suppress(WorkspaceError):
+                queue_optimization([sid])
+        publish_ws()
+        return out
+
+    @app.post("/api/qmmm/upload")
+    async def qmmm_upload(file: UploadFile = File(...), qm_atoms: str = Form(...),
+                          charge: Optional[int] = Form(None), multiplicity: Optional[int] = Form(None),
+                          qm_charge: Optional[int] = Form(None), active_radius: Optional[float] = Form(6.0),
+                          mm: str = Form("gfnff"), optimize: bool = Form(True)):
+        from mepd.web import qmmm as web_qmmm
+
+        raw = await file.read(demo.max_upload_bytes + 1 if demo is not None else -1)
+        if demo is not None and len(raw) > demo.max_upload_bytes:
+            raise WorkspaceError("file too large for the demo")
+        body = {"qm_atoms": qm_atoms, "charge": charge, "multiplicity": multiplicity,
+                "qm_charge": qm_charge if qm_charge is not None else charge, "active_radius": active_radius or None,
+                "mm": mm, "qm_multiplicity": multiplicity}
+        try:
+            out = await run_in_threadpool(web_qmmm.from_upload, W(), raw.decode("utf-8", "replace"),
+                                          file.filename or "system.xyz", body)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from None
+        if optimize:
+            with contextlib.suppress(WorkspaceError):
+                queue_optimization([out["structure"]])
+        publish_ws()
+        return out
+
+    @app.put("/api/qmmm/systems/{sysid}")
+    async def qmmm_update(sysid: str, body: dict):
+        from mepd.web import qmmm as web_qmmm
+
+        try:
+            out = await run_in_threadpool(web_qmmm.update, W(), sysid, body)
+        except ValueError as exc:
+            raise WorkspaceError(str(exc)) from None
+        publish_ws()
+        return out
+
+    @app.get("/api/qmmm/check")
+    async def qmmm_check_structure(structure: str, conformer: Optional[str] = None):
+        """Checks of one QM/MM structure against its system's reference."""
+        from mepd.web import qmmm as web_qmmm
+
+        ws = W()
+        rec = ws.structure(structure)
+        if not rec.get("qmmm"):
+            raise WorkspaceError("not a QM/MM structure")
+        fp = ws.conformer_path(structure, conformer) if conformer else ws.structure_path(structure)
+        region = ws.qmmm_region(rec["qmmm"])
+        frames = [region.reference or fp.read_text(), fp.read_text()]
+        return await run_in_threadpool(web_qmmm.check_frames, ws, rec["qmmm"], frames)
+
+    @app.get("/api/jobs/{jid}/qmmm-check")
+    async def qmmm_check_job(jid: str, entry: str):
+        """Per-frame QM/MM checks of one result entry (and its energy split,
+        when a QM/MM energy split follow-up has run on it)."""
+        from mepd.web import qmmm as web_qmmm
+
+        job = J().get(jid)
+        if not job.get("qmmm"):
+            raise WorkspaceError("not a QM/MM job")
+        result = await page_result(J(), job)
+        try:
+            _, e = find_entry(result, entry)
+        except KeyError:
+            raise HTTPException(404, f"no entry {entry!r}") from None
+        frames = [f["xyz"] for f in e["frames"]]
+        report = await run_in_threadpool(web_qmmm.check_frames, W(), job["qmmm"], frames,
+                                         [f.get("energy_hartree") for f in e["frames"]])
+        report["split"] = web_qmmm.energy_split(W(), J().jobs, jid, entry)
+        return report
 
     # ------------------------------------------------------------ design
     def _store_design(info: dict, *, name=None, source=None, charge=None, multiplicity=None, keep=None,
@@ -1506,7 +1680,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     async def import_job(body: ImportIn):
         deny_in_demo("Opening output folders on the server")
         return J().import_external(Path(body.path), op_key=body.op, charge=body.charge,
-                                    multiplicity=body.multiplicity, title=body.title)
+                                    multiplicity=body.multiplicity, title=body.title, profile=body.profile)
 
     @app.get("/api/jobs/{jid}")
     def get_job(jid: str):
@@ -1544,14 +1718,25 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         raise HTTPException(404, "this job has no TS or path")
 
     @app.get("/api/jobs/{jid}/reactor")
-    def job_reactor(jid: str, start: int = 0):
+    def job_reactor(jid: str, start: int = 0, run: Optional[int] = None):
         """A nanoreactor job's trajectory from raw frame `start` on, and its events (live view)."""
         from mepd.web.nanoreactor import reactor_view
 
-        job = J().get(jid)
-        if job.get("op") not in ("nanoreactor", "nanoreactor-more"):
-            raise HTTPException(404, "not a nanoreactor job")
-        return reactor_view(Path(job["output_dir"]), start)
+        return reactor_view(_reactor_out(J().get(jid), run), start)
+
+    def _reactor_out(job: dict, run: Optional[int] = None) -> Path:
+        """Where a job's reactor MD is: a nanoreactor job's output, or one
+        run (the newest unless `run` is given) of a network expansion with the
+        nanoreactor generator (output/reactor/run_kk, one per species)."""
+        out = Path(job["output_dir"])
+        if job.get("op") in ("nanoreactor", "nanoreactor-more"):
+            return out
+        runs = sorted((out / "reactor").glob("run_*")) if job.get("op") == "graph-enumeration" else []
+        if not runs:
+            raise HTTPException(404, "this job has no reactor MD (yet)")
+        if run is not None:
+            return runs[max(0, min(int(run), len(runs) - 1))]
+        return max(runs, key=lambda d: max((f.stat().st_mtime for f in (d / "md").glob("*")), default=0.0))
 
     @app.get("/api/jobs/{jid}/complex-live")
     def job_complex_live(jid: str):
@@ -1565,13 +1750,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         return complex_live(Path(job["output_dir"]), (job.get("params") or {}).get("method", ""), sum(counts))
 
     @app.get("/api/jobs/{jid}/reactor/events/{k}")
-    def job_reactor_event(jid: str, k: int):
+    def job_reactor_event(jid: str, k: int, run: Optional[int] = None):
         """One reaction event of a nanoreactor job, at full time resolution, cut to its atoms."""
         from mepd.web.nanoreactor import event_view
 
-        job = J().get(jid)
         try:
-            return event_view(Path(job["output_dir"]), k)
+            return event_view(_reactor_out(J().get(jid), run), k)
         except KeyError:
             raise HTTPException(404, f"no event {k} (yet)") from None
 
@@ -1643,6 +1827,11 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         structure already there); with `connect` and two picks, join them by
         an edge that remembers the result it came from."""
         jid = job["id"]
+        if job.get("external") and not job.get("level"):
+            # Imported before imports had a level: the profile kept with the output.
+            level = J()._import_level(Path(job["output_dir"]), None, job.get("qmmm"))
+            if level:
+                J()._update(job, level=level)
         frames = entry["frames"]
         added, reused, in_order = [], [], []
         for k in picks:
@@ -1680,6 +1869,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     "headline": entry.get("note", ""),
                     # IRC-derived edges know their TS (a VRI search can start from it).
                     "group": group.get("kind"), "has_ts": entry.get("ts_index") is not None})
+        if job.get("qmmm") and in_order:
+            # Ends that gained an energy at a TS's level: their edges' barriers.
+            from mepd.web import qmmm as web_qmmm
+
+            web_qmmm.refresh_edges_of(W(), J().jobs, [r["id"] for r in in_order])
+        if edge is not None and job.get("external") and edge["id"] not in job["targets"]["edges"]:
+            # An imported result belongs to the edge it was added on (also an
+            # edge that was already there): the edge lists it and its barrier.
+            J()._update(job, targets={"structures": sorted(set(job["targets"]["structures"]) |
+                                                           {r["id"] for r in in_order}),
+                                      "edges": job["targets"]["edges"] + [edge["id"]]})
         return {"added": added, "reused": reused, "edge": edge}
 
     @app.post("/api/jobs/{jid}/import-entry")

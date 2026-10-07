@@ -297,6 +297,27 @@ def test_import_existing_output_and_pull_irc_ends_into_graph(client, tmp_path):
     assert (out / "ts.xyz").exists()
 
 
+def test_imported_output_takes_its_level_from_the_profile_kept_with_it(client, tmp_path):
+    out = tmp_path / "calc" / "mepd_ts_output"
+    out.mkdir(parents=True)
+    _write_chain(out / "ts.xyz", [WATER_BENT_XYZ], [-76.30])
+    _write_chain(out / "irc.xyz", [WATER_XYZ, WATER_XYZ.replace("0.758 0.000 0.504", "1.300 0.000 0.480", 1),
+                                   WATER_BENT_XYZ], [-76.40, -76.30, -76.38])
+    (out.parent / "run.toml").write_text('engine_name = "xtb"\n')
+    job = client.post("/api/jobs/import", json={"path": str(out)}).json()
+    assert job["level"]["label"] == "GFN2-xTB" and job["level"]["source"].endswith("run.toml")
+    irc = client.get(f"/api/jobs/{job['id']}/result").json()["groups"][1]["entries"][0]
+    r = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": irc["id"], "frames": "endpoints"}).json()
+    assert all(s["level"]["key"] == job["level"]["key"] for s in r["added"])
+    # The imported result belongs to the edge it was added on.
+    assert client.get(f"/api/jobs/{job['id']}").json()["job"]["targets"]["edges"] == [r["edge"]["id"]]
+    # A workspace profile chosen for it wins; without either, the level is unknown.
+    chosen = client.post("/api/jobs/import", json={"path": str(out), "profile": "default"}).json()
+    assert chosen["level"]["profile"] == "default"
+    (out.parent / "run.toml").unlink()
+    assert client.post("/api/jobs/import", json={"path": str(out)}).json()["level"] is None
+
+
 def test_references_tab_lists_every_cited_method(client):
     refs = client.get("/api/references").json()
     features = {g["feature"]: g for g in refs}
@@ -1096,6 +1117,8 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     for op in ops:
         if not op["available"]:
             continue
+        if op["key"] in ("qmmm-inspect", "qmmm-embed"):
+            continue   # need a QM/MM system: tests/test_qmmm_web.py checks their flags
         body = {"op": op["key"], "dry_run": True, "profile": "default"}
         if op["target"] == "pair":
             body["structures"] = [a["id"], b["id"]]

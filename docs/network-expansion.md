@@ -150,13 +150,44 @@ atoms). `--max-products` keeps the lowest GFN2-xTB energies. It needs the
 optimizations); CREST runs single-threaded. CREST's `-reactor` mode is not
 used: it only analyses an xtb metadynamics trajectory made beforehand.
 
+## Nanoreactor MD (`--generator nanoreactor`)
+
+Hot molecular dynamics of the structure inside a spherical wall that
+periodically squeezes it (the piston of `mepd discovery nanoreactor`, with
+xtb's MD), followed with the nanoreactor's bond-change detection. The
+structure right after each reaction event is a product: whole, in the
+input's atom order, one per distinct bond graph, earliest first. States in
+which an atom lost all its bonds (the end of a run hot enough to tear the
+structure apart) are skipped.
+
+    mepd discovery expand seed.xyz -i inputs.toml --generator nanoreactor \
+        --generator-option temperature=3000 --generator-option time_ps=20
+
+Options: `temperature` (K, default 2500), `time_ps` (10), `compress`
+(narrow/wide wall radius, 0.7), `period_ps` (1), `md_method` (auto: GFN2 with
+xtb, else g-xTB), `seed`. Unlike the Nanoreactor operation, nothing is cut
+out: the whole structure is the product. On a QM/MM system it runs on the
+capped QM region (see qmmm.md); in the web UI it is offered as a method of
+the network card for QM/MM systems.
+
+On a QM/MM system, `--generator-option embedded=true` runs the MD with
+QM/MM forces instead (mepd/discovery/qmmm_reactor.py): the environment is
+present all along, the QM atoms are thermostatted at `temperature`, the
+moving environment near `environment_temperature` (default 300 K, stronger
+friction, so it takes up the heat), frozen atoms stay fixed, and the piston
+wall acts on the QM atoms only. Events are detected on the QM atoms; each
+product is the whole system right after an event, unless that frame changed
+a bond in the MM region or stretched a QM/MM cut bond (both are counted and
+reported). It costs one QM/MM gradient per MD step (about 0.07-0.1 s for a
+small QM region in a GFN-FF water shell: tens of minutes per 10 ps).
+
 In the web UI, Bond rules, CREST msreact, Hessian sampling and basin hopping
 are the methods of one "Reaction network expansion" card.
 
 ## Other generators
 
-Generators are registered in `mepd/discovery/generators.py`: `bond-rules`
-and `crest-msreact` are built in. To add one (autodE, Chemoton, …), write a
+Generators are registered in `mepd/discovery/generators.py`: `bond-rules`,
+`crest-msreact` and `nanoreactor` are built in. To add one (autodE, Chemoton, …), write a
 `propose(symbols, coords, edges, **settings)` that returns
 `(proposals, stats)` (or, with `kind="structures"`,
 `propose(structure, *, max_products, options)` returning product

@@ -39,6 +39,7 @@ from __future__ import annotations
 import importlib
 import itertools
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -331,11 +332,14 @@ def enumerate_bond_changes(
 
 
 def embed_product(symbols: Sequence[str], coords_angstrom: np.ndarray, product_edges: set[Edge],
-                  *, tether: float = 0.02, attempts: int = 6) -> np.ndarray:
+                  *, tether: float = 0.02, attempts: int = 6, env: Optional[np.ndarray] = None,
+                  env_atoms: Optional[int] = None, env_distance: float = 1.8) -> np.ndarray:
     """A guess geometry (Angstrom) for the product graph, starting from the
     reactant's: bonded pairs pulled to covalent length, 1-3 pairs and
     non-bonded pairs pushed out of contact, a weak tether to the start so
-    the rest of the molecule stays put."""
+    the rest of the molecule stays put. `env`: fixed atoms (a QM/MM
+    environment, Angstrom) the first `env_atoms` atoms are kept
+    `env_distance` away from."""
     from rdkit import Chem
     from scipy.optimize import minimize
 
@@ -363,6 +367,13 @@ def embed_product(symbols: Sequence[str], coords_angstrom: np.ndarray, product_e
         g = 2 * tether * (x - x0)
         np.add.at(g, iu, coef)
         np.add.at(g, ju, -coef)
+        if env is not None and len(env):
+            m = n if env_atoms is None else int(env_atoms)
+            de = x[:m, None, :] - env[None, :, :]
+            re = np.linalg.norm(de, axis=2) + 1e-12
+            short = np.minimum(re - env_distance, 0.0)
+            e += np.sum(short ** 2)
+            g[:m] += np.sum((2 * short / re)[:, :, None] * de, axis=1)
         return e, g.ravel()
 
     def relax(start):
@@ -433,6 +444,117 @@ def _perceived_edges(symbols, coords_angstrom) -> set[Edge]:
 
 def _structure_with(structure, coords_angstrom):
     return structure.model_copy(update={"geometry": np.asarray(coords_angstrom) * ANGSTROM_TO_BOHR})
+
+
+class _View:
+    """What the bond rules see of a structure: the whole molecule, or, for a
+    QM/MM system (mepd.qmmm), its QM model -- the QM atoms capped with their
+    link hydrogens, at the QM charge and spin. Link hydrogens never take
+    part in a bond change; product guesses are built inside the fixed
+    environment and put back into the full system."""
+
+    def __init__(self, region=None):
+        self.region = region
+
+    def symbols(self, node) -> list:
+        return list(self.region.model_symbols) if self.region else list(node.symbols)
+
+    def charge_mult(self, node) -> tuple[int, int]:
+        if self.region:
+            return int(self.region.qm_charge), int(self.region.qm_multiplicity)
+        return int(node.structure.charge), int(node.structure.multiplicity)
+
+    def coords(self, node) -> np.ndarray:
+        x = np.asarray(node.coords, dtype=float) / ANGSTROM_TO_BOHR
+        return self.region.model_coords(x) if self.region else x
+
+    def edges(self, node) -> set:
+        if self.region:
+            return _perceived_edges(self.symbols(node), self.coords(node))
+        return graph_edges(node)
+
+    def keep(self, props: list) -> list:
+        if not self.region:
+            return props
+        nqm = len(self.region.qm_atoms)
+        return [p for p in props if all(i < nqm and j < nqm for i, j in (*p.broken, *p.formed))]
+
+    def environment(self, node) -> Optional[np.ndarray]:
+        """Environment atoms near the QM region (Angstrom), without the
+        atoms of cut bonds."""
+        if not self.region:
+            return None
+        x = np.asarray(node.coords, dtype=float) / ANGSTROM_TO_BOHR
+        skip = set(self.region.qm_atoms) | {m for _, m in self.region.links}
+        mm = np.array([i for i in range(len(x)) if i not in skip], dtype=int)
+        if not len(mm):
+            return None
+        d = np.linalg.norm(x[mm][:, None] - x[self.region.qm_atoms][None], axis=2).min(axis=1)
+        return x[mm[d < 6.0]]
+
+    def full_structure(self, node, guess) -> object:
+        if not self.region:
+            return _structure_with(node.structure, guess)
+        x = np.asarray(node.coords, dtype=float) / ANGSTROM_TO_BOHR
+        x[self.region.qm_atoms] = np.asarray(guess)[:len(self.region.qm_atoms)]
+        return _structure_with(node.structure, x)
+
+
+def _open_structure(fp):
+    from qcdata import Structure
+
+    return Structure.open(str(fp))
+
+
+def _region_proposals(view: "_View", node, source: int, items: Iterable) -> tuple[list[Proposal], dict]:
+    """Products a whole-molecule generator made of a QM/MM system's QM model
+    (QM atoms + link H, `region.model_structure`), put back into the full
+    system: aligned onto the QM atoms where they are, relaxed briefly
+    against the nearby environment (the generator optimized them in vacuum,
+    so they can overlap it), the environment left as it is. A product whose
+    link hydrogen stopped being a cap (lost its bond to its QM atom, or
+    bonded to something else) breaks the QM/MM boundary and is dropped.
+    SMILES and bond changes are those of the QM model. Returns (proposals,
+    {"kept", "boundary"})."""
+    from qcdata import Structure
+
+    from mepd.rigid_alignment import kabsch_align
+
+    region = view.region
+    nqm = len(region.qm_atoms)
+    symbols = view.symbols(node)
+    x0 = view.coords(node)                     # the QM model as it sits in the system (Angstrom)
+    edges0 = view.edges(node)
+    caps = [(region.qm_atoms.index(q), nqm + k) for k, (q, _) in enumerate(region.links)]
+    env = view.environment(node)
+    charge, mult = view.charge_mult(node)
+    out, n_boundary = [], 0
+    for k, item in enumerate(items):
+        if not isinstance(item, Structure):
+            item = Structure.open(str(item))
+        if list(item.symbols) != symbols:
+            raise ValueError(f"a product of the QM region lists {len(item.symbols)} atoms, not the QM model's "
+                             f"{len(symbols)} in its order (QM atoms, then link H)")
+        y = kabsch_align(np.asarray(item.geometry, dtype=float) / ANGSTROM_TO_BOHR, x0)
+        edges = _perceived_edges(symbols, y)
+        if any((min(q, h), max(q, h)) not in edges or sum(h in e for e in edges) != 1 for q, h in caps):
+            n_boundary += 1
+            continue
+        guess = embed_product(symbols, y, edges, env=env, env_atoms=nqm)
+        out.append(Proposal(source, tuple(sorted(edges0 - edges)), tuple(sorted(edges - edges0)),
+                            # No Lewis structure for it (e.g. a radical the simple
+                            # picture can't place): named after it is optimized,
+                            # like an imported product.
+                            lewis_smiles(symbols, edges, charge, mult) or f"external-{k}",
+                            structure=view.full_structure(node, guess)))
+    return out, {"kept": len(out), "boundary": n_boundary}
+
+
+def _qmmm_region(engine, node):
+    from mepd.qmmm import QMMMRegion
+
+    region = getattr(engine, "region", None)
+    return region if isinstance(region, QMMMRegion) and len(node.symbols) == region.natoms else None
 
 
 def _import_generator(path: str) -> Callable:
@@ -546,13 +668,35 @@ def _morph_frames(job) -> list[str]:
     from mepd.chainhelpers import run_geodesic
 
     symbols, charge, mult, xa, xb, reference, nimages = job
-    a, b = (StructureNode(structure=Structure(symbols=list(symbols), geometry=np.asarray(x), charge=charge,
-                                              multiplicity=mult)) for x in (xa, xb))
-    try:
-        nodes = list(run_geodesic([a, b], nimages=nimages))
-    except Exception:
-        nodes = [a, b]
-    coords = [np.asarray(n.coords, dtype=float) for n in nodes]
+    sub = StructureNode._global_graph_atoms
+    if sub is not None and len(symbols) == sub[1]:
+        # A QM/MM system: geodesic over the QM atoms, the environment moved
+        # linearly (a geodesic over thousands of atoms is far too slow).
+        qm = list(sub[0])
+        sa, sb = (StructureNode(structure=Structure(symbols=[symbols[i] for i in qm], geometry=np.asarray(x)[qm]),
+                                has_molecular_graph=False) for x in (xa, xb))
+        try:
+            qm_frames = [np.asarray(n.coords) for n in run_geodesic([sa, sb], nimages=nimages, align=False)]
+        except Exception:
+            qm_frames = [np.asarray(xa)[qm] + t * (np.asarray(xb)[qm] - np.asarray(xa)[qm])
+                         for t in np.linspace(0, 1, nimages)]
+        coords = []
+        for k, q in enumerate(qm_frames):
+            t = k / max(1, len(qm_frames) - 1)
+            c = np.asarray(xa, dtype=float) + t * (np.asarray(xb, dtype=float) - np.asarray(xa, dtype=float))
+            c[qm] = q
+            coords.append(c)
+        a = StructureNode(structure=Structure(symbols=list(symbols), geometry=np.asarray(xa), charge=charge,
+                                              multiplicity=mult), has_molecular_graph=False)
+        nodes = [a] * len(coords)
+    else:
+        a, b = (StructureNode(structure=Structure(symbols=list(symbols), geometry=np.asarray(x), charge=charge,
+                                                  multiplicity=mult)) for x in (xa, xb))
+        try:
+            nodes = list(run_geodesic([a, b], nimages=nimages))
+        except Exception:
+            nodes = [a, b]
+        coords = [np.asarray(n.coords, dtype=float) for n in nodes]
     shift = coords[0].mean(axis=0)
     u, _, vt = np.linalg.svd((coords[0] - shift).T @ reference)
     rot = u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
@@ -700,25 +844,29 @@ class _LiveReactions:
         self._submit(self.job(species[p.source].node, node), write)
 
 
-def _build_guesses(props: list[Proposal], node: StructureNode, coords: np.ndarray, live, workers: int) -> None:
+def _build_guesses(props: list[Proposal], node: StructureNode, coords: np.ndarray, live, workers: int,
+                   view: Optional[_View] = None) -> None:
     """Each proposal's 3D guess (and, for a watching live view, its
     seed-to-guess animation), across `workers` forked processes."""
     from mepd.cli_common import _fork_map
 
-    symbols = list(node.symbols)
-    edges = graph_edges(node)
+    view = view or _View()
+    symbols = view.symbols(node)
+    edges = view.edges(node)
+    env = view.environment(node)
+    nfeel = len(view.region.qm_atoms) if view.region else None
 
     def build(k):
         p = props[k]
-        guess = embed_product(symbols, coords, (edges - set(p.broken)) | set(p.formed))
+        guess = embed_product(symbols, coords, (edges - set(p.broken)) | set(p.formed), env=env, env_atoms=nfeel)
         frames = None
         if live.enabled:
-            structure = _structure_with(node.structure, guess)
-            frames = _morph_frames(live.job(node, StructureNode(structure=structure)))
+            structure = view.full_structure(node, guess)
+            frames = _morph_frames(live.job(node, StructureNode(structure=structure, has_molecular_graph=False)))
         return guess, frames
 
     for p, (guess, frames) in zip(props, _fork_map(build, list(range(len(props))), workers)):
-        p.structure = _structure_with(node.structure, guess)
+        p.structure = view.full_structure(node, guess)
         p.frames = frames
 
 
@@ -780,9 +928,10 @@ def expand_network(
     elif seed._cached_energy is None:
         engine.compute_energies([seed])
     e0 = float(seed.energy)
-    symbols = list(seed.symbols)
-    charge, mult = int(seed.structure.charge), int(seed.structure.multiplicity)
-    result = ExpansionResult(species=[Species(seed, lewis_smiles(symbols, graph_edges(seed), charge, mult,
+    view = _View(_qmmm_region(engine, seed))
+    symbols = view.symbols(seed)
+    charge, mult = view.charge_mult(seed)
+    result = ExpansionResult(species=[Species(seed, lewis_smiles(symbols, view.edges(seed), charge, mult,
                                                                  allow_radicals=True, allow_zwitterions=True) or "", 0)])
     live = _LiveReactions(seed, e0, workers=workers)
 
@@ -801,7 +950,7 @@ def expand_network(
         if len(result.species) >= max_species:
             return ProposedEdge(p.source, p, "failed", error="max_species reached")
         rel = (float(opt.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
-        smi = lewis_smiles(symbols, graph_edges(opt), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
+        smi = lewis_smiles(symbols, view.edges(opt), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
         result.species.append(Species(opt.copy(), smi, rnd, rel, record))
         idx = len(result.species) - 1
         _emit(on_event, "species_found", index=idx, smiles=smi, rel_energy_kcal=rel, round=rnd)
@@ -824,7 +973,7 @@ def expand_network(
         if len(result.species) >= max_species:
             return -1, False
         rel = (float(node.energy) - e0) * HARTREE_TO_KCAL_PER_MOL
-        smi = lewis_smiles(symbols, graph_edges(node), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
+        smi = lewis_smiles(symbols, view.edges(node), charge, mult, allow_radicals=True, allow_zwitterions=True) or ""
         result.species.append(Species(node.copy(), smi, rnd, rel))
         _emit(on_event, "species_found", index=len(result.species) - 1, smiles=smi, rel_energy_kcal=rel, round=rnd)
         return len(result.species) - 1, True
@@ -894,21 +1043,63 @@ def expand_network(
         proposals, stats_all = [], []
         for src in frontier:
             node = result.species[src].node
-            coords = np.asarray(node.coords) / ANGSTROM_TO_BOHR
+            coords = view.coords(node)
             gen = get_generator(generator) if products_file is None and is_named(generator) else None
-            if gen is not None and gen.kind == "structures":   # e.g. crest-msreact: product geometries
+            if view.region is not None and (gen is None or gen.kind == "structures"):
+                # QM/MM: a whole-molecule generator (or an imported one) works on
+                # the QM model -- QM atoms capped with link H, at the QM charge and
+                # spin -- and its products are put back into the environment.
+                model = view.region.model_structure(node.structure)
+                opts = dict(generator_options or {})
+                embedded = bool(opts.pop("embedded", False)) and gen is not None and gen.name == "nanoreactor"
+                if embedded:
+                    # The nanoreactor's MD with QM/MM forces, the environment present
+                    # all along: its products are whole systems.
+                    from mepd.discovery.qmmm_reactor import qmmm_reactor_products
+
+                    items, reactor_counts = qmmm_reactor_products(
+                        node.structure, engine, view.region, max_products=max_products, on_event=on_event,
+                        **{k: v for k, v in opts.items() if k != "md_method"})
+                    for key, what in (("mm_changed", "changed a bond in the MM region"),
+                                      ("boundary", "stretched a QM/MM cut bond")):
+                        if reactor_counts[key]:
+                            _emit(on_event, "warning", message=f"{reactor_counts[key]} QM/MM nanoreactor event(s) "
+                                                               f"{what}; not used as products")
+                elif gen is not None:
+                    gen.check()
+                    items = gen.propose(model, max_products=max_products, options=opts)
+                elif products_file is not None:
+                    from mepd.qcdata_structure_helpers import read_multiple_structure_from_file
+                    items = read_multiple_structure_from_file(products_file, charge, mult) if src == 0 else []
+                else:
+                    items = _import_generator(generator)(model, **dict(generator_options or {}))
+                # Products of the whole system (e.g. a products file made for it) go
+                # in as they are; products of the QM model are put back.
+                items = [s if not isinstance(s, (str, Path)) else _open_structure(s) for s in items]
+                whole = [s for s in items if len(s.symbols) == len(node.symbols)]
+                props = external_proposals(whole, node.structure, src) if whole else []
+                region_props, counts = _region_proposals(
+                    view, node, src, [s for s in items if len(s.symbols) != len(node.symbols)])
+                props += region_props
+                stats = {(gen.name if gen is not None else "external"): len(props),
+                         **({"broke_qmmm_boundary": counts["boundary"]} if counts["boundary"] else {})}
+                if counts["boundary"]:
+                    _emit(on_event, "warning", message=f"{counts['boundary']} product(s) of the QM region broke a "
+                                                       "QM/MM boundary bond (a link H stopped being a cap); dropped")
+            elif gen is not None and gen.kind == "structures":   # e.g. crest-msreact: product geometries
                 gen.check()
                 items = gen.propose(node.structure, max_products=max_products, options=dict(generator_options or {}))
                 props = external_proposals(items, node.structure, src)
                 stats = {gen.name: len(props)}
             elif gen is not None:
                 props, stats = propose_products(
-                    generator, symbols, coords, graph_edges(node), options=generator_options, charge=charge,
+                    generator, symbols, coords, view.edges(node), options=generator_options, charge=charge,
                     multiplicity=mult, n_break=n_break, n_form=n_form, form_distance=form_distance,
                     max_products=max_products, allow_radicals=allow_radicals, allow_zwitterions=allow_zwitterions,
                     source=src,
                 )
-                _build_guesses(props, node, coords, live, workers)
+                props = view.keep(props)
+                _build_guesses(props, node, coords, live, workers, view)
             else:   # imported products, or a generator given by import path
                 if products_file is not None:  # an external tool's products of the seed
                     from mepd.qcdata_structure_helpers import read_multiple_structure_from_file

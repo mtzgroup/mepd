@@ -1493,11 +1493,45 @@ def format_neb_caption(
     return " | ".join(parts)
 
 
+_step_clock: dict[str, float] = {}
+
+
+def _log_chain_step(chain, caption: str, force_update: bool = False) -> None:
+    """One line per path-search step when stdout is not a terminal (a log
+    file, nohup): rich's live table only reaches such output when it stops,
+    so a long run (e.g. QM/MM, minutes per step) would show nothing until it
+    ends."""
+    if _console is None or _console.is_terminal or not get_progress_printer().use_rich:
+        return      # a terminal shows the live table; the plain fallback prints every step itself
+    if str(os.environ.get("NEB_DISCOVERY_SILENT_TERMINAL", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    monitor_id = _active_monitor_id()
+    now = time.time()
+    last = _step_clock.get(monitor_id)
+    if not force_update and last is not None and now - last < 2.0:
+        return
+    _step_clock[monitor_id] = now
+    parts = [f"[{monitor_id}] {caption}"]
+    try:
+        e = np.asarray(chain.energies, dtype=float)
+        rel = (e - e[0]) * 627.509474
+        k = int(np.argmax(rel))
+        parts.append(f"peak {rel[k]:.1f} kcal/mol @ image {k}/{len(rel) - 1}")
+        parts.append(f"end {rel[-1]:.1f}")
+    except Exception:
+        pass
+    if last is not None and now - last >= 1:
+        parts.append(f"{now - last:.0f} s")
+    sys.stdout.write(" | ".join(parts) + "\n")
+    sys.stdout.flush()
+
+
 def print_chain_step(chain, caption: str, force_update: bool = False):
     printer = get_progress_printer()
     ascii_plot = ascii_profile_for_chain(chain)
     printer.record_chain_plot(chain, caption)
     printer.print_chain_ascii(ascii_plot, caption, force_update=force_update)
+    _log_chain_step(chain, caption, force_update)
 
 
 def preserve_chain_snapshot(note: Optional[str] = None):

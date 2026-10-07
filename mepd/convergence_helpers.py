@@ -119,13 +119,13 @@ def chain_converged(
     # full-chain index is always valid.
     gperps = ch.get_g_perps(chain_new)
     if chain_new.parameters.frozen_atom_indices:
-        n_atoms = grad[0].shape[0] if len(grad) > 0 else 0
+        n_atoms = np.asarray(grad[0]).shape[0] if len(grad) > 0 else 0
         not_frozen_atoms = sorted(
             set(range(n_atoms)) - set(chain_new.parameters.frozen_atom_indices)
         )
-        grad = [g[not_frozen_atoms] for g in grad]
-        springgrads = [g[not_frozen_atoms] for g in springgrads]
-        gperps = [g[not_frozen_atoms] for g in gperps]
+        grad = [np.asarray(g)[not_frozen_atoms] for g in grad]
+        springgrads = [np.asarray(g)[not_frozen_atoms] for g in springgrads]
+        gperps = [np.asarray(g)[not_frozen_atoms] for g in gperps]
 
     rms_grad_conv_ind, rms_gperps = _check_rms_grad_converged(
         grad, threshold=parameters.rms_grad_thre*fraction_freeze)

@@ -131,10 +131,38 @@ class StructureNode(Node):
     _cached_result: Union[ProgramOutput, FakeQCIOOutput] = None
     graph: Molecule = None
     _global_disable_molecular_graphs: ClassVar[bool] = False
+    # QM/MM: (atom indices, total atom count). A structure of that system
+    # gets its graph from those atoms only (the QM region): species identity
+    # and elementary-step checks never look at the environment.
+    _global_graph_atoms: ClassVar[tuple | None] = None
 
     @classmethod
     def set_global_disable_molecular_graphs(cls, disable: bool) -> None:
         cls._global_disable_molecular_graphs = bool(disable)
+
+    @classmethod
+    def set_global_graph_atoms(cls, atoms, natoms: int | None = None) -> None:
+        cls._global_graph_atoms = None if atoms is None else (tuple(int(i) for i in atoms), int(natoms))
+
+    def _graph_subset(self) -> list[int] | None:
+        sub = self._global_graph_atoms
+        if sub is not None and len(self.structure.symbols) == sub[1]:
+            return list(sub[0])
+        if self.graph_atom_indices_source == "qmmm_qm_atoms" and self.comparison_atom_indices:
+            return list(self.comparison_atom_indices)
+        return None
+
+    def _build_graph(self, structure: Structure):
+        sub = self._graph_subset()
+        if sub is None:
+            return structure_to_molecule(structure)
+        self.comparison_atom_indices = sub
+        self.disable_smiles = True
+        self.graph_atom_indices_source = "qmmm_qm_atoms"
+        self.graph_subset_atom_count = len(sub)
+        self.graph_total_atom_count = len(structure.symbols)
+        return structure_to_molecule(Structure(symbols=[structure.symbols[i] for i in sub],
+                                               geometry=np.asarray(structure.geometry)[sub]))
 
     def __post_init__(self):
         if self._global_disable_molecular_graphs:
@@ -147,7 +175,7 @@ class StructureNode(Node):
         if self.graph_total_atom_count is not None:
             self.graph_total_atom_count = int(self.graph_total_atom_count)
         if self.has_molecular_graph and self.graph is None:
-            self.graph = structure_to_molecule(self.structure)
+            self.graph = self._build_graph(self.structure)
         if not self.has_molecular_graph:
             self.graph = None
         if self._cached_result is not None:
@@ -207,7 +235,7 @@ class StructureNode(Node):
             update={"geometry": new_coords}
         )
         if copy_node.has_molecular_graph and not copy_node._global_disable_molecular_graphs:
-            copy_node.graph = structure_to_molecule(copy_node.structure)
+            copy_node.graph = copy_node._build_graph(copy_node.structure)
         else:
             copy_node.graph = None
         return copy_node

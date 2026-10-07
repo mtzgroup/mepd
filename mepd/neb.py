@@ -832,10 +832,8 @@ class NEB(PathMinimizer):
             ) from exc
 
         if chain.parameters.frozen_atom_indices:
-            inds = chain.parameters.frozen_atom_indices
-            for index in inds:
-                for image_ind in range(grad_step.shape[0]):
-                    grad_step[image_ind][index] = np.array([0.0, 0.0, 0.0])
+            grad_step = np.array(grad_step, dtype=float, copy=True)
+            grad_step[:, np.asarray(chain.parameters.frozen_atom_indices, dtype=int)] = 0.0
 
         alpha = 1.0
         ntries = 0

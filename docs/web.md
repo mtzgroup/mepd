@@ -119,6 +119,10 @@ Build or edit a structure in 3D: from scratch (click empty space to drop an atom
 
 A new, empty workspace opens on Design; an empty Explore points there too.
 
+### QM/MM systems
+
+A molecule in explicit solvent (*Put in explicit solvent (QM/MM)*), or a whole system added with *Add › QM/MM system*, becomes one node named by its QM region ("NCC(=O)O · in water"). A structure with exactly that system's atoms joins it automatically. Calculations on it run embedded, at their own level ("… / QM/MM"), and only the operations that work embedded are offered. Every 3D view draws such a structure by region and can colour the environment by motion. Each result path gets *QM/MM checks* (frozen drift, MM bond changes, cut bonds, contacts) and an energy split. See [qmmm.md](qmmm.md).
+
 ### Sessions, cleanup, downloads
 
 - **Sessions.** A session is a workspace directory.
@@ -142,7 +146,7 @@ A new, empty workspace opens on Design; an empty Explore points there too.
 - **Cancel** kills the job's whole process group, which includes `--workers` children and CREST.
 - **Resume / Rerun** runs the same command into the same output folder. `channels`, `ts` and `network-splits` skip what is already on disk.
 - **Server restart.** Queued jobs stay queued. Running jobs are marked *interrupted* and can be resumed.
-- **Open existing output…** registers a mepd output directory from anywhere on disk as a read-only job. Past CLI runs can then be browsed and imported into the graph. The directory is never modified.
+- **Open existing output…** registers a mepd output directory from anywhere on disk as a read-only job. Past CLI runs can then be browsed and imported into the graph. The directory is never modified. Its level of theory is the workspace profile picked under *Computed at*, else the profile `.toml` kept next to the output (in its folder or the one above). Its structures join Explore at that level, and a result added with *Add ends + edge* is listed on that edge, together with its barrier. With no level, its energies are not compared with any others.
 
 ## Architecture
 

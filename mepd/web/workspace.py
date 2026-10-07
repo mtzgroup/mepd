@@ -135,6 +135,12 @@ def _engine_level(data: dict) -> dict:
     if engine == "mlip":
         return {"engine": "mlip", **clean(table("mlip_engine_kwds"),
                                           ("model", "family", "checkpoint", "calculator", "calculator_kwds", "options"))}
+    if engine == "xtb":
+        return {"engine": "xtb", "method": str(table("xtb_engine_kwds").get("method") or "gfn2").lower()}
+    if engine == "psi4":
+        kw = table("psi4_engine_kwds")
+        return {"engine": "psi4", "method": str(kw.get("method") or "b3lyp").lower(),
+                "basis": str(kw.get("basis") or "def2-svp").lower(), **clean(kw, ("options",))}
     if engine == "fairchem":
         kw = table("fairchem_engine_kwds")
         return {"engine": "fairchem", "model": kw.get("model") or "uma-s-1p2p1", "task": kw.get("task") or "omol",
@@ -215,6 +221,12 @@ def level_label(profile_text: Optional[str]) -> str:
     parts = [str(data.get("engine_name", "gxtb"))]
     if data.get("engine_name") in ("chemcloud", "qccompute"):
         parts[0] += f"/{data.get('program', 'xtb')}"
+    if data.get("engine_name") == "xtb":
+        kw = data.get("xtb_engine_kwds") if isinstance(data.get("xtb_engine_kwds"), dict) else {}
+        parts[0] = str(kw.get("method") or "gfn2").upper() + "-xTB"
+    if data.get("engine_name") == "psi4":
+        kw = data.get("psi4_engine_kwds") if isinstance(data.get("psi4_engine_kwds"), dict) else {}
+        parts.append(f"{kw.get('method') or 'b3lyp'}/{kw.get('basis') or 'def2-svp'}")
     model = (data.get("program_kwds") or {}).get("model") if isinstance(data.get("program_kwds"), dict) else None
     if model:
         parts.append("/".join(str(model.get(k)) for k in ("method", "basis") if model.get(k)))
@@ -246,6 +258,10 @@ class Workspace:
         # joined by an ordinary edge, so pair operations (TS search) run on it.
         self._data.setdefault("reactions", {})
         self._data.setdefault("level_profile", None)
+        # QM/MM systems (mepd.qmmm): one region per atom list, matched to a
+        # structure by its exact element sequence (see `qmmm_system_of`).
+        self._data.setdefault("qmmm_systems", {})
+        self.qmmm_dir = self.root / "qmmm"
         # Hessian check applied when structures are optimized on entry.
         self._data.setdefault("validate_minima", True)
         if any([self._ensure_conformers(rec) for rec in self._data["structures"].values()]):
@@ -315,12 +331,17 @@ class Workspace:
         A minimum holding several molecules becomes a complex: each molecule
         is added (merged with a known one) and recorded as its `members`;
         the geometry itself is kept exactly, as the complex's structure."""
+        qmmm = self.qmmm_system_of(structure)
+        if qmmm is not None:
+            # A QM/MM system: one node per state of its QM region (never
+            # split into molecules); named by the capped QM region.
+            smiles = self.perceive(structure)
         smiles = smiles or chem.perceive_smiles(structure)
         members = None
         # Several molecules by its bonds *and* by its SMILES: a hot MD snapshot
         # can stretch one bond past the bond cutoff of _fragments while it is
         # still one molecule (one SMILES): that stays a molecule.
-        if role == "minimum" and len(structure.symbols) > 1 and (not smiles or "." in smiles):
+        if role == "minimum" and len(structure.symbols) > 1 and qmmm is None and (not smiles or "." in smiles):
             from mepd.web.compose import _fragments
 
             frags = _fragments(structure)
@@ -338,7 +359,7 @@ class Workspace:
                                 if self._same_conformer(rec, conf, structure, energy, level):
                                     return {"rec": rec, "conformer": conf["id"], "merged": True, "duplicate": True}
         with self._lock:
-            match = self.find_molecule(smiles, int(structure.charge), int(structure.multiplicity)) \
+            match = self.find_molecule(smiles, int(structure.charge), int(structure.multiplicity), qmmm) \
                 if merge and role == "minimum" else None
             if match is not None:
                 cid, duplicate = self.add_conformer(match["id"], structure, energy=energy, level=level,
@@ -368,6 +389,11 @@ class Workspace:
         if members is not None:
             rec["members"] = members
             rec["name"] = name or complex_name(members, self._data["structures"])
+        if qmmm is not None:
+            rec["qmmm"] = qmmm
+            label = self._data["qmmm_systems"][qmmm].get("name") or "QM/MM"
+            # Named by its QM region: names handed in are whole-system SMILES or formulas.
+            rec["name"] = f"{smiles or 'QM region'} · {label}" + (" [TS]" if role == "ts" else "")
         with self._lock:
             structure.save(str(self.structures_dir / f"{sid}.xyz"))
             self._data["structures"][sid] = rec
@@ -456,17 +482,93 @@ class Workspace:
         rec["conformer"] = "c0"
         return True
 
-    def find_molecule(self, smiles: Optional[str], charge: int, multiplicity: int) -> Optional[dict]:
-        """The node (a minimum, not a TS) of the molecule `smiles`, if any."""
+    def find_molecule(self, smiles: Optional[str], charge: int, multiplicity: int,
+                      qmmm: Optional[str] = None) -> Optional[dict]:
+        """The node (a minimum, not a TS) of the molecule `smiles`, if any
+        (for a QM/MM system: the same QM region state in that system)."""
         if not smiles:
             return None
         key = chem.canonical_key(smiles)
         for rec in self._data["structures"].values():
             if (is_species(rec) and rec.get("smiles") and rec["charge"] == charge
                     and rec["multiplicity"] == multiplicity and not rec.get("reacted")
+                    and rec.get("qmmm") == qmmm
                     and chem.canonical_key(rec["smiles"]) == key):
                 return rec
         return None
+
+    # ---------------------------------------------------------------- QM/MM
+    @staticmethod
+    def _atoms_key(symbols) -> str:
+        import hashlib
+
+        return hashlib.sha1("|".join(str(x) for x in symbols).encode()).hexdigest()[:12]
+
+    def qmmm_system_of(self, structure) -> Optional[str]:
+        """The QM/MM system a structure belongs to: the one with exactly its
+        atoms in its order (a solvated or protein system's atom list is
+        unique enough), else None."""
+        systems = self._data.get("qmmm_systems") or {}
+        if not systems:
+            return None
+        n = len(structure.symbols)
+        cands = [k for k, v in systems.items() if v.get("natoms") == n]
+        if not cands:
+            return None
+        key = self._atoms_key(structure.symbols)
+        return next((k for k in cands if systems[k].get("atoms_key") == key), None)
+
+    def qmmm_region(self, sysid: str):
+        from mepd.qmmm import QMMMRegion
+
+        if sysid not in (self._data.get("qmmm_systems") or {}):
+            raise WorkspaceError(f"unknown QM/MM system {sysid!r}")
+        return QMMMRegion.open(self.qmmm_dir / f"{sysid}.json")
+
+    def qmmm_region_path(self, sysid: str) -> Path:
+        self.qmmm_region(sysid)
+        return self.qmmm_dir / f"{sysid}.json"
+
+    def put_qmmm_system(self, region, *, name: str = "", sysid: Optional[str] = None) -> dict:
+        """Register (or replace) the QM/MM region of a system. Returns its
+        record (a summary; the region itself is qmmm/<id>.json)."""
+        with self._lock:
+            key = self._atoms_key(region.symbols)
+            systems = self._data["qmmm_systems"]
+            sysid = sysid or next((k for k, v in systems.items() if v.get("atoms_key") == key), None) \
+                or new_id("q_")
+            self.qmmm_dir.mkdir(parents=True, exist_ok=True)
+            region.name = name or region.name or systems.get(sysid, {}).get("name") or "QM/MM system"
+            region.save(self.qmmm_dir / f"{sysid}.json")
+            ref = region.reference_structure()
+            systems[sysid] = {
+                "id": sysid, "name": region.name, "atoms_key": key, "natoms": region.natoms,
+                "sig": region.signature(), "mm": region.mm, "qm_charge": region.qm_charge,
+                "qm_multiplicity": region.qm_multiplicity, "n_qm": len(region.qm_atoms),
+                "n_links": len(region.links), "n_frozen": len(region.frozen_atoms),
+                "n_active_mm": len(region.active_mm_atoms), "active_radius": region.active_radius,
+                "problems": region.check(ref), "updated": time.time(),
+            }
+            self._save()
+            return systems[sysid]
+
+    def delete_qmmm_system(self, sysid: str) -> None:
+        with self._lock:
+            self._data["qmmm_systems"].pop(sysid, None)
+            (self.qmmm_dir / f"{sysid}.json").unlink(missing_ok=True)
+            for rec in self._data["structures"].values():
+                if rec.get("qmmm") == sysid:
+                    rec.pop("qmmm", None)
+            self._save()
+
+    def perceive(self, structure) -> Optional[str]:
+        """SMILES of a structure; of a QM/MM system, its QM region capped
+        with the link hydrogens."""
+        sysid = self.qmmm_system_of(structure)
+        if sysid is None:
+            return chem.perceive_smiles(structure)
+        region = self.qmmm_region(sysid)
+        return chem.perceive_smiles(region.model_structure(structure))
 
     def _same_conformer(self, rec: dict, conf: dict, structure: Structure, energy, level) -> bool:
         """Is this geometry one we already have? Same level and energy within
@@ -589,7 +691,7 @@ class Workspace:
             for rec in sorted(self._data["structures"].values(), key=lambda r: r.get("created", 0)):
                 if not is_species(rec) or not rec.get("smiles") or rec.get("reacted"):
                     continue
-                key = (chem.canonical_key(rec["smiles"]), rec["charge"], rec["multiplicity"])
+                key = (chem.canonical_key(rec["smiles"]), rec["charge"], rec["multiplicity"], rec.get("qmmm"))
                 groups.setdefault(key, []).append(rec)
             merged = 0
             for keeper, *dups in groups.values():
@@ -889,7 +991,7 @@ class Workspace:
                 self._save()
                 return rec
             structure.save(str(self.structures_dir / f"{sid}.xyz"))
-            new_smiles = chem.perceive_smiles(structure)
+            new_smiles = self.perceive(structure)
             old_smiles = rec.get("smiles")
             if new_smiles and old_smiles and chem.canonical_key(new_smiles) != chem.canonical_key(old_smiles):
                 # The minimization changed connectivity (a proton moved, or the

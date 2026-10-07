@@ -10,7 +10,7 @@ COMMON = dict(charge=0, multiplicity=1, n_break=2, n_form=2, form_distance=4.0, 
 
 
 def test_registry_names_the_generators_and_rejects_unknown_ones():
-    assert set(generators.GENERATORS) == {"bond-rules", "crest-msreact"}
+    assert set(generators.GENERATORS) == {"bond-rules", "crest-msreact", "nanoreactor"}
     with pytest.raises(ValueError, match="bond-rules.*package.module:function"):
         generators.get_generator("nope")
 

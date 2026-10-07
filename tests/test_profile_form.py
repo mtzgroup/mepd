@@ -48,7 +48,7 @@ def test_form_reads_the_big_choices_and_relevant_groups():
     assert _choices(f) == {"path_method": "NEB", "engine": "gxtb", "interpolation": "geodesic", "optimizer": "cg",
                            "solvent": ""}
     assert [o["value"] for o in _find(f, "interpolation")["options"]] == ["geodesic", "idpp", "lst", "linear"]
-    assert [o["value"] for o in _find(f, "engine")["options"]] == ["gxtb", "qccompute", "chemcloud", "mlip", "fairchem", "ase"]
+    assert [o["value"] for o in _find(f, "engine")["options"]] == ["gxtb", "qccompute", "chemcloud", "mlip", "fairchem", "ase", "xtb", "psi4"]
     assert f["images"]["value"] == 12
     titles = [g["title"] for g in f["groups"]]
     assert titles[0] == "NEB settings" and "g-xTB" in titles and "Conjugate gradient optimizer" in titles

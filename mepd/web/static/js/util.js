@@ -216,6 +216,10 @@ export function levelStatus(rec, levelKey = state.levels[state.levelProfile ?? '
     const why = rec.origin?.kind === 'smiles' ? 'RDKit/MMFF embedding' : rec.origin?.kind === 'job' ? 'from an imported output (level unknown)' : 'geometry as given';
     return { kind: 'none', text: 'not optimized', title: `Not at any QM level: ${why}` };
   }
+  // A QM/MM structure is at the workspace level when it was computed at that
+  // level embedded in its system's current region.
+  const sys = rec.qmmm ? state.workspace.qmmm_systems?.[rec.qmmm] : null;
+  if (sys && levelKey != null) levelKey = `${levelKey}+qmmm:${sys.sig}`;
   if (rec.level.key !== levelKey) {
     return { kind: 'other', text: rec.level.label ? `${rec.level.label} · other level` : 'other level', title: `Optimized at ${rec.level.profile ?? 'built-in defaults'} (${rec.level.label}), not the workspace level` };
   }

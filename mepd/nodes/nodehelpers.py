@@ -678,9 +678,18 @@ def _n_trans_small_ring_alkenes(node) -> int | None:
     from rdkit import Chem
     from rdkit.Chem import rdDetermineBonds, rdMolTransforms
 
+    structure = node.structure
+    sub = getattr(node, "comparison_atom_indices", None)
+    if sub and getattr(node, "graph_atom_indices_source", None) == "qmmm_qm_atoms":
+        # A QM/MM system: only its QM atoms (never perceive bonds in a
+        # whole protein or solvent box).
+        from qcdata import Structure
+
+        structure = Structure(symbols=[structure.symbols[i] for i in sub],
+                              geometry=np.asarray(structure.geometry)[list(sub)])
     try:
-        mol = Chem.MolFromXYZBlock(node.structure.to_xyz())
-        rdDetermineBonds.DetermineBonds(mol, charge=node.structure.charge)
+        mol = Chem.MolFromXYZBlock(structure.to_xyz())
+        rdDetermineBonds.DetermineBonds(mol, charge=structure.charge)
     except Exception:
         return None
     ring_info = mol.GetRingInfo()

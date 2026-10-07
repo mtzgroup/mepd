@@ -365,6 +365,14 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
             {'nodes': chain, 'parameters': chain_inputs})
     elif isinstance(chain, Chain):
         chain_inputs = chain.parameters
+    from mepd.interpolation import frozen_for, hold_frozen
+
+    frozen = frozen_for(chain_inputs, len(chain[0].symbols)) if hasattr(chain[0], "symbols") else []
+    if len(frozen):
+        # Frozen atoms define the frame: never rotate the ends onto each
+        # other, and keep the frozen atoms exactly where they are.
+        kwargs["align"] = False
+        kwargs.setdefault("ignore_atoms", frozen)
     reference_symbols = list(chain[0].symbols)
     coords = np.array([
         _coords_reordered_to_reference_symbols(
@@ -375,6 +383,8 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
         for node in chain
     ])
     smoother = run_geodesic_get_smoother((chain[0].symbols, coords), **kwargs)
+    if len(frozen):
+        hold_frozen(smoother.path, frozen)
     xyz_coords = smoother.path
     charge = chain[0].structure.charge
     spinmult = chain[0].structure.multiplicity

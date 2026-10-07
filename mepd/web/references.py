@@ -15,6 +15,25 @@ _DOI = re.compile(r"doi:\s*(10\.\S+?)[.,;)]*$")
 
 _OTHER = [
     {
+        "feature": "QM/MM",
+        "where": "Put in explicit solvent (QM/MM), QM/MM systems",
+        "items": [
+            {"what": "Subtractive (ONIOM) QM/MM embedding",
+             "cite": ["M. Svensson, S. Humbel, R. D. J. Froese, T. Matsubara, S. Sieber, K. Morokuma, J. Phys. Chem. "
+                      "100, 19357 (1996), doi:10.1021/jp962071j"]},
+            {"what": "Link atoms capping the QM region",
+             "cite": ["U. C. Singh, P. A. Kollman, J. Comput. Chem. 7, 718 (1986), doi:10.1002/jcc.540070604"]},
+            {"what": "QM/MM methods (additive scheme, boundaries, mechanical embedding)",
+             "cite": ["H. M. Senn, W. Thiel, Angew. Chem. Int. Ed. 48, 1198 (2009), doi:10.1002/anie.200802019"]},
+            {"what": "GFN-FF force field (the default environment)",
+             "cite": ["S. Spicher, S. Grimme, Angew. Chem. Int. Ed. 59, 15665 (2020), doi:10.1002/anie.202004239"]},
+            {"what": "OpenMM (AMBER environments)",
+             "cite": ["P. Eastman et al., PLoS Comput. Biol. 13, e1005659 (2017), doi:10.1371/journal.pcbi.1005659"]},
+            {"what": "Partial Hessian vibrational analysis (frozen environment)",
+             "cite": ["H. Li, J. H. Jensen, Theor. Chem. Acc. 107, 211 (2002), doi:10.1007/s00214-002-0356-6"]},
+        ],
+    },
+    {
         "feature": "Initial path",
         "where": "Settings › Initial path",
         "items": [

@@ -15,6 +15,7 @@ import { ComplexLive } from './ComplexLive.js';
 import { ReactionTable, SpawnedSearches } from './Reactions.js';
 import { RetroRoutes } from './Retro.js';
 import { Viewer3D } from './Viewer3D.js';
+import { QmmmCheck } from './QMMM.js';
 
 // ------------------------------------------------------------ live
 // Every live path of a job: one per stream (e.g. each `channels` pair) and,
@@ -485,7 +486,7 @@ function ResultPanel({ job }) {
               ${entry.barrier_kcal != null && html`<span class="badge accent">ΔE‡ ${fmtKcal(entry.barrier_kcal)} kcal/mol</span>`}
             </div>
             ${entry.note && html`<div class="small mono muted note">${entry.note}</div>`}
-            <${Viewer3D} frames=${frameXyz} frame=${frame} labels=${labels} height=${300} />
+            <${Viewer3D} frames=${frameXyz} frame=${frame} labels=${labels} height=${300} system=${job.qmmm} />
             ${multi && html`
               <div class="frame-bar">
                 <button class="btn-icon" onClick=${() => setPlaying(!playing)} title=${playing ? 'Pause' : 'Play'}>${playing ? '❚❚' : '▶'}</button>
@@ -495,6 +496,7 @@ function ResultPanel({ job }) {
               <${EnergyPlot} xs=${plotXs} ys=${plotYs} current=${frame}
                 tsIndex=${entry.ts_index} onPick=${(i) => { setPlaying(false); setFrame(i); }} height=${150} />`}
             ${!multi && f?.energy_kcal != null && html`<p class="small muted">Relative energy ${f.energy_kcal.toFixed(2)} kcal/mol</p>`}
+            ${job.qmmm && html`<${QmmmCheck} job=${job} entry=${entry} frame=${frame} onFrame=${(i) => { setPlaying(false); setFrame(i); }} />`}
             <div class="entry-actions">
               <label class="small"><input type="checkbox" checked=${labels} onChange=${(e) => setLabels(e.target.checked)} /> atom indices</label>
               <span class="spacer"></span>
@@ -960,8 +962,10 @@ export function JobView({ jobId: openedId }) {
     finished: Math.max(...family.map((j) => j.finished || 0)),
     result_rev: family.reduce((n, j) => n + (j.result_rev || 0), 0) } : job;
   const hasOutput = job.status !== 'queued';
+  // A network expansion whose products come from nanoreactor MD: it has a reactor to watch too.
+  const reactorGen = job.op === 'graph-enumeration' && job.params?.generator === 'nanoreactor';
   const current = tab || (['done'].includes(run.status) || job.external ? 'result' : run.status === 'failed' ? 'log'
-    : job.op === 'nanoreactor' ? 'reactor' : 'live');
+    : job.op === 'nanoreactor' || reactorGen ? 'reactor' : 'live');
   const targets = job.targets.structures.map((id) => ({ id, label: structureName(id) }));
   const runLabel = (j, i) => (i === 0 ? (job.op === 'ts' ? 'First search' : 'First run')
     : j.op === 'nanoreactor-more' ? `+${j.params?.more_ps ?? '?'} ps` : `More paths ${i}`);
@@ -998,7 +1002,7 @@ export function JobView({ jobId: openedId }) {
         were not added to Explore (the threshold under Explore in this calculation's settings). They are in the results, to add by hand.</p>`}
       ${['cancelled', 'interrupted'].includes(run.status) && html`<p class="warn-box small">${run.error} ${!run.external && html`<button class="btn small" onClick=${() => attempt(() => api.post(`/api/jobs/${run.id}/retry`))}>Resume</button>`}</p>`}
       <div class="tabs">
-        ${[['result', 'Results'], job.op === 'nanoreactor' && ['reactor', 'Reactor'], !job.external && job.op !== 'nanoreactor' && ['live', 'Live'], !job.external && family.some((j) => ['channels', 'channels-more'].includes(j.op)) && ['map', 'Path map'],
+        ${[['result', 'Results'], (job.op === 'nanoreactor' || reactorGen) && ['reactor', 'Reactor'], !job.external && job.op !== 'nanoreactor' && ['live', 'Live'], !job.external && family.some((j) => ['channels', 'channels-more'].includes(j.op)) && ['map', 'Path map'],
           ['ts', 'channels', 'channels-more', 'network-splits'].includes(job.op) && ['tree', 'Optimization tree'],
           !job.external && ['log', 'Log'], ['files', 'Files']].filter(Boolean)
           .map(([k, l]) => html`<button class=${current === k ? 'on' : ''} disabled=${!hasOutput && k !== 'live' && k !== 'reactor'} onClick=${() => setTab(k)}>${l}</button>`)}

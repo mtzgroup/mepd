@@ -12,6 +12,18 @@ import { ComplexMethodForm, memberCounts } from './ComplexBuild.js';
 // How many jobs an operation would create for this selection (0 = not applicable).
 export function applicability(op, sel) {
   const nS = sel.structures.length, nE = sel.edges.length;
+  // A QM/MM system takes only the operations that run embedded (the rest
+  // need whole molecules); and is already embedded.
+  const ws = state.workspace;
+  const ids = [...sel.structures, ...sel.edges.flatMap((id) => (ws.edges[id] ? [ws.edges[id].source, ws.edges[id].target] : []))];
+  const qmmm = ids.some((id) => ws.structures[id]?.qmmm);
+  const mixed = qmmm && ids.some((id) => !ws.structures[id]?.qmmm);
+  // A QM/MM structure with a gas-phase one: only putting the second into the first's system.
+  if (op.key === 'qmmm-embed') {
+    if (!(mixed && ids.length === 2)) return null;
+  } else if (mixed) return null;
+  if (qmmm && !op.qmmm) return null;
+  if (!qmmm && op.key === 'qmmm-inspect') return null;
   if (op.target === 'pair') {
     let fit = null;
     if (nE > 0 && nS === 0) fit = { n: nE, what: nE === 1 ? 'this edge' : `${nE} edges` };
@@ -336,7 +348,11 @@ export function ActionPanel({ sel }) {
       families[fam.key] = { family: fam, methods: [] };
       (byCat[x.op.category] ||= []).push({ familyKey: fam.key });
     }
+    const ws = state.workspace;
+    const qmmmSel = [...sel.structures, ...sel.edges.flatMap((id) => (ws.edges[id] ? [ws.edges[id].source, ws.edges[id].target] : []))]
+      .some((id) => ws.structures[id]?.qmmm);
     for (const [i, meth] of (x.op.methods?.length ? x.op.methods : [{ label: x.op.title, summary: x.op.summary, fixed: {}, available: true }]).entries()) {
+      if (meth.qmmm_only && !qmmmSel) continue;   // e.g. the nanoreactor on a QM region (molecules have their own card)
       families[fam.key].methods.push({ ...meth, id: `${x.op.key}:${i}`, op: x.op, fit: x.fit });
     }
   }

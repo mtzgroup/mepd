@@ -2,6 +2,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
+class InputsError(ValueError):
+    """Inputs that cannot work together, found before anything runs. The
+    command line prints the message (which says how to fix it) on one line,
+    without a traceback."""
+
+
 @dataclass
 class NoneConvergedException(Exception):
 

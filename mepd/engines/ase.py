@@ -87,6 +87,8 @@ class ASEEngine(Engine):
     ase_optimizer: Optimizer = None
     geometry_optimizer: str = "LBFGSLineSearch"
     transition_state_optimizer: str = "SELLA"
+    # Atoms held in place (ase FixAtoms) in optimizations, TS searches and IRCs.
+    fixed_atoms: list | None = None
 
     def __post_init__(self):
         if self.ase_optimizer is None:
@@ -96,6 +98,13 @@ class ASEEngine(Engine):
              available optimizer: {AVAIL_OPTS.keys()}"
 
             self.ase_optimizer = AVAIL_OPTS[self.geometry_optimizer]
+
+    def _constrain(self, atoms: Atoms) -> Atoms:
+        if self.fixed_atoms:
+            from ase.constraints import FixAtoms
+
+            atoms.set_constraint(FixAtoms(indices=[i for i in self.fixed_atoms if i < len(atoms)]))
+        return atoms
 
     @contextmanager
     def _calculator_in_use(self):
@@ -155,7 +164,7 @@ class ASEEngine(Engine):
     ) -> list[StructureNode]:
         run_kwds, optimizer_kwds = self._extract_optimizer_run_kwargs(keywords)
 
-        atoms = structure_to_ase_atoms(node.structure)
+        atoms = self._constrain(structure_to_ase_atoms(node.structure))
         tmp = tempfile.NamedTemporaryFile(suffix=".traj", mode="w+", delete=False)
         with self._calculator_in_use() as calc:
             atoms.calc = calc
@@ -423,7 +432,7 @@ class ASEEngine(Engine):
         self.compute_energies([ts_node])
 
         def _run_direction(direction: str) -> list[StructureNode]:
-            atoms = structure_to_ase_atoms(ts_node.structure)
+            atoms = self._constrain(structure_to_ase_atoms(ts_node.structure))
             tmp = tempfile.NamedTemporaryFile(suffix=".traj", mode="w+", delete=False)
             with self._calculator_in_use() as calc:
                 atoms.calc = calc

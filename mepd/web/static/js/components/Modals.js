@@ -131,9 +131,13 @@ function ImportResult({ onClose }) {
   const [op, setOp] = useState('');
   const [charge, setCharge] = useState(0);
   const [mult, setMult] = useState(1);
+  const [profile, setProfile] = useState('');
+  const profiles = useStore((s) => s.profiles);
+  const levels = useStore((s) => s.levels);
   const go = async () => {
-    const job = await attempt(() => api.post('/api/jobs/import', { path, op: op || null, charge: +charge, multiplicity: +mult }),
-      'Opened existing output');
+    const job = await attempt(() => api.post('/api/jobs/import', { path, op: op || null, charge: +charge, multiplicity: +mult,
+      profile: profile || null }),
+      (j) => (j.level ? `Opened existing output (${j.level.label})` : 'Opened existing output; level of theory unknown'));
     if (job) { onClose(); openJob(job.id); }
   };
   return html`
@@ -149,6 +153,12 @@ function ImportResult({ onClose }) {
         <input type="number" class="tiny" value=${charge} onInput=${(e) => setCharge(e.target.value)} title="Charge" />
         <input type="number" class="tiny" min="1" value=${mult} onInput=${(e) => setMult(e.target.value)} title="Multiplicity" />
       </div>
+      <div class="field"><label class="field-label">Computed at</label>
+        <select value=${profile} onChange=${(e) => setProfile(e.target.value)}>
+          <option value="">The profile saved with the output (a .toml next to it)</option>
+          ${profiles.map((p) => html`<option value=${p}>${levels[p]?.label ?? p} · ${p}</option>`)}
+        </select>
+        <span class="small muted">Its structures join Explore at this level. With neither, the level is unknown and its energies are not compared with any others.</span></div>
       <div class="modal-foot">
         <button class="btn" onClick=${onClose}>Cancel</button>
         <button class="btn primary" disabled=${!path.trim()} onClick=${go}>Open</button>

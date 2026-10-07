@@ -382,7 +382,7 @@ def _build_conformers(ctx: JobContext, p: ConformersParams) -> list[str]:
 
 class ExpandParams(Params):
     # Chosen by the method switch (Bond rules / CREST msreact), not in the form.
-    generator: Literal["bond-rules", "crest-msreact"] = P("bond-rules", "Product generator", kind="custom",
+    generator: Literal["bond-rules", "crest-msreact", "nanoreactor"] = P("bond-rules", "Product generator", kind="custom",
                                                           group="Hidden")
     rounds: int = P(1, "Rounds", "Round 2 proposes products of round 1's new species, and so on.", cli="--rounds", ge=1)
     steer: Literal["auto", "flux", "window"] = P(
@@ -407,6 +407,19 @@ class ExpandParams(Params):
     msreact_nshifts: int = P(0, "Random-shift optimizations", "Extra optimizations from randomly shifted atoms, for "
                              "more products (slower).", kind="custom", ge=0, requires="generator=crest-msreact",
                              advanced=True, group="CREST msreact")
+    reactor_temperature: float = P(3000.0, "MD temperature (K)", "Hot enough for bonds to break within "
+                                   "picoseconds (2500-3500 K). Much hotter and molecules fall apart into atoms, "
+                                   "which give no products.", kind="custom", gt=0,
+                                   requires="generator=nanoreactor")
+    reactor_time_ps: float = P(20.0, "MD time (ps)", kind="custom", gt=0, requires="generator=nanoreactor")
+    reactor_embedded: bool = P(False, "MD with QM/MM forces", "Run the hot MD with the environment present "
+                               "(QM/MM forces every step; the solvent is held near room temperature). Off: the QM "
+                               "region alone in vacuum, its products embedded afterwards (much faster). On is about "
+                               "30-60 min per 10 ps for a small QM region.", kind="custom",
+                               requires="generator=nanoreactor")
+    reactor_compress: float = P(0.5, "Squeeze to (of the wall radius)", "The piston closes the wall to this "
+                                "fraction of its radius once per picosecond.", kind="custom", gt=0, le=1,
+                                requires="generator=nanoreactor", advanced=True, group="Nanoreactor")
     max_products: int = P(50, "Proposals per species", "Bond rules: fewest bond changes first. CREST msreact: "
                           "lowest GFN2-xTB energy first.", cli="--max-products", ge=1)
     energy_window: float = P(60.0, "Expand species within (kcal/mol)", "Only species this close to the seed "
@@ -460,6 +473,19 @@ class JobContext:
         shutil.copyfile(src, dst)
         return dst
 
+    @property
+    def qmmm(self) -> Optional[str]:
+        """The QM/MM system this job runs on (its structures', or its source
+        job's), or None. Mixing systems, or QM/MM with plain structures, is
+        refused."""
+        if not self.structures:
+            return (self.source or {}).get("qmmm")
+        ids = {r.get("qmmm") for r in self.structures}
+        if len(ids) > 1:
+            raise WorkspaceError("these structures are not all in the same QM/MM system" if None not in ids else
+                                 "QM/MM structures cannot be mixed with structures outside that system")
+        return ids.pop()
+
     def common_flags(self) -> list[str]:
         # A follow-up whose structure has since left the graph (or an
         # imported folder, which never had one) uses its source job's.
@@ -469,16 +495,38 @@ class JobContext:
         if not self.structures and self.source is None and self.ws.design:
             first = self.ws.design
         argv = ["--charge", str(first["charge"]), "--multiplicity", str(first["multiplicity"])]
-        if self.profile:
+        qmmm = self.qmmm
+        if self.profile or qmmm:
             prof = self.job_dir / "inputs" / "profile.toml"
             prof.parent.mkdir(parents=True, exist_ok=True)
-            prof.write_text(self.ws.read_profile(self.profile))
+            text = self.ws.read_profile(self.profile) if self.profile else ""
+            if qmmm:
+                # The profile is the QM level; the system's region embeds it.
+                import tomllib
+
+                if "qmmm" in tomllib.loads(text or ""):
+                    raise WorkspaceError(f"profile {self.profile!r} has its own [qmmm] table; the QM/MM system "
+                                         "sets the region: remove it from the profile")
+                shutil.copyfile(self.ws.qmmm_region_path(qmmm), prof.parent / "qmmm_region.json")
+                text = text.rstrip() + '\n\n[qmmm]\nfile = "qmmm_region.json"\n'
+            prof.write_text(text)
             argv += ["--inputs", str(prof)]
         return argv
 
     def level(self) -> dict:
-        """Level of theory this job runs at (its profile's fingerprint)."""
-        return self.ws.level_of(self.profile)
+        """Level of theory this job runs at (its profile's fingerprint; for a
+        QM/MM system, also its region's: energies of different regions, or
+        of a region and the gas phase, are never compared)."""
+        level = self.ws.level_of(self.profile)
+        try:
+            qmmm = self.qmmm
+        except WorkspaceError:   # a mixed selection (e.g. putting a structure into a system)
+            qmmm = None
+        if qmmm:
+            sysrec = self.ws.snapshot()["qmmm_systems"][qmmm]
+            level = {**level, "key": f"{level['key']}+qmmm:{sysrec['sig']}",
+                     "label": f"{level['label']} / QM/MM", "qmmm": qmmm}
+        return level
 
     def at_job_level(self, rec: dict) -> bool:
         """Is this structure a minimum at the level of theory this job uses?"""
@@ -585,6 +633,7 @@ class Operation:
             "family": self.family,
             "methods": [_method_view(m) for m in self.methods],
             "same_atoms": self.same_atoms,
+            "qmmm": self.key in QMMM_OPS,
         }
 
     def parse_params(self, raw: Optional[dict]) -> Params:
@@ -601,6 +650,7 @@ def _method_view(m: dict) -> dict:
     if not reason and callable(m.get("check")):   # e.g. a Python package or a one-time setup
         reason = m["check"]() or ""
     return {"label": m["label"], "summary": m.get("summary", ""), "fixed": m.get("fixed", {}), "rank": m.get("rank", 0),
+            "qmmm_only": bool(m.get("qmmm_only")),
             "group": m.get("group", ""), "available": not reason, "reason": reason}
 
 
@@ -777,6 +827,13 @@ def _build_expand(ctx: JobContext, p: ExpandParams) -> list[str]:
         argv[out:out] = ["--generator", "crest-msreact", "--generator-option", f"mode={p.msreact_mode}",
                          "--generator-option", f"nbonds={p.msreact_nbonds}",
                          "--generator-option", f"nshifts={p.msreact_nshifts}"]
+    elif p.generator == "nanoreactor":
+        out = argv.index("--output")
+        argv[out:out] = ["--generator", "nanoreactor", "--generator-option", f"temperature={p.reactor_temperature:g}",
+                         "--generator-option", f"time_ps={p.reactor_time_ps:g}",
+                         "--generator-option", f"compress={p.reactor_compress:g}"]
+        if p.reactor_embedded:
+            argv[out:out] = ["--generator-option", "embedded=true"]
     return argv
 
 
@@ -1329,6 +1386,125 @@ EXPLORE = "Explore around a structure"
 SET = "Across a set of structures"
 FROM_TS = "Past the transition state"
 
+# ------------------------------------------------------------------ QM/MM
+
+QMMM = "QM/MM"
+# Operations that run on a QM/MM system (the rest need whole molecules:
+# atom mappings, conformers, SMILES, implicit solvent...).
+QMMM_OPS = {"ts", "optimize", "tsopt", "hessian-sample", "graph-enumeration", "network-splits", "qmmm-inspect",
+            "qmmm-embed"}
+# Operations that take a mix of QM/MM and gas-phase structures (their own rules).
+QMMM_MIXED_OPS = {"qmmm-embed"}
+
+ShellSolvent = Literal["water", "methanol", "ethanol", "acetonitrile", "dmso", "acetone", "thf",
+                       "dichloromethane", "chloroform", "benzene", "hexane"]
+
+
+class QmmmBuildParams(Params):
+    solvent: ShellSolvent = P("water", "Solvent", "Explicit solvent molecules around the molecule.",
+                              cli="--solvent")
+    shell: float = P(6.0, "Shell thickness (Å)", "How far the solvent reaches beyond the molecule.",
+                     cli="--shell", gt=1.0, le=20.0)
+    active_radius: float = P(5.0, "Moving shell (Å)", "Solvent within this distance of the molecule moves in "
+                             "optimizations; the rest is frozen.", cli="--active-radius", ge=0.0, le=20.0)
+    mm: Literal["gfnff", "tip3p", "gfn2", "gfn1"] = P(
+        "gfnff", "Environment level", "How the solvent is described. TIP3P water: fixed charges that the QM "
+        "calculation feels (electrostatic embedding: needed when charges separate, e.g. ions forming); it needs "
+        "a QM level that takes point charges (Psi4, in Settings). The others: mechanical embedding, any QM level.",
+        cli="--mm", labels={"gfnff": "GFN-FF force field", "tip3p": "TIP3P water, electrostatic embedding",
+                            "gfn2": "GFN2-xTB", "gfn1": "GFN1-xTB"})
+    relax: bool = P(True, "Relax the solvent", "GFN-FF minimization of the solvent around the fixed molecule.",
+                    cli="--relax", kind="toggle", advanced=True, group="Advanced")
+    seed: int = P(0, "Random seed", cli="--seed", advanced=True, group="Advanced")
+
+
+def _build_qmmm_build(ctx: JobContext, p: QmmmBuildParams) -> list[str]:
+    (rec,) = ctx.structures
+    if rec.get("qmmm"):
+        raise WorkspaceError(f"{rec['name']} is already a QM/MM system")
+    if is_ts(rec):
+        raise WorkspaceError("embed a minimum (a TS is better found again inside the solvent)")
+    xyz = ctx.snapshot_structure(rec, "solute")
+    return ["qmmm", "build", str(xyz), "--charge", str(rec["charge"]), "--multiplicity", str(rec["multiplicity"]),
+            *generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+class QmmmReactionParams(QmmmBuildParams):
+    use_ts: bool = P(True, "Bring the TS along", "If a TS between these two is known (an IRC-verified one from a "
+                     "TS search), put it into the solvent too and re-optimize it there, with its IRC: the most "
+                     "reliable way to the solvated reaction's TS.", kind="custom")
+
+
+def _build_qmmm_reaction(ctx: JobContext, p: QmmmReactionParams) -> list[str]:
+    a, b = ctx.structures
+    for r in (a, b):
+        if r.get("qmmm"):
+            raise WorkspaceError(f"{r['name']} is already in a QM/MM system: select two gas-phase structures")
+    if a["natoms"] != b["natoms"] or a["charge"] != b["charge"] or a["multiplicity"] != b["multiplicity"]:
+        raise WorkspaceError("the two ends must have the same atoms, charge and spin")
+    argv = ["qmmm", "reaction", "--start", str(ctx.snapshot_structure(a, "start")),
+            "--end", str(ctx.snapshot_structure(b, "end")),
+            "--charge", str(a["charge"]), "--multiplicity", str(a["multiplicity"])]
+    if p.use_ts:
+        found = edge_route_ts(ctx.ws, ctx.jobs, [a["id"], b["id"]], ctx.edge_ids)
+        if found is not None:
+            ts = ctx.job_dir / "inputs" / "ts.xyz"
+            ts.write_text(found[2])
+            argv += ["--ts", str(ts)]
+    return argv + [*generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+class QmmmEmbedParams(Params):
+    pass
+
+
+def _qmmm_embed_pair(ctx: JobContext) -> tuple[dict, dict]:
+    sys_recs = [r for r in ctx.structures if r.get("qmmm")]
+    gas = [r for r in ctx.structures if not r.get("qmmm")]
+    if len(sys_recs) != 1 or len(gas) != 1:
+        raise WorkspaceError("select one structure of a QM/MM system and one gas-phase structure of its solute")
+    return sys_recs[0], gas[0]
+
+
+def _build_qmmm_embed(ctx: JobContext, p: QmmmEmbedParams) -> list[str]:
+    host, gas = _qmmm_embed_pair(ctx)
+    region = ctx.ws.qmmm_region(host["qmmm"])
+    solute = region.solute
+    if gas["natoms"] != len(solute):
+        raise WorkspaceError(f"{gas['name']} has {gas['natoms']} atoms, the solute of this QM/MM system {len(solute)}")
+    inputs = ctx.job_dir / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ctx.ws.qmmm_region_path(host["qmmm"]), inputs / "qmmm_region.json")
+    return ["qmmm", "embed", str(ctx.snapshot_structure(gas, "solute")), "--region", str(inputs / "qmmm_region.json"),
+            "--into", str(ctx.snapshot_structure(host, "system")), "--output", str(ctx.output_dir)]
+
+
+class QmmmInspectParams(Params):
+    entry: str = P("", "Result entry", "Which path of the result (its id).", kind="custom")
+
+
+def _build_qmmm_inspect(ctx: JobContext, p: QmmmInspectParams) -> list[str]:
+    src = ctx.source
+    if src is None or not src.get("qmmm"):
+        raise WorkspaceError("the energy split is for QM/MM jobs")
+    fp = ctx.ws.jobs_dir / src["id"] / "result.json"
+    try:
+        result = json.loads(fp.read_text())
+    except (OSError, ValueError):
+        raise WorkspaceError("open the job's result first (it is read once, then cached)") from None
+    entry = next((e for g in result.get("groups", []) for e in g["entries"] if e["id"] == p.entry), None)
+    if entry is None:
+        raise WorkspaceError(f"no result entry {p.entry!r}")
+    frames = ctx.job_dir / "inputs" / "frames.xyz"
+    frames.parent.mkdir(parents=True, exist_ok=True)
+    frames.write_text("".join(f["xyz"] if f["xyz"].endswith("\n") else f["xyz"] + "\n" for f in entry["frames"]))
+    flags = ctx.common_flags()
+    inputs = flags[flags.index("--inputs") + 1]
+    ctx.output_dir.mkdir(parents=True, exist_ok=True)
+    return ["qmmm", "inspect", str(Path(inputs).parent / "qmmm_region.json"), str(frames), "--inputs", inputs,
+            "--output", str(ctx.output_dir / "report.json")]
+
+
 OPERATIONS: dict[str, Operation] = {op.key: op for op in [
     Operation(
         "ts", "Transition state", "Find the minimum-energy path and its transition state(s) between "
@@ -1424,7 +1600,11 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
              "summary": "CREST's fragment generator (msreact): biased GFN2-xTB optimizations find the fragments and "
                         "isomers the molecule can reach, e.g. likely precursors (read backwards) or nearby products. "
                         "They are re-optimized at your level of theory and grown like any other species. One molecule at a "
-                        "time: a cluster of several gets no products."})),
+                        "time: a cluster of several gets no products."},
+            {"label": "Nanoreactor", "rank": -1, "fixed": {"generator": "nanoreactor"}, "qmmm_only": True,
+             "summary": "Hot molecular dynamics of the QM region (capped with its link hydrogens) in a periodically "
+                        "squeezing wall: its state after each reaction event is put back into the environment, "
+                        "optimized embedded and grown like any other species."})),
     Operation(
         "retrosynthesis", "Retrosynthesis", "Routes from purchasable building blocks to this molecule: a "
         "tree search over single steps proposed by the chosen method; each route's steps join Explore as "
@@ -1506,6 +1686,35 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         source_ops=("ts", "tsopt", "design-tsopt", "channels"), cli_path=("substituents",),
         cli_extra_flags=("--group", "--site", "--charge", "--multiplicity", "--inputs", "--output"),
         own_output=True, produces=["barrier shift per site and group", "substituted TSs"]),
+    Operation(
+        "qmmm-build", "Put in explicit solvent (QM/MM)", "Surround this molecule with explicit solvent: the "
+        "molecule is computed at the profile's level (QM), the solvent with a force field (MM). A new QM/MM "
+        "system; every calculation on it then runs embedded. (`mepd qmmm build`)",
+        "structure", QMMM, QmmmBuildParams, _build_qmmm_build, min_structures=1,
+        produces=["a QM/MM system (molecule in solvent)"], cli_path=("qmmm", "build"),
+        cli_extra_flags=("--charge", "--multiplicity", "--output")),
+    Operation(
+        "qmmm-inspect", "QM/MM energy split", "Split each frame's energy into the QM region and its environment. "
+        "(`mepd qmmm inspect`)",
+        "job", QMMM, QmmmInspectParams, _build_qmmm_inspect, own_output=True,
+        source_ops=("ts", "optimize", "tsopt", "hessian-sample", "graph-enumeration", "network-splits"),
+        cli_path=("qmmm", "inspect"), cli_extra_flags=("--inputs", "--output")),
+    Operation(
+        "qmmm-reaction", "Model in solvent (QM/MM)", "Take this gas-phase reaction into explicit solvent: the start "
+        "is surrounded by solvent, the end (and the known TS) are put into that same solvent shell, all minimized "
+        "embedded (the TS re-optimized there, with its IRC). A QM/MM edge, ready for a TS search. "
+        "(`mepd qmmm reaction`)",
+        "pair", QMMM, QmmmReactionParams, _build_qmmm_reaction, min_structures=2,
+        produces=["the reaction in solvent: both ends and its TS as QM/MM structures"],
+        cli_path=("qmmm", "reaction"), cli_extra_flags=("--start", "--end", "--ts", "--charge", "--multiplicity",
+                                                        "--output")),
+    Operation(
+        "qmmm-embed", "Put into this QM/MM system", "Put the gas-phase structure (a product, a TS: the same atoms "
+        "as this system's solute) into the selected QM/MM structure's solvent, in place of its solute, then minimize "
+        "it embedded (a TS is re-optimized as a TS). (`mepd qmmm embed`)",
+        "set", QMMM, QmmmEmbedParams, _build_qmmm_embed, min_structures=2,
+        produces=["the structure in the QM/MM system"], cli_path=("qmmm", "embed"),
+        cli_extra_flags=("--region", "--into", "--output")),
 ]}
 
 

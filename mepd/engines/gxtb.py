@@ -113,7 +113,9 @@ class _GXTBASEResultsCalculator(Calculator):
             charge=charge,
             multiplicity=multiplicity,
         )
-        node = StructureNode(structure=structure)
+        # Energies only: no molecular graph (perceiving one every ASE step is
+        # wasted time, and slow for a large QM/MM system).
+        node = StructureNode(structure=structure, has_molecular_graph=False)
 
         energy_hartree = float(self.engine.compute_energies([node])[0])
         gradient_hartree_bohr = np.asarray(

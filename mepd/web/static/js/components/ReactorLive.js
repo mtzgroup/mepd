@@ -468,7 +468,7 @@ export function ReactorLive({ job }) {
           <div class="rx-head" ref=${headEl}></div>
         </div>
       </div>
-      ${!running && !job.external && !job.params?.trajectory && html`<${RunLonger} job=${job} />`}
+      ${!running && !job.external && job.op !== 'graph-enumeration' && !job.params?.trajectory && html`<${RunLonger} job=${job} />`}
     </div>
     <aside class="rx-events">
       <div class="section-title">Reaction events · ${shown.length}${d.final ? '' : ' so far'}</div>

@@ -11,6 +11,8 @@ live view, and path searches between the species found.
                   see network_expansion.enumerate_bond_changes and REFERENCES
     crest-msreact CREST's msreact fragment generator (fragments and isomers
                   from biased GFN2-xTB optimizations); see crest_msreact
+    nanoreactor   hot piston MD of the structure: its state after each
+                  reaction event; see nanoreactor_generator
 
 Anything else plugs in by import path ("package.module:function", returning
 product Structures in the same atom order); see network_expansion.
@@ -27,6 +29,8 @@ import importlib.util
 import shutil
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
+
+from mepd.discovery.nanoreactor_generator import OPTIONS as _REACTOR_OPTIONS
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,18 @@ def _crest_msreact(structure, *, max_products, options):
     return msreact_products(structure, max_products=max_products, **options)
 
 
+def _nanoreactor(structure, *, max_products, options):
+    from mepd.discovery.nanoreactor_generator import OPTIONS, reactor_products
+
+    if "embedded" in options or "environment_temperature" in options:
+        raise ValueError("nanoreactor embedded=true (MD with QM/MM forces) runs only on a QM/MM system "
+                         "(a profile with a [qmmm] table).")
+    unknown = set(options) - set(OPTIONS)
+    if unknown:
+        raise ValueError(f"nanoreactor options are {', '.join(sorted(OPTIONS))} (got {', '.join(sorted(unknown))}).")
+    return reactor_products(structure, max_products=max_products, **options)
+
+
 GENERATORS: dict[str, Generator] = {
     "bond-rules": Generator(
         "bond-rules", "Bond rules (mepd)",
@@ -93,6 +109,18 @@ GENERATORS: dict[str, Generator] = {
             "cite": ["P. Pracht, S. Grimme, C. Bannwarth, F. Bohle, S. Ehlert, G. Feldmann, J. Gorges, M. Müller, "
                      "T. Neudecker, C. Plett, S. Spicher, P. Steinbach, P. A. Wesołowski, F. Zeller, J. Chem. Phys. "
                      "160, 114110 (2024), doi:10.1063/5.0197592"]}}),
+    "nanoreactor": Generator(
+        "nanoreactor", "Nanoreactor MD (hot, squeezed)",
+        "Hot molecular dynamics of the structure inside a periodically contracting wall; the structure right "
+        "after each reaction event is a product. Finds what the structure does on its own when pushed hard.",
+        _nanoreactor, kind="structures",
+        install="conda install -c conda-forge xtb (or set GXTB_EXECUTABLE)",
+        options={k: v for k, v in _REACTOR_OPTIONS.items() if k != "workdir"},
+        references={"nanoreactor": {
+            "method": "piston-compressed high-temperature MD (mepd's reimplementation of the ab initio nanoreactor; "
+                      "no code from it is used), with xtb's MD and wall",
+            "cite": ["L.-P. Wang, A. Titov, R. McGibbon, F. Liu, V. S. Pande, T. J. Martinez, Nat. Chem. 6, 1044-1048 "
+                     "(2014), doi:10.1038/nchem.2099"]}}),
 }
 
 
