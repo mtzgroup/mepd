@@ -1862,7 +1862,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         for k in picks:
             f = frames[k]
             (s,) = chem.structures_from_xyz_text(f["xyz"], job.get("charge"), job.get("multiplicity"))
-            smiles = chem.perceive_smiles(s)
+            smiles = W().perceive(s)   # a QM/MM system's: its QM region (the whole system took ~10 s)
             ts_frame = (k == entry["ts_index"] and len(frames) > 1) or \
                 (len(frames) == 1 and group["kind"] in ("ts", "ts_other", "channel", "alternate", "offtarget"))
             existing = _find_duplicate(W(), smiles, f["energy_hartree"], job.get("level"), jid) if ts_frame else None
@@ -2309,7 +2309,7 @@ def attach_conformers(ws: Workspace, job: dict, result: dict) -> int:
             frame = entry["frames"][0]
             (s,) = chem.structures_from_xyz_text(frame["xyz"], job.get("charge"), job.get("multiplicity"))
             rec = ws.structure(sid)
-            smiles = chem.perceive_smiles(s)
+            smiles = ws.perceive(s)
             if smiles and rec.get("smiles") and chem.canonical_key(smiles) != chem.canonical_key(rec["smiles"]):
                 continue   # minimized into a different molecule: not a conformer of this one
             energy = frame.get("energy_hartree") if minimized else None
@@ -2414,7 +2414,7 @@ def _attach_path_conformers(ws: Workspace, job: dict, result: dict) -> int:
                 if not frames or frames[k].get("energy_hartree") is None:
                     continue
                 (s,) = chem.structures_from_xyz_text(frames[k]["xyz"], job.get("charge"), job.get("multiplicity"))
-                smiles = chem.perceive_smiles(s)
+                smiles = ws.perceive(s)
                 owner = next((sid for sid, key in keys.items() if smiles and chem.canonical_key(smiles) == key), None)
                 if owner is None:
                     continue   # an intermediate: a different molecule

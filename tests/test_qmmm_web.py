@@ -316,3 +316,29 @@ def test_demo_visitors_get_qmmm_within_limits(tmp_path):
         assert r.status_code == 400 and "QM atoms" in r.json()["detail"]
         r = c.post("/api/qmmm/systems", json={"terachem": "/etc/hosts"})
         assert r.status_code == 403
+
+
+def test_adding_a_qmmm_result_to_explore_reads_only_its_qm_region(client, tmp_path, monkeypatch):
+    """A QM/MM result's frames into Explore: the SMILES (what the node is)
+    comes from the capped QM region. Perceiving the whole solvated system
+    took ~10 s per frame on 574 atoms, and said nothing more."""
+    from qcdata import Structure
+
+    from mepd.web import chem
+    from test_web import _write_chain  # noqa: E402  (tests/ is on sys.path)
+
+    _upload(client)
+    s = Structure.from_xyz(SYSTEM)
+    out = tmp_path / "tsopt"
+    out.mkdir()
+    _write_chain(out / "ts.xyz", [SYSTEM], [-10.0])
+    _write_chain(out / "irc.xyz", [SYSTEM, SYSTEM, SYSTEM], [-10.1, -10.0, -10.08])
+    job = client.post("/api/jobs/import", json={"path": str(out), "op": "tsopt"}).json()
+    entry = next(e for g in client.get(f"/api/jobs/{job['id']}/result").json()["groups"] for e in g["entries"]
+                 if e["id"].endswith("irc"))
+    seen = []
+    real = chem.perceive_smiles
+    monkeypatch.setattr(chem, "perceive_smiles", lambda st: seen.append(len(st.symbols)) or real(st))
+    r = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": entry["id"], "frames": "endpoints"})
+    assert r.status_code == 200, r.text
+    assert seen and max(seen) < len(s.symbols)          # the QM region (+ link H), never all 15 atoms

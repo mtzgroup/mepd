@@ -336,7 +336,8 @@ class Workspace:
             # A QM/MM system: one node per state of its QM region (never
             # split into molecules); named by the capped QM region.
             smiles = self.perceive(structure)
-        smiles = smiles or chem.perceive_smiles(structure)
+        elif not smiles:
+            smiles = chem.perceive_smiles(structure)
         members = None
         # Several molecules by its bonds *and* by its SMILES: a hot MD snapshot
         # can stretch one bond past the bond cutoff of _fragments while it is

@@ -869,7 +869,7 @@ class JobManager:
                 if parent not in known:
                     continue    # its parent was deleted
                 (s,) = chem.structures_from_xyz_text(ev["xyz"], job.get("charge"), job.get("multiplicity"))
-                smiles = chem.perceive_smiles(s) or ev.get("smiles") or None
+                smiles = self.ws.perceive(s) or ev.get("smiles") or None
                 validation = ev.get("validation")
                 # A molecule already in the graph gets this geometry as one
                 # more conformer rather than a second node.
