@@ -627,7 +627,7 @@ export function DesignView() {
         <aside class="design-side">
           <input class="title-input" value=${design.name || ''} placeholder="Name"
             onChange=${(e) => attempt(() => api.put('/api/design', { name: e.target.value }))} />
-          ${design.smiles && html`<div class="smiles">${design.smiles}${rx ? html` >> ${rx.product.smiles}` : ''}</div>`}
+          ${design.smiles && html`<div class="smiles" title=${`${design.smiles}${rx ? ` >> ${rx.product.smiles}` : ''}`}>${design.smiles}${rx ? html` >> ${rx.product.smiles}` : ''}</div>`}
           ${rx && html`<div class="rxn-box small">
             ${!rx.balanced && html`<p class="warn-box small">The two sides no longer have the same atoms (an edit was made on one side only).
               Make them match (or undo) before searching.</p>`}

@@ -774,7 +774,7 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .design-start { display: grid; gap: 14px; }
 .design-start .row { display: flex; gap: 8px; align-items: center; }
 .design-start .row input, .design-start .row select { flex: 1; min-width: 0; }
-.design-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 190px minmax(0, 1fr) 300px; gap: 12px; padding: 0 16px 16px; }
+.design-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px minmax(0, 1fr) 300px; gap: 12px; padding: 0 16px 16px; }
 .design-tools { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
 .design-tools .tool { text-align: left; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
   font: inherit; cursor: pointer; color: var(--text); }
@@ -793,10 +793,16 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .design-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 10px; border-top: 1px solid var(--border);
   background: var(--panel); }
 .design-side { overflow-y: auto; min-width: 0; }
-.design-side .smiles { overflow-wrap: anywhere; }
+.design-side .smiles { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }   /* a long reaction SMILES: two lines, the whole on hover */
 .design-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
 .row-actions { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
-@media (max-width: 1100px) { .design-body { grid-template-columns: 160px minmax(0, 1fr); } .design-side { grid-column: 1 / -1; } }
+/* Narrower: the side panel goes below, the viewers keep their height and the page scrolls to it
+   (the viewers had shrunk to ~160 px, a wide rule after this one overriding the columns). */
+@media (max-width: 1100px) {
+  .design-body { grid-template-columns: 160px minmax(0, 1fr); grid-template-rows: minmax(440px, 1fr) auto; overflow-y: auto; }
+  .design-side { grid-column: 1 / -1; overflow-y: visible; }
+}
 @media (max-width: 720px) {
   .design-body { display: flex; flex-direction: column; padding: 0 16px 16px; }
   .design-tools { flex-direction: row; flex-wrap: wrap; }
@@ -818,7 +824,6 @@ button.monitor { text-align: left; font: inherit; cursor: pointer; }
 .ptable .pt { padding: 2px 0; font-size: 9.5px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel);
   color: var(--text); cursor: pointer; min-width: 0; }
 .ptable .pt.on { border-color: var(--accent); background: var(--accent-soft); }
-.design-body { grid-template-columns: 260px minmax(0, 1fr) 300px; }
 
 /* ---- Channels path map ---- */
 .cmap-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 6px; }

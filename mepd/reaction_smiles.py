@@ -207,7 +207,46 @@ def _match(r, p, strict: bool = True) -> tuple[list[int], float]:
     return order, rmsd
 
 
-def _in_reactant_frame(r, p) -> bool:
+def _stereo_centres(mol) -> dict:
+    """{atom index: 'R'/'S'} of the stereocentres `mol` specifies."""
+    Chem = _chem()
+    return {i: str(lab) for i, lab in Chem.FindMolChiralCenters(mol, includeUnassigned=False,
+                                                                 useLegacyImplementation=False)}
+
+
+def _stereo_of(p, xyz) -> dict:
+    """The stereocentres `p` would have in geometry `xyz`."""
+    Chem = _chem()
+    t = Chem.Mol(p)
+    conf = t.GetConformer()
+    for i, x in enumerate(xyz):
+        conf.SetAtomPosition(i, [float(v) for v in x])
+    Chem.AssignStereochemistryFrom3D(t)
+    return _stereo_centres(t)
+
+
+def _invert_centres(p, xyz, wrong) -> "np.ndarray | None":
+    """`xyz` with each centre in `wrong` inverted like an umbrella: the
+    centre and its hydrogen reflected through the plane of its other three
+    neighbours, which stay put (None if a centre has no hydrogen)."""
+    import numpy as np
+
+    x = np.array(xyz, dtype=float)
+    for i in wrong:
+        atom = p.GetAtomWithIdx(i)
+        hs = [n.GetIdx() for n in atom.GetNeighbors() if n.GetAtomicNum() == 1]
+        others = [n.GetIdx() for n in atom.GetNeighbors() if n.GetIdx() not in hs[:1]]
+        if not hs or len(others) != 3:
+            return None
+        a, b, c = x[others]
+        n = np.cross(b - a, c - a)
+        n /= np.linalg.norm(n) or 1.0
+        for k in (i, hs[0]):
+            x[k] = x[k] - 2 * np.dot(x[k] - a, n) * n
+    return x
+
+
+def _in_reactant_frame(r, p) -> tuple[bool, str]:
     """Rebuild the product's geometry (atoms already in the reactant's
     order) from the reactant's: each atom starts where it is in the
     reactant, the product's bonds are pulled to length
@@ -215,34 +254,55 @@ def _in_reactant_frame(r, p) -> bool:
     With several molecules on a side, two independently packed sides put the
     molecules in unrelated places: a path between them drags whole molecules
     through each other (interpolations that look atomized), however good the
-    atom mapping. True if the rebuilt product has exactly its own bonds."""
+    atom mapping. Returns (whether the rebuilt product has exactly its own
+    bonds and stereocentres, why not)."""
     from rdkit.Chem import AllChem
 
     from mepd.discovery.network_expansion import _perceived_edges, embed_product
 
     symbols = [a.GetSymbol() for a in r.GetAtoms()]
     want = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in p.GetBonds()}
+    stereo = _stereo_centres(p)
+
+    def bonds_ok(x) -> bool:
+        return {tuple(sorted(e)) for e in _perceived_edges(symbols, x)} == want
+
     try:
         xyz = embed_product(symbols, r.GetConformer().GetPositions(), want)
     except Exception:
-        return False
+        return False, "embedding failed"
+    # Pulling bonds to length does not keep handedness: a stereocentre that
+    # forms (e.g. an aldol's new C-OH) can come out inverted. Flip it back
+    # (its H through the other three neighbours' plane) and re-embed.
+    wrong = [i for i, lab in stereo.items() if _stereo_of(p, xyz).get(i) != lab]
+    if wrong:
+        flipped = _invert_centres(p, xyz, wrong)
+        if flipped is not None:
+            xyz = embed_product(symbols, flipped, want)
+        if _stereo_of(p, xyz) != stereo:
+            return False, "its stereocentres came out inverted"
+    if not bonds_ok(xyz):
+        return False, "its bonds changed"
     trial = _chem().Mol(p)
     conf = trial.GetConformer()
     for i, x in enumerate(xyz):
         conf.SetAtomPosition(i, [float(v) for v in x])
+    relaxed = _chem().Mol(trial)
     try:
-        if AllChem.MMFFHasAllMoleculeParams(trial):
-            AllChem.MMFFOptimizeMolecule(trial, maxIters=200)
+        if AllChem.MMFFHasAllMoleculeParams(relaxed):
+            AllChem.MMFFOptimizeMolecule(relaxed, maxIters=200)
         else:
-            AllChem.UFFOptimizeMolecule(trial, maxIters=200)
+            AllChem.UFFOptimizeMolecule(relaxed, maxIters=200)
     except Exception:
         pass
-    got = {tuple(sorted(e)) for e in _perceived_edges(symbols, trial.GetConformer().GetPositions())}
-    if got != want:
-        return False
+    # The force field can wreck a strained start (atoms pushed onto each
+    # other): then the embedded geometry, whose bonds and handedness are right.
+    rx = relaxed.GetConformer().GetPositions()
+    if bonds_ok(rx) and _stereo_of(p, rx) == stereo:
+        trial = relaxed
     p.RemoveAllConformers()
     p.AddConformer(trial.GetConformer(), assignId=True)
-    return True
+    return True, ""
 
 
 def _reordered(mol, order: list[int]):
@@ -299,11 +359,12 @@ def reaction_pair(text: str, seed: int = 11) -> ReactionPair:
     rmsd, r, p, rxn = best
     Chem = _chem()
     if len(Chem.GetMolFrags(r)) > 1 or len(Chem.GetMolFrags(p)) > 1:
-        if _in_reactant_frame(r, p):
+        ok, why = _in_reactant_frame(r, p)
+        if ok:
             rmsd = _rmsd(p.GetConformer().GetPositions(), r.GetConformer().GetPositions())
         else:
-            notes.append("The product could not be rebuilt in the reactants' arrangement; its molecules are placed "
-                         "independently, so a path search must also move them into place.")
+            notes.append(f"The product could not be rebuilt in the reactants' arrangement ({why}); its molecules "
+                         "are placed independently, so a path search must also move them into place.")
     if Chem.GetFormalCharge(r) != Chem.GetFormalCharge(p):
         raise ReactionSmilesError(f"the two sides have different charges ({Chem.GetFormalCharge(r):+d} and "
                                   f"{Chem.GetFormalCharge(p):+d})")

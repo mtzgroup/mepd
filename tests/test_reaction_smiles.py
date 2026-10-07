@@ -156,3 +156,19 @@ def test_several_molecules_keep_their_places_across_the_reaction():
     assert np.linalg.norm(X[n] - Y[n], axis=1).max() < 1.0          # the ammonia spectator barely moves
     assert np.linalg.norm(X - Y, axis=1).max() < 4.0                  # and no atom travels across the system
     assert not pr.notes
+
+
+def test_a_new_stereocentre_keeps_its_handedness_in_the_rebuilt_product():
+    """Proline-catalysed aldol: the product is rebuilt in the reactants'
+    arrangement, and its new C-OH centre must come out as the SMILES says
+    (pulling bonds to length had inverted it, and the product was then
+    placed on its own, far from the reactants)."""
+    pytest.importorskip("slapmapper")
+    from mepd.reaction_smiles import _stereo_centres, _stereo_of, reaction_pair
+
+    pair = reaction_pair("CC(C)=O.O=Cc1ccc(cc1)[N+](=O)[O-].OC(=O)[C@@H]1CCCN1"
+                         ">>CC(=O)C[C@@H](O)c1ccc(cc1)[N+](=O)[O-].OC(=O)[C@@H]1CCCN1")
+    assert not any("could not be rebuilt" in n for n in pair.notes)
+    p = pair.product
+    assert len(_stereo_centres(p)) == 2
+    assert _stereo_of(p, p.GetConformer().GetPositions()) == _stereo_centres(p)
