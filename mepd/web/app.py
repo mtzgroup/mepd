@@ -530,6 +530,23 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def visitor_of(request: Request) -> Optional[str]:
         return getattr(request.state, "visitor", None)
 
+    def builtin_profiles() -> list[str]:
+        """The demo admin's profiles: every visitor gets them, read-only."""
+        return sorted(fp.stem for fp in (Path(workspace_root) / "profiles").glob("*.toml"))
+
+    def check_visitor_profile(name: str, text: Optional[str] = None) -> None:
+        """A demo visitor may change only their own profiles, within the demo's limits."""
+        if demo is None:
+            return
+        if name in builtin_profiles():
+            raise HTTPException(403, f"{name} is a built-in profile: use Save as… to make your own copy")
+        if text is not None:
+            demo.check_profile(text)
+            own = set(W().profile_names()) - set(builtin_profiles())
+            if name not in own and len(own) >= demo.max_profiles:
+                raise WorkspaceError(f"the demo keeps at most {demo.max_profiles} profiles of your own; "
+                                     "delete one first")
+
     def deny_in_demo(what: str) -> None:
         if demo is not None:
             raise HTTPException(403, f"{what} is not available in the demo")
@@ -639,7 +656,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             "path_summaries": W().path_summaries(),
             "max_concurrent": J().max_concurrent,
             "auth": bool(auth_token) or demo is not None,
-            "demo": demo.public() if demo is not None else None,
+            "demo": {**demo.public(), "builtin_profiles": builtin_profiles()} if demo is not None else None,
             "cpus": os.cpu_count(),
             "solvents": _solvent_list(),
         }
@@ -1452,14 +1469,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
     @app.put("/api/profiles/{name}")
     def put_profile(name: str, body: ProfileIn):
-        deny_in_demo("Editing compute profiles")
+        check_visitor_profile(name, body.text)
         W().write_profile(name, body.text)
         bus.publish("profiles", W().profile_names(), key=str(W().root))
         return {"ok": True}
 
     @app.delete("/api/profiles/{name}")
     def delete_profile(name: str):
-        deny_in_demo("Deleting compute profiles")
+        check_visitor_profile(name)
         W().delete_profile(name)
         bus.publish("profiles", W().profile_names(), key=str(W().root))
         return {"ok": True}
@@ -1475,14 +1492,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     @app.post("/api/profiles/form/apply")
     def profile_form_apply(body: ProfileFormIn):
         """Change one form setting; returns the new TOML (not saved) and form."""
-        deny_in_demo("Editing compute profiles")
         from mepd.web import profile_form
 
         return profile_form.apply(body.text, body.path, body.value)
 
     @app.post("/api/profiles/validate")
     async def validate_profile(body: ProfileIn):
-        deny_in_demo("Validating custom profiles")
+        if demo is not None:
+            try:
+                demo.check_profile(body.text)
+            except WorkspaceError as exc:
+                return {"ok": False, "message": str(exc)}
         return await run_in_threadpool(validate_profile_text, body.text)
 
     # ------------------------------------------------------------- jobs

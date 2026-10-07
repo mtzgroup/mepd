@@ -177,6 +177,66 @@ class DemoPolicy:
         if big:
             raise WorkspaceError(f"the demo is limited to {self.max_atoms} atoms per structure (got {max(big)})")
 
+    # ------------------------------------------------------------ visitors' own profiles
+    max_profiles: int = 10              # a visitor's own, besides the built-in ones
+    profile_engines: tuple = ("gxtb", "xtb", "mlip")
+    # Never in a visitor's profile: programs, import paths, model files and
+    # other files on the server, credentials, debugging dumps.
+    profile_forbidden_keys: tuple = (
+        "executable", "checkpoint", "calculator", "calculator_kwds", "family", "model_path", "mlp_checkpoint",
+        "file", "input_files", "prmtop", "pdb", "tcin", "debug_dump_dir", "debug_dump_inputs", "chemcloud_queue",
+        "hf_token", "model_cache_dir", "model_repo", "keep_workdirs", "collect_files", "qmmm")
+    # Parallelism and size: no more than a visitor's share of the machine.
+    profile_caps: dict = field(default_factory=lambda: {
+        "n_parallel": 2, "n_threads": 2, "node_threads": 2, "threads": 2, "workers": 2, "batch_size": 16,
+        "nimages": 30, "nnodes": 30, "adaptive_max_images": 40, "min_images": 30})
+
+    def check_profile(self, text: str) -> None:
+        """A visitor's profile may use only the demo's engines and named
+        models, no file or program on the server, and capped parallelism."""
+        import tomllib
+
+        from mepd.engines.mlip import MODELS
+        from mepd.inputs import _normalized_path_method
+
+        try:
+            data = tomllib.loads(text or "")
+        except tomllib.TOMLDecodeError as exc:
+            raise WorkspaceError(f"not valid TOML: {exc}") from None
+
+        def walk(node, where=""):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    here = f"{where}.{key}" if where else key
+                    if key in self.profile_forbidden_keys:
+                        raise WorkspaceError(f"{here} is not available in the demo")
+                    cap = self.profile_caps.get(key)
+                    if cap is not None and isinstance(value, (int, float)) and not isinstance(value, bool) \
+                            and (value > cap or value <= 0):
+                        raise WorkspaceError(f"{here} = {value} is outside the demo's limit (1 to {cap})")
+                    walk(value, here)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value, where)
+            elif isinstance(node, str) and ("/" in node or "\\" in node or node.startswith("~")):
+                raise WorkspaceError(f"{where}: paths on the server are not available in the demo")
+
+        walk(data)
+        engine = str(data.get("engine_name") or "gxtb").lower()
+        if engine not in self.profile_engines:
+            raise WorkspaceError(f"engine {engine!r} is not available in the demo "
+                                 f"(use {', '.join(self.profile_engines)})")
+        if _normalized_path_method(data.get("path_min_method") or "NEB") == "NEB-DLF":
+            raise WorkspaceError("DL-FIND NEB (TeraChem) is not available in the demo")
+        models = [((data.get("mlip_engine_kwds") or {}).get("model"), "mlip_engine_kwds.model")] if engine == "mlip" else []
+        models.append(((data.get("path_min_inputs") or {}).get("mlp_model"), "path_min_inputs.mlp_model"))
+        for name, where in models:
+            if engine == "mlip" and where.startswith("mlip") and not name:
+                raise WorkspaceError("pick a model (mlip_engine_kwds.model)")
+            if name and (name not in MODELS or MODELS[name].gated):
+                open_names = ", ".join(n for n, spec in MODELS.items() if not spec.gated)
+                raise WorkspaceError(f"{where} = {name!r}: the demo runs only these models: {open_names}")
+
     def check_text(self, text: str) -> None:
         if len(text.encode()) > self.max_upload_bytes:
             raise WorkspaceError("input too large for the demo")

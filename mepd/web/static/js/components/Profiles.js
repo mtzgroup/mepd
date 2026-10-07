@@ -6,7 +6,8 @@ import { prefs, set, state, toast, useStore } from '../store.js';
 export function ProfilesView() {
   const profiles = useStore((s) => s.profiles);
   const summaries = useStore((s) => s.pathSummaries);
-  const readOnly = !!useStore((s) => s.demo);
+  // The demo: the built-in profiles are read-only; a visitor's own (Save as…) are theirs to edit.
+  const builtin = useStore((s) => s.demo?.builtin_profiles) || null;
   // Come back to the profile you were editing (not the first in the list).
   const [name, setNameState] = useState(() => {
     const last = prefs.get('profileName', null);
@@ -26,9 +27,11 @@ export function ProfilesView() {
     api.get(`/api/profiles/${encodeURIComponent(name)}`).then((t) => { setText(t); setSaved(t); }).catch(() => {});
   }, [name]);
 
+  const isBuiltin = !!builtin && builtin.includes(name);   // edits go to a copy (Save as…), never back
   const dirty = text !== saved;
   useEffect(() => { setCheck(null); }, [text]);   // a Validate result describes the text it checked
   const save = async () => {
+    if (isBuiltin) { await saveAs(); return false; }   // (the demo's built-ins are kept as they are)
     const ok = await attempt(() => api.put(`/api/profiles/${encodeURIComponent(name)}`, { text }), `Saved ${name}`);
     if (ok) setSaved(text);
     return !!ok;
@@ -76,17 +79,17 @@ export function ProfilesView() {
       </div>
       <div class="profiles-body">
         <ul class="profile-list">
-          ${profiles.map((p) => html`<li class=${p === name ? 'on' : ''} onClick=${() => pick(p)}>${p}</li>`)}
+          ${profiles.map((p) => html`<li class=${p === name ? 'on' : ''} onClick=${() => pick(p)}>${p}${builtin?.includes(p) ? html` <span class="small muted">built-in</span>` : ''}</li>`)}
         </ul>
         ${name ? html`
           <div class="profile-editor">
             <div class="editor-bar">
               <strong class="mono">${name}.toml</strong>${dirty && html` <span class="badge">unsaved</span>`}
               <span class="spacer"></span>
-              ${readOnly ? html`<span class="small muted">read-only in the demo</span>` : html`
+              ${isBuiltin && html`<span class="small muted">built-in: change it, then Save as… to keep your own copy</span>`}
               <button class="btn" onClick=${validate} disabled=${checking} title="Builds RunInputs (engine included) from this text in a scratch process">${checking ? 'Checking…' : 'Validate'}</button>
-              <button class="btn" onClick=${saveAs}>Save as…</button>
-              <button class="btn primary" onClick=${save} disabled=${!dirty}>Save</button>
+              <button class=${`btn${isBuiltin ? ' primary' : ''}`} onClick=${saveAs}>Save as…</button>
+              ${!isBuiltin && html`<button class="btn primary" onClick=${save} disabled=${!dirty}>Save</button>
               <button class="btn danger-outline" onClick=${del} disabled=${profiles.length < 2}
                 title=${profiles.length < 2 ? "The only profile can't be deleted: every calculation needs one (Save as… makes another)" : 'Delete this profile'}>Delete</button>`}
             </div>
@@ -100,8 +103,8 @@ export function ProfilesView() {
               <button class=${mode === 'toml' ? 'on' : ''} onClick=${() => setMode('toml')}>TOML</button>
             </div>
             ${mode === 'form'
-              ? html`<${ProfileForm} key=${name} text=${text} onText=${setText} readOnly=${readOnly} />`
-              : html`<textarea class="toml" spellcheck="false" value=${text} readOnly=${readOnly} onInput=${(e) => setText(e.target.value)}
+              ? html`<${ProfileForm} key=${name} text=${text} onText=${setText} readOnly=${false} />`
+              : html`<textarea class="toml" spellcheck="false" value=${text} onInput=${(e) => setText(e.target.value)}
               onKeyDown=${(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); save(); } }} />`}
           </div>`
         : html`<div class="empty-hint"><p>No profiles yet.</p></div>`}

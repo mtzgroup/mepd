@@ -671,7 +671,21 @@ def test_demo_visitors_are_isolated_and_locked_down(demo_app, tmp_path):
 
             # locked down
             assert alice.put("/api/profiles/default", json={"text": 'engine_name = "x"'}).status_code == 403
-            assert alice.post("/api/profiles/validate", json={"text": ""}).status_code == 403
+            assert alice.delete("/api/profiles/default").status_code == 403          # built-in
+            # Their own profiles: within the demo's engines and limits, private to them.
+            for bad in ('engine_name = "ase"\n', '[gxtb_engine_kwds]\nexecutable = "/bin/sh"\n',
+                        '[gxtb_engine_kwds]\nn_parallel = 32\n'):
+                r = alice.put("/api/profiles/mine", json={"text": bad})
+                assert r.status_code == 400, bad
+                assert alice.post("/api/profiles/validate", json={"text": bad}).json()["ok"] is False
+            ok = 'engine_name = "gxtb"\npath_min_method = "MLPGI"\n[gi_inputs]\nnimages = 12\n'
+            assert alice.put("/api/profiles/mine", json={"text": ok}).status_code == 200
+            st = alice.get("/api/state").json()
+            assert "mine" in st["profiles"] and st["demo"]["builtin_profiles"] == ["default"]
+            assert "mine" not in bob.get("/api/state").json()["profiles"]
+            r = alice.post("/api/profiles/form/apply", json={"text": ok, "path": "path_method", "value": "FNEB"})
+            assert r.status_code == 200 and "FNEB" in r.json()["text"]
+            assert alice.delete("/api/profiles/mine").status_code == 200
             assert alice.post("/api/jobs/import", json={"path": str(tmp_path)}).status_code == 403
             r = alice.post("/api/sessions/open", json={"path": str(tmp_path)})
             assert r.status_code == 400
@@ -1459,3 +1473,26 @@ def test_complex_members_are_always_molecules(tmp_path):
     (tmp_path / "flat" / "workspace.json").write_text(_json.dumps(data))
     st = Workspace(tmp_path / "flat").snapshot()["structures"]
     assert sorted(st[cx["id"]]["members"]) == sorted([w["id"], w["id"], h["id"]])
+
+
+def test_demo_profile_sync_keeps_visitors_own(tmp_path):
+    from types import SimpleNamespace
+
+    from mepd.web.sessions import Sessions
+
+    root = tmp_path / "demo"
+    (root / "profiles").mkdir(parents=True)
+    (root / "profiles" / "default.toml").write_text('engine_name = "gxtb"\n')
+    (root / "profiles" / "gsm.toml").write_text('path_min_method = "GSM"\n')
+    ws = SimpleNamespace(profiles_dir=tmp_path / "visitor" / "profiles")
+    ws.profiles_dir.mkdir(parents=True)
+    (ws.profiles_dir / "default.toml").write_text("old copy\n")
+    (ws.profiles_dir / "retired.toml").write_text("an admin profile since removed\n")
+    sync = Sessions._sync_demo_profiles
+    sync(SimpleNamespace(demo_root=root), ws)        # first sync: what was there was the admin's
+    assert sorted(p.name for p in ws.profiles_dir.glob("*.toml")) == ["default.toml", "gsm.toml"]
+    (ws.profiles_dir / "mine.toml").write_text('engine_name = "xtb"\n')
+    (root / "profiles" / "gsm.toml").unlink()
+    sync(SimpleNamespace(demo_root=root), ws)
+    assert sorted(p.name for p in ws.profiles_dir.glob("*.toml")) == ["default.toml", "mine.toml"]
+    assert (ws.profiles_dir / "default.toml").read_text() == 'engine_name = "gxtb"\n'

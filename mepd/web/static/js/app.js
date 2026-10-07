@@ -116,7 +116,7 @@ function App() {
   const showInspector = (view.tab === 'graph' || view.tab === 'jobs') && !(nothingSelected && howToHidden);
   return html`
     <${TopBar} />
-    ${demo && html`<div class="demo-banner small">${`Demo: this is your private workspace. Limits: ${demo.max_atoms} atoms per structure, ${demo.max_active_jobs} calculations at a time, ${Math.round(demo.job_timeout_s / 60)} min per calculation${demo.op_timeout_s?.vri ? ` (VRI searches ${Math.round(demo.op_timeout_s.vri / 60)} min)` : ''}. Compute profiles are fixed.`}</div>`}
+    ${demo && html`<div class="demo-banner small">${`Demo: this is your private workspace. Limits: ${demo.max_atoms} atoms per structure, ${demo.max_active_jobs} calculations at a time, ${Math.round(demo.job_timeout_s / 60)} min per calculation${demo.op_timeout_s?.vri ? ` (VRI searches ${Math.round(demo.op_timeout_s.vri / 60)} min)` : ''}. Settings: the built-in profiles are fixed; Save as… makes your own (g-xTB, xTB or an open machine-learned potential).`}</div>`}
     <main class=${`layout tab-${view.tab} ${showInspector ? '' : 'no-inspector'}`}>
       <${Library} />
       <section class="center">

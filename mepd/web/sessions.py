@@ -187,14 +187,21 @@ class Sessions:
         return self._visitor_current[visitor]
 
     def _sync_demo_profiles(self, ws: Workspace) -> None:
-        """Visitors get exactly the admin's profiles (read-only for them)."""
+        """Visitors get the admin's profiles as they are now (read-only for
+        them), next to their own. An admin profile since removed goes; the
+        visitor's own (never listed in .builtin) stay."""
         src = self.demo_root / "profiles"
+        manifest = ws.profiles_dir / ".builtin"
         wanted = {fp.name for fp in src.glob("*.toml")}
-        for fp in ws.profiles_dir.glob("*.toml"):
-            if fp.name not in wanted:
-                fp.unlink()
+        if manifest.exists():
+            before = set(manifest.read_text().split())
+        else:   # before visitors had profiles of their own, every one was the admin's
+            before = {fp.name for fp in ws.profiles_dir.glob("*.toml")}
+        for name in before - wanted:
+            (ws.profiles_dir / name).unlink(missing_ok=True)
         for fp in src.glob("*.toml"):
             shutil.copyfile(fp, ws.profiles_dir / fp.name)
+        manifest.write_text("\n".join(sorted(wanted)) + "\n")
 
     # ------------------------------------------------------ concurrency
     def total_running(self) -> int:
