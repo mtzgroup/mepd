@@ -938,13 +938,18 @@ def _optimize_ts_and_irc(
         return TsIrcResult(ts_node=ts_node)
 
     typer.echo(f"Computing IRC ({label})...")
+    # Beside the TS: why its IRC failed, so a result can say so (rather
+    # than "no IRC was run").
+    failed_fp = output / ("irc_failed.txt" if label == "ts" else f"{label}_irc_failed.txt")
     try:
         irc_fn = getattr(engine, "compute_irc_chain", None)
         irc_chain = irc_fn(ts_node) if callable(irc_fn) else compute_irc_chain_with_geometric(engine, ts_node)
     except Exception as exc:
         typer.echo(f"IRC computation failed ({label}; {type(exc).__name__}: {exc}); TS structure was still written.")
+        failed_fp.write_text(f"{type(exc).__name__}: {exc}\n")
         return TsIrcResult(ts_node=ts_node)
 
+    failed_fp.unlink(missing_ok=True)
     irc_path = output / ("irc.xyz" if label == "ts" else f"{label}_irc.xyz")
     irc_chain.write_to_disk(irc_path)
     typer.echo(f"Wrote IRC path to {irc_path}")

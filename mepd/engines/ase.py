@@ -427,16 +427,31 @@ class ASEEngine(Engine):
             tmp = tempfile.NamedTemporaryFile(suffix=".traj", mode="w+", delete=False)
             with self._calculator_in_use() as calc:
                 atoms.calc = calc
-                optimizer = SellaIRC(
-                    atoms=atoms,
-                    logfile=None,
-                    trajectory=tmp.name,
-                    **optimizer_kwds,
-                )
-                try:
-                    optimizer.run(fmax=fmax, steps=steps, direction=direction)
-                except Exception as exc:
-                    raise ElectronicStructureError(msg="ASE IRC computation failed.", obj=exc)
+                # Sella's inner loop can fail to converge on the first steps
+                # off the saddle (seen on every g-xTB IRC tried): it then
+                # stops the whole IRC. keep_going steps on past it, and the
+                # IRC reaches its minima; tried once, from the TS again.
+                tries = [optimizer_kwds]
+                if not optimizer_kwds.get("keep_going"):
+                    tries.append({**optimizer_kwds, "keep_going": True})
+                for k, kwds in enumerate(tries):
+                    if k:
+                        atoms.set_positions(structure_to_ase_atoms(ts_node.structure).get_positions())
+                        Path(tmp.name).write_bytes(b"")
+                    optimizer = SellaIRC(
+                        atoms=atoms,
+                        logfile=None,
+                        trajectory=tmp.name,
+                        **kwds,
+                    )
+                    try:
+                        optimizer.run(fmax=fmax, steps=steps, direction=direction)
+                        break
+                    except Exception as exc:
+                        if k + 1 < len(tries) and type(exc).__name__ == "IRCInnerLoopConvergenceFailure":
+                            continue
+                        raise ElectronicStructureError(msg=f"ASE IRC computation failed ({type(exc).__name__}).",
+                                                       obj=exc)
 
             charge = ts_node.structure.charge
             multiplicity = ts_node.structure.multiplicity

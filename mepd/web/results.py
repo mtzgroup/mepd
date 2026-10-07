@@ -171,6 +171,17 @@ def _ts_dir_items(out: Path, charge: int, multiplicity: int) -> list[tuple]:
     return items
 
 
+def _irc_failure(out: Path, label: str) -> Optional[str]:
+    """Why the IRC of TS `label` failed (the CLI's `<label>_irc_failed.txt`),
+    or None (it ran, was not asked for, or the run predates the marker)."""
+    fp = Path(out) / ("irc_failed.txt" if label == "ts" else f"{label}_irc_failed.txt")
+    try:
+        text = fp.read_text().strip()
+    except OSError:
+        return None
+    return (text.splitlines() or ["unknown error"])[0][:200]
+
+
 def _oriented(irc, start, end):
     """`irc` drawn from `start` to `end` (the job's reactant and product), so
     an IRC reads the same way as the edge it belongs to: flipped when its
@@ -263,19 +274,25 @@ def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[f
     if len(leaves) > 1:
         groups.append(_group("Elementary steps", "path", leaves))
 
-    ts_entries, off_route, irc_entries = [], [], []
-    route = _verify_route(reactant, mep[-1] if mep is not None else None, ts_items, floor)
+    ts_entries, off_route, unknown, irc_entries = [], [], [], []
+    failed = {label: why for label, _, _ in ts_items if (why := _irc_failure(out, label))}
+    route = _verify_route(reactant, mep[-1] if mep is not None else None, ts_items, floor, failed)
     if _extra is not None:
         _extra.update(floor=floor, route=route)
     for info in route["items"]:
         label, ts_node, irc, barrier = info["label"], info["ts"], info["irc"], info["barrier"]
         entry = _entry(label, label, [ts_node], floor, barrier=barrier, note=info["note"])
-        (ts_entries if info["on_route"] else off_route).append(entry)
+        (ts_entries if info["on_route"] else unknown if irc is None else off_route).append(entry)
         if irc is not None:
             irc_entries.append(_entry(f"{label}_irc", f"{label} IRC", irc.nodes, floor, note=info["note"],
                                       barrier=barrier))
     groups.append(_group("Transition states on the start → end route", "ts", ts_entries))
     groups.append(_group("Other saddle points (do not connect start → end)", "ts_other", off_route))
+    # No IRC (it failed, or was not run): what these connect is not known.
+    groups.append(_group("Saddle points without an IRC (what they connect is unknown)", "ts_other", unknown))
+    if failed:
+        warnings.append(f"{len(failed)} IRC(s) failed, so what those TSs connect is unknown; e.g. "
+                        f"{next(iter(failed))}: {next(iter(failed.values()))}")
     groups.append(_group("IRC paths", "irc", irc_entries))
 
     network = _network_group(out / "network.json", floor)
@@ -299,7 +316,7 @@ def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[f
         barrier, source = path_max, "path maximum; not verified by TS/IRC"
         if ts_items:
             warnings.append("No optimized TS has an IRC connecting the start and end of this path, so its barrier "
-                            "is unverified (see 'Other saddle points' for what the TS searches found instead).")
+                            "is unverified (see the saddle points listed for what the TS searches found instead).")
     else:
         barrier, source = None, ""
     n_steps = len(leaves) if leaves else (1 if mep is not None else 0)
@@ -348,7 +365,7 @@ def _route_ts(label: str, ts_node, barrier: Optional[float]) -> dict:
     return {"label": label, "barrier_kcal": _clean(barrier), "xyz": ts_node.structure.to_xyz()}
 
 
-def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
+def _verify_route(start, end, ts_items: list, floor: Optional[float], failed: Optional[dict] = None) -> dict:
     """Which optimized TSs actually lie on a route from `start` to `end`.
 
     Every IRC end and the two path ends are grouped by connectivity. A TS
@@ -358,13 +375,20 @@ def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
     highest TS). Returns {"barrier", "n_steps", "items": [...]} with a note
     per TS saying what it connects."""
     items = []
+    failed = failed or {}
+
+    def no_irc(label: str) -> str:
+        why = failed.get(label)
+        return (f"the IRC failed ({why}), so what this TS connects is unknown" if why
+                else "no IRC was run, so what this TS connects is unknown")
+
     for label, ts_node, irc in ts_items:
         e = _node_energy(ts_node)
         barrier = (e - floor) * HARTREE_TO_KCAL if e is not None and floor is not None else None
         items.append({"label": label, "ts": ts_node, "irc": irc, "barrier": barrier, "on_route": False, "note": ""})
     if start is None or end is None:
         for it in items:
-            it["note"] = _irc_note(it["irc"]) if it["irc"] is not None else "no IRC"
+            it["note"] = _irc_note(it["irc"]) if it["irc"] is not None else no_irc(it["label"])
         return {"barrier": None, "n_steps": 0, "direct": None, "items": items}
 
     nodes = [start, end]
@@ -384,7 +408,7 @@ def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
     k = 2
     for it in items:
         if it["irc"] is None:
-            it["note"] = "no IRC was run, so what this TS connects is unknown"
+            it["note"] = no_irc(it["label"])
             continue
         a, b = classes[k], classes[k + 1]
         k += 2
@@ -497,8 +521,14 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
             irc_entries.append(_entry(f"{label}_irc", f"{label} IRC", irc.nodes, floor, note=_irc_note(irc),
                                       barrier=barrier))
     headline = f"{len(ts_entries)} TS optimized" if ts_entries else "No TS converged"
+    failed = {label: why for label, _, irc in ts_items if irc is None and (why := _irc_failure(out, label))}
     if ts_entries and irc_entries:
         headline += f" · {irc_entries[0]['note']}"
+    elif failed:
+        headline += " · IRC failed"
+    for e in ts_entries:
+        if e["id"] in failed:
+            e["note"] = f"IRC failed ({failed[e['id']]}): what this TS connects is unknown"
     return _result(headline, [_group("Transition states", "ts", ts_entries),
                               _group("IRC paths", "irc", irc_entries)],
                    [{"label": "Barrier reference", "value": "lower IRC end"}],
@@ -1560,7 +1590,9 @@ def collect_cached(job: dict, job_dir: Path) -> dict:
 
 def summarize(result: dict) -> dict:
     """The bit of a result stored on the job record (list views, edge badges)."""
-    counts = {g["kind"]: len(g["entries"]) for g in result.get("groups", [])}
+    counts: dict = {}
+    for g in result.get("groups", []):   # two groups can share a kind (saddle points with and without an IRC)
+        counts[g["kind"]] = counts.get(g["kind"], 0) + len(g["entries"])
     return {"headline": result.get("headline"), "barrier_kcal": result.get("barrier_kcal"),
             # False: the barrier is not backed by IRCs connecting the job's
             # two ends (edges then show it as unconfirmed).
