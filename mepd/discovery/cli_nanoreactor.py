@@ -97,7 +97,8 @@ def nanoreactor(
     multiplicity: Optional[int] = typer.Option(
         None, "--multiplicity", help="Total spin multiplicity (default: 1 for an even electron count, else 2)."),
     temperature: float = typer.Option(2000.0, "--temperature", help="MD temperature (K)."),
-    time_ps: float = typer.Option(20.0, "--time", help="Simulated time (ps)."),
+    time_ps: float = typer.Option(5.0, "--time", help="Simulated time (ps). For more, rerun with a larger --time "
+                                  "into the same --output: finished MD segments are kept (Run longer in mepd web)."),
     radius: Optional[float] = typer.Option(
         None, "--radius", help="Wide wall radius (Angstrom). Default: from the number of atoms."),
     compress: float = typer.Option(0.6, "--compress", help="Narrow radius as a fraction of the wide one."),

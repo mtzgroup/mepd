@@ -852,8 +852,9 @@ class NanoreactorParams(Params):
                     "or by name, e.g. 'CC=O: 2, O: 6'.", kind="custom")
     temperature: float = P(2000.0, "Temperature (K)", "Hot on purpose: reactions that take hours at room "
                            "temperature happen within picoseconds.", cli="--temperature", gt=0)
-    time_ps: float = P(20.0, "Simulated time (ps)", "With g-xTB, a few dozen atoms take about 4 min per ps (20 ps: over "
-                       "an hour); an MLIP is much faster. The status line shows the time left.", cli="--time", gt=0)
+    time_ps: float = P(5.0, "Simulated time (ps)", "With g-xTB, a few dozen atoms take about 4 min per ps (5 ps: about "
+                       "20 min); an MLIP is much faster. Run longer from the result if it found too little. The status "
+                       "line shows the time left.", cli="--time", gt=0)
     compress: float = P(0.6, "Piston squeeze", "Narrow wall radius as a fraction of the wide one: smaller pushes "
                         "the molecules harder together.", cli="--compress", gt=0, le=1)
     md_method: Literal["level", "auto", "gfn2", "gfn1", "gxtb"] = P(
