@@ -64,6 +64,9 @@ class DemoPolicy:
     # op -> field -> the only values allowed (text and choice fields). A
     # method (family card) fixing a value outside them is shown unavailable.
     allowed_values: dict = field(default_factory=lambda: {
+        # Only the interactive reactor's Stop & analyze reads a trajectory (it
+        # submits directly); a visitor's own nanoreactor job runs its MD.
+        "nanoreactor": {"trajectory": ("",), "trajectory_start": ("",)},
         "retrosynthesis": {
             "method": ("templates",),            # the others need GBs of models, or call a URL the user picks
             "verify": ("none",),                 # top/all: a path search + TS + IRC per step
@@ -72,6 +75,9 @@ class DemoPolicy:
             "llm_url": ("http://localhost:11434/v1",),
         },
     })
+    # Interactive reactors (mepd.web.sandbox): each holds a CPU while it runs.
+    sandbox: dict = field(default_factory=lambda: {"total": 2, "per_owner": 1, "idle_s": 180.0,
+                                                   "max_s": 15 * 60.0})
     # Operations visitors may run at all.
     allowed_ops: tuple = ("ts", "channels", "tsopt", "hessian-sample", "hessian-global", "optimize",
                           "network-splits", "vri", "vri-check", "vri-surface", "graph-enumeration", "nanoreactor",

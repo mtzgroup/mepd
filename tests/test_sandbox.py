@@ -72,7 +72,7 @@ def test_the_endpoints_start_steer_snapshot_and_stop(tmp_path):
         assert c.get(f"/api/sandbox/{sid}").status_code == 404
 
 
-def test_the_demo_has_no_interactive_reactor(tmp_path):
+def test_the_demo_reactor_is_per_visitor_and_never_evicts_another(tmp_path):
     from fastapi.testclient import TestClient
 
     from mepd.web.app import create_app
@@ -81,13 +81,41 @@ def test_the_demo_has_no_interactive_reactor(tmp_path):
     root = tmp_path / "demo"
     (root / "profiles").mkdir(parents=True)
     (root / "profiles" / "default.toml").write_text('engine_name = "gxtb"\n')
-    app = create_app(root, demo=DemoPolicy(), demo_password="pw")
-    with TestClient(app, follow_redirects=False) as c:
+    policy = DemoPolicy(max_atoms=10, sandbox={"total": 2, "per_owner": 1, "idle_s": 60, "max_s": 60})
+    app = create_app(root, demo=policy, demo_password="pw")
+
+    def visitor():
+        c = TestClient(app, follow_redirects=False)
+        c.__enter__()
         r = c.post("/login", data={"password": "pw"})
         c.cookies.set("mepd_visitor", r.cookies.get("mepd_visitor"))
         (w,) = c.post("/api/structures", json={"text": "O water", "optimize": False}).json()
-        r = c.post("/api/sandbox", json={"counts": {w["id"]: 2}})
-        assert r.status_code == 400 and "demo" in r.json()["detail"]
+        return c, w["id"]
+
+    (a, wa), (b, wb), (c, wc) = visitor(), visitor(), visitor()
+    started = []
+    try:
+        r = a.post("/api/sandbox", json={"counts": {wa: 11}})          # 33 atoms > 3 x max_atoms
+        assert r.status_code == 400 and "at most 30" in r.json()["detail"]
+        first = a.post("/api/sandbox", json={"counts": {wa: 2}}).json()["id"]
+        second = a.post("/api/sandbox", json={"counts": {wa: 2}}).json()["id"]   # replaces a's first
+        started += [first, second]
+        assert a.get(f"/api/sandbox/{first}").status_code == 404
+        assert sandbox.get(second).max_s == 60
+        assert b.get(f"/api/sandbox/{second}").status_code == 404        # not b's to see or stop
+        assert b.delete(f"/api/sandbox/{second}").status_code == 404
+        started.append(b.post("/api/sandbox", json={"counts": {wb: 2}}).json()["id"])
+        r = c.post("/api/sandbox", json={"counts": {wc: 2}})             # full: refused, nobody evicted
+        assert r.status_code == 400 and "in use" in r.json()["detail"]
+        assert a.get(f"/api/sandbox/{second}").status_code == 200
+        r = a.post("/api/jobs", json={"op": "nanoreactor", "structures": [wa],
+                                      "params": {"trajectory": "/etc/passwd"}})
+        assert r.status_code == 400
+    finally:
+        for sid in started:
+            sandbox.stop(sid)
+        for client in (a, b, c):
+            client.__exit__(None, None, None)
 
 
 def test_reaction_events_are_found_as_the_nanoreactor_finds_them():

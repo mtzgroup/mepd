@@ -10,7 +10,9 @@ their force capped so a fast drag cannot blow the system up. The page
 sends commands; the process streams frames back (~25 per second). A
 sandbox nobody has looked at for a while stops by itself.
 
-Not for the public demo (it holds a CPU for as long as it runs).
+Each holds a CPU while it runs. In the public demo `limits` keeps that
+bounded: a few at once server-wide (a new one is refused, never someone
+else's stopped), one per visitor, and each for a limited time.
 """
 from __future__ import annotations
 
@@ -175,7 +177,8 @@ class Sandbox:
     """One interactive reactor: its MD process, and the latest frame it sent."""
 
     def __init__(self, sid: str, symbols, coords_A, charge: int, multiplicity: int, radius: float,
-                 temperature: float, names: str = "", owner: str = "", sources: Optional[list] = None):
+                 temperature: float, names: str = "", owner: str = "", sources: Optional[list] = None,
+                 idle_s: float = IDLE_STOP_S, max_s: Optional[float] = None):
         ctx = mp.get_context("spawn")
         self.id, self.symbols, self.charge, self.multiplicity, self.names = sid, list(symbols), int(charge), \
             int(multiplicity), names
@@ -193,6 +196,7 @@ class Sandbox:
         self.owner = owner                 # the workspace it was started from (listed there)
         self.sources = list(sources or [])  # the structures it was started from
         self.started = time.time()
+        self.idle_s, self.max_s = float(idle_s), max_s   # stop when unwatched this long / after this long
         self.temperature = float(temperature)
         self.traj: list = []               # evenly spaced frames (TRAJ_FS apart), Angstrom
         self.events: list = []             # reaction events, as the nanoreactor's live view lists them
@@ -211,7 +215,8 @@ class Sandbox:
             try:
                 msg = self.out_q.get(timeout=0.5)
             except queue.Empty:
-                if time.time() - self.seen > IDLE_STOP_S:
+                now = time.time()
+                if now - self.seen > self.idle_s or (self.max_s and now - self.started > self.max_s):
                     self.stop()
                 continue
             with self.cond:
@@ -334,10 +339,31 @@ _LOCK = threading.Lock()
 MAX_SANDBOXES = 2
 
 
+def _make_room(owner: str, limits: Optional[dict]) -> dict:
+    """Under _LOCK: stop what a new sandbox of `owner` replaces, and return
+    the Sandbox timing arguments. Without `limits` the oldest sandboxes go
+    beyond MAX_SANDBOXES; with them (the demo: {"total", "per_owner",
+    "idle_s", "max_s"}) only the owner's own oldest go, and a full server
+    refuses (RuntimeError)."""
+    for sid, box in list(_SANDBOXES.items()):
+        if not box.proc.is_alive():
+            _SANDBOXES.pop(sid)
+    if not limits:
+        while len(_SANDBOXES) >= MAX_SANDBOXES:
+            _SANDBOXES.pop(next(iter(_SANDBOXES))).stop()
+        return {}
+    mine = [sid for sid, box in _SANDBOXES.items() if box.owner == owner]
+    while mine and len(mine) >= int(limits.get("per_owner", 1)):
+        _SANDBOXES.pop(mine.pop(0)).stop()
+    if len(_SANDBOXES) >= int(limits.get("total", MAX_SANDBOXES)):
+        raise RuntimeError("every interactive reactor of the demo is in use: try again in a few minutes")
+    return {"idle_s": float(limits.get("idle_s", IDLE_STOP_S)), "max_s": limits.get("max_s")}
+
+
 def start(sid: str, structures: list, *, temperature: float = 800.0, radius: Optional[float] = None,
-          names: str = "", owner: str = "", sources: Optional[list] = None) -> Sandbox:
+          names: str = "", owner: str = "", sources: Optional[list] = None, limits: Optional[dict] = None) -> Sandbox:
     """A new sandbox from one structure per molecule (repeated for copies),
-    packed like the nanoreactor's. The oldest is stopped beyond MAX_SANDBOXES."""
+    packed like the nanoreactor's. Room is made by _make_room."""
     from mepd.discovery.nanoreactor import pack_reactor
 
     symbols, coords, radius, _ = pack_reactor(structures, radius, seed=int(time.time()) % 1000)
@@ -348,16 +374,16 @@ def start(sid: str, structures: list, *, temperature: float = 800.0, radius: Opt
     if missing:
         raise ValueError(f"the interactive reactor does not know {', '.join(missing)}")
     with _LOCK:
-        while len(_SANDBOXES) >= MAX_SANDBOXES:
-            old = next(iter(_SANDBOXES))
-            _SANDBOXES.pop(old).stop()
-        box = Sandbox(sid, symbols, coords, charge, mult, float(radius) * 1.15, temperature, names, owner, sources)
+        timing = _make_room(owner, limits)
+        box = Sandbox(sid, symbols, coords, charge, mult, float(radius) * 1.15, temperature, names, owner, sources,
+                      **timing)
         _SANDBOXES[sid] = box
     return box
 
 
 def start_from(sid: str, structure, *, temperature: float = 800.0, radius: Optional[float] = None,
-               names: str = "", owner: str = "", sources: Optional[list] = None) -> Sandbox:
+               names: str = "", owner: str = "", sources: Optional[list] = None,
+               limits: Optional[dict] = None) -> Sandbox:
     """A new sandbox starting from one geometry as it is (a complex's
     arrangement), centred; the wall a little beyond its farthest atom."""
     symbols = list(structure.symbols)
@@ -368,11 +394,9 @@ def start_from(sid: str, structure, *, temperature: float = 800.0, radius: Optio
     xyz = xyz - xyz.mean(axis=0)
     radius = float(radius or (np.linalg.norm(xyz, axis=1).max() + 2.0))
     with _LOCK:
-        while len(_SANDBOXES) >= MAX_SANDBOXES:
-            old = next(iter(_SANDBOXES))
-            _SANDBOXES.pop(old).stop()
+        timing = _make_room(owner, limits)
         box = Sandbox(sid, symbols, xyz, int(structure.charge), int(structure.multiplicity), radius, temperature, names,
-                      owner, sources)
+                      owner, sources, **timing)
         _SANDBOXES[sid] = box
     return box
 

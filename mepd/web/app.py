@@ -1795,9 +1795,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import sandbox
 
         try:
-            return sandbox.get(sid)
+            box = sandbox.get(sid)
         except KeyError:
             raise HTTPException(404, "this interactive reactor is not running (stopped, or the server restarted)")
+        if demo is not None and box.owner != str(W().root):
+            raise HTTPException(404, "this interactive reactor is not running (stopped, or the server restarted)")
+        return box
 
     @app.post("/api/sandbox")
     def sandbox_start(body: SandboxIn):
@@ -1805,19 +1808,20 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import sandbox
         from mepd.web.compose import species_structures
 
-        if demo is not None:
-            raise WorkspaceError("the interactive reactor is not available in the demo")
+        limits = demo.sandbox if demo is not None else None
+        max_atoms = min(120, demo.max_atoms * 3) if demo is not None else 120
         if body.structure:
             from mepd.web.workspace import new_id
 
             rec = W().structure(body.structure)
-            if rec["natoms"] > 120:
-                raise WorkspaceError(f"{rec['natoms']} atoms is more than the interactive reactor keeps up with (at most 120)")
+            if rec["natoms"] > max_atoms:
+                raise WorkspaceError(f"{rec['natoms']} atoms is more than the interactive reactor keeps up with "
+                                     f"(at most {max_atoms})")
             try:
                 box = sandbox.start_from(new_id("sb_"), W().load_structure(body.structure), temperature=body.temperature,
                                          radius=body.radius, names=rec["name"], owner=str(W().root),
-                                         sources=[body.structure])
-            except ValueError as exc:
+                                         sources=[body.structure], limits=limits)
+            except (ValueError, RuntimeError) as exc:
                 raise WorkspaceError(str(exc)) from None
             return box.describe()
         ids = [sid for sid, n in body.counts.items() if int(n) > 0]
@@ -1825,16 +1829,16 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         if not mols:
             raise WorkspaceError("pick at least one molecule")
         natoms = sum(len(m.symbols) for m in mols)
-        if natoms > 120:
-            raise WorkspaceError(f"{natoms} atoms is more than the interactive reactor keeps up with (at most 120)")
+        if natoms > max_atoms:
+            raise WorkspaceError(f"{natoms} atoms is more than the interactive reactor keeps up with (at most {max_atoms})")
         names = " + ".join(f"{body.counts[i]} {W().structure(i)['name']}" if int(body.counts[i]) > 1
                            else W().structure(i)["name"] for i in ids)
         try:
             from mepd.web.workspace import new_id
 
             box = sandbox.start(new_id("sb_"), mols, temperature=body.temperature, radius=body.radius, names=names,
-                                owner=str(W().root), sources=ids)
-        except ValueError as exc:
+                                owner=str(W().root), sources=ids, limits=limits)
+        except (ValueError, RuntimeError) as exc:
             raise WorkspaceError(str(exc)) from None
         return box.describe()
 
@@ -1897,6 +1901,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         from mepd.web import sandbox
 
         box = _sandbox(sid)
+        if demo is not None:
+            demo.check_capacity(J().list())
         try:
             traj, start = box.save(W().root / "sandbox" / sid)
         except RuntimeError as exc:
@@ -1911,6 +1917,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
     def sandbox_stop(sid: str):
         from mepd.web import sandbox
 
+        if demo is not None:
+            _sandbox(sid)      # (a visitor stops only their own)
         sandbox.stop(sid)
         return {"ok": True}
 
