@@ -48,12 +48,13 @@ function tsState(r, edges, jobs) {
   if (st.status === 'running' || st.status === 'queued') return { kind: 'busy', text: `${st.status}…` };
   if (st.barrier != null) return { kind: 'ts', text: `ΔE‡ ${fmtKcal(st.barrier)}`, v: st.barrier };
   if (st.barrierUnverified != null) return { kind: 'unverified', text: `≈${fmtKcal(st.barrierUnverified)}?`, v: st.barrierUnverified, title: 'path maximum; no TS/IRC confirmed it' };
+  if (edge.origin?.qmmm_ts) return { kind: 'busy', text: 'TS, barrier pending', title: edge.origin.headline || '' };
   return { kind: 'todo', text: 'no TS yet' };
 }
 
 // Where a reaction came from, in a word (a nanoreactor's: how often the MD saw it).
 function sourceLabel(r) {
-  if (r.origin?.kind === 'edge') return 'TS search on this edge';
+  if (r.origin?.kind === 'edge') return 'TS on this edge';
   if (r.origin?.kind === 'composed') return 'composed';
   if (r.origin?.retro) return 'retrosynthesis';
   return r.count ? `seen ${r.count}×` : '';
@@ -176,11 +177,13 @@ function ReactionsAnalyze() {
   const [q, setQ] = useState('');
   const [only, setOnly] = useState('all');   // all | todo | ts | shuttle
   const structures = ws.structures, edges = ws.edges;
-  // Edges a TS search ran on that no reaction stands for (two structures
-  // you connected): listed too, as a reaction of their two ends.
+  // Edges no reaction stands for (two structures you connected) that a TS
+  // search ran on, or that carry a barrier of their own (e.g. a TS attached
+  // in a QM/MM solvent): listed too, as a reaction of their two ends.
   const ofEdge = new Set(Object.values(ws.reactions || {}).map((r) => r.edge).filter(Boolean));
+  const computed = (e) => edgeStatus(e, jobs).count > 0 || e.origin?.barrier_kcal != null || !!e.origin?.qmmm_ts;
   const edgeRows = Object.values(edges).filter((e) => !ofEdge.has(e.id) && isSpecies(structures[e.source])
-    && isSpecies(structures[e.target]) && edgeStatus(e, jobs).count > 0)
+    && isSpecies(structures[e.target]) && computed(e))
     .map((e) => ({ id: `edge:${e.id}`, reactants: [e.source], products: [e.target], edge: e.id, origin: { kind: 'edge' } }));
   const all = [...Object.values(ws.reactions || {}), ...edgeRows];
   const filterIds = nav.species || null;      // from Explore: reactions of these species
