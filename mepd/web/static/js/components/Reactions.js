@@ -5,7 +5,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, select, set, state, useStore } from '../store.js';
-import { depictUrl, edgeStatus, fmtKcal } from '../util.js';
+import { depictUrl, edgeStatus, fmtKcal, levelBarrierText } from '../util.js';
 import { ProfilePicker, defaultProfile } from './Actions.js';
 import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
 import { Viewer3D } from './Viewer3D.js';
@@ -55,8 +55,12 @@ export function TsCell({ r, why = 'not in Explore (deleted?)' }) {
     return html`<a href="#" class="small" title="Watch it live" onClick=${(e) => { e.preventDefault(); if (j) openJob(j.id, 'live'); }}>${st.status}…</a>`;
   }
   const label = st.barrier != null ? `ΔE‡ ${fmtKcal(st.barrier)}` : st.barrierUnverified != null ? `≈${fmtKcal(st.barrierUnverified)}?` : null;
+  // Several levels of theory: each level's lowest, each opening its own calculation.
+  const perLevel = st.levels?.length > 1 && html`${st.levels.map((l, i) => html`${i ? ' · ' : ''}${l.job
+    ? html`<a href="#" class="mono" title="Open the calculation behind this barrier" onClick=${(e) => { e.preventDefault(); openJob(l.job); }}>${levelBarrierText(l)}</a>`
+    : html`<span class="mono">${levelBarrierText(l)}</span>`}`)}`;
   return html`<span class="ts-cell">
-    ${label && (st.barrierJob
+    ${perLevel || label && (st.barrierJob
     ? html`<a href="#" class="mono" onClick=${(e) => { e.preventDefault(); openJob(st.barrierJob); }}
         title=${`${st.barrier != null ? 'Barrier from the reactant side, TS + IRC verified' : 'Path maximum; no TS/IRC confirmed it'}. Open its TS search (TS, IRC, sample more paths)`}>${label}</a>`
     : html`<span class="mono" title=${st.barrier != null ? 'Barrier from the reactant side, TS + IRC verified' : 'Path maximum; no TS/IRC confirmed it'}>${label}</span>`)}
@@ -272,7 +276,10 @@ export function ReactionCard({ r, event = null, compact = false }) {
         : running ? html`<p class="small">TS search ${st.status}…
             ${runningJob && html` <a href="#" onClick=${(e) => { e.preventDefault(); openJob(runningJob.id, 'live'); }}>watch it live</a>`}</p>`
           : html`<div class="rc-ts-row">
-            ${st.barrierJob ? html`<a href="#" class="rc-barrier" onClick=${(e) => { e.preventDefault(); openJob(st.barrierJob); }}
+            ${st.levels?.length > 1 ? html`<span class="rc-barrier">${st.levels.map((l, i) => html`${i ? ' · ' : ''}${l.job
+              ? html`<a href="#" title="Its TS search at this level of theory" onClick=${(e) => { e.preventDefault(); openJob(l.job); }}>${levelBarrierText(l)}</a>`
+              : levelBarrierText(l)}`)} kcal/mol</span>`
+            : st.barrierJob ? html`<a href="#" class="rc-barrier" onClick=${(e) => { e.preventDefault(); openJob(st.barrierJob); }}
                 title="Its TS search: TS, IRC, energy profile, sample more paths">
                 ${st.barrier != null ? `ΔE‡ ${fmtKcal(st.barrier)}` : `≈${fmtKcal(st.barrierUnverified)}? (not verified)`} kcal/mol from the reactant complex →</a>`
               : html`<span class="small muted">No TS yet.</span>`}

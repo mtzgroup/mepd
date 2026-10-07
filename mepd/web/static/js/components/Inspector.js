@@ -256,7 +256,9 @@ function EdgeDetail({ edge }) {
         <div class="stat"><span class="stat-v">${st.count}</span><span class="stat-l">calculations</span></div>
       </div>
       ${st.levels?.length > 1 && html`<p class="small muted" title="Barriers at different levels of theory are not comparable: each level's own lowest">
-        By level of theory: ${st.levels.map((l) => levelBarrierText(l)).join(' · ')}</p>`}
+        By level of theory: ${st.levels.map((l, i) => html`${i ? ' · ' : ''}${l.job
+          ? html`<a href="#" title="Open the calculation behind this barrier" onClick=${(e) => { e.preventDefault(); openJob(l.job); }}>${levelBarrierText(l)}</a>`
+          : levelBarrierText(l)}`)}</p>`}
       ${[a, b].some((r) => (r?.conformers || []).length > 1) && html`<div class="conf-picks">
         ${[['start', a], ['end', b]].map(([role, r]) => r && html`<label class="field">
           <span class="field-label">${role} conformer · ${r.name}</span>
