@@ -342,3 +342,16 @@ def test_adding_a_qmmm_result_to_explore_reads_only_its_qm_region(client, tmp_pa
     r = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": entry["id"], "frames": "endpoints"})
     assert r.status_code == 200, r.text
     assert seen and max(seen) < len(s.symbols)          # the QM region (+ link H), never all 15 atoms
+
+
+
+def test_edit_in_design_opens_the_qm_region_not_the_whole_system(client):
+    """A QM/MM node in Design is its QM region (capped), with a note: the
+    whole solvated system was hundreds of atoms of gas-phase molecule."""
+    out = _upload(client)
+    d = client.post("/api/design/load", json={"structure": out["structure"]})
+    assert d.status_code == 200, d.text
+    design = d.json().get("design") or d.json()
+    assert design["natoms"] == 6 and design["smiles"] == "CO"           # methanol, not the 15-atom cluster
+    assert any(w.startswith("Only the QM region (6 atoms)") for w in design.get("warnings", []))
+    assert (design.get("source") or {}).get("qmmm") == out["system"]["id"]

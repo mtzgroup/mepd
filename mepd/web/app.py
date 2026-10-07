@@ -1160,12 +1160,25 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         ws = W()
         rec = ws.structure(body.structure)
         xyz = (ws.conformer_path(rec["id"], body.conformer) if body.conformer else ws.structure_path(rec["id"])).read_text()
-        info, warnings = design.from_xyz(xyz, rec["charge"])
-        info["warnings"] = warnings
-        out = _store_design(info, name=f"{rec['name']} (edited)", charge=rec["charge"],
-                            multiplicity=rec["multiplicity"], keep={},
+        charge, mult, name, note = rec["charge"], rec["multiplicity"], rec["name"], []
+        if rec.get("qmmm"):
+            # A QM/MM system: its QM region, capped (the whole solvated system
+            # in Design was hundreds of atoms of gas-phase molecule to edit).
+            region = ws.qmmm_region(rec["qmmm"])
+            (full,) = chem.structures_from_xyz_text(xyz, rec["charge"], rec["multiplicity"])
+            model = region.model_structure(full)
+            xyz, charge, mult = model.to_xyz(), int(region.qm_charge), int(region.qm_multiplicity)
+            name = rec.get("smiles") or name
+            n_link = len(region.links)
+            note = [f"Only the QM region ({len(region.qm_atoms)} atoms" + (f" + {n_link} link H" if n_link else "")
+                    + "); the solvent stays in its QM/MM system. To put an edit back into it: Add to Explore, then "
+                    "\u201cPut into this QM/MM system\u201d."]
+        info, warnings = design.from_xyz(xyz, charge)
+        info["warnings"] = note + warnings
+        out = _store_design(info, name=f"{name} (edited)", charge=charge,
+                            multiplicity=mult, keep={},
                             source={"kind": "graph", "structure": rec["id"], "conformer": body.conformer,
-                                    "name": rec["name"], "ts": is_ts(rec)})
+                                    "name": rec["name"], "ts": is_ts(rec), "qmmm": rec.get("qmmm")})
         publish_ws()
         return out
 
