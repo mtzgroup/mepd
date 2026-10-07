@@ -425,6 +425,8 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                  if j["status"] == "done" and j.get("summary") and ("barrier_verified" not in j["summary"]
                      # ...or from before the edge's TS was recorded (route_ts, for VRI on edges)
                      or (j["op"] in ("ts", "channels") and "route_ts" not in j["summary"])
+                     # ...or from before multistep routes were told from direct steps (Explore's edges)
+                     or (j["op"] in ("ts", "channels", "channels-more") and "n_steps" not in j["summary"])
                      # ...or a solvent comparison from before reaction energies were kept
                      or (j["op"] == "solvent" and "gas_reaction_kcal" not in (j["summary"].get("conditions") or {})))]
         if stale:

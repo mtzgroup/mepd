@@ -214,6 +214,7 @@ input.switch:checked::after { transform: translateX(13px); }
 .lg.queued { border-color: var(--warn); border-top-style: dashed; }
 .lg.running { border-color: var(--accent); }
 .lg.done { border-color: var(--ok); }
+.lg.route { border-color: var(--ok); border-top-style: dotted; }
 .lg.failed { border-color: var(--danger); border-top-style: dashed; }
 /* Sized by the layout only: the canvas inside must never feed back into it
    (at a fractional display scale its rounded size did, and graph and legend

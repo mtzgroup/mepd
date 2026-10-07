@@ -243,10 +243,12 @@ function EdgeDetail({ edge }) {
       <${Editable} value=${edge.label || ''} onSave=${(label) => patch({ label })} className="label-input" placeholder="Add a label…" />`}
       <div class="stat-row">
         <div class=${`stat ${st.barrierJob ? 'linked' : ''}`} onClick=${() => st.barrierJob && openJob(st.barrierJob)}
-          title=${(st.barrier == null && st.barrierUnverified != null ? 'No TS/IRC found so far connects these two structures; this is only the highest point of the path' : 'Lowest barrier whose IRCs connect these two structures')
+          title=${(st.routeSteps ? `No single step joins these two structures: the highest step of a ${st.routeSteps}-step route through intermediates`
+            : st.barrier == null && st.barrierUnverified != null ? 'No TS/IRC found so far connects these two structures; this is only the highest point of the path' : 'Lowest barrier whose IRCs connect these two structures')
             + (st.barrierJob ? '. Click for its TS, IRC and follow-ups' : '')}>
           <span class="stat-v">${st.barrier != null ? fmtKcal(st.barrier) : st.barrierUnverified != null ? `≈${fmtKcal(st.barrierUnverified)}?` : '—'}</span>
-          <span class="stat-l">${st.barrier == null && st.barrierUnverified != null ? 'path max, not IRC-verified' : 'best ΔE‡ (kcal/mol)'}</span></div>
+          <span class="stat-l">${st.routeSteps ? `${st.routeSteps}-step route, highest ΔE‡${st.barrier == null ? ' (not verified)' : ''}`
+            : st.barrier == null && st.barrierUnverified != null ? 'path max, not IRC-verified' : 'best ΔE‡ (kcal/mol)'}</span></div>
         <div class="stat"><span class="stat-v">${st.count}</span><span class="stat-l">calculations</span></div>
       </div>
       ${[a, b].some((r) => (r?.conformers || []).length > 1) && html`<div class="conf-picks">

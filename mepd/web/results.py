@@ -314,6 +314,10 @@ def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[f
     ]
     result = _result(headline, groups, summary, barrier, warnings)
     result["barrier_verified"] = verified
+    # Explore draws the edge start -> end solid only for a direct path: a
+    # verified single step, or an unverified path that did not split.
+    result["n_steps"] = route["n_steps"] if verified else n_steps
+    result["direct_barrier_kcal"] = _clean(route["direct"]) if route["direct"] is not None else None
     if verified:
         # The TS that sets the edge's barrier (a VRI search on the edge starts here).
         top = [i for i in route["items"] if i["on_route"] and i["barrier"] is not None
@@ -361,7 +365,7 @@ def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
     if start is None or end is None:
         for it in items:
             it["note"] = _irc_note(it["irc"]) if it["irc"] is not None else "no IRC"
-        return {"barrier": None, "n_steps": 0, "items": items}
+        return {"barrier": None, "n_steps": 0, "direct": None, "items": items}
 
     nodes = [start, end]
     for it in items:
@@ -402,6 +406,9 @@ def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
             x = parent[x]
         return x
 
+    # A single TS whose IRC joins start and end: a direct path (the edge
+    # start -> end is then one elementary step, not only a route).
+    direct = _min(barrier for barrier, a, b, _ in steps if s_cls != e_cls and {a, b} == {s_cls, e_cls})
     bottleneck = None
     for barrier, a, b, _ in sorted(steps, key=lambda t: t[0]):
         parent[find(a)] = find(b)
@@ -442,7 +449,7 @@ def _verify_route(start, end, ts_items: list, floor: Optional[float]) -> dict:
             it["note"] += " · on the start → end route"
         elif it["irc"] is not None and "conformer change" not in it["note"]:
             it["note"] += " · not on the start → end route"
-    return {"barrier": bottleneck, "n_steps": n_steps, "items": items}
+    return {"barrier": bottleneck, "n_steps": n_steps, "direct": direct, "items": items}
 
 
 def _network_group(fp: Path, floor: Optional[float]) -> Optional[dict]:
@@ -654,6 +661,14 @@ def collect_channels(out: Path, charge: int, multiplicity: int, floor_hint: Opti
     lowest = [i for i in channels if i.get("barrier") is not None and best is not None and abs(i["barrier"] - best) < 1e-6]
     if lowest:
         result["route_ts"] = _route_ts(lowest[0]["title"], lowest[0]["ts"], lowest[0]["barrier"])
+    # Explore's edge: a direct channel is one step; with none, the lowest
+    # multi-step route (as high as its highest step) stands, as a route.
+    result["direct_barrier_kcal"] = best
+    result["n_steps"] = 1 if channels else None
+    routes = [(max(b), len(b)) for b in ([s.get("barrier") for s in a["steps"]] for a in alternates)
+              if b and all(x is not None for x in b)]
+    if not channels and routes:
+        result["barrier_kcal"], result["n_steps"] = _clean(min(routes)[0]), min(routes)[1]
     return result
 
 
@@ -722,10 +737,12 @@ def collect_ts_extended(ts_out: Path, channels_out: Path, charge: int, multiplic
         # Nothing classified yet (or at all): the first search's answer stands.
         ch["headline"], ch["barrier_kcal"] = ts["headline"], ts["barrier_kcal"]
         ch["barrier_verified"], ch["route_ts"] = ts.get("barrier_verified", True), ts.get("route_ts")
+        ch["n_steps"], ch["direct_barrier_kcal"] = ts.get("n_steps"), ts.get("direct_barrier_kcal")
         ch["warnings"] = ts["warnings"] + ch["warnings"]
     elif chans:
         ch["headline"] = f"{len(chans)} direct channel(s)" + (f" · lowest ΔE‡ {best:.1f} kcal/mol" if best is not None else "")
         ch["barrier_kcal"], ch["barrier_verified"] = best, True
+        ch["n_steps"], ch["direct_barrier_kcal"] = 1, best   # direct channels: start -> end in one step
         lowest = next(e for e in chans if e["barrier_kcal"] == best) if best is not None else None
         if lowest is not None and lowest["id"].startswith("first_"):
             ch["route_ts"] = ts.get("route_ts")
@@ -1548,6 +1565,10 @@ def summarize(result: dict) -> dict:
             # False: the barrier is not backed by IRCs connecting the job's
             # two ends (edges then show it as unconfirmed).
             "barrier_verified": result.get("barrier_verified", True), "counts": counts,
+            # How many elementary steps the barrier's route takes, and the
+            # lowest verified direct (one-step) barrier: Explore draws an edge
+            # solid only for a direct path. None: not known (a single TS).
+            "n_steps": result.get("n_steps"), "direct_barrier_kcal": result.get("direct_barrier_kcal"),
             "barrier_warning": negative_barrier_text(result["barrier_kcal"])
             if result.get("barrier_kcal") is not None and result["barrier_kcal"] < NEGATIVE_BARRIER_TOL else None,
             # Which TS sets that barrier (no geometry: that is in route_ts.xyz).
