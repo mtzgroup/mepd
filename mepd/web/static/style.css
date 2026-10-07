@@ -398,11 +398,21 @@ textarea.toml { min-height: calc(100vh - 260px); font-size: 12.5px; line-height:
 .toast.ok { background: var(--ok); color: #fff; }
 @keyframes rise { from { transform: translateY(6px); opacity: 0; } }
 
-/* ---------- narrow screens: stack panes, keep everything reachable */
+/* ---------- narrower screens: the same three columns, slimmer (the selection
+   panel used to drop below the graph here, leaving it a strip); phones below. */
 @media (max-width: 1100px) and (min-height: 521px) {
-  .layout, .layout.no-inspector { grid-template-columns: 250px minmax(0, 1fr); }
-  .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--border); max-height: 50vh; }
-  .layout { grid-auto-rows: minmax(0, 1fr); overflow: auto; }
+  .layout { grid-template-columns: 220px minmax(0, 1fr) 320px; }
+  .layout.no-inspector { grid-template-columns: 220px minmax(0, 1fr); }
+}
+@media (max-width: 900px) and (min-height: 521px) {
+  .layout { grid-template-columns: 170px minmax(0, 1fr) 290px; }
+  .layout.no-inspector { grid-template-columns: 170px minmax(0, 1fr); }
+  .main-tabs { gap: 12px; }
+  .main-tabs button { font-size: 14px; }
+  .topbar .layout-switch { font-size: 13px; white-space: nowrap; }
+  .topbar { gap: 10px; padding-left: 14px; padding-right: 14px; }
+  .topbar .brand { font-size: 19px; }
+  .topbar .btn.primary { padding: 6px 10px; font-size: 14px; white-space: nowrap; }
 }
 /* Phones -- portrait (narrow) and landscape (short): one scrolling column,
    and the selection panel (with every calculation option) as a bottom sheet
