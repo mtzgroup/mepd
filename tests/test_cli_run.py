@@ -1131,3 +1131,27 @@ def test_cli_run_pair_from_replaces_the_other_endpoint_with_one_built_from_it(tm
     replaced = chain[-1] if side == "start" else chain[0]
     dmat = lambda x: np.linalg.norm(np.asarray(x)[:, None] - np.asarray(x)[None], axis=-1)
     assert np.allclose(dmat(replaced.coords), dmat(built.coords), atol=1e-4)   # the output is aligned
+
+
+def test_snap_metrics_compare_snap_placements_not_every_relabeling(capsys):
+    """Snap places a mechanism's symmetric atoms itself, from any one of its
+    numberings: the relabelings are not candidates (they gave the same picks
+    from 200 starts as from one); the log says what is compared."""
+    pytest.importorskip("slapmapper")
+    from mepd.atom_mapping import check_atom_mapping
+    from mepd.cli import _check_endpoint_atom_mapping
+    from mepd.cli_common import _candidate_atom_maps
+
+    start = _propene_structure(range(9))
+    swapped = np.asarray(start.geometry).copy()
+    swapped[[6, 7, 8]] = swapped[[7, 8, 6]]          # the methyl's H traded places
+    end = start.model_copy(update={"geometry": swapped})
+    run_inputs = _run_inputs_for_test()
+    run_inputs.atom_mapping_inputs.metric = "snap-gi-xtb"
+    am = check_atom_mapping(start, end)
+    assert am.is_identity
+    assert [m.is_identity for m in _candidate_atom_maps(start, end, am, run_inputs)] == [True]
+    result = _check_endpoint_atom_mapping(start, end, True, run_inputs)
+    assert np.allclose(np.asarray(result.geometry), np.asarray(start.geometry), atol=1e-6)   # snap still fixes it
+    out = " ".join(capsys.readouterr().out.split())
+    assert "snap's placements of the symmetric atoms for the current numbering" in out and "relabeling" not in out

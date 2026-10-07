@@ -380,6 +380,13 @@ def _dump_atom_mapping_candidates(
     )
 
 
+def _snap_relabels(candidate, start_structure: Structure) -> bool:
+    """Would snap renumber any symmetric atoms of this candidate?"""
+    from mepd.atom_mapping_selection import _snap_picks
+
+    return any(p.label != "identity" for p in _snap_picks(candidate, start_structure))
+
+
 def _candidate_atom_maps(start_structure: Structure, end_structure: Structure, atom_map, run_inputs) -> list:
     """The candidate mappings the --atom-mapping check compares: SLAPMapper's
     (the budget filled with relabelings of symmetric atoms), or, when the
@@ -394,12 +401,21 @@ def _candidate_atom_maps(start_structure: Structure, end_structure: Structure, a
     atom_maps = (expand_mapping_fully(atom_map, start_structure, end_structure, max_variants=n_candidates)
                  if atom_map.is_identity else
                  suggest_atom_mapping_candidates(start_structure, end_structure, max_candidates=n_candidates))
+    seeds = atom_maps[:20]   # where --explore-mechanisms starts (as before: what it finds depends on them)
+    if run_inputs.atom_mapping_inputs.metric in ("snap", "snap-gi-xtb"):
+        # Snap places the symmetric atoms itself, from any one numbering of a
+        # mechanism: started from each relabeling it gave the same picks as
+        # from the current numbering alone (200 starts, 3 picks), so they go.
+        atom_maps = [m for m in atom_maps if not getattr(m, "relabeling", False)
+                     and not (atom_map.is_identity and not m.is_identity)]
+        if atom_map.is_identity and not any(m.is_identity for m in atom_maps):
+            atom_maps.insert(0, atom_map)
     n_explore = int(getattr(run_inputs.atom_mapping_inputs, "explore_mechanisms", 0) or 0)
     if n_explore > 0:
         # Mechanisms beyond SLAPMapper's minimal-edit ones compete too:
         # relays and exchanges through other molecules (a catalyst, solvent).
         from mepd.atom_mapping import catalytic_participants, explore_mechanisms, mechanism_key, realign_end_to_start
-        explored = explore_mechanisms(start_structure, end_structure, atom_maps[:20], max_new=n_explore)
+        explored = explore_mechanisms(start_structure, end_structure, seeds, max_new=n_explore)
         for m in explored:
             aligned = realign_end_to_start(m, end_structure)
             cats = catalytic_participants(start_structure, aligned)
@@ -536,30 +552,39 @@ def _check_endpoint_atom_mapping(
         return end_structure
 
     candidates = build_candidates(start_structure, end_structure, atom_maps)
-    if [c.label for c in candidates] in ([], ["identity"]):
+    metric = run_inputs.atom_mapping_inputs.metric
+    snap = metric in ("snap", "snap-gi-xtb")
+    if [c.label for c in candidates] in ([], ["identity"]) and not (
+            snap and candidates and _snap_relabels(candidates[0], start_structure)):
         # Nothing but the current numbering (no symmetric atoms to relabel).
         if atom_map.is_identity:
             typer.echo("Atom mapping: the start's and end's atoms are already numbered the same way "
                        "(checked with SLAPMapper), so nothing is renumbered.")
         return end_structure
 
-    metric = run_inputs.atom_mapping_inputs.metric
     n_other = sum(c.label != "identity" for c in candidates)
-    if atom_map.is_identity:
+    n_exp = sum(c.label != "identity" and getattr(c.atom_map, "explored", False) for c in candidates)
+    if atom_map.is_identity and snap:
+        typer.echo(
+            "Atom mapping: the start's and end's bonds already correspond (checked with SLAPMapper); comparing "
+            "snap's placements of the symmetric atoms for the current numbering"
+            + (f" and {n_exp} explored mechanism(s)" if n_exp else "") + f", by {metric}...")
+    elif atom_map.is_identity:
         typer.echo(
             f"Atom mapping: the start's and end's bonds already correspond (checked with SLAPMapper); comparing "
-            f"the current numbering with {n_other} relabeling(s) of its symmetric atoms, by {metric}...")
+            f"the current numbering with {n_other - n_exp} relabeling(s) of its symmetric atoms"
+            + (f" and {n_exp} explored mechanism(s)" if n_exp else "") + f", by {metric}...")
     else:
         # What SLAPMapper found, and what was added: the budget (n_candidates)
         # is filled with relabelings of symmetric atoms of its best mapping.
         n_sym = sum(c.label != "identity" and getattr(c.atom_map, "relabeling", False) for c in candidates)
-        n_exp = sum(c.label != "identity" and getattr(c.atom_map, "explored", False) for c in candidates)
-        pool = f"{n_other - n_sym - n_exp} numbering(s) from SLAPMapper"
+        pool = (f"snap's placements of the symmetric atoms for " if snap else "") + \
+            f"{n_other - n_sym - n_exp} numbering(s) from SLAPMapper"
         if n_sym:
             pool += f" and {n_sym} relabeling(s) of their symmetric atoms"
         if n_exp:
             pool += f", plus {n_exp} explored mechanism(s)"
-        if len(atom_maps) >= n_candidates:
+        if len(atom_maps) >= n_candidates and not snap:
             pool += f" (capped at {n_candidates})"
         typer.echo(
             f"Atom mapping: the end's atoms may be numbered differently from the start's. Comparing its "
