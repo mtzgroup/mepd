@@ -75,6 +75,41 @@ def adopt_nanoreactor(ws, job: dict, *, final: bool = False) -> bool:
     for name, data in datas:
         changed |= _adopt_one(ws, job, data, nodes, refined, final=final and name == "network.json")
     job["nano_keys"], job["nano_refined_keys"] = nodes, refined
+    return _sync_events(ws, job, out) or changed
+
+
+def _sync_events(ws, job: dict, out: Path) -> bool:
+    """Each of the job's reactions with the MD events that are that
+    reaction now. A reaction refined while the MD ran kept the numbers its
+    events had then; the live analysis renumbers them as the trajectory
+    grows (an H lost and then taken up again became one event), so its card
+    played a different reaction. Events carry their reaction's key; runs
+    from before that keep their numbers."""
+    evs, final = _events(out)
+    if final and not any(e.get("key") for e in evs):
+        # The final analysis lists its species: the key from them.
+        data = _json(out / "network.json") or {}
+        keys = {sp["id"]: _sp_key(sp) for sp in data.get("species") or []}
+        for e in evs:
+            if e.get("reaction") is not None and all(i in keys for i in e.get("reactants", []) + e.get("products", [])):
+                e["key"] = _rx_key({"reactants": e["reactants"], "products": e["products"]}, keys)
+    if not any(e.get("key") for e in evs):
+        return False
+    by_key: dict = {}
+    for e in evs:
+        if e.get("key"):
+            by_key.setdefault(e["key"], []).append(e["event"])
+    changed = False
+    with ws._lock:
+        for r in ws._data.get("reactions", {}).values():
+            o = r.get("origin") or {}
+            if o.get("job") != job["id"] or not o.get("key"):
+                continue
+            want = by_key.get(o["key"], [])
+            if r.get("events") != want:
+                r["events"], changed = want, True
+        if changed:
+            ws._save()
     return changed
 
 

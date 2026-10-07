@@ -1144,6 +1144,10 @@ def build_network(symbols, frames: np.ndarray, hist: BondHistory, events: list[E
         else:
             rxn.reverse_count += 1
         rec_ev["reaction"], rec_ev["direction"] = rxn.id, direction
+        # Its identity, as the refined reactions carry it: the live analysis
+        # renumbers events as the trajectory grows (an event can absorb what
+        # follows it), so a reaction finds its events by this, not by number.
+        rec_ev["key"] = reaction_key(rxn, {r.id: r for r in species.values()})
         if len(rxn.instances) < max_instances:
             rxn.instances.append({"event": n, "direction": direction, "atoms": list(ev.atoms), "charge": q,
                                   "reactant_frame": ev.reactant_frame, "product_frame": ev.product_frame,

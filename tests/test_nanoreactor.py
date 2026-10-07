@@ -58,6 +58,11 @@ def test_direct_and_shuttled_tautomerization_are_two_reactions():
     assert set(by_label) == {"CC=O -> C=CO", "CC=O + O -> C=CO + O"}
     shuttle = by_label["CC=O + O -> C=CO + O"]
     assert [names[i] for i in shuttle.shuttles] == ["O"]
+    # Each event carries its reaction's identity (what a refined reaction is found by).
+    by_id = {s.id: s for s in species}
+    for rec in records:
+        rxn = next(r for r in reactions if r.id == rec["reaction"])
+        assert rec["key"] == nr.reaction_key(rxn, by_id)
     assert by_label["CC=O -> C=CO"].shuttles == []
     water = next(s for s in species if s.smiles == "O")
     assert water.initial == 2

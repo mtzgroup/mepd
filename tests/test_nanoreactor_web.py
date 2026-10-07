@@ -194,3 +194,27 @@ def test_engine_relaxation_writes_its_steps(tmp_path):
     assert abs(np.linalg.norm(pos[1] - pos[0]) - 2.0) < 0.05
     syms, frames, comments = nr.read_xyz_frames(tmp_path / "relax.xyz")
     assert syms == ["O", "O"] and len(frames) > 1 and "energy:" in comments[0]
+
+
+def test_a_reaction_shows_the_events_that_are_it_now(tmp_path):
+    """A reaction refined while the MD ran kept its events' numbers; the
+    live analysis renumbers events as the trajectory grows (an H lost and
+    taken up again became one event), so its card played another reaction.
+    Events carry their reaction's key, and each reaction gets those."""
+    from mepd.web.chem import structure_from_smiles
+    from mepd.web.nanoreactor import _sync_events
+
+    ws = Workspace(tmp_path / "ws")
+    a = ws.add_structure(structure_from_smiles("CC=O"), name="a", smiles="CC=O", origin={"kind": "smiles"})
+    b = ws.add_structure(structure_from_smiles("C=CO"), name="b", smiles="C=CO", origin={"kind": "smiles"})
+    origin = {"kind": "job", "job": "j1", "nanoreactor": True}
+    ws.put_reaction(reactants=[a["id"]], products=[b["id"]], origin={**origin, "index": 0, "key": "K1"}, events=[10])
+    ws.put_reaction(reactants=[b["id"]], products=[a["id"]], origin={**origin, "index": 1, "key": "K3"}, events=[4])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "live_events.json").write_text(json.dumps({"events": [
+        {"event": 4, "key": "K3"}, {"event": 10, "key": "K2"}, {"event": 12, "key": "K1"}, {"event": 13, "key": "K1"}]}))
+    assert _sync_events(ws, {"id": "j1"}, out)
+    got = {r["origin"]["key"]: r["events"] for r in ws.snapshot()["reactions"].values()}
+    assert got == {"K1": [12, 13], "K3": [4]}          # event 10 is another reaction now
+    assert not _sync_events(ws, {"id": "j1"}, out)     # nothing left to change
