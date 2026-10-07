@@ -39,6 +39,8 @@ def _normalized_path_method(path_min_method: str) -> str:
         "GEOMETRIC": "GEOMETRIC-NEB",
         "GEOMETRICNEB": "GEOMETRIC-NEB",
         "FSM": "FNEB",  # freezing string method
+        "MLP-GI": "MLPGI",
+        "GI": "MLPGI",
     }
     return aliases.get(method, method)
 
@@ -564,6 +566,29 @@ class RunInputs:
                 "trust": 0.1,
                 "tmax": 0.3,
                 "tmin": 1.2e-3,
+                "v": False,
+            }
+        elif path_method == "MLPGI":
+            # 10.1021/acs.jctc.5c01221, Table 1 (see mepd/mlp_geodesic.py).
+            default_kwds = {
+                "mlp_model": None,      # None: the profile's engine; else a `mepd models` name
+                "mlp_checkpoint": None,
+                "mlp_device": None,
+                "fire_stage1_iter": 200,
+                "fire_stage2_iter": 500,
+                "fire_grad_tol": 0.01,                  # eV/Angstrom
+                "variance_penalty_weight": 0.0433641,   # eV (1 kcal/mol)
+                "fire_conv_window": 20,
+                "fire_conv_geolen_tol": 0.25,           # kcal/mol
+                "fire_conv_erelpeak_tol": 0.25,         # kcal/mol
+                "refinement_step_interval": 10,
+                "refinement_dynamic_threshold_fraction": 0.1,
+                "tangent_project": True,
+                "climb": True,
+                "alpha_climb": 0.5,
+                "skip_identical_graphs": True,
+                "disregard_stereochem": False,
+                "do_elem_step_checks": True,
                 "v": False,
             }
         elif path_method == "GSM":

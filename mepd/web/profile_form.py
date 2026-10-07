@@ -28,11 +28,18 @@ from mepd.web.workspace import WorkspaceError
 # ------------------------------------------------------------------ choices
 
 from mepd.atom_mapping_metrics import LABELS as _MAPPING_LABELS, OFFERED as _OFFERED_METRICS
+try:
+    from mepd.engines.mlip import MODELS as _MLIP_MODELS
+except ImportError:      # a server-only environment without ASE
+    _MLIP_MODELS = {}
 
 PATH_METHODS = [
     ("NEB", "NEB", "Nudged elastic band (mepd's own), optionally with a climbing image."),
     ("FNEB", "FSM (FNEB)", "Freezing string method: grows the path from both ends, then relaxes it."),
     ("GSM", "GSM", "Growing string method (molecularGSM binary)."),
+    ("MLPGI", "MLP-GI", "Geodesic path on the energy surface: minimizes the path's energy-weighted length and adds "
+                        "images near barriers. Runs on this profile's engine, or on a machine-learned potential "
+                        "with the final path re-scored here."),
     ("GEOMETRIC-NEB", "geomeTRIC NEB", "geomeTRIC's NEB implementation."),
     ("NEB-DLF", "DL-FIND NEB", "DL-FIND's NEB inside TeraChem (needs TeraChem via QCCompute or ChemCloud)."),
 ]
@@ -104,6 +111,8 @@ CLI_OWNED_PATH_KEYS = {"validate_minima_with_hessian", "hessian_minimum_frequenc
 # Read by a method's code although not in its default dict (aliases, optional keys).
 EXTRA_PATH_KEYS = {
     "GEOMETRIC-NEB": {"ncimg", "epsilon", "images", "prefix", "maxg", "avgg", "neb_maxcyc"},
+    "MLPGI": {"backend", "model_path", "device", "beta", "tau_refine", "cutoff", "convergence_window",
+              "path_length_tolerance", "barrier_height_tolerance"},
     "NEB-DLF": {"ts_method", "constraints_text", "input_files", "staged_elem_check", "early_stop_two_stage",
                 "loose_path_min_inputs", "early_stop_loose_path_min_inputs", "dlf_keywords"},
 }
@@ -117,16 +126,19 @@ KEY_PATH_FIELDS = {
     "GSM": ["nnodes", "seed_with_geodesic_interpolation", "max_opt_iters", "conv_tol", "ts_final_type",
             "early_stop_on_minima", "executable"],
     "GEOMETRIC-NEB": ["max_steps", "rms_grad_thre", "max_rms_grad_thre", "climb", "nebk"],
+    "MLPGI": ["mlp_model", "mlp_device", "mlp_checkpoint", "fire_stage1_iter", "fire_stage2_iter", "climb",
+              "refinement_step_interval"],
     "NEB-DLF": ["nstep", "min_nebk", "max_nebk", "min_image", "new_minimizer"],
 }
 # Types of settings whose mepd default is None (so the default says nothing).
 TYPE_HINTS = {"min_image": "int", "max_nebk": "float", "timeout": "float", "min_timestep": "float",
               "max_timestep": "float", "max_step_norm": "float", "executable": "text", "checkpoint": "text",
+              "mlp_checkpoint": "text",
               "chemcloud_queue": "text", "model_path": "text", "calculator": "text"}
 # Smallest sensible value per setting (else: >= 0 unless the default is negative).
 MINIMUMS = {"nimages": 3, "max_steps": 1, "nnodes": 3, "n_candidates": 1, "n_threads": 1, "batch_size": 1, "maxit": 1,
             "max_opt_iters": 1, "step_opt_iters": 1, "max_grow_iter": 1, "max_min_iter": 1, "min_images": 2,
-            "nstep": 1, "adaptive_max_images": 2, "history_size": 1, "n_min": 1}
+            "nstep": 1, "adaptive_max_images": 2, "history_size": 1, "n_min": 1, "fire_conv_window": 1}
 
 OPTIONS = {
     "path_min_inputs.tangent": [("geodesic", "geodesic"), ("linear", "linear")],
@@ -145,6 +157,8 @@ OPTIONS = {
     "mlip_engine_kwds.family": [("", "from the model name"), *((f, f) for f in ("aimnet2", "orb", "mace", "ani", "fairchem"))],
     "mlip_engine_kwds.geometry_optimizer": [(o, o) for o in ("LBFGSLineSearch", "LBFGS", "BFGS", "FIRE", "MDMin")],
     "program_kwds.device": [("cuda", "GPU (cuda)"), ("cpu", "CPU")],
+    "path_min_inputs.mlp_model": [("", "this profile's engine")] + [(m, m) for m in _MLIP_MODELS],
+    "path_min_inputs.mlp_device": [("", "automatic (GPU if available)"), ("cuda", "GPU (cuda)"), ("cpu", "CPU")],
     "atom_mapping_inputs.metric": [(m, _MAPPING_LABELS[m]) for m in _OFFERED_METRICS],
 }
 
@@ -173,6 +187,22 @@ HELP = {
     "ts_final_type": "How GSM treats the final TS: 1 if a bond breaks, 0 otherwise.",
     "early_stop_on_minima": "Stop GSM early when the string develops an intermediate minimum.",
     "executable": "Path to the program; empty uses $GSM_EXECUTABLE / $GXTB_EXECUTABLE or the one on PATH.",
+    "mlp_model": "The surface the path is optimized on: this profile's engine, or a machine-learned potential "
+                 "(the ones `mepd models` lists), then the path is re-scored on this profile's engine.",
+    "mlp_device": "Where the machine-learned potential runs.",
+    "mlp_checkpoint": "A local checkpoint file for the chosen model, used instead of the downloaded one.",
+    "fire_stage1_iter": "Steps of the first stage (relaxing the path, no climbing).",
+    "fire_stage2_iter": "Steps of the second stage (climbing image, images added near barriers).",
+    "fire_grad_tol": "A stage stops when the largest gradient of the path length falls below this (eV/Å).",
+    "variance_penalty_weight": "β: how strongly segments are kept equally long (eV; 0.0434 = 1 kcal/mol).",
+    "fire_conv_window": "Steps over which the path length and barriers must hold steady to stop a stage.",
+    "fire_conv_geolen_tol": "…the path length varying by less than this (kcal/mol).",
+    "fire_conv_erelpeak_tol": "…and each barrier by less than this (kcal/mol).",
+    "refinement_step_interval": "Every this many second-stage steps, add images where a segment hides a maximum.",
+    "refinement_dynamic_threshold_fraction": "How far (as a fraction of the segment's length) a hidden maximum must "
+                                             "differ from the sampled energies to get an image.",
+    "tangent_project": "Remove the along-path part of each image's gradient (images don't slide along the path).",
+    "alpha_climb": "How hard the highest image climbs (0 to 1).",
     "grad_tol": "FSM gradient tolerance (Eh/bohr).",
     "max_grow_iter": "Growth iterations (FSM grows the path from both ends).",
     "max_min_iter": "Minimization iterations per growth step.",
@@ -226,7 +256,14 @@ HELP = {
 _WORDS = {"thre": "threshold", "tol": "tolerance", "rtol": "relative tolerance", "ts": "TS", "rms": "RMS",
           "gi": "GI", "nebk": "NEB k", "opt": "optimization", "iters": "iterations", "n": "number of",
           "acc": "accuracy", "dt": "Δt", "ene": "energy", "neb": "NEB", "grad": "gradient"}
-LABELS = {"nimages": "Images", "nnodes": "Nodes", "k": "Spring constant k", "delta_k": "Spring spread Δk",
+LABELS = {"mlp_model": "Optimize on", "mlp_device": "Model device", "mlp_checkpoint": "Model checkpoint",
+          "fire_stage1_iter": "Stage 1 steps", "fire_stage2_iter": "Stage 2 steps",
+          "fire_grad_tol": "Gradient tolerance", "variance_penalty_weight": "Spacing weight β",
+          "fire_conv_window": "Convergence window", "fire_conv_geolen_tol": "Path length tolerance",
+          "fire_conv_erelpeak_tol": "Barrier tolerance", "refinement_step_interval": "Add images every",
+          "refinement_dynamic_threshold_fraction": "Image threshold", "tangent_project": "Tangent projection",
+          "alpha_climb": "Climbing strength",
+          "nimages": "Images", "nnodes": "Nodes", "k": "Spring constant k", "delta_k": "Spring spread Δk",
           "n_threads": "Threads per call", "n_parallel": "Calls at once", "timeout_s": "Time limit per call (s)",
           "maxit": "Max iterations",
           "n_candidates": "Candidates", "n_min": "Steps before speeding up", "nstep": "Steps"}
@@ -416,6 +453,19 @@ def _ase_calculator_choice(data: dict):
         custom, problem
 
 
+def _mlip_missing(model: str) -> Optional[str]:
+    """Why the MLIP `model` can't run here, or None."""
+    import importlib.util
+
+    spec = _MLIP_MODELS.get(model)
+    if spec is None:
+        return f"unknown model {model!r} (`mepd models` lists them)."
+    package = MLIP_PACKAGES.get(spec.family)
+    if package and importlib.util.find_spec(package) is None:
+        return f"{model} is not installed here: {spec.install}."
+    return None
+
+
 def _mlip_model_choice(data: dict):
     import importlib.util
 
@@ -482,6 +532,13 @@ def form(text: str) -> dict:
     if method == "NEB-DLF" and not tc_ok:
         issues.append(f"DL-FIND NEB {tc_reason}: pick another path method or switch the engine to TeraChem.")
         path_issues.append(issues[-1])
+    surrogate = _get(data, "path_min_inputs.mlp_model") if method == "MLPGI" else None
+    if surrogate:
+        problem = _mlip_missing(str(surrogate))
+        if problem:
+            issues.append(f"MLP-GI: {problem}")
+            path_issues.append(issues[-1])
+
 
     basic = [
         _choice("path_method", "Path method", method, PATH_METHODS, "How the minimum-energy path is found.",
@@ -540,7 +597,8 @@ def form(text: str) -> dict:
         basic.append(_choice("optimizer", "Chain optimizer", opt, [(k, l, "") for k, l in OPTIMIZERS],
                              "How the path's images are moved each step."))
     images = _field(data, "gi_inputs.nimages", GI_DEFAULTS["nimages"], key=True, label="Images",
-                    help="Images along the path (GSM: its nodes, when seeded from the initial path).")
+                    help="Images along the path (GSM: its nodes, when seeded from the initial path; MLP-GI: "
+                         "the images it starts with, more are added near barriers).")
 
     groups = []
     defaults = method_defaults(method) if _known_method(method) else {}

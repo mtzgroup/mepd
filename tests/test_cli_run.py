@@ -165,7 +165,7 @@ def test_build_path_minimizer_dispatches_neb(monkeypatch):
 def test_build_path_minimizer_rejects_unsupported_method(monkeypatch):
     _install_fake_gxtb(monkeypatch)
     run_inputs = _run_inputs_for_test()
-    run_inputs.path_min_method = "MLPGI"
+    run_inputs.path_min_method = "NO-SUCH-METHOD"
     node = StructureNode(structure=_water())
     chain = Chain.model_validate(
         {"nodes": [node, node.copy()], "parameters": run_inputs.chain_inputs}

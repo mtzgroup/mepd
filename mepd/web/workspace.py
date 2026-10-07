@@ -197,6 +197,11 @@ def path_summary(profile_text: Optional[str]) -> dict:
             text += " · early stop off"
             warnings.append("early_stop_on_minima = false: a multistep path runs to max_opt_iters before it is "
                             "split. mepd's default is true.")
+    elif method in ("MLPGI", "MLP-GI", "GI"):
+        surface = pmi.get("mlp_model") or "this profile's engine"
+        text = f"MLP-GI · starts from {nimages} images · on {surface}"
+        if pmi.get("mlp_model"):
+            text += ", re-scored on the engine"
     else:
         text = f"{method} · {nimages} images"
     return {"text": text, "warnings": warnings}

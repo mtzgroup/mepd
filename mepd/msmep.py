@@ -1244,7 +1244,7 @@ class MSMEP:
 
         elif path_method == "MLPGI":
             from mepd.pathminimizers.mlpgi import MLPGI
-            self._say("Using MLP Geodesic Optimizer")
+            self._say("Using MLP-GI (geodesic path length on the PES)")
             n = MLPGI(
                 initial_chain=initial_chain,
                 engine=self.inputs.engine,

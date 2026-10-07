@@ -35,6 +35,9 @@ _OTHER = [
         "items": [
             {"what": "Energy-weighted spring constants (k, delta_k)",
              "cite": ["doi:10.1021/acs.jctc.1c00462"]},
+            {"what": "MLP-GI path method (geodesic path length on the energy surface)",
+             "cite": ["Efficient Discovery of Transition States on Machine-Learned Potential Energy Surfaces via "
+                      "Geodesic Path Optimization, J. Chem. Theory Comput. (2025), doi:10.1021/acs.jctc.5c01221"]},
             {"what": "FIRE chain optimizer",
              "cite": ["E. Bitzek, P. Koskinen, F. Gähler, M. Moseler, P. Gumbsch, Phys. Rev. Lett. 97, 170201 "
                       "(2006), doi:10.1103/PhysRevLett.97.170201"]},

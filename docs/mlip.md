@@ -90,3 +90,28 @@ calculator_kwds = { some_option = 1 }
   The FAIR-Chem engine batches every image of a chain into one forward pass
   instead.
 - **Hessians.** These are central differences of the model's own gradients.
+
+## MLP-GI: paths found on a model, reported at your level
+
+`path_min_method = "MLPGI"` minimizes the path's geodesic length on the
+energy surface (two FIRE stages, a climbing image, images added where a
+segment hides a maximum; doi:10.1021/acs.jctc.5c01221, code in
+`mepd/mlp_geodesic.py`). It runs on the profile's own engine, or on a model
+from the tables above, with the finished path re-scored on the profile's
+engine:
+
+```toml
+engine_name = "gxtb"
+path_min_method = "MLPGI"
+
+[path_min_inputs]
+mlp_model = "aimnet2"     # leave out to optimize on g-xTB itself
+mlp_device = "cpu"
+```
+
+Each step costs one gradient per image and per midpoint between images.
+The defaults are the paper's (Table 1); `fire_conv_geolen_tol` and
+`fire_conv_erelpeak_tol` are in kcal/mol, the rest in eV and Angstrom. The
+path's highest image is a TS guess: on hard cases (e.g. keto-enol 1,3-H
+shifts at g-xTB) it can sit several kcal/mol above the saddle, so keep TS
+optimization on. In mepd web: Settings › Path method › MLP-GI.
