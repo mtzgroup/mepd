@@ -9,7 +9,7 @@
 //    or let the bond rules propose them) and turn them into reactions.
 import { html, useMemo, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
-import { set, state, useStore } from '../store.js';
+import { openJob, select, set, state, useStore } from '../store.js';
 import { depictUrl, edgeStatus, fmtKcal, isSpecies } from '../util.js';
 import { NO_TS_SHORT, ReactionCard, findTs, noTsWhy } from './Reactions.js';
 import { KineticsView } from './Kinetics.js';
@@ -49,6 +49,14 @@ function tsState(r, edges, jobs) {
   if (st.barrier != null) return { kind: 'ts', text: `ΔE‡ ${fmtKcal(st.barrier)}`, v: st.barrier };
   if (st.barrierUnverified != null) return { kind: 'unverified', text: `≈${fmtKcal(st.barrierUnverified)}?`, v: st.barrierUnverified, title: 'path maximum; no TS/IRC confirmed it' };
   return { kind: 'todo', text: 'no TS yet' };
+}
+
+// Where a reaction came from, in a word (a nanoreactor's: how often the MD saw it).
+function sourceLabel(r) {
+  if (r.origin?.kind === 'edge') return 'TS search on this edge';
+  if (r.origin?.kind === 'composed') return 'composed';
+  if (r.origin?.retro) return 'retrosynthesis';
+  return r.count ? `seen ${r.count}×` : '';
 }
 
 // ------------------------------------------------------------ new reaction
@@ -168,7 +176,13 @@ function ReactionsAnalyze() {
   const [q, setQ] = useState('');
   const [only, setOnly] = useState('all');   // all | todo | ts | shuttle
   const structures = ws.structures, edges = ws.edges;
-  const all = Object.values(ws.reactions || {});
+  // Edges a TS search ran on that no reaction stands for (two structures
+  // you connected): listed too, as a reaction of their two ends.
+  const ofEdge = new Set(Object.values(ws.reactions || {}).map((r) => r.edge).filter(Boolean));
+  const edgeRows = Object.values(edges).filter((e) => !ofEdge.has(e.id) && isSpecies(structures[e.source])
+    && isSpecies(structures[e.target]) && edgeStatus(e, jobs).count > 0)
+    .map((e) => ({ id: `edge:${e.id}`, reactants: [e.source], products: [e.target], edge: e.id, origin: { kind: 'edge' } }));
+  const all = [...Object.values(ws.reactions || {}), ...edgeRows];
   const filterIds = nav.species || null;      // from Explore: reactions of these species
   const shown = all.filter((r) => {
     const ids = [...r.reactants, ...r.products];
@@ -188,8 +202,16 @@ function ReactionsAnalyze() {
   const ordered = Object.values(groups).map((rs) => rs.sort((a, b) => (tsState(a, edges, jobs).v ?? 1e9) - (tsState(b, edges, jobs).v ?? 1e9)))
     .sort((a, b) => b.length - a.length || (tsState(a[0], edges, jobs).v ?? 1e9) - (tsState(b[0], edges, jobs).v ?? 1e9));
   const selected = nav.reaction && ws.reactions?.[nav.reaction] ? ws.reactions[nav.reaction] : null;
-  const pick = (rid) => set({ analyze: { ...nav, reaction: rid, compose: false } });
-  const todo = shown.filter((r) => tsState(r, edges, jobs).kind === 'todo');
+  const pick = (rid) => {
+    if (rid.startsWith('edge:')) {   // no reaction card: its calculation
+      const edge = edges[rid.slice(5)];
+      const job = edge && edgeStatus(edge, jobs).barrierJob;
+      if (job) openJob(job); else { select({ structures: [], edges: [rid.slice(5)] }); set({ view: { tab: 'graph', jobId: null } }); }
+      return;
+    }
+    set({ analyze: { ...nav, reaction: rid, compose: false } });
+  };
+  const todo = shown.filter((r) => r.origin?.kind !== 'edge' && tsState(r, edges, jobs).kind === 'todo');
   const findAll = async () => {
     if (!window.confirm(`Queue ${todo.length} TS search${todo.length > 1 ? 'es' : ''}? They run a few at a time.`)) return;
     for (const r of todo) await findTs(r);
@@ -226,7 +248,7 @@ function ReactionsAnalyze() {
               <span class="an-via">${routeLabel(r, structures)}</span>
               <span class=${`an-ts ${t.kind}`} title=${t.title || ''}>${t.text}</span>
               <span class="an-de mono small">${r.delta_e_kcal != null ? `ΔE ${r.delta_e_kcal >= 0 ? '+' : ''}${fmtKcal(r.delta_e_kcal)}` : ''}</span>
-              <span class="an-src small muted">${r.origin?.kind === 'composed' ? 'composed' : `seen ${r.count || 0}×`}</span>
+              <span class="an-src small muted">${sourceLabel(r)}</span>
             </button>`;
           })}
         </div>`)}

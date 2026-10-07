@@ -87,7 +87,8 @@ export function ProfilesView() {
               <button class="btn" onClick=${validate} disabled=${checking} title="Builds RunInputs (engine included) from this text in a scratch process">${checking ? 'Checking…' : 'Validate'}</button>
               <button class="btn" onClick=${saveAs}>Save as…</button>
               <button class="btn primary" onClick=${save} disabled=${!dirty}>Save</button>
-              <button class="btn danger-outline" onClick=${del} title="Delete this profile">Delete</button>`}
+              <button class="btn danger-outline" onClick=${del} disabled=${profiles.length < 2}
+                title=${profiles.length < 2 ? "The only profile can't be deleted: every calculation needs one (Save as… makes another)" : 'Delete this profile'}>Delete</button>`}
             </div>
             ${summaries[name] && html`<div class="path-summary small">
               <span>Saved version: <b>${summaries[name].text}</b>${dirty ? ' · unsaved edits are not used by jobs until you Save' : ''}</span>

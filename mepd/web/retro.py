@@ -26,13 +26,17 @@ def _read_json(fp: Path) -> Optional[dict]:
         return None
 
 
-def adopt_retro(ws, job: dict) -> bool:
+def adopt_retro(ws, job: dict, route: Optional[int] = None) -> bool:
     """Bring a finished job's routes into the workspace (network.json; the
     live file's routes change as the search goes, so they stay in the job
-    view). Returns True when the workspace changed."""
+    view). Anything already there is reused, so this also puts back what was
+    deleted since. `route`: only that route's steps and species (1-based, as
+    the results list them). Returns True when the workspace changed."""
     data = _read_json(Path(job.get("output_dir") or "") / "network.json")
     if not data:
         return False
+    if route is not None:
+        data = _one_route(data, route)
     nodes: dict = dict(job.get("retro_nodes") or {})       # SMILES -> structure id
     changed = False
     known = ws.snapshot()["structures"]
@@ -52,7 +56,7 @@ def adopt_retro(ws, job: dict) -> bool:
                 continue
             (s,) = chem.structures_from_xyz_text(text, sp["charge"], sp["multiplicity"])
             note = {"stock": "in stock", "small": "small, counted as available"}.get(sp.get("in_stock") or "")
-            rec = ws.add_or_merge(s, name=smi, smiles=smi, optimized=False,
+            rec = ws.add_or_merge(s, name=chem.common_name(smi) or smi, smiles=smi, optimized=False,
                                   origin={"kind": "job", "job": job["id"], "entry": f"species_{sp['id']}",
                                           "label": "building block" if note else sp.get("role", "species"),
                                           "retro": True, **({"note": note} if note else {})})["rec"]
@@ -68,6 +72,40 @@ def adopt_retro(ws, job: dict) -> bool:
         changed |= _put_step(ws, job, rx, r_ids, p_ids)
     job["retro_nodes"] = nodes
     return changed
+
+
+def adopt_best_route(ws, job: dict) -> bool:
+    """A finished job's best route into Explore (the others are added from
+    the result page, route by route). False when it found none."""
+    try:
+        return adopt_retro(ws, job, route=1)
+    except WorkspaceError:   # no route 1: nothing found
+        return False
+
+
+def _one_route(data: dict, route: int) -> dict:
+    """network.json cut to one route: its steps, their species, the target."""
+    steps = [rx for rx in data.get("reactions") or [] if route in (rx.get("routes") or [])]
+    if not steps:
+        raise WorkspaceError(f"this job has no route {route}")
+    used = {i for rx in steps for i in (*rx["reactants"], *rx["products"])}
+    species = [sp for sp in data.get("species") or [] if sp["id"] in used or sp.get("role") == "target"]
+    return {**data, "reactions": steps, "species": species}
+
+
+def route_elements(ws, job: dict, route: int) -> dict:
+    """The structures and edges of one route as they are now in the
+    workspace (after adopt_retro), to select it in Explore."""
+    data = _one_route(_read_json(Path(job.get("output_dir") or "") / "network.json") or {}, route)
+    snap = ws.snapshot()
+    nodes = job.get("retro_nodes") or {}
+    sids = [nodes[sp["smiles"]] for sp in data["species"] if nodes.get(sp["smiles"]) in snap["structures"]]
+    edges = []
+    for rx in data["reactions"]:
+        rec = ws.find_reaction(job["id"], rx["key"], key=rx["key"])
+        if rec and rec.get("edge") in snap["edges"]:
+            edges.append(rec["edge"])
+    return {"structures": list(dict.fromkeys(sids)), "edges": edges}
 
 
 def _put_step(ws, job: dict, rx: dict, r_ids: list, p_ids: list) -> bool:

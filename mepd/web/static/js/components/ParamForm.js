@@ -1,6 +1,7 @@
 // Renders any operation's parameter form from its pydantic JSON schema.
 // Field extras from mepd.web.operations: group, advanced, cli, cli_kind.
 import { html, useEffect, useState } from '../lib.js';
+import { prefs } from '../store.js';
 
 // A number field that lets you type: it keeps its own text while you edit
 // ("0.", "-", "1e-" are fine half-way) and reports a number only when the text
@@ -98,6 +99,25 @@ export function clampToSchema(schema, values) {
   return out;
 }
 
+// A calculation form remembers only the settings you changed from its
+// defaults, so a default that changes later still reaches every setting you
+// never touched. (Version 2 of the stored form: version 1 kept every value,
+// defaults included, so one changed default stayed stale forever; those are
+// not read, which starts every form once from the current defaults.)
+const REMEMBERED = (key) => `params2:${key}`;
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+export function rememberedValues(op, extra = {}) {
+  const defaults = defaultsFor(op.schema);
+  return clampToSchema(op.schema, { ...defaults, ...prefs.get(REMEMBERED(op.key), {}), ...extra });
+}
+
+export function rememberValues(op, values) {
+  const defaults = defaultsFor(op.schema);
+  const changed = Object.fromEntries(Object.entries(values).filter(([k, v]) => k in defaults && !same(v, defaults[k])));
+  prefs.set(REMEMBERED(op.key), changed);
+}
+
 export function defaultsFor(schema) {
   const out = {};
   for (const [k, p] of Object.entries(schema?.properties || {})) out[k] = p.default ?? null;
@@ -115,7 +135,8 @@ export function ParamForm({ schema, values, onChange }) {
   if (!schema?.properties || !Object.keys(schema.properties).length) {
     return html`<p class="muted small">No parameters.</p>`;
   }
-  const entries = Object.entries(schema.properties).filter(([, p]) => requirementMet(values, p.requires));
+  // group "Hidden": set by the page itself (e.g. Sandbox › Stop & analyze), never a form field.
+  const entries = Object.entries(schema.properties).filter(([, p]) => p.group !== 'Hidden' && requirementMet(values, p.requires));
   const basic = entries.filter(([, p]) => !p.advanced);
   const advanced = entries.filter(([, p]) => p.advanced);
   const groups = {};

@@ -1030,6 +1030,10 @@ class Workspace:
         _atomic_write(self.profile_path(name), text)
 
     def delete_profile(self, name: str) -> None:
+        if self.profile_names() == [name]:
+            # Every calculation needs a profile: with none, the Run buttons go.
+            raise WorkspaceError("the only profile can't be deleted: every calculation needs one "
+                                 "(make another with Save as… first)")
         self.profile_path(name).unlink(missing_ok=True)
 
     def ensure_default_profile(self) -> None:

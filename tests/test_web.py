@@ -100,7 +100,19 @@ def test_structures_from_smiles_and_multiframe_xyz(client):
 def test_bad_smiles_is_a_400_not_a_crash(client):
     r = client.post("/api/structures", json={"text": "not_a_smiles(("})
     assert r.status_code == 400
-    assert "could not embed" in r.json()["detail"]
+    detail = r.json()["detail"]
+    # One line a newcomer can act on, not the RDKit/Open Babel tracebacks.
+    assert detail.startswith("Not a valid SMILES: not_a_smiles((") and "\n" not in detail
+    r = client.post("/api/structures", json={"text": "C1CC"})
+    assert r.json()["detail"] == "Not a valid SMILES: C1CC (unclosed ring)"
+
+
+def test_the_only_profile_cannot_be_deleted(client):
+    """With no profile every Run button goes: the last one stays."""
+    r = client.delete("/api/profiles/default")
+    assert r.status_code == 400 and "only profile" in r.json()["detail"]
+    assert client.put("/api/profiles/other", json={"text": 'engine_name = "gxtb"\n'}).status_code == 200
+    assert client.delete("/api/profiles/default").status_code == 200   # another one is there now
 
 
 def test_edges_conserve_atoms_and_cascade_on_delete(client):

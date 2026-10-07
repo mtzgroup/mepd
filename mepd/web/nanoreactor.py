@@ -102,7 +102,8 @@ def _adopt_one(ws, job: dict, data: dict, nodes: dict, refined: dict, *, final: 
         smiles = sp["smiles"] if not str(sp["smiles"]).startswith("?") and "unusual bonding" not in str(sp["smiles"]) \
             else None
         res = ws.add_or_merge(
-            s, name=smiles or sp["smiles"] or chem.formula(s), smiles=smiles, energy=energy, optimized=opt,
+            s, name=chem.common_name(smiles) or smiles or sp["smiles"] or chem.formula(s), smiles=smiles, energy=energy,
+            optimized=opt,
             level=level if opt else None,
             origin={"kind": "job", "job": job["id"], "entry": f"species_{sp['id']}", "label": f"Species {sp['id']}",
                     "nanoreactor": True})

@@ -792,7 +792,8 @@ class RetroParams(Params):
     # Chosen by the method switch, not in the form.
     method: Literal["templates", "reactiont5", "local-llm", "aizynthfinder"] = P(
         "templates", "Method", kind="custom", group="Hidden")
-    routes: int = P(5, "Routes", "How many routes to report (and add to Explore), cheapest first.", cli="--routes",
+    routes: int = P(5, "Routes", "How many routes to report, cheapest first. The best is added to Explore; the "
+                    "others from the result page.", cli="--routes",
                     ge=1, le=50)
     max_depth: int = P(6, "Most steps", "Longest route from a building block to the target.", cli="--max-depth",
                        ge=1, le=15)
@@ -851,7 +852,8 @@ class NanoreactorParams(Params):
                     "or by name, e.g. 'CC=O: 2, O: 6'.", kind="custom")
     temperature: float = P(2000.0, "Temperature (K)", "Hot on purpose: reactions that take hours at room "
                            "temperature happen within picoseconds.", cli="--temperature", gt=0)
-    time_ps: float = P(20.0, "Simulated time (ps)", cli="--time", gt=0)
+    time_ps: float = P(20.0, "Simulated time (ps)", "With g-xTB, a few dozen atoms take about 4 min per ps (20 ps: over "
+                       "an hour); an MLIP is much faster. The status line shows the time left.", cli="--time", gt=0)
     compress: float = P(0.6, "Piston squeeze", "Narrow wall radius as a fraction of the wide one: smaller pushes "
                         "the molecules harder together.", cli="--compress", gt=0, le=1)
     md_method: Literal["level", "auto", "gfn2", "gfn1", "gxtb"] = P(

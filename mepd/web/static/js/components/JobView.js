@@ -5,7 +5,7 @@ import { api, attempt, refreshState } from '../api.js';
 import { familyOf, openJob, pageJobId, prefs, select, set, state, toast, update, useStore } from '../store.js';
 import { STATUS_LABEL, copy, downloadText, entryToXyz, fmtDuration, fmtKcal, jobElapsed, safeName, structureName, tsFrameIndex } from '../util.js';
 import { EnergyPlot } from './EnergyPlot.js';
-import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
+import { ParamForm, clampToSchema, defaultsFor, rememberValues, rememberedValues } from './ParamForm.js';
 import { JobControls, useTick } from './Jobs.js';
 import { NetworkLive } from './NetworkLive.js';
 import { ChannelsMap } from './ChannelsMap.js';
@@ -529,13 +529,13 @@ const VRI_NEXT = {
 
 function FollowUpCard({ op, job, runs, done, initial = {}, note = null }) {
   const [open, setOpen] = useState(false);
-  const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}), ...initial }));
+  const [values, setValues] = useState(() => rememberedValues(op, initial));
   const [busy, setBusy] = useState(false);
   const last = runs[0];
   const active = last && ['queued', 'running'].includes(last.status);
   const run = async () => {
     setBusy(true);
-    prefs.set(`params:${op.key}`, values);
+    rememberValues(op, values);
     const out = await attempt(() => api.post('/api/jobs', { op: op.key, params: values, source_job: job.id }),
       (js) => `Queued: ${js[0].title}`);
     setBusy(false);
@@ -637,7 +637,7 @@ function TsFollowUps({ job }) {
   const runs = useMemo(() => Object.values(state.jobs).filter((j) => j.extends === job.id)
     .sort((a, b) => b.created - a.created), [runsKey]);
   const [open, setOpen] = useState(false);
-  const [values, setValues] = useState(() => (op ? clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get('params:channels', {}) }) : {}));
+  const [values, setValues] = useState(() => (op ? rememberedValues(op) : {}));
   const [busy, setBusy] = useState(false);
   if (!op || job.status !== 'done' || job.external || job.targets.structures.length !== 2) return null;
   const last = runs[0];
@@ -647,7 +647,7 @@ function TsFollowUps({ job }) {
   const conformers = Object.fromEntries(job.targets.structures.map((sid, i) => [sid, job.target_conformers?.[i] || null]));
   const run = async () => {
     setBusy(true);
-    prefs.set('params:channels', values);
+    rememberValues(op, values);
     const out = await attempt(() => api.post('/api/jobs', {
       op: 'channels', structures: job.targets.structures, edges: job.targets.edges || [], params: values,
       profile: job.profile, conformers, extends: job.id }), (js) => `Queued: ${js[0].title}`);

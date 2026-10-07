@@ -53,6 +53,60 @@ def structure_from_smiles(
     return _load_structure_from_smiles_or_xyz(smiles.strip(), charge, multiplicity)
 
 
+# Small molecules whose SMILES reads as something else ("Cl" is HCl, "O"
+# water): named for what they are. Keys are RDKit canonical SMILES.
+_COMMON_NAMES = {
+    "O": "water", "Cl": "HCl", "Br": "HBr", "I": "HI", "F": "HF", "N": "ammonia", "S": "H2S",
+    "[HH]": "H2", "OO": "H2O2", "O=P(O)(O)O": "phosphoric acid", "O=S(=O)(O)O": "sulfuric acid",
+    "O=[N+]([O-])O": "nitric acid", "O=C=O": "CO2", "[C-]#[O+]": "CO", "O=S=O": "SO2",
+    "C": "methane", "CO": "methanol", "CCO": "ethanol", "CC(=O)O": "acetic acid", "C=O": "formaldehyde",
+    "CC(C)=O": "acetone", "CC#N": "acetonitrile", "ClCCl": "dichloromethane", "ClC(Cl)Cl": "chloroform",
+    "CS(C)=O": "DMSO", "C1CCOC1": "THF", "c1ccccc1": "benzene", "Cc1ccccc1": "toluene",
+}
+
+
+def common_name(smiles: Optional[str]) -> Optional[str]:
+    """A small molecule's everyday name ("Cl" -> "HCl", "O" -> "water"), or None."""
+    if not smiles:
+        return None
+    try:
+        from rdkit import Chem, rdBase
+
+        with rdBase.BlockLogs():   # scoped: smiles_problem reads RDKit's messages
+            mol = Chem.MolFromSmiles(smiles)
+        return _COMMON_NAMES.get(Chem.MolToSmiles(mol)) if mol is not None else None
+    except Exception:
+        return None
+
+
+def smiles_problem(smiles: str) -> Optional[str]:
+    """Why RDKit cannot read `smiles`, in one line (e.g. "syntax error
+    around position 5", "unclosed ring"), or None when it can."""
+    import contextlib
+    import io
+    import re
+
+    from rdkit import Chem, rdBase
+
+    buf = io.StringIO()
+    rdBase.LogToPythonStderr()
+    with contextlib.redirect_stderr(buf):
+        mol = Chem.MolFromSmiles(smiles)
+    if mol is not None:
+        return None
+    lines = [re.sub(r"^\[[\d:]+\]\s*", "", ln).replace("SMILES Parse Error: ", "").strip()
+             for ln in buf.getvalue().splitlines() if ln.strip()]
+    if not lines:
+        return "not a valid SMILES"
+    reason = re.sub(r"\s+(while parsing|for input):.*$", "", lines[0])
+    if m := re.match(r"Explicit valence for atom # (\d+) (\w+), (\d+), is greater than permitted", reason):
+        reason = f"atom {int(m.group(1)) + 1} ({m.group(2)}) has {m.group(3)} bonds, more than it can"
+    elif reason.startswith("Can't kekulize"):
+        reason = "an aromatic ring that cannot be drawn with alternating double bonds (check the lowercase atoms)"
+    where = next((m.group(1) for ln in lines if (m := re.search(r"around position (\d+)", ln))), None)
+    return f"{reason} around position {where}" if where else reason
+
+
 def perceive_smiles(structure: Structure) -> Optional[str]:
     import qcinf
 

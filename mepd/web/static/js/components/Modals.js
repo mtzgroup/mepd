@@ -4,7 +4,7 @@ import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, prefs, set, state, useStore } from '../store.js';
 import { fmtAgo, readFileText } from '../util.js';
-import { clampToSchema, defaultsFor } from './ParamForm.js';
+import { clampToSchema, defaultsFor, rememberedValues } from './ParamForm.js';
 import { defaultProfile } from './Actions.js';
 
 function Modal({ title, children, onClose }) {
@@ -89,7 +89,7 @@ function QuickStart({ onClose }) {
       if (m.pair && recs[0].smiles && recs[0].smiles === recs[1].smiles) {
         throw new Error(`After minimization both ends are ${recs[0].smiles}, so there is no reaction between them to search. Both structures are in the graph; nothing was run.`);
       }
-      const params = clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) });
+      const params = rememberedValues(op);
       const profile = defaultProfile();
       return api.post('/api/jobs', { op: op.key, structures: ids, params, profile });
     });

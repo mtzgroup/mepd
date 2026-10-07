@@ -344,9 +344,11 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
 
                     spawn_ts_searches(manager, base)
             if job["op"] == "retrosynthesis" and job["status"] == "done":
-                from mepd.web.retro import adopt_retro
+                from mepd.web.retro import adopt_best_route
 
-                if await run_in_threadpool(adopt_retro, manager.ws, job):
+                # The best route only: every species of every route was a
+                # wall of unoptimized nodes; the others are a click away.
+                if await run_in_threadpool(adopt_best_route, manager.ws, job):
                     manager._update(job)
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
             if job["op"] == "complex" and job["status"] == "done" and not job.get("external"):
@@ -670,8 +672,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 try:
                     s = chem.structure_from_smiles(smi, charge, mult)
                 except Exception as exc:
-                    raise WorkspaceError(f"could not embed {smi!r}: {exc}") from None
-                todo.append((s, {"name": (line_name.strip() or name if len(lines) == 1 else line_name.strip()) or smi,
+                    why = chem.smiles_problem(smi)
+                    raise WorkspaceError(f"Not a valid SMILES: {smi} ({why})" if why else
+                                         f"Could not build a 3D structure for {smi}: "
+                                         f"{str(exc).strip().splitlines()[0][:200]}") from None
+                todo.append((s, {"name": (line_name.strip() or name if len(lines) == 1 else line_name.strip())
+                                 or chem.common_name(smi) or smi,
                                  "origin": {"kind": "smiles", "input": smi}, "smiles": smi}))
         if demo is not None:
             demo.check_structures(len(W().snapshot()["structures"]), [len(s.symbols) for s, _ in todo])
@@ -1690,6 +1696,21 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         out = await run_in_threadpool(_import_picks, job, group, entry, picks, connect)
         publish_ws()
         return out
+
+    @app.post("/api/jobs/{jid}/retro/routes/{route}/explore")
+    async def retro_route_to_explore(jid: str, route: int):
+        """One retrosynthesis route into Explore: whatever of it is no longer
+        there (deleted since) is added back, the rest reused. Returns the
+        route's structures and edges, to select."""
+        from mepd.web.retro import adopt_retro, route_elements
+
+        job = J().get(jid)
+        if job.get("op") != "retrosynthesis" or job.get("status") != "done":
+            raise WorkspaceError("only a finished retrosynthesis job has routes to add")
+        if await run_in_threadpool(adopt_retro, W(), job, route):
+            J()._update(job)
+            publish_ws()
+        return await run_in_threadpool(route_elements, W(), job, route)
 
     @app.post("/api/jobs/{jid}/import-entries")
     async def import_entries(jid: str, body: EntriesImportIn):

@@ -81,6 +81,15 @@ def _clean(x: Optional[float]) -> Optional[float]:
     return None if x is None or not math.isfinite(x) else round(float(x), 4)
 
 
+def _one_decimal(x: float) -> str:
+    """`x` to one decimal as the page shows the stored value (JavaScript's
+    toFixed(1) of `_clean(x)`: ties up), so a headline and its edge agree --
+    f"{x:.1f}" gave 65.7 for a stored 65.75 the edge showed as 65.8."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    return str(Decimal(_clean(x)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
 def _frames(nodes, baseline: Optional[float]) -> list[dict]:
     from mepd.chain import Chain
     from mepd.inputs import ChainInputs
@@ -321,7 +330,7 @@ def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[f
         barrier, source = None, ""
     n_steps = len(leaves) if leaves else (1 if mep is not None else 0)
     approx = "" if verified else "≈ "
-    headline = (f"ΔE‡ {approx}{barrier:.1f} kcal/mol ({source})" if barrier is not None else "No path found") + \
+    headline = (f"ΔE‡ {approx}{_one_decimal(barrier)} kcal/mol ({source})" if barrier is not None else "No path found") + \
         (f" · {n_steps} path steps" if n_steps > 1 else "")
     summary = [
         {"label": "Elementary steps", "value": n_steps or None},
@@ -1005,8 +1014,21 @@ def collect_conformers(out: Path, charge: int, multiplicity: int) -> dict:
                        [node], floor, note=note)
         entry["validation"] = val
         entries.append(entry)
+    # Minimized into the same minimum (within 0.05 kcal/mol, the rule a node
+    # keeps its conformers by): one conformer, as Explore shows it.
+    distinct = []
+    for entry, (_, node, _) in zip(entries, nodes):
+        e = _node_energy(node)
+        same = next((d for d in distinct if e is not None and d[1] is not None
+                     and abs(e - d[1]) * HARTREE_TO_KCAL < 0.05), None)
+        if same is None:
+            distinct.append((entry, e))
+        else:
+            entry["note"] += f" · same minimum as {same[0]['label'].split(' (')[0]}"
     stats = s.get("stats") or {}
-    return _result(f"{len(entries)} conformer(s) · {s.get('backend', '?')}"
+    n_shown = len(distinct) if opt else len(entries)
+    return _result(f"{n_shown} conformer(s)" + (f" ({len(entries)} minimized, some to the same minimum)"
+                                                if n_shown != len(entries) else "") + f" · {s.get('backend', '?')}"
                    + ("" if opt else " (not minimized)"),
                    [_group("Conformers", "conformers", entries)],
                    [{"label": "Backend", "value": s.get("backend")},

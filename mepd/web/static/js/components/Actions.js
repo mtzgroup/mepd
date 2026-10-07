@@ -5,7 +5,7 @@
 import { html, useEffect, useState } from '../lib.js';
 import { api, attempt } from '../api.js';
 import { openJob, prefs, useStore, state } from '../store.js';
-import { ParamForm, clampToSchema, defaultsFor } from './ParamForm.js';
+import { ParamForm, clampToSchema, defaultsFor, rememberValues, rememberedValues } from './ParamForm.js';
 import { conformerLabel, conformerRows, isComplex, isTs } from '../util.js';
 import { ComplexMethodForm, memberCounts } from './ComplexBuild.js';
 
@@ -15,7 +15,12 @@ export function applicability(op, sel) {
   if (op.target === 'pair') {
     let fit = null;
     if (nE > 0 && nS === 0) fit = { n: nE, what: nE === 1 ? 'this edge' : `${nE} edges` };
-    else if (nE === 0 && nS === 2) fit = { n: 1, what: 'these two structures' };
+    else if (nE === 0 && nS === 2) {
+      // Different atom counts cannot be the two ends of a reaction (the panel says so): nothing to run.
+      const [a, b] = sel.structures.map((id) => state.workspace.structures[id]);
+      if (a && b && a.natoms !== b.natoms) return null;
+      fit = { n: 1, what: 'these two structures' };
+    }
     if (fit && op.needs_route_ts) Object.assign(fit, routeTsCheck(sel));
     return fit;
   }
@@ -28,7 +33,7 @@ export function applicability(op, sel) {
   if (op.target === 'job') return null;   // follow-ups live on their source job's result page
   if (op.target === 'set') {
     if (!(nS >= op.min_structures && nE === 0)) return null;
-    const fit = { n: 1, what: `${nS} structures` };
+    const fit = { n: 1, what: nS === 1 ? 'this structure' : `${nS} structures` };
     if (op.same_atoms) {
       const recs = sel.structures.map((id) => state.workspace.structures[id]).filter(Boolean);
       const key = (r) => `${r.formula}|${r.charge}|${r.multiplicity}`;
@@ -135,8 +140,19 @@ function withoutFields(schema, keys) {
   return { ...schema, properties };
 }
 
+// A done, running or queued job of `op` on the same structures with the same
+// settings and profile: running it again only repeats it.
+function sameCalculation(op, sel, params, profile) {
+  const ws = state.workspace;
+  const ends = (t) => [...new Set([...(t.structures || []), ...(t.edges || []).flatMap((id) => (ws.edges[id] ? [ws.edges[id].source, ws.edges[id].target] : []))])].sort().join(',');
+  const want = ends(sel);
+  return Object.values(state.jobs).find((j) => j.op === op.key && ['done', 'running', 'queued'].includes(j.status)
+    && (j.profile ?? null) === (profile ?? null) && ends(j.targets || {}) === want
+    && Object.entries(params).every(([k, v]) => JSON.stringify(j.params?.[k] ?? null) === JSON.stringify(v ?? null))) || null;
+}
+
 function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = false }) {
-  const [values, setValues] = useState(() => clampToSchema(op.schema, { ...defaultsFor(op.schema), ...prefs.get(`params:${op.key}`, {}) }));
+  const [values, setValues] = useState(() => rememberedValues(op));
   // Default to the session's level-of-theory profile, so a calculation runs
   // on the surface its structures were minimized on.
   const [profile, setProfile] = useState(() => defaultProfile());
@@ -165,8 +181,11 @@ function OperationCard({ op, sel, fit, open, onToggle, fixed = null, embedded = 
   });
 
   const run = async () => {
+    const twin = sameCalculation(op, sel, params(), profile);
+    if (twin && !confirm(`This exact calculation ${twin.status === 'done' ? 'already ran' : `is already ${twin.status}`} `
+      + `(${twin.title}): same structures, settings and profile, so it would ${twin.status === 'done' ? 'give the same result' : 'run twice'}. Run it anyway?`)) return;
     setBusy(true);
-    prefs.set(`params:${op.key}`, clean(values));   // (a method's fixed params are not remembered as choices)
+    rememberValues(op, clean(values));   // (a method's fixed params are not remembered as choices)
     prefs.set('profile', profile);
     const jobs = await attempt(() => api.post('/api/jobs', body(false)),
       (js) => (js.length === 1 ? `Queued: ${js[0].title}` : `Queued ${js.length} jobs`));

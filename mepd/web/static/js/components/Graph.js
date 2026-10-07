@@ -74,6 +74,11 @@ function fitCapped(c, padding = 70) {
   c.panBy({ x: 0, y: 22 });   // clear of the floating toolbar
 }
 
+// The view fitted to the graph, as the layout in use wants it.
+function fitView(c) {
+  if (state.layout === 'playground') fitInto(c, playgroundFitMargins()); else fitCapped(c);
+}
+
 // Fit everything into the canvas minus margins (px) kept free for overlays.
 function fitInto(c, m) {
   const eles = c.elements();
@@ -469,6 +474,7 @@ export function Graph() {
   const glowing = useRef(new Set());    // nodes currently wearing the 'calculation running' glow
   const arranging = useRef(false);      // a layout is animating
   const pendingArrange = useRef(false); // new nodes arrived while the graph was hidden
+  const fittedFor = useRef(null);       // the workspace whose saved layout the view was fitted to
   const arrangeRef = useRef(() => {});
   const treeRef = useRef(() => {});
   const selection = useStore((s) => s.selection);
@@ -587,7 +593,8 @@ export function Graph() {
       c.resize();
       // Structures added while another tab was showing: arrange on reveal.
       if (pendingArrange.current && host.current && host.current.offsetWidth > 0) {
-        (pendingArrange.current === 'tree' ? treeRef : arrangeRef).current();
+        if (pendingArrange.current === 'fit') { pendingArrange.current = false; fitView(c); }
+        else (pendingArrange.current === 'tree' ? treeRef : arrangeRef).current();
       }
     });
     ro.observe(host.current);
@@ -713,6 +720,14 @@ export function Graph() {
     if (unplacedRetro) treeRef.current();
     else if (unplaced) arrangeRef.current();   // e.g. minima just added from a result
     else if (placed && Object.keys(positions).length === 0) fitCapped(c);
+    else if (placed && fittedFor.current !== workspace.root) {
+      // Saved positions drawn for the first time (a reload, another
+      // session): the view is not saved, and the default one showed them
+      // under the toolbar or off-screen. Fit once; when shown, if hidden.
+      if (host.current && host.current.offsetWidth > 0) fitView(c);
+      else pendingArrange.current = pendingArrange.current || 'fit';
+    }
+    if (placed) fittedFor.current = workspace.root;
   }, [workspace, statusKey]);
 
   // --- "breathing" nodes: a structure with a calculation running on it

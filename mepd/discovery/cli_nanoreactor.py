@@ -13,6 +13,23 @@ import typer
 from mepd.discovery.cli import discovery_app
 
 
+def _time_left(live: dict, done_ps: float, total_ps: float) -> str:
+    """' · about N min left' from the simulated time per second so far
+    (measured from the first MD segment, so the relaxation and setup do
+    not count); '' until there is a rate to go on."""
+    import time
+
+    now = time.time()
+    if "md_t0" not in live:
+        live["md_t0"], live["md_ps0"] = now, done_ps
+        return ""
+    rate = (done_ps - live["md_ps0"]) / max(now - live["md_t0"], 1e-9)
+    if rate <= 0 or done_ps >= total_ps:
+        return ""
+    left = (total_ps - done_ps) / rate
+    return f" · about {left / 60:.0f} min left" if left >= 90 else f" · about {left:.0f} s left"
+
+
 def _parse_molecule(item: str) -> tuple[str, int]:
     """'SMILES', 'SMILES*3', '3*SMILES' or an xyz path (optionally '*N')."""
     left, sep, right = item.rpartition("*")
@@ -212,7 +229,8 @@ def nanoreactor(
             typer.echo(f"Relaxing the packed reactor ({payload['natoms']} atoms)...")
         elif event == "md_segment":
             typer.echo(f"MD {payload['time_ps']:.2f} / {payload['total_ps']:.2f} ps (wall {payload['radius']:.1f} A"
-                       + (f", {payload['temperature']:.0f} K" if payload.get("temperature") else "") + ")")
+                       + (f", {payload['temperature']:.0f} K" if payload.get("temperature") else "") + ")"
+                       + _time_left(live, payload["time_ps"], payload["total_ps"]))
         elif event == "refine_species":
             typer.echo(f"Optimizing species {payload['index'] + 1}/{payload['total']}: {payload['smiles']}")
         elif event == "refine_reaction":

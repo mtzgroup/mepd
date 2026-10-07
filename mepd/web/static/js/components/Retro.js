@@ -2,7 +2,8 @@
 // they are run (building blocks first), each step's TS search one click away
 // (the step is an ordinary reaction in Explore).
 import { html, useState } from '../lib.js';
-import { useStore } from '../store.js';
+import { api, attempt } from '../api.js';
+import { select, set, toast, useStore } from '../store.js';
 import { depictUrl, fmtKcal } from '../util.js';
 import { ReactionCard, TsCell, reactionOf } from './Reactions.js';
 
@@ -46,7 +47,20 @@ function Step({ job, s, stock, open, onOpen }) {
   </div>`;
 }
 
+// A route into Explore: what was deleted since is added back, then the
+// route is selected there.
+async function toExplore(job, rank) {
+  const out = await attempt(() => api.post(`/api/jobs/${job.id}/retro/routes/${rank}/explore`));
+  if (!out) return;
+  select({ structures: out.structures, edges: out.edges });
+  set({ view: { tab: 'graph', jobId: null } });
+  toast(`Route ${rank} is in Explore (selected)`, 'ok', 4000);
+}
+
 export function RetroRoutes({ job, retro }) {
+  const ws = useStore((s) => s.workspace);
+  // A route is in Explore when each of its building blocks is (as the job placed it).
+  const inExplore = (rt) => rt.leaves.every((l) => ws.structures[job.retro_nodes?.[l.smiles]]);
   const [openRoute, setOpenRoute] = useState(0);
   const [openStep, setOpenStep] = useState(null);
   if (retro.live) return html`<p class="small muted">Searching… routes appear when the search ends.</p>`;
@@ -63,6 +77,8 @@ export function RetroRoutes({ job, retro }) {
           ${rt.highest_barrier_kcal != null && html`<span class="badge accent" title="Highest barrier along the route (each step checked by path search)">ΔE‡ max ${rt.all_verified ? '' : '≈'}${fmtKcal(rt.highest_barrier_kcal)}</span>`}
           <span class="spacer"></span>
           <span class="small muted" title="Product of the step scores (the search's cost is −log of it)">score ${rt.score != null ? rt.score.toPrecision(2) : '—'}</span>
+          <button class="btn small" title=${inExplore(rt) ? "Select this route's molecules and steps in Explore" : "Add this route's molecules and steps to Explore (anything deleted since comes back) and select them there"}
+            onClick=${(e) => { e.stopPropagation(); toExplore(job, rt.rank); }}>${inExplore(rt) ? 'Show in Explore' : 'Add to Explore'}</button>
           ${!open && html`<span class="retro-mini">${rt.leaves.slice(0, 4).map((l) => html`<${Mol} smiles=${l.smiles} stock=${l.in_stock} size=${38} />`)}</span>`}
         </div>
         ${open && rt.steps.map((s, k) => html`<${Step} job=${job} s=${s} stock=${stock}
