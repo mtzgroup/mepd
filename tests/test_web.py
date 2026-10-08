@@ -287,6 +287,10 @@ def test_import_existing_output_and_pull_irc_ends_into_graph(client, tmp_path):
     r = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": irc["id"], "frames": "endpoints"}).json()
     assert len(r["added"]) == 2 and r["edge"] is not None
     assert r["edge"]["origin"]["barrier_kcal"] == pytest.approx(0.10 * 627.509474, abs=1e-3)
+    # The TS's own energy goes with its barrier (kinetics puts it on the species' scale).
+    assert r["edge"]["origin"]["ts_energy_hartree"] == pytest.approx(-76.30)
+    from mepd.web.results import summarize
+    assert summarize(result)["ts_energy_hartree"] == pytest.approx(-76.30, abs=1e-6)
     # Importing the same ends again reuses them (same connectivity + energy).
     r2 = client.post(f"/api/jobs/{job['id']}/import-entry", json={"entry": irc["id"], "frames": "endpoints"}).json()
     assert r2["added"] == [] and len(r2["reused"]) == 2

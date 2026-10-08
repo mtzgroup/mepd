@@ -315,10 +315,12 @@ def _put_ts(ws, job: dict, eid: str, rx: dict) -> None:
         if edge is None:
             return
         o = edge.get("origin") or {}
-        if o.get("barrier_kcal") == ts["barrier_kcal"] and not o.get("proposed"):
+        if o.get("barrier_kcal") == ts["barrier_kcal"] and not o.get("proposed") \
+                and o.get("ts_energy_hartree") == ts.get("energy"):
             return
         edge["origin"] = {"kind": "job", "job": job["id"], "entry": f"reaction_{rx['id']}_irc", "group": "irc",
                           "has_ts": True, "barrier_kcal": ts["barrier_kcal"], "label": ts.get("label"),
+                          "ts_energy_hartree": ts.get("energy"),
                           "nanoreactor": True, "reaction": rx["id"],
                           "headline": "TS + IRC on the reaction's subsystem (nanoreactor)"}
         ws._save()

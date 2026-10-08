@@ -55,7 +55,7 @@ def network(tmp_path):
         {"id": 1, "reactants": [0, 1], "products": [1, 2], "shuttles": [1], "label": "CC=O + O -> C=CO + O",
          "first_fs": 30.0, "count": 1, "reverse_count": 0, "instances": [], "delta_e_kcal": 12.5,
          "complex": complex_of(1, ["CC=O", "O"], ["C=CO", "O"], -25.01, -24.99),
-         "ts": {"barrier_kcal": 31.0, "label": "pair_0_1_ts0", "files": {}}},
+         "ts": {"barrier_kcal": 31.0, "energy": -25.01 + 31.0 / 627.509474, "label": "pair_0_1_ts0", "files": {}}},
     ]
     (out / "network.json").write_text(json.dumps({"species": species, "reactions": reactions, "events": []}))
     return out
@@ -135,8 +135,12 @@ def test_kinetics_uses_reactions_with_barriers_and_ranks_what_controls_the_targe
     snap = ws.snapshot()
     rx = {r["label"]: r for r in snap["reactions"].values()}
     direct, shuttled = rx["CC=O -> C=CO"], rx["CC=O + O -> C=CO + O"]
-    jobs = {"t1": {"id": "t1", "targets": {"edges": [direct["edge"]]}, "status": "done",
-                   "summary": {"barrier_kcal": 40.0, "barrier_verified": True}}}
+    # The TS search's barrier (40) is from its own start, 5 kcal/mol above the
+    # species' stored energy: the model takes the TS's energy, not 40 on top
+    # of the species.
+    jobs = {"t1": {"id": "t1", "targets": {"edges": [direct["edge"]]}, "status": "done", "level": None,
+                   "summary": {"barrier_kcal": 40.0, "barrier_verified": True,
+                               "ts_energy_hartree": -20.0 + 45.0 / 627.509474}}}
     sid = {s["smiles"]: s["id"] for s in snap["structures"].values() if s["role"] == "minimum"}
     # Short enough to be under kinetic control (at equilibrium no barrier would matter, X = 0).
     out = analyze(snap, jobs, None, initial={sid["CC=O"]: 1.0, sid["O"]: 1.0}, held=[], temperature=500,
@@ -145,11 +149,19 @@ def test_kinetics_uses_reactions_with_barriers_and_ranks_what_controls_the_targe
     labels = [s["label"] for s in out["steps"]]
     assert sorted(labels) == ["CC=O + O -> C=CO + O", "CC=O -> C=CO"]
     assert out["target"]["final"] > 0
+    fwd = {s["label"]: s["barrier_fwd"] for s in out["steps"]}
+    assert fwd["CC=O -> C=CO"] == pytest.approx(45.0, abs=1e-6)
+    # (from the separated reactants, 0.01 Hartree above the run's complex)
+    assert fwd["CC=O + O -> C=CO + O"] == pytest.approx(31.0 - 0.01 * 627.509474, abs=1e-6)
     ctl = dict(zip(labels, out["control"]["steps"]))
     assert ctl["CC=O + O -> C=CO + O"] > 0.9 > ctl["CC=O -> C=CO"]       # the lower route controls it
     out2 = analyze(snap, {}, None, initial={sid["CC=O"]: 1.0}, held=[], temperature=500, time_s=1.0, target=None)
     assert [s["label"] for s in out2["steps"]] == ["CC=O + O -> C=CO + O"]  # without the TS job: only the run's own
     assert any(e["label"] == "CC=O -> C=CO" and e["reason"] == "no barrier yet" for e in out2["excluded"])
+    # A TS at another level of theory never joins this level's species.
+    other = {"t1": {**jobs["t1"], "level": {"key": "other"}}}
+    out3 = analyze(snap, other, None, initial={sid["CC=O"]: 1.0}, held=[], temperature=500, time_s=1.0, target=None)
+    assert any(e["label"] == "CC=O -> C=CO" and e["reason"] == "TS at another level of theory" for e in out3["excluded"])
 
 
 def test_reactor_view_shows_packing_and_relaxation_before_the_md(tmp_path):

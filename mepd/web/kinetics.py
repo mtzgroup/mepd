@@ -14,28 +14,52 @@ from mepd.web.workspace import is_species
 HARTREE_KCAL = 627.509474
 
 
-def edge_barrier(edge: dict, jobs: dict, include_unverified: bool) -> tuple[Optional[float], bool, Optional[str]]:
-    """(barrier from the edge's source side, verified?, job id) -- as the graph
-    shows it: the lowest IRC-verified barrier, else (if allowed) the lowest
-    path maximum."""
-    ver, unver = [], []
+def _level(job: Optional[dict]) -> Optional[str]:
+    return ((job or {}).get("level") or {}).get("key")
+
+
+def edge_ts(edge: dict, jobs: dict, level_key: Optional[str],
+            include_unverified: bool) -> tuple[Optional[float], bool, Optional[str], Optional[str]]:
+    """(TS energy in Hartree, verified?, job id, why not) of an edge's lowest
+    TS at `level_key`: the IRC-verified ones, else (if allowed) path maxima.
+    The TS's own energy, never a barrier added to a species' energy: a
+    barrier is measured from the structure its search started from (an IRC
+    end, a conformer), which need not be the species' stored structure.
+    TSs are compared by energy, not by barrier, for the same reason."""
+    ver, unver, other_level, no_energy = [], [], False, False
+
+    def consider(e_ts, level, verified, jid):
+        nonlocal other_level, no_energy
+        if level != level_key:
+            other_level = True
+        elif e_ts is None:
+            no_energy = True
+        else:
+            (ver if verified else unver).append((e_ts, jid))
+
     for j in jobs.values():
         if edge["id"] not in j["targets"]["edges"] or j["status"] != "done":
             continue
-        b = (j.get("summary") or {}).get("barrier_kcal")
-        if b is None:
+        sm = j.get("summary") or {}
+        if sm.get("barrier_kcal") is None:
             continue
-        (unver if (j.get("summary") or {}).get("barrier_verified") is False else ver).append((b, j["id"]))
+        consider(sm.get("ts_energy_hartree"), _level(j), sm.get("barrier_verified") is not False, j["id"])
     o = edge.get("origin") or {}
     if o.get("barrier_kcal") is not None:
-        ver.append((o["barrier_kcal"], o.get("job")))
-    if ver:
-        b, jid = min(ver, key=lambda x: x[0])
-        return b, True, jid
-    if include_unverified and unver:
-        b, jid = min(unver, key=lambda x: x[0])
-        return b, False, jid
-    return None, False, None
+        t = o.get("qmmm_ts") or {}
+        if t:
+            consider(t.get("energy"), t.get("level"), True, t.get("job"))
+        else:
+            consider(o.get("ts_energy_hartree"), _level(jobs.get(o.get("job"))), True, o.get("job"))
+    for pool, verified in ((ver, True), (unver, False)):
+        if pool and (verified or include_unverified):
+            e, jid = min(pool, key=lambda x: x[0])
+            return e, verified, jid, None
+    why = ("no barrier yet" if not (other_level or no_energy or unver) else
+           "only unverified barriers" if unver else
+           "TS at another level of theory" if other_level and not no_energy else
+           "TS energy not known")
+    return None, False, None, why
 
 
 def build(snap: dict, jobs: dict, level_key: Optional[str], *, include_unverified: bool = False):
@@ -55,9 +79,9 @@ def build(snap: dict, jobs: dict, level_key: Optional[str], *, include_unverifie
             excluded.append({"label": label, "reason": "no TS endpoints (" + (r.get("complex_reason") or "none") + ")",
                              "reaction": r["id"]})
             continue
-        b, verified, jid = edge_barrier(edge, jobs, include_unverified)
-        if b is None:
-            excluded.append({"label": label, "reason": "no barrier yet", "reaction": r["id"]})
+        e_ts, verified, jid, why = edge_ts(edge, jobs, level_key, include_unverified)
+        if e_ts is None:
+            excluded.append({"label": label, "reason": why, "reaction": r["id"]})
             continue
         rc = st.get(edge["source"])
         missing = [st.get(s, {}).get("name", s) for s in r["reactants"] + r["products"] if s not in index]
@@ -66,22 +90,25 @@ def build(snap: dict, jobs: dict, level_key: Optional[str], *, include_unverifie
                              "reason": "energies missing at this level: " + ", ".join(missing or ["reactant complex"])})
             continue
         steps.append(mk.Step([index[s] for s in r["reactants"]], [index[s] for s in r["products"]],
-                             rc["energy"] * HARTREE_KCAL + b, label))
+                             e_ts * HARTREE_KCAL, label))
         info.append({"kind": "reaction", "reaction": r["id"], "edge": edge["id"], "label": label,
                      "verified": verified, "job": jid, "shuttles": r.get("shuttles") or []})
     complexes = {sid for sid, rec in st.items() if rec.get("role") == "complex"}
     for e in snap["edges"].values():
         if e["source"] in complexes or e["target"] in complexes:
             continue
-        b, verified, jid = edge_barrier(e, jobs, include_unverified)
-        if b is None:
+        e_ts, verified, jid, why = edge_ts(e, jobs, level_key, include_unverified)
+        if e_ts is None:
+            if why not in ("no barrier yet", "only unverified barriers"):
+                excluded.append({"label": f"{st.get(e['source'], {}).get('name', '?')} -> "
+                                          f"{st.get(e['target'], {}).get('name', '?')}", "reason": why, "edge": e["id"]})
             continue
         a, c = e["source"], e["target"]
         label = f"{st.get(a, {}).get('name', '?')} -> {st.get(c, {}).get('name', '?')}"
         if a not in index or c not in index:
             excluded.append({"label": label, "reason": "an end has no energy at this level", "edge": e["id"]})
             continue
-        steps.append(mk.Step([index[a]], [index[c]], st[a]["energy"] * HARTREE_KCAL + b, label))
+        steps.append(mk.Step([index[a]], [index[c]], e_ts * HARTREE_KCAL, label))
         info.append({"kind": "edge", "edge": e["id"], "label": label, "verified": verified, "job": jid,
                      "shuttles": []})
     # The same transformation from several runs (same reactants and products,

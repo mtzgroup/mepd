@@ -37,7 +37,7 @@ from mepd.web import chem
 from mepd.web.jobs import Broadcaster, JobManager, _reduce_chain_payload
 from mepd.web.sessions import Sessions
 from mepd.web.operations import OPERATIONS
-from mepd.web.results import MINIMA_KINDS, collect_cached, find_entry, summarize
+from mepd.web.results import MINIMA_KINDS, collect_cached, entry_ts_energy, find_entry, summarize
 from mepd.web.workspace import HARTREE_TO_KCAL, Workspace, WorkspaceError, is_ts, validate_profile_text
 from mepd.web.workspace import find_duplicate as _find_duplicate
 
@@ -486,10 +486,11 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                 attached |= bool(web_qmmm.attach_ts(manager.ws, job, manager.jobs))
             except Exception:
                 logging.getLogger(__name__).exception("could not attach the QM/MM TS of %s", job["id"])
-        # ...and QM/MM edges with a TS but no barrier yet (their ends may have
-        # gained energies at its level since, e.g. IRC ends added from a result).
+        # ...and QM/MM edges with a TS but no barrier yet, or one from before
+        # it was taken from the TS's own IRC ends.
         pending = [eid for eid, e in manager.ws.snapshot()["edges"].items()
-                   if (e.get("origin") or {}).get("qmmm_ts") and (e.get("origin") or {}).get("barrier_kcal") is None]
+                   if (t := (e.get("origin") or {}).get("qmmm_ts"))
+                   and ((e.get("origin") or {}).get("barrier_kcal") is None or t.get("source_energy") is None)]
         for eid in pending:
             try:
                 attached |= web_qmmm.edge_barrier(manager.ws, manager.jobs, eid) is not None
@@ -504,8 +505,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                      # ...or from before multistep routes were told from direct steps (Explore's edges)
                      or (j["op"] in ("ts", "channels", "channels-more") and "n_steps" not in j["summary"])
                      # ...or a solvent comparison from before reaction energies were kept
-                     or (j["op"] == "solvent" and "gas_reaction_kcal" not in (j["summary"].get("conditions") or {})))]
-        if stale:
+                     or (j["op"] == "solvent" and "gas_reaction_kcal" not in (j["summary"].get("conditions") or {}))
+                     # ...or a barrier from before its TS's energy was kept (kinetics)
+                     or (j["summary"].get("barrier_kcal") is not None and "ts_energy_hartree" not in j["summary"]))]
+        # Edges added from a result's entry before their TS's energy was kept.
+        no_ts = [(eid, o) for eid, e in manager.ws.snapshot()["edges"].items()
+                 if (o := e.get("origin") or {}).get("barrier_kcal") is not None and not o.get("qmmm_ts")
+                 and "ts_energy_hartree" not in o and o.get("entry") and o.get("job") in manager.jobs]
+        if stale or no_ts:
             async def redo() -> None:
                 for job in stale:
                     try:
@@ -513,6 +520,17 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                         manager._update(job)
                     except Exception:
                         continue
+                for eid, o in no_ts:
+                    try:
+                        _, entry = find_entry(await page_result(manager, manager.jobs[o["job"]]), o["entry"])
+                        e_ts = entry_ts_energy(entry)
+                    except Exception:
+                        e_ts = None
+                    with manager.ws._lock:
+                        e = manager.ws._data["edges"].get(eid)
+                        if e is not None:
+                            e.setdefault("origin", {})["ts_energy_hartree"] = e_ts
+                            manager.ws._save()
             asyncio.get_running_loop().create_task(redo())
 
     sessions = Sessions(bus, max_concurrent=max_concurrent, on_finished=on_finished,
@@ -1913,6 +1931,7 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
             if len(set(ids)) == 2:
                 edge = W().add_edge(ids[0], ids[1], label=entry["label"], origin={
                     "kind": "job", "job": jid, "entry": entry["id"], "barrier_kcal": entry.get("barrier_kcal"),
+                    "ts_energy_hartree": entry_ts_energy(entry),
                     "headline": entry.get("note", ""),
                     # IRC-derived edges know their TS (a VRI search can start from it).
                     "group": group.get("kind"), "has_ts": entry.get("ts_index") is not None})

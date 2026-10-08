@@ -346,6 +346,7 @@ def collect_ts(out: Path, charge: int, multiplicity: int, floor_hint: Optional[f
         {"label": "Barrier reference", "value": "lowest reactant-side energy (path start / IRC ends)"},
     ]
     result = _result(headline, groups, summary, barrier, warnings)
+    result["barrier_floor_hartree"] = floor     # barrier_kcal = E(TS) - this (summarize: the TS's energy)
     result["barrier_verified"] = verified
     # Explore draws the edge start -> end solid only for a direct path: a
     # verified single step, or an unverified path that did not split.
@@ -519,7 +520,7 @@ def _network_group(fp: Path, floor: Optional[float]) -> Optional[dict]:
 
 def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
     ts_items = _ts_dir_items(out, charge, multiplicity)
-    ts_entries, irc_entries = [], []
+    ts_entries, irc_entries, floors = [], [], []
     for label, ts_node, irc in ts_items:
         # No reactant is known: the barrier is from the lower IRC end, so
         # draw the IRC from that end (an edge made from its ends then points
@@ -531,6 +532,7 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
         floor = _min(_node_energy(n) for n in (irc.nodes if irc is not None else []))
         e = _node_energy(ts_node)
         barrier = (e - floor) * HARTREE_TO_KCAL if e is not None and floor is not None else None
+        floors.append(floor)
         ts_entries.append(_entry(label, label, [ts_node], floor if floor is not None else e,
                                  barrier=barrier, note=_irc_note(irc) if irc is not None else ""))
         if irc is not None:
@@ -545,10 +547,12 @@ def collect_tsopt(out: Path, charge: int, multiplicity: int) -> dict:
     for e in ts_entries:
         if e["id"] in failed:
             e["note"] = f"IRC failed ({failed[e['id']]}): what this TS connects is unknown"
-    return _result(headline, [_group("Transition states", "ts", ts_entries),
-                              _group("IRC paths", "irc", irc_entries)],
-                   [{"label": "Barrier reference", "value": "lower IRC end"}],
-                   ts_entries[0]["barrier_kcal"] if len(ts_entries) == 1 else None)
+    result = _result(headline, [_group("Transition states", "ts", ts_entries),
+                                _group("IRC paths", "irc", irc_entries)],
+                     [{"label": "Barrier reference", "value": "lower IRC end"}],
+                     ts_entries[0]["barrier_kcal"] if len(ts_entries) == 1 else None)
+    result["barrier_floor_hartree"] = floors[0] if len(floors) == 1 else None
+    return result
 
 
 def collect_channels(out: Path, charge: int, multiplicity: int, floor_hint: Optional[float] = None,
@@ -704,6 +708,7 @@ def collect_channels(out: Path, charge: int, multiplicity: int, floor_hint: Opti
         {"label": "Barrier reference", "value": "lowest reactant conformer / reactant-side IRC end"},
     ]
     result = _result(headline, groups, summary, best, warnings)
+    result["barrier_floor_hartree"] = floor     # every barrier here, routes too, is E(TS) - this
     lowest = [i for i in channels if i.get("barrier") is not None and best is not None and abs(i["barrier"] - best) < 1e-6]
     if lowest:
         result["route_ts"] = _route_ts(lowest[0]["title"], lowest[0]["ts"], lowest[0]["barrier"])
@@ -792,6 +797,7 @@ def collect_ts_extended(ts_out: Path, channels_out: Path, charge: int, multiplic
         lowest = next(e for e in chans if e["barrier_kcal"] == best) if best is not None else None
         if lowest is not None and lowest["id"].startswith("first_"):
             ch["route_ts"] = ts.get("route_ts")
+    ch["barrier_floor_hartree"] = shared        # both reads are on it
     b = ts["barrier_kcal"]
     ch["summary"].insert(0, {"label": tag, "value": None if b is None else
                              f"ΔE‡ {b:.1f} kcal/mol" + ("" if ts.get("barrier_verified") else ", not IRC-verified")})
@@ -1742,6 +1748,10 @@ def summarize(result: dict) -> dict:
             # lowest verified direct (one-step) barrier: Explore draws an edge
             # solid only for a direct path. None: not known (a single TS).
             "n_steps": result.get("n_steps"), "direct_barrier_kcal": result.get("direct_barrier_kcal"),
+            # The energy (Hartree, the job's level) of the TS that sets barrier_kcal:
+            # kinetics puts TSs and species on one scale with it, never adding a
+            # barrier measured from one structure to another structure's energy.
+            "ts_energy_hartree": ts_energy_hartree(result),
             "barrier_warning": negative_barrier_text(result["barrier_kcal"])
             if result.get("barrier_kcal") is not None and result["barrier_kcal"] < NEGATIVE_BARRIER_TOL else None,
             # Which TS sets that barrier (no geometry: that is in route_ts.xyz).
@@ -1755,6 +1765,24 @@ def summarize(result: dict) -> dict:
             "substituents": {"insight": next((i["text"] for i in result["substituents"].get("insights") or []
                                               if i["level"] in ("selectivity", "accelerates")), None)}
             if result.get("substituents") else None}
+
+
+def entry_ts_energy(entry: dict) -> Optional[float]:
+    """Energy (Hartree) of the TS behind an entry's barrier_kcal: its TS
+    frame, or its only frame (a TS listed alone)."""
+    frames = entry.get("frames") or []
+    if entry.get("barrier_kcal") is None or not frames:
+        return None
+    k = entry.get("ts_index")
+    if k is None and len(frames) == 1:
+        k = 0
+    return frames[k].get("energy_hartree") if k is not None and 0 <= k < len(frames) else None
+
+
+def ts_energy_hartree(result: dict) -> Optional[float]:
+    """Absolute energy of the TS behind a result's barrier_kcal, or None."""
+    b, floor = result.get("barrier_kcal"), result.get("barrier_floor_hartree")
+    return floor + b / HARTREE_TO_KCAL if b is not None and floor is not None else None
 
 
 def _conditions_summary(cond: Optional[dict]) -> Optional[dict]:
