@@ -11,10 +11,11 @@ atoms their cut bonds reach), y the environment --
 
 (the QM/MM minimum free-energy path: H. Hu, Z. Lu, W. Yang, J. Chem. Theory
 Comput. 3, 390 (2007), doi:10.1021/ct600240y). The average is over an MD of
-the environment at `temperature` with the solute held: xtb's dynamics at
-the region's low level (GFN-FF, or GFN1/GFN2), the solute kept rigid by
-stiff restraints on all its distances (xtb ignores exact fixing in MD), each
-frame then turned back onto the solute and the solute put back exactly. In
+the environment at `temperature` with the solute held (and the region's
+frozen outer shell: the droplet's or protein's boundary): xtb's dynamics at
+the region's low level (GFN-FF, or GFN1/GFN2), the held atoms kept rigid by
+stiff restraints on all their distances (xtb ignores exact fixing in MD),
+each frame then turned back onto them and them put back exactly. In
 the subtractive (mechanical) embedding the QM energy of a fixed solute does
 not depend on the environment, so these dynamics sample the QM/MM ensemble
 exactly and each frame costs only low-level gradients: one QM gradient per
@@ -119,6 +120,9 @@ class MeanForceEngine(ModifiedEngine):
     _lock: object = field(default_factory=threading.Lock, repr=False)
     last_samples: dict = field(default_factory=dict, repr=False)
     _estimates: dict = field(default_factory=dict, repr=False)   # solute geometry -> its own energy estimate
+    _samplings: dict = field(default_factory=dict, repr=False)   # solute geometry -> its frames, for the live view
+    _shown: dict = field(default_factory=dict, repr=False)       # live stream -> the solute geometry it shows
+    max_live_frames: int = 12
 
     def __post_init__(self):
         from mepd.engines.qmmm import QMMMEngine, _OpenMMLow, _XTBLow
@@ -138,6 +142,9 @@ class MeanForceEngine(ModifiedEngine):
         r = self.region
         self.solute = sorted(set(r.qm_atoms) | {int(m) for _, m in r.links})
         self.environment = [i for i in range(r.natoms) if i not in set(self.solute)]
+        # Held during the environment's dynamics: the solute, and the region's
+        # frozen outer shell (the droplet's or protein's boundary).
+        self.held = sorted(set(self.solute) | {int(i) for i in r.frozen_atoms})
         self._inherit()
 
     def __repr__(self) -> str:
@@ -154,7 +161,7 @@ class MeanForceEngine(ModifiedEngine):
         if not warm:
             return x.copy()
         best = min(warm, key=lambda w: float(np.sum((w[0] - s) ** 2)))
-        return onto_solute(best[1], s, self.solute)
+        return onto_solute(best[1], x[self.held], self.held)
 
     def _remember(self, x: np.ndarray, frame: np.ndarray) -> None:
         with self._lock:
@@ -167,7 +174,7 @@ class MeanForceEngine(ModifiedEngine):
         r = self.region
         total = float(self.equilibrate_ps) + float(self.sample_ps)
         dump_fs = max(float(self.timestep_fs), 1000.0 * float(self.sample_ps) / max(1, int(self.frames)))
-        atoms = ",".join(str(i + 1) for i in self.solute)
+        atoms = ",".join(str(i + 1) for i in self.held)
         with tempfile.TemporaryDirectory(prefix="mepd_meanforce_") as tmp:
             tmp = Path(tmp)
             angstrom = start_bohr / ANGSTROM_TO_BOHR
@@ -206,7 +213,7 @@ class MeanForceEngine(ModifiedEngine):
         x = np.asarray(node.coords, dtype=float)
         r = self.region
         charge = int(node.structure.charge)
-        frames = [onto_solute(f, x[self.solute], self.solute) for f in self._md(self._start(x), charge)]
+        frames = [onto_solute(f, x[self.held], self.held) for f in self._md(self._start(x), charge)]
         self._remember(x, frames[-1])
         low = self.base._low.terms(frames, charge)                      # E_low(real) - E_low(model), per frame
         env_only = self._environment_energies(frames, charge)
@@ -218,6 +225,7 @@ class MeanForceEngine(ModifiedEngine):
         mean[self.solute] = r.model_gradient_to_full(g_qm)[self.solute] + grads[:, self.solute].mean(axis=0)
         e_int = np.array([lw["energy"] - e for lw, e in zip(low, env_only)])
         stderr = grads[:, self.solute].std(axis=0) / np.sqrt(max(1, len(frames) - 1))
+        self._keep_for_live(node, frames, e_int, {"force_stderr": float(np.abs(stderr).max())})
         return {"energy": e_qm + float(e_int.mean()), "gradient": mean, "frames": len(frames),
                 "force_stderr": float(np.abs(stderr).max()),
                 "interaction_kcal": float(e_int.mean() * HARTREE_KCAL),
@@ -261,7 +269,7 @@ class MeanForceEngine(ModifiedEngine):
                 self._system_xml = openmm.XmlSerializer.serialize(low.context.getSystem())
             xml = self._system_xml
         system = openmm.XmlSerializer.deserialize(xml)
-        for i in self.solute:
+        for i in self.held:
             system.setParticleMass(i, 0.0)
         if qm_charges is not None:
             nb = next(f for f in system.getForces() if isinstance(f, openmm.NonbondedForce))
@@ -300,7 +308,7 @@ class MeanForceEngine(ModifiedEngine):
         start_node = _bare(node, start)
         q, first = self._solute_charges(start_node) if self.electrostatic else (None, None)
         seed = (abs(hash(x[self.solute].round(5).tobytes())) + len(self._warm)) % (2 ** 31)
-        frames = [onto_solute(f, x[self.solute], self.solute) for f in self._openmm_frames(start, q, seed)]
+        frames = [onto_solute(f, x[self.held], self.held) for f in self._openmm_frames(start, q, seed)]
         self._remember(x, frames[-1])
         frame_nodes = [_bare(node, f) for f in frames]
         if self.electrostatic:
@@ -319,10 +327,12 @@ class MeanForceEngine(ModifiedEngine):
             low = self.base._low.terms(frames, int(node.structure.charge))
             grads = np.array([g_qm + lw["gradient"] for lw in low])
             energy = float(model.energy)
-            e_int = np.zeros(len(frames))
+            e_int = np.array([lw["energy"] for lw in low]) - float(np.mean([lw["energy"] for lw in low]))
         mean = np.zeros_like(x)
         mean[self.solute] = grads[:, self.solute].mean(axis=0)
         stderr = grads[:, self.solute].std(axis=0) / np.sqrt(max(1, len(frames) - 1))
+        self._keep_for_live(node, frames, e_frames if self.electrostatic else e_int,
+                            {"force_stderr": float(np.abs(stderr).max())})
         return {"energy": energy, "gradient": mean, "frames": len(frames),
                 "force_stderr": float(np.abs(stderr).max()),
                 "interaction_kcal": float(e_int.mean() * HARTREE_KCAL),
@@ -373,6 +383,53 @@ class MeanForceEngine(ModifiedEngine):
             self._chain_energies(nodes)
         return nodes
 
+    def _keep_for_live(self, node: StructureNode, frames: list, energies, info: dict) -> None:
+        """The frames this geometry's mean force was averaged over (at most
+        max_live_frames), for the live view; the newest one is also shown as
+        the latest sampling. Nothing is kept when no viewer is attached."""
+        from mepd.progress import live_viewer_attached, write_sampling
+
+        if not live_viewer_attached() or not frames:
+            return
+        r = self.region
+        # About 45 bytes per atom per frame: keep each image's stream near 2 MB
+        # at most (a protein shows fewer frames).
+        cap = max(2, min(int(self.max_live_frames), int(2_000_000 / (45 * max(1, r.natoms)))))
+        step = max(1, int(np.ceil(len(frames) / cap)))
+        keep = list(range(0, len(frames), step))
+        ang = 1.0 / ANGSTROM_TO_BOHR
+        xyz = [f"{r.natoms}\nsampled frame {k + 1} of {len(frames)}\n" + "".join(
+            f"{s} {a * ang:.4f} {b * ang:.4f} {c * ang:.4f}\n" for s, (a, b, c) in zip(r.symbols, frames[k]))
+            for k in keep]
+        e = np.asarray(energies, dtype=float) * HARTREE_KCAL
+        e_rel = [float(e[k] - e.mean()) for k in keep] if len(e) == len(frames) else [None] * len(keep)
+        what = ("QM energy in each frame's field" if self.electrostatic else "force-field energy"
+                if self.sampler == "openmm" else "solute-environment interaction")
+        caption = (f"{len(frames)} frames over {self.sample_ps:g} ps at {self.temperature:g} K (QM region held) · "
+                   f"mean-force standard error {info['force_stderr']:.1e} Eh/bohr · plotted: {what}, vs its mean")
+        entry = {"frames": xyz, "energies": e_rel, "caption": caption}
+        with self._lock:
+            self._samplings[self._key(node)] = entry
+            del_keys = list(self._samplings)[:-400]
+            for k in del_keys:
+                self._samplings.pop(k, None)
+        write_sampling("sampling_latest", xyz, e_rel, label="solvent sampling (latest)", caption=caption)
+
+    def _show_chain_samplings(self, nodes: list[StructureNode]) -> None:
+        """Each image of a path handed over whole gets its own live stream:
+        the sampling its current mean force came from."""
+        from mepd.progress import write_sampling
+
+        for i, n in enumerate(nodes):
+            key = self._key(n)
+            stream = f"sampling_image_{i:02d}"
+            entry = self._samplings.get(key)
+            if entry is None or self._shown.get(stream) == key:
+                continue
+            self._shown[stream] = key
+            write_sampling(stream, entry["frames"], entry["energies"], label=f"image {i + 1} · solvent",
+                           caption=entry["caption"])
+
     def _key(self, node: StructureNode) -> bytes:
         return np.round(np.asarray(node.coords, dtype=float)[self.solute], 6).tobytes()
 
@@ -391,6 +448,7 @@ class MeanForceEngine(ModifiedEngine):
                 acc += 0.5 * float(np.sum((g + prev[1]) * (x - prev[0])))
             n._cached_energy = float(first) + acc
             prev = (x, g)
+        self._show_chain_samplings(nodes)
 
     def compute_hessian(self, *args, **kwargs):
         raise NotImplementedError("Hessians, TS optimizations and IRCs on the mean-force (free-energy) surface are not "

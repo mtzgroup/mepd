@@ -191,3 +191,41 @@ def test_adaptive_integration_resolves_a_step_within_one_segment():
     assert np.abs(one - exact).max() > 1.0
     assert np.abs(auto - exact).max() < 0.5
     assert max(v for _, v in fine) == pytest.approx((a_of(0.3) - a_of(-1.0)) * HARTREE_KCAL, abs=0.3)
+
+
+def test_sampling_holds_the_frozen_shell_and_streams_each_image(tmp_path, monkeypatch):
+    _xtb()
+    pytest.importorskip("openmm")
+    import json
+
+    from mepd.chain import Chain
+    from mepd.engines.gfnff import XTBEngine
+    from mepd.engines.mean_force import MeanForceEngine
+    from mepd.engines.qmmm import QMMMEngine
+    from mepd.inputs import ChainInputs
+
+    monkeypatch.setenv("MEPD_DRIVE_CHAIN_DIR", str(tmp_path / "live"))
+    s = Structure.from_xyz(SYSTEM)
+    region = QMMMRegion.build(s, "0-5", active_radius=2.5, mm="tip3p")      # some waters frozen
+    assert region.frozen_atoms
+    base = QMMMEngine(base=XTBEngine(method="gfn2", n_parallel=2), region=region)
+    mf = MeanForceEngine(base=base, equilibrate_ps=0.02, sample_ps=0.05, frames=3, n_parallel=1)
+    x0 = np.asarray(s.geometry)
+    q, _ = mf._solute_charges(StructureNode(structure=s, has_molecular_graph=False))
+    frames = mf._openmm_frames(x0, q, seed=2)
+    held = mf.held
+    assert set(region.frozen_atoms) <= set(held) and all(np.allclose(f[held], x0[held]) for f in frames)
+    moving = [i for i in range(region.natoms) if i not in set(held)]
+    assert any(not np.allclose(f[moving], x0[moving]) for f in frames)
+    # A path handed over whole: one live stream per image, and the latest.
+    x1 = x0.copy()
+    x1[:6] += 0.05
+    nodes = [StructureNode(structure=s.model_copy(update={"geometry": g}), has_molecular_graph=False)
+             for g in (x0, x1, 0.5 * (x0 + x1))]
+    mf.compute_gradients(Chain.model_validate({"nodes": nodes, "parameters": ChainInputs()}))
+    live = sorted(p.name for p in (tmp_path / "live").glob("*.json"))
+    assert live == ["sampling_image_00.json", "sampling_image_01.json", "sampling_image_02.json",
+                    "sampling_latest.json"]
+    data = json.loads((tmp_path / "live" / "sampling_image_01.json").read_text())
+    assert data["kind"] == "sampling" and data["finished"] and len(data["geometry"]["frames"]) == 3
+    assert data["geometry"]["frames"][0].startswith(f"{region.natoms}\n")

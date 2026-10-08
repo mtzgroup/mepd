@@ -36,9 +36,10 @@ function livePaths(progress, now) {
         state: st.finished ? state : st.status === 'queued' ? 'queued' : 'running' });
       continue;
     }
-    if (st.kind === 'minimization') {
-      // One geometry minimization (a Hessian-sampling candidate).
-      out.push({ id: name, kind: 'minimization', label: st.label || name, plot: st.plot || { x: [], y: [] },
+    if (st.kind === 'minimization' || st.kind === 'sampling') {
+      // One geometry minimization (a Hessian-sampling candidate), or the
+      // environment's dynamics at one path image (the mean-force surface).
+      out.push({ id: name, kind: st.kind, label: st.label || name, plot: st.plot || { x: [], y: [] },
         geometry: st.geometry, caption: st.caption, state, outcome: st.outcome, reference: st.reference, updated: st.updated });
       continue;
     }
@@ -70,6 +71,7 @@ function fmtSigned(v) {
 // One minimization, live: the newest optimizer step while it runs; once it
 // is done, its whole trajectory to scrub or replay.
 function MinimizationLive({ job, fg }) {
+  const sampling = fg.kind === 'sampling';
   const [full, setFull] = useState(null);     // finished: the replay, fetched on demand
   const [pick, setPick] = useState(null);     // chosen frame (null = newest)
   const [playing, setPlaying] = useState(false);
@@ -109,9 +111,9 @@ function MinimizationLive({ job, fg }) {
     <div class="card-block live-path">
       <div class="live-head">
         <h4><span class="badge accent">${fg.label}</span>
-          ${running ? ' Minimizing' : ` ${fg.outcome || fg.state}`}
-          <span class="muted small"> · step ${y.length ? step + 1 : 0}${y.length ? ` of ${y.length}` : ''}${e != null ? ` · ${fmtSigned(e)} kcal/mol vs ${fg.reference === 'seed' ? 'the seed' : 'the start'}` : ''}</span>
-          <span class=${`live-state ${fg.state}`}>${running ? 'minimizing' : fg.state}</span></h4>
+          ${sampling ? ' Solvent sampling' : running ? ' Minimizing' : ` ${fg.outcome || fg.state}`}
+          <span class="muted small"> · ${sampling ? 'frame' : 'step'} ${y.length ? step + 1 : 0}${y.length ? ` of ${y.length}` : ''}${e != null ? ` · ${fmtSigned(e)} kcal/mol vs ${fg.reference === 'seed' ? 'the seed' : fg.reference === 'mean' ? 'the mean' : 'the start'}` : ''}</span>
+          ${!sampling && html`<span class=${`live-state ${fg.state}`}>${running ? 'minimizing' : fg.state}</span>`}</h4>
         ${!running && frames.length > 1 && html`<button class="btn small" onClick=${() => { if (!playing && shown >= frames.length - 1) setPick(0); setPlaying(!playing); }}>
           ${playing ? 'Pause' : 'Replay'}</button>`}
       </div>
@@ -154,6 +156,8 @@ function LivePanel({ job }) {
   // searches (--connect) are listed below it as usual.
   const reactions = allPaths.filter((p) => p.kind === 'morph');
   const paths = allPaths.filter((p) => p.kind !== 'morph');
+  // The environment's sampling at each image (mean-force surface): listed after the paths.
+  paths.sort((a, b) => (a.kind === 'sampling') - (b.kind === 'sampling'));
   const minimizing = paths.length > 0 && paths.every((p) => p.kind === 'minimization');
   // First time anything shows up, pin the first path; afterwards stay put.
   useEffect(() => { if (!selected && paths.length) choose(paths[0].id); }, [selected, paths.length]);
@@ -173,9 +177,9 @@ function LivePanel({ job }) {
   return html`
     <div class="live">
       <div class="last-line mono">${progress?.last_line || job.last_line || (job.status === 'queued' ? 'Waiting for a free slot…' : '')}</div>
-      ${fg && fg.kind === 'minimization' && html`<${MinimizationLive} job=${job} fg=${fg} />`}
+      ${fg && (fg.kind === 'minimization' || fg.kind === 'sampling') && html`<${MinimizationLive} job=${job} fg=${fg} />`}
       ${(reactions.length > 0 || job.op === 'graph-enumeration') && html`<${NetworkLive} job=${job} reactions=${reactions} />`}
-      ${fg && fg.kind !== 'minimization' && html`
+      ${fg && fg.kind !== 'minimization' && fg.kind !== 'sampling' && html`
         <div class="card-block live-path">
           <div class="live-head">
             <h4><span class="badge accent">${fg.label}</span>
@@ -202,10 +206,12 @@ function LivePanel({ job }) {
               class=${`monitor ${p.state === 'running' ? 'active' : ''} ${p.id === fg?.id ? 'pinned' : ''}`}
               onClick=${() => { setAutoFollow(false); choose(p.id); }} title=${p.caption || p.label}>
             <div class="small monitor-head"><b>${p.label}</b>
-              ${p.kind === 'minimization' && p.outcome
+              ${p.kind === 'sampling'
+                ? html`<span class="live-state done">solvent</span>`
+                : p.kind === 'minimization' && p.outcome
                 ? html`<span class=${`live-state outcome-${p.outcome.replace(/\s+/g, '-')}`}>${p.outcome}</span>`
                 : html`<span class=${`live-state ${p.state === 'running' && p.kind === 'minimization' ? 'running' : p.state}`}>${p.kind === 'minimization' && p.state === 'running' ? 'minimizing' : p.state}</span>`}
-              ${p.kind === 'minimization'
+              ${p.kind === 'sampling' ? null : p.kind === 'minimization'
                 ? lastEnergy(p) != null && html`<span class="muted mono">${fmtSigned(lastEnergy(p))}</span>`
                 : pathBarrier(p) != null && html`<span class="muted mono">${pathBarrier(p).toFixed(1)}</span>`}</div>
             <${EnergyPlot} xs=${p.plot.x} ys=${p.plot.y} compact />

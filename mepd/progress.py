@@ -356,6 +356,33 @@ def set_minimization_outcome(stream: str, outcome: str) -> None:
         _write_minimization(state)
 
 
+def write_sampling(stream: str, frames: list, energies_kcal: list, *, label: str = "", caption: str = "") -> None:
+    """A live stream (kind "sampling") of the environment's dynamics at one
+    path image on the mean-force surface: its sampled frames (xyz, the QM
+    region held) to replay, and each frame's energy (kcal/mol, relative to
+    their mean). Rewritten with each new sampling of that image, so it never
+    grows. No-op unless a live viewer is attached (MEPD_DRIVE_CHAIN_DIR)."""
+    fp = _stream_path(stream)
+    if fp is None:
+        return
+    payload = {
+        "kind": "sampling", "stream": stream, "label": label or stream, "caption": caption,
+        "plot": {"x": list(range(len(energies_kcal))), "y": [None if e is None else round(float(e), 3)
+                                                            for e in energies_kcal], "caption": caption},
+        "geometry": {"frames": list(frames), "frame_steps": list(range(len(frames))), "ts_index": None},
+        "reference": "mean", "updated": time.time(), "finished": True, "status": "done", "outcome": None,
+    }
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(fp, payload)
+    except Exception:
+        return
+
+
+def live_viewer_attached() -> bool:
+    return _live_hook_enabled()
+
+
 def write_morph(stream: str, frames: list, *, label: str = "", caption: str = "", status: str = "queued",
                 finished: bool = False, outcome: str | None = None, energies_kcal: tuple = (None, None),
                 reactant_smiles: str = "", product_smiles: str = "", extra: dict | None = None) -> None:
