@@ -413,6 +413,11 @@ class AtomMappingInputs:
         (snap + GI + xtb) and, in channels, searched as its own mechanism;
         those in which a molecule takes part and is regenerated are labelled
         "[catalytic: ...]". Default 0 (off).
+    `rebuild_on_split`: experimental. "start": at every recursive split,
+        each new leg's product is rebuilt in the frame of the leg's start
+        (`network_expansion.build_partners`); "end": the leg's start in the
+        frame of its product. Kept only when bonds and stereochemistry
+        survive minimization. None (default): legs keep the endpoints found.
     """
 
     n_candidates: int = 200
@@ -427,6 +432,7 @@ class AtomMappingInputs:
     # ...a mapping with more bond changes than SLAPMapper's minimal one must
     # beat its relaxed barrier by more than this (kcal/mol), or SLAPMapper's is kept.
     relax_margin: float = 5.0
+    rebuild_on_split: str = None
     # metric "rmsd-geodesic": only candidates within this many standard
     # deviations of the lowest endpoint RMSD are scored by geodesic distance.
     rmsd_window: float = 1.0

@@ -31,12 +31,14 @@ _LEAF = {
     "attempted_elsewhere": ("skipped", "This endpoint pair was already searched elsewhere in the tree."),
     "offtarget_split_rejected": ("rejected", "direct_only: none of the pieces of this split touch a queried species, "
                                              "so none was run."),
-    "max_depth_reached": ("unresolved", "The split limit (recursive depth) was reached; the path is kept as it is."),
-    "same_pair_split_limit_reached": ("unresolved", "The same endpoint pair kept splitting without finding anything "
-                                                    "new; stopped."),
+    "max_depth_reached": ("elementary", "The split limit (recursive depth) was reached, so the path is not split; "
+                                        "it was optimized to convergence and treated as one step."),
+    "same_pair_split_limit_reached": ("elementary", "The same endpoint pair kept splitting without finding anything "
+                                                    "new, so it is not split again; the path was optimized to "
+                                                    "convergence and treated as one step."),
     "time_budget": ("unresolved", "The search budget ran out; the path is kept without splitting it."),
-    "cycle": ("unresolved", "The endpoint pair repeats an ancestor's (a cycle); the path is kept without "
-                            "splitting it again."),
+    "cycle": ("elementary", "The endpoint pair repeats an ancestor's (a cycle), so it is not split again; the "
+                            "path was optimized to convergence and treated as one step."),
     "electronic_structure_error": ("failed", "The electronic-structure calculation failed."),
     "path_minimization_error": ("failed", "The path search raised an error."),
     "worker_failure": ("failed", "The worker process running this branch failed."),

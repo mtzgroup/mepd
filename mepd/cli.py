@@ -399,6 +399,13 @@ def run(
         "some candidate scored marginally better. Default 0.0 is a pure "
         "best-of-N with no calibrated stability margin yet.",
     ),
+    rebuild_splits_from: str = typer.Option(
+        "none", "--rebuild-splits-from",
+        help="Experimental: at every recursive split, rebuild each new leg's product in the frame of its "
+        "start (start), or its start in the frame of its product (end) -- each atom where it is, the "
+        "new bonds pulled to length, minimized -- kept only if bonds and stereochemistry survive. "
+        "Legs then meet at different conformers of an intermediate. none: legs end where the search found them.",
+    ),
     atom_mapping_recheck_splits: bool = typer.Option(
         False, "--atom-mapping-recheck-splits",
         help="Experimental: also re-run the same best-of-N atom-mapping "
@@ -446,6 +453,10 @@ def run(
         typer.echo("--network-completion requires recursive splitting; enabling --recursive.")
         recursive = True
 
+    if not isinstance(rebuild_splits_from, str):   # typer's OptionInfo when called directly
+        rebuild_splits_from = "none"
+    if rebuild_splits_from not in ("none", "start", "end"):
+        raise typer.BadParameter("--rebuild-splits-from must be none, start or end.")
     run_inputs = _open_run_inputs(inputs)
     run_inputs.path_min_inputs.validate_minima_with_hessian = validate_minima_with_hessian
     run_inputs.path_min_inputs.hessian_minimum_frequency_cutoff = hessian_minimum_frequency_cutoff
@@ -460,6 +471,7 @@ def run(
         run_inputs.atom_mapping_inputs.relax_top = max(0, relax_mechanisms)
     if isinstance(relax_margin, (int, float)):
         run_inputs.atom_mapping_inputs.relax_margin = max(0.0, float(relax_margin))
+    run_inputs.atom_mapping_inputs.rebuild_on_split = None if rebuild_splits_from == "none" else rebuild_splits_from
     _echo_run_inputs_summary(run_inputs)
 
     # A --reaction pair is embedded from SMILES too, but is already one

@@ -333,8 +333,8 @@ def _built_pairs_by_mechanism(sources: list, src: str, start_node, end_node, run
     for key in sorted(by_key):
         mine = sorted(by_key[key], key=lambda r: r.score)
         kept += mine[:pairs_per_mechanism] if pairs_per_mechanism > 0 else mine
-        typer.echo(f"  {_describe_mechanism(key)}: {len(by_key[key])} conformer(s)"
-                   + (f", the {min(len(mine), pairs_per_mechanism)} lowest path peak(s) kept"
+        typer.echo(f"  {_describe_mechanism(key)}: {len(mine)} built pair(s)"
+                   + (f", the {pairs_per_mechanism} with the lowest path peak kept"
                       if 0 < pairs_per_mechanism < len(mine) else ""))
     a = [StructureNode(structure=r.start) for r in kept]
     b = [StructureNode(structure=r.end) for r in kept]
@@ -918,6 +918,13 @@ def channels(
         "some candidate scored marginally better. Default 0.0 is a pure "
         "best-of-N with no calibrated stability margin yet.",
     ),
+    rebuild_splits_from: str = typer.Option(
+        "none", "--rebuild-splits-from",
+        help="Experimental: at every recursive split, rebuild each new leg's product in the frame of its "
+        "start (start), or its start in the frame of its product (end) -- each atom where it is, the "
+        "new bonds pulled to length, minimized -- kept only if bonds and stereochemistry survive. "
+        "Legs then meet at different conformers of an intermediate. none: legs end where the search found them.",
+    ),
     atom_mapping_recheck_splits: bool = typer.Option(
         False, "--atom-mapping-recheck-splits",
         help="Experimental: also re-run the same best-of-N atom-mapping "
@@ -1195,6 +1202,10 @@ def channels(
     from mepd.nodes.node import StructureNode
     from mepd.NetworkBuilder import NetworkBuilder
 
+    if not isinstance(rebuild_splits_from, str):   # typer's OptionInfo when called directly
+        rebuild_splits_from = "none"
+    if rebuild_splits_from not in ("none", "start", "end"):
+        raise typer.BadParameter("--rebuild-splits-from must be none, start or end.")
     run_inputs = _open_run_inputs(inputs)
     if isinstance(direct_only, bool):
         run_inputs.path_min_inputs.direct_only = direct_only
@@ -1214,6 +1225,7 @@ def channels(
         run_inputs.atom_mapping_inputs.relax_top = max(0, relax_mechanisms)
     if isinstance(relax_margin, (int, float)):
         run_inputs.atom_mapping_inputs.relax_margin = max(0.0, float(relax_margin))
+    run_inputs.atom_mapping_inputs.rebuild_on_split = None if rebuild_splits_from == "none" else rebuild_splits_from
     _echo_run_inputs_summary(run_inputs)
 
     if reaction is not None:

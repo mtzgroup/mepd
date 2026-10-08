@@ -893,3 +893,31 @@ def test_pair_from_builds_each_partner_in_its_conformer_s_frame():
     dist = lambda a, b: float(np.abs(np.asarray(a.structure.geometry) - np.asarray(b.structure.geometry)).max())
     for k in range(2):   # bonds are pulled to length, so near (not on) its own conformer, far from the other
         assert dist(built[k], kept[k]) < 0.2 < dist(built[k], kept[1 - k])
+
+
+@pytest.mark.parametrize("source", ["start", "end"])
+def test_rebuild_splits_from_replaces_each_leg_s_other_end(source):
+    """--rebuild-splits-from: each split leg's other endpoint is rebuilt in
+    the frame of `source`, so it lands near that end's geometry."""
+    from mepd.msmep import MSMEP
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=2, randomSeed=1)
+    a, b = [StructureNode(structure=Structure(
+        symbols=[x.GetSymbol() for x in mol.GetAtoms()],
+        geometry=np.asarray(c.GetPositions()) * 1.8897259886, charge=0, multiplicity=1)) for c in mol.GetConformers()]
+
+    class Engine:
+        def compute_geometry_optimization(self, node, keywords=None):
+            return [node]
+
+    run_inputs = RunInputs()
+    run_inputs.engine = Engine()
+    run_inputs.atom_mapping_inputs.rebuild_on_split = source
+    leg = Chain.model_validate({"nodes": [a, b], "parameters": ChainInputs()})
+    out = MSMEP(inputs=run_inputs)._rebuild_leg_endpoint(leg, source)
+    kept, rebuilt = (out[0], out[-1]) if source == "start" else (out[-1], out[0])
+    assert kept is (a if source == "start" else b)
+    dist = lambda x, y: float(np.abs(np.asarray(x.coords) - np.asarray(y.coords)).max())
+    other = b if source == "start" else a
+    assert dist(rebuilt, kept) < 0.2 < dist(rebuilt, other)

@@ -24,6 +24,18 @@ from mepd.engines.engine import Engine
 from mepd.errors import ElectronicStructureError
 
 
+
+def _quiet_status(quiet_s: float, reported_minutes: int) -> tuple[Optional[str], int]:
+    """What to put on the live line while GSM has asked for no energies for
+    `quiet_s` seconds: once a minute (a new message only when the whole
+    minutes change), nothing in the first minute. Returns (message or None,
+    minutes now reported)."""
+    minutes = int(quiet_s // 60)
+    if minutes < 1 or minutes == reported_minutes:
+        return None, reported_minutes
+    return (f"GSM is working on its internal coordinates: no new energies requested for {minutes} min "
+            "(slow on large or many-fragment systems)"), minutes
+
 class GSMHelperError(ElectronicStructureError):
     """molecularGSM could not get energies/gradients from mepd at all (its
     `./grad.py` helper never ran). Retrying GSM differently cannot help, so
@@ -878,6 +890,10 @@ class GSM(PathMinimizer):
 
         start_time = time.time()
         last_mtime = None
+        # GSM asks for energies in batches; between them it can spend minutes on
+        # its own internal coordinates (many fragments, large systems). Say so on
+        # the live line, or a frozen live view looks broken.
+        last_activity, quiet_minutes = start_time, 0
         while proc.poll() is None:
             if timeout is not None and (time.time() - start_time) > timeout:
                 proc.kill()
@@ -889,8 +905,13 @@ class GSM(PathMinimizer):
                 mtime = live_path.stat().st_mtime
             except OSError:
                 mtime = None
+            message, quiet_minutes = _quiet_status(time.time() - last_activity, quiet_minutes)
+            if message:
+                from mepd.progress import update_status
+
+                update_status(message)
             if mtime is not None and mtime != last_mtime:
-                last_mtime = mtime
+                last_mtime, last_activity, quiet_minutes = mtime, time.time(), 0
                 live_chain = self._build_live_chain(
                     live_path, reactant, product, e_reactant, chain_parameters
                 )

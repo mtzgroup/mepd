@@ -1572,8 +1572,29 @@ class MSMEP:
         if getattr(getattr(self.inputs, "atom_mapping_inputs", None), "recheck_on_split", False):
             parent_ends = [chain[0], chain[-1]] if len(chain) >= 2 else []
             chains = [self._maybe_realign_chain_endpoints(c, forbidden=parent_ends) for c in chains]
+        rebuild = getattr(getattr(self.inputs, "atom_mapping_inputs", None), "rebuild_on_split", None)
+        if rebuild in ("start", "end"):
+            chains = [self._rebuild_leg_endpoint(c, rebuild) for c in chains]
 
         return chains
+
+    def _rebuild_leg_endpoint(self, chain: Chain, source: str) -> Chain:
+        """`--rebuild-splits-from`: replace this leg's other endpoint with
+        one built in the frame of `source` ("start"/"end"); unchanged when
+        the build changes bonds or stereochemistry, or fails."""
+        from mepd.discovery.network_expansion import build_partners
+
+        src, tgt = (chain[0], chain[-1]) if source == "start" else (chain[-1], chain[0])
+        try:
+            _, built = build_partners([src], tgt, self.inputs)
+        except Exception:
+            built = []
+        if not built:
+            return chain
+        if _get_verbose(self.inputs):
+            print(f"--rebuild-splits-from {source}: rebuilt a split leg's {'product' if source == 'start' else 'start'}.")
+        chain.nodes = [chain.nodes[0], built[0]] if source == "start" else [built[0], chain.nodes[-1]]
+        return chain
 
     def _maybe_realign_chain_endpoints(self, chain: Chain, forbidden: Sequence[Node] = ()) -> Chain:
         """`--atom-mapping-recheck-splits`: re-run the same best-of-N
