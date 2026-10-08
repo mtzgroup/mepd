@@ -166,6 +166,9 @@ OPTIONS = {
     "program_kwds.device": [("cuda", "GPU (cuda)"), ("cpu", "CPU")],
     "path_min_inputs.mlp_model": [("", "this profile's engine")] + [(m, m) for m in _MLIP_MODELS],
     "path_min_inputs.mlp_device": [("", "automatic (GPU if available)"), ("cuda", "GPU (cuda)"), ("cpu", "CPU")],
+    "qmmm_environment": [("", "relaxed: the moving shell relaxes with each structure"),
+                         ("cage", "cage: the environment frozen, the path found in its field"),
+                         ("mean_force", "free energy: mean force over environment dynamics")],
     "atom_mapping_inputs.metric": [(m, _MAPPING_LABELS[m]) for m in _OFFERED_METRICS],
 }
 
@@ -210,6 +213,16 @@ HELP = {
                                              "differ from the sampled energies to get an image.",
     "tangent_project": "Remove the along-path part of each image's gradient (images don't slide along the path).",
     "alpha_climb": "How hard the highest image climbs (0 to 1).",
+    "qmmm_environment": "Relaxed: each structure's moving shell is minimized with it (paths include solvent "
+                        "rearrangements). Cage: the whole environment frozen, as in a protein pocket. Free energy: "
+                        "the QM region's potential of mean force, each gradient averaged over dynamics of the "
+                        "environment (much slower; any path method).",
+    "temperature": "Temperature of the environment's dynamics (K).",
+    "equilibrate_ps": "Dynamics discarded before sampling at each geometry (ps).",
+    "sample_ps": "Dynamics averaged over at each geometry (ps).",
+    "frames": "Frames of those dynamics the force is averaged over.",
+    "restraint": "Force constant holding the QM region rigid during the dynamics (Eh/bohr²).",
+    "timestep_fs": "Time step of the dynamics (fs).",
     "grad_tol": "FSM gradient tolerance (Eh/bohr).",
     "max_grow_iter": "Growth iterations (FSM grows the path from both ends).",
     "max_min_iter": "Minimization iterations per growth step.",
@@ -263,7 +276,9 @@ HELP = {
 _WORDS = {"thre": "threshold", "tol": "tolerance", "rtol": "relative tolerance", "ts": "TS", "rms": "RMS",
           "gi": "GI", "nebk": "NEB k", "opt": "optimization", "iters": "iterations", "n": "number of",
           "acc": "accuracy", "dt": "Δt", "ene": "energy", "neb": "NEB", "grad": "gradient"}
-LABELS = {"mlp_model": "Optimize on", "mlp_device": "Model device", "mlp_checkpoint": "Model checkpoint",
+LABELS = {"equilibrate_ps": "Equilibration (ps)", "sample_ps": "Sampling (ps)", "timestep_fs": "Time step (fs)",
+          "temperature": "Temperature (K)", "frames": "Frames averaged", "restraint": "QM-region restraint",
+          "mlp_model": "Optimize on", "mlp_device": "Model device", "mlp_checkpoint": "Model checkpoint",
           "fire_stage1_iter": "Stage 1 steps", "fire_stage2_iter": "Stage 2 steps",
           "fire_grad_tol": "Gradient tolerance", "variance_penalty_weight": "Spacing weight β",
           "fire_conv_window": "Convergence window", "fire_conv_geolen_tol": "Path length tolerance",
@@ -673,6 +688,13 @@ def form(text: str) -> dict:
     groups.append({"id": "chain", "title": "Chain", "fields": [_field(data, f"chain_inputs.{k}", v) for k, v in CHAIN_DEFAULTS.items()]})
     groups.append({"id": "mapping", "title": "Atom mapping",
                    "fields": [_field(data, f"atom_mapping_inputs.{k}", v) for k, v in MAPPING_DEFAULTS.items()]})
+    from mepd.engines.mean_force import DEFAULTS as MEAN_FORCE_DEFAULTS
+
+    qmmm_fields = [_field(data, "qmmm_environment", None, key=True, label="Environment along a path")]
+    if str(data.get("qmmm_environment") or "") == "mean_force":
+        qmmm_fields += [_field(data, f"mean_force.{k}", v) for k, v in MEAN_FORCE_DEFAULTS.items()]
+    groups.append({"id": "qmmm", "title": "QM/MM systems", "fields": qmmm_fields,
+                   "note": "Used by calculations on QM/MM systems (explicit solvent or protein); ignored otherwise."})
 
     unused = sorted(k for k in _table(data, "path_min_inputs")
                     if _known_method(method) and k not in _used_path_keys(method))

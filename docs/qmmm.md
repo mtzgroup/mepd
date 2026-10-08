@@ -138,6 +138,56 @@ When a path search's output goes to a file instead of a terminal, every step
 is logged as one line: step, gradients, the peak (kcal/mol, image) and the
 end energy relative to the start, and the time the step took.
 
+## The environment along a path: relaxed, cage, or free energy
+
+`qmmm_environment` in a profile (Settings › Advanced › QM/MM systems) says
+what the environment does while a path is searched:
+
+- `relaxed` (default): the moving shell relaxes with every structure. Each
+  image sits in its own local minimum of the solvent, so a path's energies
+  include solvent rearrangements that have nothing to do with the reaction.
+- `cage`: the whole environment frozen; only the QM region moves, in the
+  environment's field. The usual approximation in a protein pocket. Every
+  image sees the reactant's solvent arrangement, which can favour the start.
+- `mean_force`: the QM region's free-energy surface (potential of mean
+  force). At each geometry the solute is held and the environment is run as
+  GFN-FF dynamics (`[mean_force]`: `temperature`, `equilibrate_ps`,
+  `sample_ps`, `frames`); the gradient is the mean force on the solute
+  (Hu, Lu, Yang, JCTC 3, 390 (2007), doi:10.1021/ct600240y). Any path
+  method relaxes in that space (NEB, FSM, GSM, MLP-GI). When the path is
+  done its energies are replaced by the free-energy profile: the mean force
+  integrated along it, sampled again halfway along each segment (Simpson's
+  rule). During the search, images carry the QM energy plus the mean
+  solute-environment interaction (no entropy), only for tangents and the
+  climbing image.
+
+```toml
+qmmm_environment = "mean_force"
+[mean_force]
+equilibrate_ps = 0.5
+sample_ps = 1.0
+frames = 10
+```
+
+HCN → HNC in a 93-atom water shell (GFN2-xTB QM region, GFN-FF water, NEB
+with 8 images and 30 steps), kcal/mol:
+
+| | barrier | reaction |
+|---|---|---|
+| gas-phase QM along the same geometries | 73.2 | 20.3 |
+| cage | 77.3 | 25.8 |
+| free energy (mean force) | 74.9 | 23.1 |
+
+Cost: one QM gradient per geometry plus `equilibrate_ps + sample_ps` of
+environment dynamics (about 20 s for 1.3 ps of 230 atoms on one core) and
+`frames` low-level gradients; images run `n_parallel` at a time. Limits:
+mechanical embedding with an xTB-family environment only (not AMBER/TIP3P
+yet); no Hessians, TS optimizations or IRCs on this surface (use the
+climbing image, or the cage for a TS optimization); minimizations and
+elementary-step checks see a noisy surface (switch `do_elem_step_checks`
+off for a single path); the forces are averages over `frames`, so their
+noise (about 2e-3 Eh/bohr at the defaults) limits how far a path converges.
+
 ## Checking that a result is not nonsense
 
 `mepd qmmm inspect` (and the web UI's *QM/MM checks*) report, frame by frame:

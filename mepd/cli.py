@@ -655,6 +655,12 @@ def run(
     final_chain = minimizer.chain_trajectory[-1] if minimizer.chain_trajectory else initial_chain
     run_inputs.engine.compute_energies(final_chain)
     run_inputs.engine.compute_gradients(final_chain)
+    from mepd.engines.mean_force import apply_free_energy_profile
+
+    profile = apply_free_energy_profile(final_chain, run_inputs.engine)
+    if profile is not None:
+        typer.echo("Free-energy profile (kcal/mol, mean forces integrated along the path): "
+                   + " ".join(f"{a:.1f}" for a in profile))
 
     out_path = output / "mep_output.xyz"
     final_chain.write_to_disk(out_path)

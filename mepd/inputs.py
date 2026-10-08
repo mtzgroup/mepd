@@ -486,6 +486,13 @@ class RunInputs:
         {file = "region.json"} or {reference = "system.xyz",
         qm_atoms = "0-11", qm_charge = 0, active_radius = 6.0}. Environment
         atoms outside `active_radius` (Å) of the QM region are frozen.
+    `qmmm_environment`: what the QM/MM environment does along a path:
+        "relaxed" (default; the moving shell relaxes with each structure),
+        "cage" (all of it frozen: the path is found in its field) or
+        "mean_force" (the free-energy surface of the QM region: each gradient
+        the mean force over dynamics of the environment, settings in
+        `mean_force` = {temperature, equilibrate_ps, sample_ps, frames};
+        see mepd/engines/mean_force.py).
     """
 
     engine_name: str = "gxtb"
@@ -513,6 +520,8 @@ class RunInputs:
     optimizer_kwds: dict = None
     solvation: dict = None
     qmmm: dict = None
+    qmmm_environment: str = None
+    mean_force: dict = None
 
     def __post_init__(self):
         disable_molecular_graphs = False
@@ -923,7 +932,22 @@ class RunInputs:
                 from mepd.engines.qmmm import QMMMEngine
 
                 eng = QMMMEngine(base=eng, region=region, base_dir=self.qmmm.get("base_dir"))
-            frozen = sorted(set(frozen) | set(region.frozen_atoms))
+            environment = str(self.qmmm_environment or "relaxed").lower().replace("-", "_")
+            if environment not in ("relaxed", "cage", "mean_force"):
+                raise InputsError(f"qmmm_environment must be relaxed, cage or mean_force, not {self.qmmm_environment!r}")
+            if environment == "relaxed":
+                frozen = sorted(set(frozen) | set(region.frozen_atoms))
+            else:
+                # Only the QM region moves in the path (with mean_force also the
+                # MM atoms its cut bonds reach: the solute of the free energy).
+                moving = set(region.qm_atoms)
+                if environment == "mean_force":
+                    from mepd.engines.mean_force import MeanForceEngine
+
+                    settings = dict(self.mean_force or {})
+                    eng = MeanForceEngine(base=eng, **settings)
+                    moving = set(eng.solute)
+                frozen = sorted(set(frozen) | (set(range(region.natoms)) - moving))
             self.chain_inputs.frozen_atom_indices = frozen
             if self.chain_inputs.node_ene_thre == ChainInputs.node_ene_thre:
                 # A minimum's QM/MM energy depends on how its environment

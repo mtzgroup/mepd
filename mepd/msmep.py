@@ -1312,6 +1312,9 @@ class MSMEP:
             elem_step_results = n.optimize_chain()
             setattr(n, "converged", True)
             out_chain = n.optimized
+            from mepd.engines.mean_force import apply_free_energy_profile
+
+            apply_free_energy_profile(out_chain, self.inputs.engine)   # free energies on the mean-force surface
 
         except NoneConvergedException:
             setattr(n, "converged", False)

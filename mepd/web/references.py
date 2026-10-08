@@ -29,6 +29,10 @@ _OTHER = [
              "cite": ["S. Spicher, S. Grimme, Angew. Chem. Int. Ed. 59, 15665 (2020), doi:10.1002/anie.202004239"]},
             {"what": "OpenMM (AMBER environments)",
              "cite": ["P. Eastman et al., PLoS Comput. Biol. 13, e1005659 (2017), doi:10.1371/journal.pcbi.1005659"]},
+            {"what": "Free-energy paths of the QM region (mean force over environment dynamics)",
+             "cite": ["H. Hu, Z. Lu, W. Yang, J. Chem. Theory Comput. 3, 390 (2007), doi:10.1021/ct600240y",
+                      "H. Hu, Z. Lu, J. M. Parks, S. K. Burger, W. Yang, J. Chem. Phys. 128, 034105 (2008), "
+                      "doi:10.1063/1.2816557"]},
             {"what": "Partial Hessian vibrational analysis (frozen environment)",
              "cite": ["H. Li, J. H. Jensen, Theor. Chem. Acc. 107, 211 (2002), doi:10.1007/s00214-002-0356-6"]},
         ],
