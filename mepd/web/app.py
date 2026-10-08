@@ -1760,7 +1760,14 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
         """A nanoreactor job's trajectory from raw frame `start` on, and its events (live view)."""
         from mepd.web.nanoreactor import reactor_view
 
-        return reactor_view(_reactor_out(J().get(jid), run), start)
+        job = J().get(jid)
+        out = reactor_view(_reactor_out(job, run), start)
+        if out.get("qm_atoms") is not None and out.get("frozen_atoms") is None and job.get("qmmm"):
+            try:   # runs from before the schedule kept them: the system's
+                out["frozen_atoms"] = list(W().qmmm_region(job["qmmm"]).frozen_atoms)
+            except Exception:
+                pass
+        return out
 
     def _reactor_out(job: dict, run: Optional[int] = None) -> Path:
         """Where a job's reactor MD is: a nanoreactor job's output, or one

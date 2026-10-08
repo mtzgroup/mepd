@@ -478,6 +478,9 @@ def reactor_view(out: Path, start: int = 0) -> dict:
     frame, and every event. Coordinates in Angstrom, 2 decimals."""
     import math
 
+    import numpy as np
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
     out = Path(out)
     symbols, frames = _trajectory(out)
     sched = _json(out / "md" / "schedule.json") or {}
@@ -508,7 +511,15 @@ def reactor_view(out: Path, start: int = 0) -> dict:
         return next((r for end, r in bounds if tf <= end + 1e-6), bounds[-1][1] if bounds else None)
 
     events, final = _events(out)
-    return {"prep": _prep(out) if not len(frames) else None, "symbols": list(symbols), "dump_fs": dump_fs, "stride": stride, "total_ps": total_ps,
+    # A QM/MM reactor: which atoms react (QM) and which never move (frozen),
+    # so the view can fade the environment.
+    region = {"qm_atoms": sched["qm_atoms"], "frozen_atoms": sched.get("frozen_atoms")} if sched.get("qm_atoms") else {}
+    if sched.get("centre_bohr") is not None and len(frames):
+        # Its piston wall is around where the QM region started, not the
+        # origin: shift the frames so it is (the wall drawn, and the view
+        # framed, around the atoms that react).
+        frames = frames - np.asarray(sched["centre_bohr"], dtype=float) / ANGSTROM_TO_BOHR
+    return {**region, "prep": _prep(out) if not len(frames) else None, "symbols": list(symbols), "dump_fs": dump_fs, "stride": stride, "total_ps": total_ps,
             "n_frames": int(len(frames)), "start": first, "frames": [frames[k].reshape(-1).tolist() for k in idx],
             "radius": [radius(k) for k in idx], "events": events, "final": final}
 

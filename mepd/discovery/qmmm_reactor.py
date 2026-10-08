@@ -60,7 +60,8 @@ def run_qmmm_reactor_md(structure, engine, region, *, settings, workdir: Path,
     centre = pos0[qm].mean(axis=0)
     (workdir / "schedule.json").write_text(json.dumps({
         "dump_fs": settings.dump_fs, "time_ps": settings.time_ps, "segments": [[d, r] for d, r in schedule],
-        "engine": "QM/MM", "qm_atoms": region.qm_atoms, "centre_bohr": centre.tolist()}))
+        "engine": "QM/MM", "qm_atoms": region.qm_atoms, "frozen_atoms": list(region.frozen_atoms),
+        "centre_bohr": centre.tolist()}))
     masses = _masses(symbols)
     wall_au = settings.wall_force / HARTREE_TO_KCAL_PER_MOL / ANGSTROM_TO_BOHR
     dt = settings.step_fs

@@ -179,6 +179,26 @@ def test_reactor_view_shows_packing_and_relaxation_before_the_md(tmp_path):
     assert reactor_view(tmp_path)["n_frames"] == 2
 
 
+
+def test_qmmm_reactor_view_is_centred_on_its_wall_and_names_its_regions(tmp_path):
+    """A QM/MM reactor's wall sits around where the QM region started, not the
+    origin: the view shifts the frames there, and says which atoms react
+    (QM) and which never move (frozen), so the page can fade the rest."""
+    from qcconst.constants import ANGSTROM_TO_BOHR
+
+    from mepd.web.nanoreactor import reactor_view
+
+    md = tmp_path / "md"
+    md.mkdir()
+    (md / "schedule.json").write_text(json.dumps({"dump_fs": 2.0, "time_ps": 1.0, "segments": [[1.0, 5.0]], "qm_atoms": [0, 1],
+                                                  "frozen_atoms": [2], "centre_bohr": [10 * ANGSTROM_TO_BOHR, 0.0, 0.0]}))
+    xyz = "3\n\nO 10 0 0\nO 11 0 0\nC 20 0 0\n"
+    (md / "reactor.xyz").write_text(xyz)
+    (md / "xtb.trj").write_text(xyz * 2)
+    view = reactor_view(tmp_path)
+    assert view["qm_atoms"] == [0, 1] and view["frozen_atoms"] == [2]
+    assert view["frames"][0] == pytest.approx([0, 0, 0, 1, 0, 0, 10, 0, 0])
+
 def test_engine_relaxation_writes_its_steps(tmp_path):
     from mepd.discovery import nanoreactor as nr
 

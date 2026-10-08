@@ -72,6 +72,7 @@ export function useStage(host) {
     viewer.current = window.$3Dmol.createViewer(host.current, { backgroundColor: cssVar('--viewer-bg', '#fff'), antialias: true });
     el.current = host.current;
     fitted.current = false;
+    fixedKey.current = null;
     ro.current = new ResizeObserver(() => { viewer.current?.resize(); viewer.current?.render(); });
     ro.current.observe(host.current);
     return viewer.current;
@@ -80,19 +81,30 @@ export function useStage(host) {
   // `extent` (Angstrom around the origin): what the first view must hold,
   // e.g. the wide wall, not just today's atoms.
   const wall = useRef(null);
+  // `fixed` ({key, paint}): a model that stays across draws until its key
+  // changes, e.g. the frozen atoms of a QM/MM system (thousands of them, the
+  // same every frame).
+  const fixedKey = useRef(null), fixedModel = useRef(null);
   // `shapes`: this draw repaints the shapes too (else they stay: the wall).
-  const draw = (paint, { refit = false, extent = null, shapes = true } = {}) => {
+  const draw = (paint, { refit = false, extent = null, shapes = true, fixed = null } = {}) => {
     const v = ensure();
     if (!v) return;
     const view = v.getView();
-    v.removeAllModels();
+    const key = fixed ? fixed.key : null;
+    if (key !== fixedKey.current) {
+      v.removeAllModels();
+      fixedModel.current = fixed ? fixed.paint(v) : null;
+      fixedKey.current = key;
+    } else {
+      for (const m of [...v.getModelList()]) if (m !== fixedModel.current) v.removeModel(m);
+    }
     if (shapes) { v.removeAllShapes(); v.removeAllLabels(); wall.current = null; }
     if (!fitted.current || refit) {
       if (extent) {   // fit to invisible marker atoms at +-extent, then drop them
         const r = extent;
         const pts = [[r, 0, 0], [-r, 0, 0], [0, r, 0], [0, -r, 0], [0, 0, r], [0, 0, -r]];
         const m = v.addModel(`6\n\n${pts.map((q) => `He ${q.join(' ')}`).join('\n')}\n`, 'xyz');
-        v.zoomTo();
+        v.zoomTo({ model: m });   // the marker only, not a fixed model
         v.removeModel(m);
       } else v.zoomTo();
       paint(v);
@@ -133,6 +145,32 @@ const faded = () => {
   if (grey !== _fadedGrey) { _fadedGrey = grey; _faded = { stick: { radius: 0.06, color: grey }, sphere: { scale: 0.12, color: grey } }; }
   return _faded;
 };
+// A QM/MM reactor: only the QM atoms react. The MM atoms that move are drawn
+// faint and the frozen ones all but invisible, each in a model of its own
+// (3Dmol's stick/sphere opacity is per model). Transparency costs a depth
+// sort per frame, but the alternative hides the reaction behind solvent.
+const ENV = { stick: { radius: 0.06, opacity: 0.25 }, sphere: { scale: 0.1, opacity: 0.25 } };
+const FROZEN = { stick: { radius: 0.05, opacity: 0.06 }, sphere: { scale: 0.08, opacity: 0.06 } };
+const _parts = new WeakMap();
+function regionParts(d) {
+  if (!d.qm_atoms) return null;
+  if (_parts.has(d)) return _parts.get(d);
+  const qm = d.qm_atoms;
+  const frozen = new Set(d.frozen_atoms || []);
+  const inQm = new Set(qm);
+  const env = [], fro = [];
+  for (let a = 0; a < d.symbols.length; a += 1) if (!inQm.has(a)) (frozen.has(a) ? fro : env).push(a);
+  const local = new Map(qm.map((a, k) => [a, k]));
+  const parts = { qm, env, frozen: fro, local };
+  _parts.set(d, parts);
+  return parts;
+}
+function subsetXyz(symbols, flat, atoms) {
+  const lines = [String(atoms.length), ''];
+  for (const a of atoms) lines.push(`${symbols[a]} ${flat[3 * a]} ${flat[3 * a + 1]} ${flat[3 * a + 2]}`);
+  return `${lines.join('\n')}\n`;
+}
+
 const short = (text, n = 46) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
 
 // Play/pause and a frame counter advancing at `speed` x FPS.
@@ -379,11 +417,29 @@ export function ReactorLive({ job }) {
     const act = activeAt(dd.events, raw);
     const sel = act.map((e) => e.event).join(',');
     // (3Dmol perceives the bonds anew each frame: that is how they form and break.)
+    const parts = regionParts(dd);
     stage.draw((v) => {
-      v.addModel(xyzText(dd.symbols, flat), 'xyz');
-      v.setStyle({}, act.length ? faded() : FULL);
-      if (act.length) v.setStyle({ index: [...new Set(act.flatMap((e) => e.atoms))] }, FULL);
-    }, { extent: reach(dd), shapes: false });
+      if (!parts) {
+        v.addModel(xyzText(dd.symbols, flat), 'xyz');
+        v.setStyle({}, act.length ? faded() : FULL);
+        if (act.length) v.setStyle({ index: [...new Set(act.flatMap((e) => e.atoms))] }, FULL);
+        return;
+      }
+      const m = v.addModel(subsetXyz(dd.symbols, flat, parts.qm), 'xyz');
+      m.setStyle({}, act.length ? faded() : FULL);
+      if (act.length) {
+        const index = [...new Set(act.flatMap((e) => e.atoms))].map((a) => parts.local.get(a)).filter((k) => k !== undefined);
+        m.setStyle({ index }, FULL);
+      }
+      if (parts.env.length) v.addModel(subsetXyz(dd.symbols, flat, parts.env), 'xyz').setStyle({}, ENV);
+    }, {
+      extent: reach(dd),
+      shapes: false,
+      fixed: parts?.frozen.length ? {
+        key: `frozen:${dd.symbols.length}:${parts.frozen.length}`,
+        paint: (v) => { const m = v.addModel(subsetXyz(dd.symbols, flat, parts.frozen), 'xyz'); m.setStyle({}, FROZEN); return m; },
+      } : null,
+    });
     const wide = wallWide(dd);
     const squeezed = dd.radius[i] && wide && dd.radius[i] < wide - 0.05;
     stage.setWall(dd.radius[i] || null, squeezed ? cssVar('--warn', '#b7791f') : accent);
