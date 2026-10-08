@@ -20,6 +20,14 @@ not depend on the environment, so these dynamics sample the QM/MM ensemble
 exactly and each frame costs only low-level gradients: one QM gradient per
 geometry in all.
 
+AMBER and TIP3P environments (OpenMM) are sampled by OpenMM Langevin
+dynamics with the solute's atoms fixed exactly (mass 0). With electrostatic
+embedding the QM energy depends on the environment's charges: the dynamics
+see the QM region as fixed point charges (the QM program's atomic charges at
+that geometry in its starting environment, link-atom charges on the atom
+they cap; Hu, Lu and Yang use ESP charges), and the mean force is the
+average of full QM/MM gradients, one QM calculation in each frame's field.
+
 The environment's coordinates on the nodes are only a starting point: the
 path minimizer sees them frozen (gradient zero; mepd.inputs freezes them),
 and each sampling starts from the last frames sampled near that solute
@@ -77,6 +85,12 @@ def onto_solute(frame: np.ndarray, solute: np.ndarray, idx: list[int]) -> np.nda
     return out
 
 
+def _bare(node: StructureNode, coords_bohr: np.ndarray) -> StructureNode:
+    """`node`'s structure at other coordinates, without a bond graph or cache."""
+    return StructureNode(structure=node.structure.model_copy(update={"geometry": np.asarray(coords_bohr, dtype=float)}),
+                         has_molecular_graph=False)
+
+
 def _read_xyz_frames(fp: Path, natoms: int) -> list[np.ndarray]:
     lines = fp.read_text().splitlines()
     out, k = [], 0
@@ -104,16 +118,22 @@ class MeanForceEngine(ModifiedEngine):
     _warm: list = field(default_factory=list, repr=False)       # (solute coords, last frame) seen so far
     _lock: object = field(default_factory=threading.Lock, repr=False)
     last_samples: dict = field(default_factory=dict, repr=False)
+    _estimates: dict = field(default_factory=dict, repr=False)   # solute geometry -> its own energy estimate
 
     def __post_init__(self):
-        from mepd.engines.qmmm import QMMMEngine, _XTBLow
+        from mepd.engines.qmmm import QMMMEngine, _OpenMMLow, _XTBLow
 
-        if not isinstance(self.base, QMMMEngine) or not isinstance(self.base._low, _XTBLow):
-            raise ValueError("the mean-force (free-energy) environment needs a QM/MM system with an xTB-family "
-                             "environment (GFN-FF, GFN1 or GFN2): AMBER/TIP3P environments are not supported yet")
-        if self.base.region.embedding == "electrostatic":
-            raise ValueError("the mean-force environment needs mechanical embedding (the QM energy of a fixed "
-                             "solute must not depend on the environment)")
+        if not isinstance(self.base, QMMMEngine):
+            raise ValueError("the mean-force (free-energy) environment needs a QM/MM system of mepd's own "
+                             "(not TeraChem's QM/MM)")
+        low = self.base._low
+        if isinstance(low, _XTBLow):
+            self.sampler = "xtb"
+        elif isinstance(low, _OpenMMLow):
+            self.sampler = "openmm"
+        else:
+            raise ValueError(f"no environment dynamics for a {type(low).__name__} environment")
+        self.electrostatic = bool(getattr(low, "electrostatic", False))
         self.region = self.base.region
         r = self.region
         self.solute = sorted(set(r.qm_atoms) | {int(m) for _, m in r.links})
@@ -181,6 +201,8 @@ class MeanForceEngine(ModifiedEngine):
 
     def sample(self, node: StructureNode) -> dict:
         """Mean force and energy at this node's solute geometry."""
+        if self.sampler == "openmm":
+            return self._sample_openmm(node)
         x = np.asarray(node.coords, dtype=float)
         r = self.region
         charge = int(node.structure.charge)
@@ -200,6 +222,112 @@ class MeanForceEngine(ModifiedEngine):
                 "force_stderr": float(np.abs(stderr).max()),
                 "interaction_kcal": float(e_int.mean() * HARTREE_KCAL),
                 "interaction_stderr_kcal": float(e_int.std() / np.sqrt(max(1, len(e_int) - 1)) * HARTREE_KCAL),
+                "last_frame": frames[-1]}
+
+    # ------------------------------------------------------------ OpenMM environments (AMBER, TIP3P)
+    def _solute_charges(self, node: StructureNode) -> tuple[np.ndarray, dict]:
+        """The QM region's atomic charges (the QM program's, Mulliken) at this
+        geometry in its starting environment: what the environment's dynamics
+        see in place of the QM density (QM/MM-MFEP's ESP-charge sampling,
+        with the program's own charges). A link atom's charge goes to the QM
+        atom it caps. Also returns that QM/MM evaluation."""
+        r = self.region
+        res = self.base.evaluate([node])[0]
+        q_model = res.get("qm_charges")
+        if q_model is None:
+            raise ValueError(f"{type(self.base.base).__name__} does not report atomic charges: the environment's "
+                             "dynamics need the QM region's charges")
+        q_model = np.asarray(q_model, dtype=float).reshape(-1)
+        nq = len(r.qm_atoms)
+        q = q_model[:nq].copy()
+        pos = {a: k for k, a in enumerate(r.qm_atoms)}
+        for k, (qa, _) in enumerate(r.links):
+            if nq + k < len(q_model):
+                q[pos[qa]] += q_model[nq + k]
+        return q, res
+
+    def _openmm_frames(self, start_bohr: np.ndarray, qm_charges: Optional[np.ndarray], seed: int) -> list[np.ndarray]:
+        """Environment frames (bohr) from OpenMM Langevin dynamics with the
+        solute's atoms fixed exactly (mass 0); with electrostatic embedding
+        the QM atoms carry `qm_charges`."""
+        import openmm
+        import openmm.unit as u
+
+        from mepd.engines.qmmm import BOHR_NM
+
+        low, r = self.base._low, self.region
+        with self._lock:
+            if getattr(self, "_system_xml", None) is None:
+                self._system_xml = openmm.XmlSerializer.serialize(low.context.getSystem())
+            xml = self._system_xml
+        system = openmm.XmlSerializer.deserialize(xml)
+        for i in self.solute:
+            system.setParticleMass(i, 0.0)
+        if qm_charges is not None:
+            nb = next(f for f in system.getForces() if isinstance(f, openmm.NonbondedForce))
+            for i, qi in zip(r.qm_atoms, qm_charges):
+                _, sig, eps = nb.getParticleParameters(i)
+                nb.setParticleParameters(i, float(qi), sig, eps)
+        dt = float(self.timestep_fs) / 1000.0
+        integrator = openmm.LangevinMiddleIntegrator(float(self.temperature) * u.kelvin, 1.0 / u.picosecond,
+                                                     dt * u.picoseconds)
+        integrator.setRandomNumberSeed(int(seed))
+        try:
+            platform = openmm.Platform.getPlatformByName("CPU")
+            context = openmm.Context(system, integrator, platform, {"Threads": "1"})
+        except Exception:
+            context = openmm.Context(system, integrator)
+        context.setPositions(np.asarray(start_bohr, dtype=float) * BOHR_NM * u.nanometer)
+        openmm.LocalEnergyMinimizer.minimize(context, 10.0, 200)       # settle a solute that moved since
+        context.setVelocitiesToTemperature(float(self.temperature) * u.kelvin, int(seed))
+        n_equil = int(round(float(self.equilibrate_ps) / dt))
+        n_total = max(1, int(round(float(self.sample_ps) / dt)))
+        every = max(1, n_total // max(1, int(self.frames)))
+        if n_equil:
+            integrator.step(n_equil)
+        frames = []
+        for _ in range(max(1, int(self.frames))):
+            integrator.step(every)
+            pos = context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(u.nanometer)
+            frames.append(np.asarray(pos, dtype=float) / BOHR_NM)
+        del context, integrator
+        return frames
+
+    def _sample_openmm(self, node: StructureNode) -> dict:
+        r = self.region
+        x = np.asarray(node.coords, dtype=float)
+        start = self._start(x)
+        start_node = _bare(node, start)
+        q, first = self._solute_charges(start_node) if self.electrostatic else (None, None)
+        seed = (abs(hash(x[self.solute].round(5).tobytes())) + len(self._warm)) % (2 ** 31)
+        frames = [onto_solute(f, x[self.solute], self.solute) for f in self._openmm_frames(start, q, seed)]
+        self._remember(x, frames[-1])
+        frame_nodes = [_bare(node, f) for f in frames]
+        if self.electrostatic:
+            # The QM energy now depends on the environment: a QM/MM gradient in
+            # every frame's field, averaged.
+            res = self.base.evaluate(frame_nodes)
+            grads = np.array([rr["gradient"] for rr in res])
+            e_frames = np.array([rr["qm"] for rr in res])
+            energy = float(e_frames.mean())                       # the QM energy in the field, averaged
+            e_int = e_frames - float(first["qm"]) if first is not None else e_frames - e_frames.mean()
+        else:
+            # Mechanical: the QM energy of a fixed solute is the same in every
+            # frame; only the force field's forces on it change.
+            model = StructureNode(structure=r.model_structure(node.structure), has_molecular_graph=False)
+            g_qm = r.model_gradient_to_full(np.asarray(self.base.base.compute_gradients([model])[0], dtype=float))
+            low = self.base._low.terms(frames, int(node.structure.charge))
+            grads = np.array([g_qm + lw["gradient"] for lw in low])
+            energy = float(model.energy)
+            e_int = np.zeros(len(frames))
+        mean = np.zeros_like(x)
+        mean[self.solute] = grads[:, self.solute].mean(axis=0)
+        stderr = grads[:, self.solute].std(axis=0) / np.sqrt(max(1, len(frames) - 1))
+        return {"energy": energy, "gradient": mean, "frames": len(frames),
+                "force_stderr": float(np.abs(stderr).max()),
+                "interaction_kcal": float(e_int.mean() * HARTREE_KCAL),
+                "interaction_stderr_kcal": float(e_int.std() / np.sqrt(max(1, len(e_int) - 1)) * HARTREE_KCAL),
+                "solute_charges": None if q is None else [round(float(v), 4) for v in q],
                 "last_frame": frames[-1]}
 
     def _environment_energies(self, frames: list[np.ndarray], charge: int) -> list[float]:
@@ -238,7 +366,31 @@ class MeanForceEngine(ModifiedEngine):
             update_node_cache(node_list=todo, results=[
                 FakeQCIOOutput.model_validate({"results": FakeQCIOResults.model_validate(
                     {"energy": r["energy"], "gradient": r["gradient"]})}) for r in res])
+            with self._lock:
+                for n, r in zip(todo, res):
+                    self._estimates[self._key(n)] = r["energy"]
+        if isinstance(chain, Chain) and len(nodes) >= 3:
+            self._chain_energies(nodes)
         return nodes
+
+    def _key(self, node: StructureNode) -> bytes:
+        return np.round(np.asarray(node.coords, dtype=float)[self.solute], 6).tobytes()
+
+    def _chain_energies(self, nodes: list[StructureNode]) -> None:
+        """A path handed over whole: its energies become the mean forces
+        integrated along it (trapezoid), from the first node's estimate, so a
+        path method's tangents and climbing image follow the free energy
+        rather than the per-geometry estimate."""
+        first = self._estimates.get(self._key(nodes[0]), nodes[0]._cached_energy)
+        acc = 0.0
+        prev = None
+        for n in nodes:
+            x = np.asarray(n.coords, dtype=float)[self.solute]
+            g = np.asarray(n._cached_gradient, dtype=float)[self.solute]
+            if prev is not None:
+                acc += 0.5 * float(np.sum((g + prev[1]) * (x - prev[0])))
+            n._cached_energy = float(first) + acc
+            prev = (x, g)
 
     def compute_hessian(self, *args, **kwargs):
         raise NotImplementedError("Hessians, TS optimizations and IRCs on the mean-force (free-energy) surface are not "
@@ -255,33 +407,105 @@ class MeanForceEngine(ModifiedEngine):
         return self.base.decompose(structures)
 
 
-def free_energy_profile(chain, solute: Optional[list[int]] = None, engine: Optional["MeanForceEngine"] = None
-                        ) -> np.ndarray:
+def free_energy_profile(chain, solute: Optional[list[int]] = None, engine: Optional["MeanForceEngine"] = None,
+                        panels: Union[int, str] = "auto", dense: bool = False, tolerance_kcal: float = 0.5,
+                        max_panels: int = 8):
     """A(s_i) - A(s_0) in kcal/mol along a path whose nodes carry mean forces
     (gradients of the free energy), by thermodynamic integration over the
-    solute's displacement between neighbouring nodes. With `engine`, the mean
-    force is also sampled halfway along each segment and Simpson's rule is
-    used (exact for a cubic along the segment); without, the trapezoid rule,
-    which is crude when images are far apart (on HCN -> HNC with 8 images it
-    put the barrier 11 kcal/mol low; Simpson's was within 0.3)."""
+    solute's displacement between neighbouring nodes.
+
+    With `engine`, the mean force is also sampled inside each segment and
+    Simpson's rule is used over `panels` panels per segment (2*panels
+    sub-intervals; exact for a cubic). "auto" doubles a segment's panels
+    until its integral changes by less than `tolerance_kcal` (at most
+    `max_panels`): a bond breaking within one segment (the Menshutkin
+    reaction's ion pair forming) needs several. Without `engine`, the
+    trapezoid rule, which is crude when images are far apart (on HCN -> HNC
+    with 8 images it put the barrier 11 kcal/mol low; one Simpson panel was
+    within 0.3). `dense=True` also returns (fraction along the path, A) at
+    every point sampled."""
     nodes = chain.nodes if isinstance(chain, Chain) else list(chain)
     xs = [np.asarray(n.coords, dtype=float) for n in nodes]
     gs = [np.asarray(n.gradient, dtype=float) for n in nodes]
     if solute is None:
         solute = engine.solute if engine is not None else list(range(len(xs[0])))
-    mids = None
-    if engine is not None and len(nodes) > 1:
-        mid_nodes = [nodes[k - 1].update_coords(0.5 * (xs[k - 1] + xs[k])) for k in range(1, len(nodes))]
-        mids = [np.asarray(g, dtype=float) for g in engine.compute_gradients(mid_nodes)]
-    a = [0.0]
+    total = max(1, len(nodes) - 1)
+    a, fine = [0.0], [(0.0, 0.0)]
+    if engine is None or len(nodes) < 2:
+        for k in range(1, len(nodes)):
+            dx = xs[k][solute] - xs[k - 1][solute]
+            a.append(a[-1] + 0.5 * float(np.sum((gs[k][solute] + gs[k - 1][solute]) * dx)))
+            fine.append((k / total, a[-1]))
+        profile = np.asarray(a) * HARTREE_KCAL
+        return (profile, [(t, v * HARTREE_KCAL) for t, v in fine]) if dense else profile
+
+    slopes: dict = {}          # (segment, fraction as a reduced pair) -> dA/dt along the segment
+
+    def need(m: int, segments) -> None:
+        todo = []
+        for k in segments:
+            for jj in range(1, 2 * m):
+                key = (k, *_reduced(jj, 2 * m))
+                if key not in slopes and key not in [t[0] for t in todo]:
+                    todo.append((key, xs[k - 1] + (xs[k] - xs[k - 1]) * jj / (2 * m)))
+        if todo:
+            pts = [nodes[0].update_coords(x) for _, x in todo]
+            for (key, _), g in zip(todo, engine.compute_gradients(pts)):
+                k = key[0]
+                slopes[key] = float(np.sum(np.asarray(g, dtype=float)[solute] * (xs[k][solute] - xs[k - 1][solute])))
+
+    def slope(k: int, jj: int, n: int) -> float:
+        if jj == 0:
+            return float(np.sum(gs[k - 1][solute] * (xs[k][solute] - xs[k - 1][solute])))
+        if jj == n:
+            return float(np.sum(gs[k][solute] * (xs[k][solute] - xs[k - 1][solute])))
+        return slopes[(k, *_reduced(jj, n))]
+
+    def integral(k: int, m: int) -> tuple[float, list]:
+        h, acc, pts = 1.0 / (2 * m), 0.0, []
+        for p in range(m):
+            f0, f1, f2 = slope(k, 2 * p, 2 * m), slope(k, 2 * p + 1, 2 * m), slope(k, 2 * p + 2, 2 * m)
+            pts.append(((2 * p + 1) * h, acc + h * (5 * f0 + 8 * f1 - f2) / 12))
+            acc += h * (f0 + 4 * f1 + f2) / 3
+            pts.append(((2 * p + 2) * h, acc))
+        return acc, pts
+
+    fixed = panels != "auto"
+    m_seg = {k: (max(1, int(panels)) if fixed else 1) for k in range(1, len(nodes))}
+    need(max(m_seg.values()), list(m_seg))
+    if not fixed:
+        tol = float(tolerance_kcal) / HARTREE_KCAL
+        open_segments = set(m_seg)
+        while open_segments:
+            for k in open_segments:
+                m_seg[k] *= 2
+            need_m = {}
+            for k in open_segments:
+                need_m.setdefault(m_seg[k], []).append(k)
+            for m, segments in need_m.items():
+                need(m, segments)
+            done = set()
+            for k in open_segments:
+                coarse, _ = integral(k, m_seg[k] // 2)
+                finer, _ = integral(k, m_seg[k])
+                if abs(finer - coarse) < tol or m_seg[k] >= int(max_panels):
+                    done.add(k)
+            open_segments -= done
     for k in range(1, len(nodes)):
-        dx = xs[k][solute] - xs[k - 1][solute]
-        if mids is None:
-            step = 0.5 * float(np.sum((gs[k][solute] + gs[k - 1][solute]) * dx))
-        else:
-            step = float(np.sum((gs[k - 1][solute] + 4 * mids[k - 1][solute] + gs[k][solute]) * dx)) / 6.0
-        a.append(a[-1] + step)
-    return np.asarray(a) * HARTREE_KCAL
+        value, pts = integral(k, m_seg[k])
+        fine.extend(((k - 1 + t) / total, a[-1] + v) for t, v in pts)
+        a.append(a[-1] + value)
+    profile = np.asarray(a) * HARTREE_KCAL
+    if dense:
+        return profile, [(t, v * HARTREE_KCAL) for t, v in fine]
+    return profile
+
+
+def _reduced(j: int, n: int) -> tuple[int, int]:
+    from math import gcd
+
+    g = gcd(j, n)
+    return j // g, n // g
 
 
 def mean_force_engine(engine) -> Optional[MeanForceEngine]:

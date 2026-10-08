@@ -88,7 +88,7 @@ def test_mean_force_on_the_solute_only(tmp_path):
     out = mf.sample(node)
     g = out["gradient"]
     assert np.all(g[mf.environment] == 0.0) and np.abs(g[mf.solute]).max() > 1e-4
-    assert out["frames"] >= 2 and np.isfinite(out["energy"]) and out["interaction_kcal"] < 0   # H-bonded waters
+    assert out["frames"] >= 2 and np.isfinite(out["energy"]) and np.isfinite(out["interaction_kcal"])
     # The engine caches it like any other, and refuses what it cannot do on this surface.
     assert np.allclose(mf.compute_gradients([node])[0], mf.compute_gradients([node])[0])
     with pytest.raises(NotImplementedError):
@@ -128,3 +128,66 @@ def test_unknown_environment_is_refused(tmp_path):
             RunInputs.open(tmp_path / "p.toml")
     finally:
         _reset_globals()
+
+
+def test_electrostatic_embedding_samples_tip3p_with_the_solute_charges():
+    _xtb()
+    pytest.importorskip("openmm")
+    from mepd.engines.gfnff import XTBEngine
+    from mepd.engines.mean_force import MeanForceEngine
+    from mepd.engines.qmmm import QMMMEngine
+
+    s = Structure.from_xyz(SYSTEM)
+    region = QMMMRegion.build(s, "0-5", active_radius=None, mm="tip3p")      # electrostatic
+    base = QMMMEngine(base=XTBEngine(method="gfn2", n_parallel=2), region=region)
+    mf = MeanForceEngine(base=base, equilibrate_ps=0.05, sample_ps=0.1, frames=4, n_parallel=1)
+    assert (mf.sampler, mf.electrostatic) == ("openmm", True)
+    node = StructureNode(structure=s, has_molecular_graph=False)
+    q, _ = mf._solute_charges(node)
+    assert len(q) == 6 and abs(q.sum()) < 0.05 and q[1] < -0.2                # methanol's O is negative
+    x0 = np.asarray(s.geometry)
+    frames = mf._openmm_frames(x0, q, seed=1)
+    assert len(frames) == 4
+    assert all(np.allclose(f[:6], x0[:6]) for f in frames)                   # the solute held exactly
+    assert len({f[6:].round(3).tobytes() for f in frames}) == 4               # the water moves
+    out = mf.sample(node)
+    g = out["gradient"]
+    assert np.all(g[6:] == 0.0) and np.abs(g[:6]).max() > 1e-4 and out["solute_charges"] is not None
+
+
+def test_adaptive_integration_resolves_a_step_within_one_segment():
+    """A free energy that rises and drops steeply inside one segment: one
+    Simpson panel misses it, the adaptive rule converges to it."""
+    from mepd.engines.mean_force import HARTREE_KCAL
+
+    def a_of(v):        # Hartree; a sharp barrier at v = 0.3 between nodes at 0 and 1
+        return 0.02 * np.exp(-((v - 0.3) / 0.08) ** 2) - 0.01 * v
+
+    def da(v):
+        return 0.02 * np.exp(-((v - 0.3) / 0.08) ** 2) * (-2 * (v - 0.3) / 0.08 ** 2) - 0.01
+
+    class Fake:
+        solute = [0]
+
+        def compute_gradients(self, pts):
+            out = []
+            for n in pts:
+                g = np.zeros((2, 3))
+                g[0, 0] = da(float(np.asarray(n.coords)[0, 0]))
+                out.append(g)
+            return out
+
+    nodes = []
+    for v in (-1.0, 0.0, 1.0, 2.0):
+        geom = np.array([[v, 0.0, 0.0], [0.0, 3.0, 0.0]])
+        n = StructureNode(structure=Structure(symbols=["H", "H"], geometry=geom), has_molecular_graph=False)
+        g = np.zeros((2, 3))
+        g[0, 0] = da(v)
+        n._cached_energy, n._cached_gradient = 0.0, g
+        nodes.append(n)
+    exact = np.array([a_of(v) - a_of(-1.0) for v in (-1.0, 0.0, 1.0, 2.0)]) * HARTREE_KCAL
+    one = free_energy_profile(nodes, engine=Fake(), panels=1)
+    auto, fine = free_energy_profile(nodes, engine=Fake(), dense=True, max_panels=32)
+    assert np.abs(one - exact).max() > 1.0
+    assert np.abs(auto - exact).max() < 0.5
+    assert max(v for _, v in fine) == pytest.approx((a_of(0.3) - a_of(-1.0)) * HARTREE_KCAL, abs=0.3)

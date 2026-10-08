@@ -108,6 +108,9 @@ class FrozenAtomsEngine(ModifiedEngine):
                     grad = np.array(n._cached_gradient, dtype=float)
                     grad[self._mask(len(grad))] = 0.0
                     n._cached_gradient = grad
+        hook = getattr(self.base, "_chain_energies", None)
+        if hook is not None and isinstance(chain, Chain) and len(nodes) >= 3:
+            hook(nodes)    # (the mean-force surface: energies integrated along a whole path)
         return nodes
 
     def _ase(self, node: StructureNode):

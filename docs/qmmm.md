@@ -151,15 +151,17 @@ what the environment does while a path is searched:
   image sees the reactant's solvent arrangement, which can favour the start.
 - `mean_force`: the QM region's free-energy surface (potential of mean
   force). At each geometry the solute is held and the environment is run as
-  GFN-FF dynamics (`[mean_force]`: `temperature`, `equilibrate_ps`,
-  `sample_ps`, `frames`); the gradient is the mean force on the solute
+  dynamics (`[mean_force]`: `temperature`, `equilibrate_ps`, `sample_ps`,
+  `frames`) -- xtb's for GFN-FF/GFN1/GFN2 environments, OpenMM's for AMBER
+  and TIP3P; the gradient is the mean force on the solute
   (Hu, Lu, Yang, JCTC 3, 390 (2007), doi:10.1021/ct600240y). Any path
   method relaxes in that space (NEB, FSM, GSM, MLP-GI). When the path is
   done its energies are replaced by the free-energy profile: the mean force
-  integrated along it, sampled again halfway along each segment (Simpson's
-  rule). During the search, images carry the QM energy plus the mean
-  solute-environment interaction (no entropy), only for tangents and the
-  climbing image.
+  integrated along it, sampled again inside each segment (Simpson's rule,
+  panels doubled per segment until its integral changes by less than 0.5
+  kcal/mol: a bond breaking within one segment needs several). During the
+  search a path's images get the mean force integrated along it (trapezoid
+  rule), so tangents and the climbing image follow the free energy.
 
 ```toml
 qmmm_environment = "mean_force"
@@ -178,11 +180,35 @@ with 8 images and 30 steps), kcal/mol:
 | cage | 77.3 | 25.8 |
 | free energy (mean force) | 74.9 | 23.1 |
 
-Cost: one QM gradient per geometry plus `equilibrate_ps + sample_ps` of
-environment dynamics (about 20 s for 1.3 ps of 230 atoms on one core) and
-`frames` low-level gradients; images run `n_parallel` at a time. Limits:
-mechanical embedding with an xTB-family environment only (not AMBER/TIP3P
-yet); no Hessians, TS optimizations or IRCs on this surface (use the
+Electrostatic embedding (TIP3P, or AMBER with `embedding =
+"electrostatic"`): the QM energy depends on where the environment's charges
+are, so the dynamics see the QM region as fixed point charges (the QM
+program's atomic charges at that geometry; Hu, Lu and Yang use ESP charges)
+and every sampled frame gets a full QM/MM gradient in its own field: `frames`
+QM calculations per geometry. With mechanical embedding the QM energy of the
+held solute is the same in every frame: one QM gradient per geometry.
+
+Menshutkin reaction, NH3 + CH3Cl -> CH3NH3+ Cl- (contact ion pair), GFN2-xTB
+QM region in a 300-atom TIP3P droplet, electrostatic embedding, NEB with 12
+images and 120 steps, 1 ps of TIP3P dynamics and 10 QM gradients per
+geometry (8 minutes on 8 cores), kcal/mol:
+
+| | barrier | reaction |
+|---|---|---|
+| gas-phase QM along the same path | 42.4 | +31.3 |
+| cage (water as around the reactant) | 45.7 | -5.3 |
+| free energy (three profiles of the same path) | 20 ± 1.3 | -13 ± 1.5 |
+
+The barrier is in the 20-30 kcal/mol range of earlier QM/MM free-energy
+studies and sits earlier along the path than in the gas phase (C-N 1.9 Å,
+C-Cl 2.3 Å). The spread between profiles is the sampling noise of 1 ps
+per geometry; sample longer for tighter numbers.
+
+Cost (mechanical): one QM gradient per geometry plus `equilibrate_ps +
+sample_ps` of environment dynamics (about 20 s for 1.3 ps of 230 atoms of
+GFN-FF on one core; OpenMM is much faster) and `frames` low-level gradients;
+images run `n_parallel` at a time. Limits: no Hessians, TS optimizations or
+IRCs on this surface (use the
 climbing image, or the cage for a TS optimization); minimizations and
 elementary-step checks see a noisy surface (switch `do_elem_step_checks`
 off for a single path); the forces are averages over `frames`, so their
