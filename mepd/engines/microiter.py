@@ -55,11 +55,19 @@ class MicroIterations:
         self.inner_gtol, self.inner_maxiter = inner_gtol, inner_maxiter
         self.max_move = 0.5
         self.calls = {"qm": 0, "inner_steps": 0}
+        self._reduced = None
 
     # ------------------------------------------------------------ inner
     def _inner_energy(self, x: np.ndarray, qm_charges: Optional[np.ndarray], charge: int):
-        low = self.qmmm._low.terms([x], charge)[0]
-        e, g = float(low["energy"]), np.array(low["gradient"], dtype=float)
+        if self._reduced is None and self.inner and hasattr(self.qmmm._low, "reduced"):
+            # A cut-off force field: only the atoms near the moving ones matter
+            # to their forces (a protein: a few thousand atoms fewer per step).
+            self._reduced = self.qmmm._low.reduced(sorted(set(self.inner) | set(self.outer))) or False
+        if self._reduced:
+            e, g = self._reduced.terms(x)
+        else:
+            low = self.qmmm._low.terms([x], charge)[0]
+            e, g = float(low["energy"]), np.array(low["gradient"], dtype=float)
         if self.electrostatic and qm_charges is not None:
             model = self.region.model_coords(x)
             idx, q = self.qmmm._low.point_charges()
@@ -144,10 +152,25 @@ class MicroIterations:
                     self.charges = res["qm_charges"]
                 self.correction = engine._correction(x, res, self.charges, charge)
                 self.trajectory.append(engine._node(structure, x, res))
+                engine._report(len(self.trajectory), res)
                 self.results["energy"] = res["energy"] * HARTREE_EV
                 self.results["forces"] = -np.asarray(res["gradient"])[engine.outer] * HARTREE_EV * ANGSTROM_TO_BOHR
 
         return _Calc()
+
+    def _report(self, step: int, res: dict) -> None:
+        """A line every 10 QM/MM steps (a log shows the optimization moving)."""
+        import time
+
+        now = time.time()
+        if step == 1:
+            self._t0, self._inner0 = now, self.calls["inner_steps"]
+        if step % 10:
+            return
+        f = np.abs(np.asarray(res["gradient"])[self.outer]).max() * HARTREE_EV * ANGSTROM_TO_BOHR
+        inner = (self.calls["inner_steps"] - self._inner0) / max(step, 1)
+        print(f"  QM/MM step {step}: energy {res['energy']:.6f} Eh, max QM force {f:.3f} eV/Å, "
+              f"{inner:.0f} environment steps per QM step, {(now - self._t0) / step:.1f} s per step", flush=True)
 
     def _correction(self, x, res, qm_charges, charge: int) -> Optional[np.ndarray]:
         """Full QM/MM gradient minus the cheap one, on the environment atoms."""

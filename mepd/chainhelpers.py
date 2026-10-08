@@ -382,10 +382,26 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
         )
         for node in chain
     ])
-    smoother = run_geodesic_get_smoother((chain[0].symbols, coords), **kwargs)
+    sub = _geodesic_subsystem(coords, frozen)
+    if sub is None:
+        smoother = run_geodesic_get_smoother((chain[0].symbols, coords), **kwargs)
+        path = smoother.path
+    else:
+        # Mostly frozen (a protein around a QM region): interpolate the free
+        # atoms with the frozen ones near them as context; the rest are the
+        # same at both ends and only cost time (geodesic coordinates grow
+        # with the square of the atom count).
+        keep, sub_frozen = sub
+        kwargs["ignore_atoms"] = sub_frozen
+        smoother = run_geodesic_get_smoother(([chain[0].symbols[i] for i in keep], coords[:, keep]), **kwargs)
+        n = len(smoother.path)
+        path = np.array([coords[0] + t * (coords[-1] - coords[0]) for t in np.linspace(0, 1, n)])
+        path[:, keep] = smoother.path
     if len(frozen):
-        hold_frozen(smoother.path, frozen)
-    xyz_coords = smoother.path
+        hold_frozen(path, frozen)
+        if sub is None:
+            smoother.path = path
+    xyz_coords = path
     charge = chain[0].structure.charge
     spinmult = chain[0].structure.multiplicity
 
@@ -400,6 +416,27 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
     if return_smoother:
         return chain_copy, smoother
     return chain_copy
+
+
+def _geodesic_subsystem(coords: np.ndarray, frozen, context: float = 3.0):
+    """(atoms to interpolate, their frozen ones in the sub-system's numbering)
+    when most atoms are frozen: the free atoms plus frozen atoms within
+    `context` Å of any of them (in either end). None otherwise."""
+    frozen = np.asarray(frozen, dtype=int)
+    natoms = coords.shape[1]
+    if len(frozen) < 0.5 * natoms or natoms < 300:
+        return None
+    from scipy.spatial import cKDTree
+
+    free = np.setdiff1d(np.arange(natoms), frozen)
+    keep = set(free.tolist())
+    for end in (coords[0], coords[-1]):
+        tree = cKDTree(np.asarray(end) / 1.8897259886)
+        for hits in tree.query_ball_point(np.asarray(end)[free] / 1.8897259886, r=context):
+            keep.update(hits)
+    keep = np.array(sorted(keep), dtype=int)
+    fset = set(frozen.tolist())
+    return keep, [k for k, a in enumerate(keep) if a in fset]
 
 
 def calculate_geodesic_distance(

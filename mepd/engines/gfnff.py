@@ -207,6 +207,24 @@ class GFNFFEngine(Engine):
     def compute_energies(self, chain: Union[Chain, List]) -> NDArray:
         return np.array([n.energy for n in self._compute(chain)])
 
+    def compute_hessian(self, node, step_size: float | None = None) -> NDArray:
+        """Central differences of xtb's analytic gradients (6N runs, as many
+        at once as n_parallel), not the generic energy-only fallback."""
+        h = float(step_size if step_size is not None else getattr(self, "finite_difference_hessian_step_size", 1e-3) or 1e-3)
+        x0 = np.asarray(node.coords, dtype=float)
+        flat = x0.reshape(-1)
+        symbols, charge = list(node.symbols), int(node.structure.charge)
+        uhf = int(node.structure.multiplicity) - 1
+        jobs = []
+        for i in range(flat.size):
+            for sign in (1.0, -1.0):
+                x = flat.copy()
+                x[i] += sign * h
+                jobs.append((symbols, x.reshape(x0.shape), charge, None, uhf))
+        grads = [np.asarray(g).reshape(-1) for _, g in self.energy_gradients(jobs)]
+        hessian = np.array([(grads[2 * i] - grads[2 * i + 1]) / (2.0 * h) for i in range(flat.size)])
+        return 0.5 * (hessian + hessian.T)
+
     def _ase(self, node):
         from mepd.engines.ase import ASEEngine
         from mepd.engines.gxtb import _GXTBASEResultsCalculator

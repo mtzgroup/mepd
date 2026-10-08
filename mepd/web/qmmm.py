@@ -168,6 +168,41 @@ def adopt_build(ws: Workspace, job: dict) -> Optional[str]:
     return res["rec"]["id"]
 
 
+def adopt_protein_build(ws: Workspace, job: dict) -> dict:
+    """A finished `qmmm-protein-build` job: its system as a new QM/MM node
+    (the protein's force-field PDB goes with the region); with a reaction
+    brought along, its other end (and TS) too, the ends joined by an edge.
+    Returns {"start", "end", "ts", "edge"} like `adopt_reaction` (the caller
+    minimizes the ends and re-optimizes the TS)."""
+    out = Path(job["output_dir"])
+    if not (out / "region.json").exists() or not (out / "system.xyz").exists():
+        return {}
+    region = QMMMRegion.open(out / "region.json")
+    where = region.name or "in protein"
+    ws.put_qmmm_system(region, name=where, base_dir=out)
+    origin = {"kind": "job", "job": job["id"]}
+
+    def add(fname, label, role="minimum"):
+        fp = out / fname
+        if not fp.exists():
+            return None
+        # The whole system's charge: the protein's plus the species'.
+        (s,) = chem.structures_from_xyz_text(fp.read_text(), region.charge, job.get("multiplicity"))
+        res = ws.add_or_merge(s, optimized=False, role=role, origin={**origin, "entry": fname.split(".")[0],
+                                                                      "label": label})
+        return res["rec"]["id"]
+
+    start = add("system.xyz", f"{where} (QM/MM)")
+    end = add("product.xyz", f"the other end, {where}")
+    ts = add("ts.xyz", f"TS {where} (from the gas phase, to re-optimize)", role="ts")
+    edge = None
+    if start and end and start != end:
+        edge = (ws.find_edge(start, end) or ws.add_edge(start, end, label=where, origin={
+            **origin, "headline": "the reaction inside the protein (QM/MM)",
+            "gas_edges": [e for e in [(job.get("params") or {}).get("edge")] if e]}))["id"]
+    return {"start": start, "end": end, "ts": ts, "edge": edge}
+
+
 def from_terachem(ws: Workspace, path: str, mm: str = "amber", active_radius: Optional[float] = None) -> dict:
     """A TeraChem QM/MM input on this machine as a QM/MM system + node."""
     from mepd.qmmm_build import from_terachem as convert

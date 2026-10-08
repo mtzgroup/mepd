@@ -1489,6 +1489,41 @@ def collect_qmmm_build(out: Path, charge: int, multiplicity: int) -> dict:
                    warnings=list(s.get("problems") or []))
 
 
+def collect_protein_sites(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd qmmm protein-sites`: where the species docks in the protein (the
+    view draws the protein with the poses; each site can be built)."""
+    data = _read_json(out / "sites.json") or {}
+    sites = data.get("sites") or []
+    prep = data.get("prepared") or {}
+    if not sites:
+        return _result("Docking…" if not data else "No sites found", [], [])
+    best = sites[0]
+    return {**_result(f"{len(sites)} site{'s' if len(sites) != 1 else ''}, best {best['score']:.1f} kcal/mol "
+                      f"(Vina score)", [],
+                      [{"label": "Protein", "value": f"{prep.get('atoms')} atoms, chains {','.join(prep.get('chains') or [])}, "
+                                                     f"charge {prep.get('charge', 0):+d} at pH {prep.get('ph', 7):g}"},
+                       {"label": "Removed", "value": ", ".join(prep.get("removed") or [])},
+                       {"label": "Gaps not rebuilt", "value": prep.get("gaps_not_rebuilt") or None}]),
+            "protein_sites": {"protein": data.get("protein"), "species": data.get("species"),
+                              "sites": [{k: s[k] for k in ("id", "score", "centroid", "coords", "hits", "residues")}
+                                        for s in sites]}}
+
+
+def collect_protein_build(out: Path, charge: int, multiplicity: int) -> dict:
+    """`mepd qmmm protein-build`: the species at its site, in the protein."""
+    s = _read_json(out / "summary.json") or {}
+    chain = _load_chain(out / "system.xyz", charge, multiplicity)
+    entries = [_entry("system", f"Site {s.get('site', '?')} in the protein", [chain[0]], None)] if chain else []
+    return _result(f"Site {s.get('site', '?')}: {s.get('qm_atoms', '?')} QM atoms in {s.get('natoms', '?')}",
+                   [_group("QM/MM system", "qmmm", entries)],
+                   [{"label": "QM atoms", "value": s.get("qm_atoms")},
+                    {"label": "Moving environment atoms", "value": s.get("active_mm_atoms")},
+                    {"label": "Frozen environment atoms", "value": s.get("frozen_atoms")},
+                    {"label": "Vina score", "value": s.get("score")},
+                    {"label": "Added to Explore", "value": "as a QM/MM node, minimized embedded"}],
+                   warnings=list(s.get("problems") or []))
+
+
 def collect_qmmm_reaction(out: Path, charge: int, multiplicity: int) -> dict:
     """A `mepd qmmm reaction` / `mepd qmmm embed` folder: the structures put
     into the solvent (starting geometries: the workspace minimizes them, and
@@ -1525,6 +1560,8 @@ def collect_qmmm_inspect(out: Path, charge: int, multiplicity: int) -> dict:
 
 COLLECTORS = {
     "qmmm-build": collect_qmmm_build,
+    "qmmm-protein-sites": collect_protein_sites,
+    "qmmm-protein-build": collect_protein_build,
     "qmmm-inspect": collect_qmmm_inspect,
     "qmmm-reaction": collect_qmmm_reaction,
     "qmmm-embed": collect_qmmm_reaction,
@@ -1661,7 +1698,7 @@ def _log_warnings(log: Path, limit: int = 8) -> list[str]:
 
 
 # Bump when collectors change what they return, so cached results are rebuilt.
-RESULT_VERSION = 28
+RESULT_VERSION = 29
 
 
 def collect_cached(job: dict, job_dir: Path) -> dict:

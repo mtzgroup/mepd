@@ -14,6 +14,7 @@ import { ReactorLive } from './ReactorLive.js';
 import { ComplexLive } from './ComplexLive.js';
 import { ReactionTable, SpawnedSearches } from './Reactions.js';
 import { RetroRoutes } from './Retro.js';
+import { ProteinSites } from './ProteinSites.js';
 import { Viewer3D } from './Viewer3D.js';
 import { QmmmCheck } from './QMMM.js';
 
@@ -427,7 +428,7 @@ function ResultPanel({ job }) {
 
   if (error) return html`<div class="warn-box">Could not read results: ${error} <button class="btn small" onClick=${load}>Retry</button></div>`;
   if (!result) return html`<p class="muted">Reading results…</p>`;
-  if (!result.groups.length && !result.mechano && !result.conditions && !result.substituents && !result.retro) {
+  if (!result.groups.length && !result.mechano && !result.conditions && !result.substituents && !result.retro && !result.protein_sites) {
     return html`<div class="empty-hint"><p>${result.headline}</p>
       ${running && html`<button class="btn small" onClick=${load} disabled=${loading}>${loading ? 'Reading…' : 'Check for partial results'}</button>`}</div>`;
   }
@@ -463,6 +464,7 @@ function ResultPanel({ job }) {
       ${job.op === 'nanoreactor' && html`<${SpawnedSearches} job=${job} />`}
       ${result.nanoreactor && html`<${ReactionTable} job=${job} reactions=${result.nanoreactor.reactions} />`}
       ${result.retro && html`<${RetroRoutes} job=${job} retro=${result.retro} />`}
+      ${result.protein_sites && html`<${ProteinSites} job=${job} data=${result.protein_sites} />`}
       ${result.conditions && html`<${ConditionsPanel} cond=${result.conditions} />`}
       ${result.mechano && html`<p class="level-note small">Mechanical-force results are not shown in the web UI for now;
         this job's files are under Files.</p>`}

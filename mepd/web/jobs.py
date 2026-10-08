@@ -29,7 +29,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from mepd.web.operations import JobContext, get_operation
+from mepd.web.operations import OPERATIONS, JobContext, get_operation
 from mepd.web.workspace import Workspace, WorkspaceError, _atomic_write, new_id, remove_tree
 
 TERMINAL = {"done", "failed", "cancelled", "interrupted"}
@@ -647,6 +647,9 @@ class JobManager:
             raise WorkspaceError("imported results cannot be rerun")
         if job["status"] not in TERMINAL:
             raise WorkspaceError(f"job is {job['status']}")
+        op = OPERATIONS.get(job.get("op"))
+        if op is not None and not op.available:   # e.g. switched off in the web UI since it ran
+            raise WorkspaceError(op.unavailable_reason or f"{op.title} is not available")
         self._update(job, status="queued", error=None, returncode=None, finished=None, summary=None)
         (self.job_dir(jid) / "result.json").unlink(missing_ok=True)
         self._wake.set()

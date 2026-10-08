@@ -561,7 +561,6 @@ def form(text: str) -> dict:
             issues.append(f"MLP-GI: {problem}")
             path_issues.append(issues[-1])
 
-
     basic = [
         _choice("path_method", "Path method", method, PATH_METHODS, "How the minimum-energy path is found.",
                 disabled={"NEB-DLF": tc_reason} if tc_reason and method != "NEB-DLF" else None),

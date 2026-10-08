@@ -5,6 +5,10 @@
            TS) put into that same solvent shell
   embed    another geometry of the solute (product, TS) into an existing system
   region   a QM/MM region on a structure you bring (xyz or PDB)
+  protein-sites  dock a species (rigid, its own geometry) into a protein:
+           the sites it binds, best first
+  protein-build  the species at one of those sites as a QM/MM system (the
+           protein and a water shell around it are the environment)
   from-tc  convert a TeraChem QM/MM input (tc.in + prmtop + rst7 + qmindices)
   inspect  per-frame checks (frozen drift, boundary bonds, MM bond changes,
            clashes) and, with --inputs, the QM / environment energy split
@@ -53,8 +57,12 @@ def _write(output: Path, system, region, extra: Optional[dict] = None) -> None:
     region.save(output / "region.json")
     profile = output / "qmmm_profile.toml"
     if not profile.exists():
-        profile.write_text('# QM level: edit like any profile. The [qmmm] table embeds it.\nengine_name = "gxtb"\n'
-                           'path_min_method = "FNEB"\n\n[qmmm]\nfile = "region.json"\n')
+        # Electrostatic embedding needs a QM level that takes point charges.
+        engine = "xtb" if region.embedding == "electrostatic" else "gxtb"
+        profile.write_text(f'# QM level: edit like any profile. The [qmmm] table embeds it.\nengine_name = "{engine}"\n'
+                           # NEB, not FNEB: FNEB regrows its string by geodesic interpolation,
+                           # slow for hundreds of moving solvent atoms.
+                           'path_min_method = "NEB"\n\n[qmmm]\nfile = "region.json"\n')
     summary = {"system": str(output / "system.xyz"), "region": str(output / "region.json"),
                "profile": str(profile), "natoms": region.natoms, "qm_atoms": len(region.qm_atoms),
                "links": [list(x) for x in region.links], "frozen_atoms": len(region.frozen_atoms),
@@ -265,6 +273,127 @@ def region_cmd(
                               qm_multiplicity=multiplicity, active_radius=active_radius or None,
                               frozen_atoms=frozen, mm=mm, **extra)
     _write(output, s, region)
+
+
+@qmmm_app.command("protein-sites")
+def protein_sites(
+    species: str = typer.Argument(..., help="The molecule or complex to place (xyz or SMILES): docked rigid, in "
+                                  "this geometry (e.g. a reactant optimized with QM)."),
+    protein: str = typer.Option(..., "--protein", help="The protein: a PDB file, or a PDB ID to download."),
+    chains: Optional[str] = typer.Option(None, "--chains", help="Chains to keep, e.g. 'A,B,C' (default: all)."),
+    ph: float = typer.Option(7.0, "--ph", help="pH for the protonation states of the protein's residues."),
+    box: float = typer.Option(20.0, "--box", help="Edge of each docking box, Å."),
+    spacing: float = typer.Option(12.0, "--spacing", help="Spacing of the box centres over the protein, Å."),
+    exhaustiveness: int = typer.Option(8, "--exhaustiveness", help="Vina search effort per box."),
+    max_sites: int = typer.Option(20, "--max-sites"),
+    workers: int = typer.Option(4, "--workers", help="Docking processes at once."),
+    charge: Optional[int] = typer.Option(None, "--charge", help="Charge of the species."),
+    multiplicity: Optional[int] = typer.Option(None, "--multiplicity"),
+    output: Path = typer.Option(Path("mepd_protein_sites"), "--output", "-o"),
+):
+    """Where a species binds in a protein: the protein prepared (hydrogens at
+    --ph, ligands and crystal water removed), the species docked rigid with
+    AutoDock Vina in boxes covering it, the poses grouped into sites."""
+    import numpy as np
+
+    from mepd.cli_common import _load_structure_from_smiles_or_xyz
+    from mepd.qmmm_protein import fetch_pdb, find_sites, prepare_protein, sites_to_json
+
+    output.mkdir(parents=True, exist_ok=True)
+    s = _load_structure_from_smiles_or_xyz(species, charge, multiplicity)
+    src = Path(protein)
+    if not src.exists():
+        typer.echo(f"Downloading {protein} from the PDB...")
+        src = fetch_pdb(protein, output)
+    prep = prepare_protein(src, output / "protein.pdb", chains=chains.split(",") if chains else None, ph=ph)
+    typer.echo(f"Protein: {prep['atoms']} atoms, {prep['residues']} residues, chains {','.join(prep['chains'])}, "
+               f"charge {prep['charge']:+d} at pH {ph:g}"
+               + (f"; removed {', '.join(prep['removed'])}" if prep["removed"] else "")
+               + (f"; {prep['gaps_not_rebuilt']} gap(s) not rebuilt" if prep["gaps_not_rebuilt"] else ""))
+    s.save(str(output / "species.xyz"))
+    x = np.asarray(s.geometry) / 1.8897259886
+
+    def progress(k, n):
+        if k % max(1, n // 10) == 0 or k == n:
+            typer.echo(f"  docked {k}/{n} boxes")
+
+    typer.echo("Docking the species (rigid) over the protein...")
+    sites = find_sites(output / "protein.pdb", [str(a) for a in s.symbols], x, output / "dock", box=box,
+                       spacing=spacing, exhaustiveness=exhaustiveness, max_sites=max_sites, workers=workers,
+                       progress=progress)
+    (output / "sites.json").write_text(json.dumps({
+        "protein": "protein.pdb", "species": "species.xyz", "charge": int(s.charge),
+        "multiplicity": int(s.multiplicity), "prepared": prep, "sites": sites_to_json(sites)}, indent=1))
+    for st in sites[:10]:
+        typer.echo(f"  site {st.id}: {st.score:.1f} kcal/mol, found {st.hits}x, near "
+                   + " ".join(st.residues[:6]) + (" ..." if len(st.residues) > 6 else ""))
+    typer.echo(f"Wrote {output}/sites.json ({len(sites)} sites). Next: mepd qmmm protein-build {output} --site 0")
+
+
+@qmmm_app.command("protein-build")
+def protein_build(
+    sites_dir: Path = typer.Argument(..., exists=True, help="A folder from `mepd qmmm protein-sites`."),
+    site: int = typer.Option(0, "--site", help="Which site (its id in sites.json)."),
+    qm_residues: str = typer.Option("", "--qm-residues", help="Residue side chains to add to the QM region, e.g. "
+                                    "'A:ARG90 A:GLU78' (cut at CA-CB, with link atoms)."),
+    water_shell: float = typer.Option(8.0, "--water-shell", help="TIP3P water within this many Å of the species."),
+    active_radius: float = typer.Option(6.0, "--active-radius", help="Water and protein atoms within this many Å "
+                                        "of the QM region move; the rest is frozen."),
+    freeze_protein: bool = typer.Option(False, "--freeze-protein", help="Freeze every protein atom outside the QM "
+                                        "region (only the water around the species moves)."),
+    cutoff: float = typer.Option(12.0, "--cutoff", help="Force-field non-bonded cutoff, Å (0: none). The QM region "
+                                 "feels every charge regardless."),
+    end: Optional[str] = typer.Option(None, "--end", help="The reaction's other end (xyz: the species' atoms): put "
+                                      "into the site in place of the species, as in `mepd qmmm reaction`."),
+    ts: Optional[str] = typer.Option(None, "--ts", help="A TS between them (xyz, same atoms) to put in too."),
+    output: Path = typer.Option(Path("mepd_protein_qmmm"), "--output", "-o"),
+):
+    """The species at a docked site as a QM/MM system: the protein (AMBER
+    ff14SB) and a TIP3P water shell as the environment, whose charges act on
+    the QM region (electrostatic embedding: use engine_name "xtb" or "psi4")."""
+    import numpy as np
+    from qcdata import Structure
+
+    from mepd.qmmm_protein import build_site_system
+
+    info = json.loads((sites_dir / "sites.json").read_text())
+    rec = next((x for x in info["sites"] if x["id"] == site), None)
+    if rec is None:
+        raise typer.BadParameter(f"no site {site} in {sites_dir}/sites.json")
+    species = Structure.open(str(sites_dir / info["species"]))
+    rep = build_site_system(sites_dir / info["protein"], [str(a) for a in species.symbols], np.asarray(rec["coords"]),
+                            output, ligand_charge=info["charge"], ligand_multiplicity=info["multiplicity"],
+                            qm_residues=qm_residues.split(), water_shell=water_shell, active_radius=active_radius,
+                            freeze_protein=freeze_protein, cutoff=cutoff or None,
+                            name=f"site {site} of {Path(info['prepared']['pdb']).stem}")
+    typer.echo(f"Site {site} ({rec['score']:.1f} kcal/mol): {rep['protein_atoms']} protein atoms, {rep['waters']} "
+               f"waters, the species; system charge {rep['charge']:+d}.")
+    _write(output, rep["structure"], rep["region_obj"], {"site": rec["id"], "score": rec["score"],
+                                                        "residues": rec["residues"], "sites": str(sites_dir)})
+    if end:
+        # The reaction's other end (and TS) into the same site, in the
+        # species' atom order: one QM/MM system, as for a reaction in solvent.
+        b = Structure.open(end) if Path(end).exists() else None
+        if b is None:
+            raise typer.BadParameter("--end must be an xyz file")
+        b = b.model_copy(update={"charge": species.charge, "multiplicity": species.multiplicity})
+        order = _end_onto_start(species, b)
+        if order is None:
+            raise typer.BadParameter("--end could not be matched atom for atom to the species")
+        items, names = [_reorder(b, order)], ["product"]
+        if ts:
+            t = Structure.open(ts).model_copy(update={"charge": species.charge, "multiplicity": species.multiplicity})
+            if list(t.symbols) == list(species.symbols):
+                items.append(t)
+            elif list(t.symbols) == list(b.symbols):
+                items.append(_reorder(t, order))
+            else:
+                raise typer.BadParameter("--ts must list the species' (or the end's) atoms in the same order")
+            names.append("ts")
+        placed = _embed_all(items, rep["structure"], rep["region_obj"], output, names)
+        summary = json.loads((output / "summary.json").read_text())
+        summary.update(embedded=placed, end=end, ts=ts)
+        (output / "summary.json").write_text(json.dumps(summary, indent=1))
 
 
 @qmmm_app.command("from-tc")

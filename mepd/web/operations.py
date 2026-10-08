@@ -120,6 +120,11 @@ class TsParams(Params):
         "moves.", cli="--pair-from", group="Endpoints", advanced=True,
         labels={"both": "Both as given", "start": "Product built from reactant",
                 "end": "Reactant built from product"})
+    rebuild_splits_from: Literal["none", "start", "end"] = P(
+        "none", "Rebuild at splits", "Experimental: at every split, rebuild each new leg's product from its "
+        "start (or its start from its product), kept only if bonds and stereochemistry survive.",
+        cli="--rebuild-splits-from", group="Endpoints", advanced=True,
+        labels={"none": "Off", "start": "Product from start", "end": "Start from product"})
     atom_mapping_candidates: int = P(200, "Mapping candidates", cli="--atom-mapping-candidates",
                                      group="Atom mapping", advanced=True, ge=1, requires="atom_mapping")
     atom_mapping_metric: AtomMappingMetric = P(
@@ -219,6 +224,11 @@ class ChannelsParams(Params):
         labels={"both": "Both sides sampled", "start": "Reactant conformers, products built",
                 "end": "Product conformers, reactants built",
                 "start+end": "Each side's conformers, partners built"})
+    rebuild_splits_from: Literal["none", "start", "end"] = P(
+        "none", "Rebuild at splits", "Experimental: at every split, rebuild each new leg's product from its "
+        "start (or its start from its product), kept only if bonds and stereochemistry survive.",
+        cli="--rebuild-splits-from", group="Pairs", advanced=True,
+        labels={"none": "Off", "start": "Product from start", "end": "Start from product"})
     max_pairs: int = P(0, "Max pairs", "0 = no cap.", cli="--max-pairs", group="Pairs", advanced=True, ge=0)
     atom_mapping: bool = P(True, "Atom mapping per pair", cli="--atom-mapping", kind="toggle",
                            group="Pairs", advanced=True)
@@ -1479,6 +1489,74 @@ def _build_qmmm_embed(ctx: JobContext, p: QmmmEmbedParams) -> list[str]:
             "--into", str(ctx.snapshot_structure(host, "system")), "--output", str(ctx.output_dir)]
 
 
+class ProteinSitesParams(Params):
+    protein: str = P("", "Protein", "A PDB ID to download (e.g. 2CHT), or the path of a PDB file on this machine.",
+                     cli="--protein", kind="custom")
+    chains: str = P("", "Chains", "Chains to keep, e.g. A,B,C (empty: all). A big crystal often holds several copies.",
+                    cli="--chains")
+    ph: float = P(7.0, "pH", "Protonation states of the protein's residues.", cli="--ph", ge=0.0, le=14.0)
+    exhaustiveness: int = P(8, "Search effort", "Vina's exhaustiveness in each docking box.",
+                            cli="--exhaustiveness", ge=1, advanced=True, group="Advanced")
+    spacing: float = P(12.0, "Box spacing (Å)", "Spacing of the docking boxes over the protein (each 20 Å).",
+                       cli="--spacing", gt=0.0, advanced=True, group="Advanced")
+    max_sites: int = P(20, "Sites kept", cli="--max-sites", ge=1, advanced=True, group="Advanced")
+    workers: int = P(4, "Docking processes", cli="--workers", ge=1, advanced=True, group="Advanced")
+
+
+def _build_protein_sites(ctx: JobContext, p: ProteinSitesParams) -> list[str]:
+    (rec,) = ctx.structures
+    if rec.get("qmmm"):
+        raise WorkspaceError(f"{rec['name']} is already a QM/MM system: dock the molecule (or complex) itself")
+    if not p.protein.strip():
+        raise WorkspaceError("name the protein: a PDB ID or the path of a PDB file")
+    argv = ["qmmm", "protein-sites", str(ctx.snapshot_structure(rec, "species")), "--protein", p.protein.strip(),
+            "--charge", str(rec["charge"]), "--multiplicity", str(rec["multiplicity"])]
+    return argv + [*generic_flags(p), "--output", str(ctx.output_dir)]
+
+
+class ProteinBuildParams(Params):
+    site: int = P(0, "Site", "Which docked site (its number in the result).", cli="--site", ge=0)
+    qm_residues: str = P("", "Residues in the QM region", "Side chains that take part in the chemistry, e.g. "
+                         "A:ARG90 A:GLU78 (cut at CA-CB, with link atoms).", cli="--qm-residues")
+    water_shell: float = P(8.0, "Water shell (Å)", "TIP3P water within this distance of the species.",
+                           cli="--water-shell", ge=0.0)
+    active_radius: float = P(6.0, "Moving shell (Å)", "Water and protein atoms within this distance of the QM "
+                             "region move in optimizations; the rest is frozen.", cli="--active-radius", ge=0.0)
+    freeze_protein: bool = P(False, "Freeze the protein", "Only the water around the species moves; the protein "
+                             "still acts on the QM region through its charges.", cli="--freeze-protein",
+                             kind="switch")
+    cutoff: float = P(12.0, "Force-field cutoff (Å)", "Non-bonded cutoff for the force field (0: none). The QM "
+                      "region feels every charge regardless.", cli="--cutoff", ge=0.0, advanced=True,
+                      group="Advanced")
+    edge: str = P("", "Bring a reaction along", "An edge of the docked species (its id): its other end, and its "
+                  "TS if one is known, are put into the same site, as for a reaction taken into solvent.",
+                  kind="custom")
+
+
+def _build_protein_build(ctx: JobContext, p: ProteinBuildParams) -> list[str]:
+    src = ctx.source
+    if src is None or src.get("op") != "qmmm-protein-sites" or src.get("status") != "done":
+        raise WorkspaceError("build from a finished protein-site search")
+    argv = ["qmmm", "protein-build", str(src["output_dir"]), *generic_flags(p)]
+    if p.edge:
+        edge = ctx.ws.snapshot()["edges"].get(p.edge)
+        species = (src.get("targets") or {}).get("structures") or []
+        if edge is None or not species or species[0] not in (edge["source"], edge["target"]):
+            raise WorkspaceError("that reaction is not one of the docked species' edges")
+        other = edge["target"] if edge["source"] == species[0] else edge["source"]
+        rec = ctx.ws.structure_view(other)
+        if rec.get("qmmm"):
+            raise WorkspaceError(f"{rec['name']} is already in a QM/MM system: bring a gas-phase reaction")
+        argv += ["--end", str(ctx.snapshot_structure(rec, "end"))]
+        found = edge_route_ts(ctx.ws, ctx.jobs, [species[0], other], [p.edge])
+        if found is not None:
+            ts = ctx.job_dir / "inputs" / "ts.xyz"
+            ts.parent.mkdir(parents=True, exist_ok=True)
+            ts.write_text(found[2])
+            argv += ["--ts", str(ts)]
+    return argv + ["--output", str(ctx.output_dir)]
+
+
 class QmmmInspectParams(Params):
     entry: str = P("", "Result entry", "Which path of the result (its id).", kind="custom")
 
@@ -1708,6 +1786,21 @@ OPERATIONS: dict[str, Operation] = {op.key: op for op in [
         produces=["the reaction in solvent: both ends and its TS as QM/MM structures"],
         cli_path=("qmmm", "reaction"), cli_extra_flags=("--start", "--end", "--ts", "--charge", "--multiplicity",
                                                         "--output")),
+    Operation(
+        "qmmm-protein-sites", "Place in a protein (QM/MM)", "Dock this molecule or complex into a protein, rigid "
+        "in its own geometry, with AutoDock Vina over the whole protein; see where it binds, then build a QM/MM "
+        "system at the site you choose (the protein and a water shell as the environment). "
+        "(`mepd qmmm protein-sites`)",
+        "structure", QMMM, ProteinSitesParams, _build_protein_sites, min_structures=1,
+        produces=["the sites where it binds"], cli_path=("qmmm", "protein-sites"),
+        cli_extra_flags=("--protein", "--charge", "--multiplicity", "--output")),
+    Operation(
+        "qmmm-protein-build", "QM/MM system at this site", "The species at the chosen docked site as a QM/MM "
+        "system: protein (AMBER ff14SB) and TIP3P water around it as the environment, whose charges act on the QM "
+        "region (needs a QM level that takes point charges: xTB or Psi4). (`mepd qmmm protein-build`)",
+        "job", QMMM, ProteinBuildParams, _build_protein_build, own_output=True,
+        source_ops=("qmmm-protein-sites",), produces=["a QM/MM system (species in the protein)"],
+        cli_path=("qmmm", "protein-build"), cli_extra_flags=("--end", "--ts", "--output")),
     Operation(
         "qmmm-embed", "Put into this QM/MM system", "Put the gas-phase structure (a product, a TS: the same atoms "
         "as this system's solute) into the selected QM/MM structure's solvent, in place of its solute, then minimize "

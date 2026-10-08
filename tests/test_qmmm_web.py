@@ -344,6 +344,56 @@ def test_adding_a_qmmm_result_to_explore_reads_only_its_qm_region(client, tmp_pa
     assert seen and max(seen) < len(s.symbols)          # the QM region (+ link H), never all 15 atoms
 
 
+def test_protein_site_build_brings_the_reaction_along_and_becomes_a_qmmm_edge(client, tmp_path):
+    """A finished site search, built at a site with an edge of the docked
+    species: the command carries the edge's other end, and the finished
+    build becomes a QM/MM system (its force-field PDB kept with it) with
+    both ends joined by an edge."""
+    import time as _time
+
+    pytest.importorskip("openmm")
+    from qcdata import Structure
+
+    from mepd.qmmm import QMMMRegion
+
+    ws = client.app.state.sessions.current.ws
+    a = client.post("/api/structures", json={"text": "CC(=O)O", "optimize": False}).json()[0]["id"]
+    b = client.post("/api/structures", json={"text": "OC(=C)O", "optimize": False}).json()[0]["id"]
+    eid = ws.add_edge(a, b)["id"]
+    jm = client.app.state.sessions.current.jobs
+    src = client.post("/api/jobs", json={"op": "qmmm-protein-sites", "structures": [a], "dry_run": True,
+                                         "params": {"protein": "2CHT"}}).json()[0]
+    out = tmp_path / "sites"
+    out.mkdir()
+    jm.jobs[src["id"]] = {**src, "status": "done", "finished": _time.time(), "output_dir": str(out)}
+    r = client.post("/api/jobs", json={"op": "qmmm-protein-build", "source_job": src["id"], "dry_run": True,
+                                       "params": {"site": 3, "qm_residues": "A:ARG90", "freeze_protein": True,
+                                                  "edge": eid}})
+    assert r.status_code == 200, r.text
+    argv = r.json()[0]["argv"]
+    assert argv[:3] == ["qmmm", "protein-build", str(out)] and "--end" in argv and "--freeze-protein" in argv
+    assert argv[argv.index("--site") + 1] == "3" and argv[argv.index("--qm-residues") + 1] == "A:ARG90"
+    # A finished build: system, product, region naming its environment PDB.
+    done = tmp_path / "build"
+    done.mkdir()
+    s = Structure.from_xyz(SYSTEM)
+    region = QMMMRegion.build(s, "0-5", active_radius=3.0, mm="tip3p", name="site 3 of test")
+    (done / "environment.pdb").write_text("REMARK test\nEND\n")
+    region.pdb = "environment.pdb"
+    region.save(done / "region.json")
+    s.save(str(done / "system.xyz"))
+    x = np.asarray(s.geometry).copy()
+    x[5] = x[0] + np.array([0.0, 0.0, 2.05])
+    s.model_copy(update={"geometry": x}).save(str(done / "product.xyz"))
+    from mepd.web.qmmm import adopt_protein_build
+
+    made = adopt_protein_build(ws, {"id": "j_b", "output_dir": str(done), "multiplicity": 1, "params": {"edge": eid}})
+    assert made["start"] and made["end"] and made["edge"]
+    sysid = ws.structure(made["start"])["qmmm"]
+    stored = QMMMRegion.open(ws.qmmm_region_path(sysid))
+    assert Path(stored.pdb).is_file() and Path(stored.pdb).parent == ws.qmmm_dir     # kept with the region
+    assert ws.edge(made["edge"])["origin"]["gas_edges"] == [eid]
+
 
 def test_edit_in_design_opens_the_qm_region_not_the_whole_system(client):
     """A QM/MM node in Design is its QM region (capped), with a note: the

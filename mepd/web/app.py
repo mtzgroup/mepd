@@ -380,10 +380,12 @@ def create_app(workspace_root: Path, *, max_concurrent: int = 2, auth_token: Opt
                     except WorkspaceError:
                         pass
                     bus.publish("workspace", manager.ws.snapshot(), key=str(manager.ws.root))
-            if job["op"] in ("qmmm-reaction", "qmmm-embed") and job["status"] == "done" and not job.get("external"):
+            if job["op"] in ("qmmm-reaction", "qmmm-embed", "qmmm-protein-build") and job["status"] == "done" \
+                    and not job.get("external"):
                 from mepd.web import qmmm as web_qmmm
 
-                adopt = web_qmmm.adopt_reaction if job["op"] == "qmmm-reaction" else web_qmmm.adopt_embed
+                adopt = {"qmmm-reaction": web_qmmm.adopt_reaction, "qmmm-embed": web_qmmm.adopt_embed,
+                         "qmmm-protein-build": web_qmmm.adopt_protein_build}[job["op"]]
                 made = await run_in_threadpool(adopt, manager.ws, job)
                 minima = [made.get(k) for k in ("start", "end") if made.get(k)]
                 if made.get("role") == "minimum" and made.get("structure"):

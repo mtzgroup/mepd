@@ -1261,3 +1261,16 @@ input.invalid { border-color: var(--danger); outline-color: var(--danger); }
 .sandbox-controls label { display: flex; align-items: center; gap: 6px; }
 .sandbox-controls input[type=range] { width: 140px; }
 .sandbox-return { color: var(--accent); border-color: var(--accent); margin-right: 8px; }
+
+/* ------------------------------------------------------- protein sites */
+.protein-sites { display: grid; grid-template-columns: minmax(0, 3fr) minmax(260px, 2fr); gap: 14px; align-items: start; }
+@media (max-width: 900px) { .protein-sites { grid-template-columns: 1fr; } }
+.site-table { width: 100%; border-collapse: collapse; }
+.site-table th, .site-table td { padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--border); }
+.site-table tbody tr { cursor: pointer; }
+.site-table tbody tr:hover { background: var(--hover, rgba(0,0,0,.04)); }
+.site-table tr.selected { background: var(--accent-soft, rgba(56,104,184,.12)); }
+.chip-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 8px; }
+.chip { border: 1px solid var(--border); background: transparent; border-radius: 10px; padding: 1px 7px; cursor: pointer; }
+.chip.on { background: var(--accent, #3868b8); color: white; border-color: transparent; }
+.protein-view { min-width: 0; }

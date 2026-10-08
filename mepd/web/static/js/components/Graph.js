@@ -734,7 +734,7 @@ export function Graph() {
       else pendingArrange.current = pendingArrange.current || 'fit';
     }
     if (placed) fittedFor.current = workspace.root;
-  }, [workspace, statusKey]);
+  }, [workspace, statusKey, condKey]);
 
   // --- "breathing" nodes: a structure with a calculation running on it
   // glows softly, the halo slowly swelling and fading (no shaking).

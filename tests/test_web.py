@@ -353,7 +353,8 @@ def test_interrupted_jobs_survive_a_restart(tmp_path, quick_op):
         (s,) = _add(c, WATER_XYZ)
         (job,) = c.post("/api/jobs", json={"op": "quick", "structures": [s["id"]]}).json()
         _wait(c, job["id"])
-    # Simulate a server killed mid-run.
+    # Simulate a server killed mid-run, its run killed with it (no exit code
+    # recorded: a run that ended on its own would be finished from that).
     import json
     fp = ws / "jobs" / job["id"] / "job.json"
     rec = json.loads(fp.read_text())
@@ -1131,8 +1132,8 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
     for op in ops:
         if not op["available"]:
             continue
-        if op["key"] in ("qmmm-inspect", "qmmm-embed"):
-            continue   # need a QM/MM system: tests/test_qmmm_web.py checks their flags
+        if op["key"] in ("qmmm-inspect", "qmmm-embed", "qmmm-protein-build"):
+            continue   # need a QM/MM system or site search: tests/test_qmmm_web.py checks their flags
         body = {"op": op["key"], "dry_run": True, "profile": "default"}
         if op["target"] == "pair":
             body["structures"] = [a["id"], b["id"]]
@@ -1148,8 +1149,9 @@ def test_every_web_operation_emits_only_real_cli_flags(client, tmp_path):
             body["structures"] = [ts["id"] if op.get("structure_role") == "ts" else a["id"]]
         props = (op["schema"] or {}).get("properties", {})
         flipped = {k: not v.get("default") for k, v in props.items() if v.get("type") == "boolean"}
+        base = {"protein": "2CHT"} if op["key"] == "qmmm-protein-sites" else {}
         for params in ({}, flipped):
-            r = client.post("/api/jobs", json={**body, "params": params})
+            r = client.post("/api/jobs", json={**body, "params": {**base, **params}})
             if r.status_code == 400 and params:
                 continue  # an invalid combination (e.g. IRC without TS optimization)
             assert r.status_code == 200, (op["key"], r.text)

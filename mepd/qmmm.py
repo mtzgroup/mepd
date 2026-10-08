@@ -182,6 +182,10 @@ class QMMMRegion:
     pdb: Optional[str] = None
     forcefield: list[str] = field(default_factory=lambda: ["amber14-all.xml", "amber14/tip3p.xml"])
     tcin: Optional[str] = None            # mm = "terachem": a tc.in template
+    # mm = "amber": force-field non-bonded interactions cut off beyond this
+    # many Å (reaction field), for large systems such as a protein; None = all
+    # pairs. The QM region still feels every environment charge.
+    mm_cutoff: Optional[float] = None
     # The molecule the system was built around (system atom indices, in that
     # molecule's own order): where another geometry of it (a product, a TS)
     # is put by mepd.qmmm_build.embed. Empty = the QM atoms.

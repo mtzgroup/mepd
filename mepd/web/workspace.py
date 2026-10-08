@@ -530,15 +530,29 @@ class Workspace:
         self.qmmm_region(sysid)
         return self.qmmm_dir / f"{sysid}.json"
 
-    def put_qmmm_system(self, region, *, name: str = "", sysid: Optional[str] = None) -> dict:
+    def put_qmmm_system(self, region, *, name: str = "", sysid: Optional[str] = None,
+                        base_dir: Optional[Path] = None) -> dict:
         """Register (or replace) the QM/MM region of a system. Returns its
-        record (a summary; the region itself is qmmm/<id>.json)."""
+        record (a summary; the region itself is qmmm/<id>.json). Force-field
+        files the region names (a protein's PDB, a prmtop; relative ones from
+        `base_dir`) are copied next to it, so jobs find them wherever they run."""
         with self._lock:
             key = self._atoms_key(region.symbols)
             systems = self._data["qmmm_systems"]
             sysid = sysid or next((k for k, v in systems.items() if v.get("atoms_key") == key), None) \
                 or new_id("q_")
             self.qmmm_dir.mkdir(parents=True, exist_ok=True)
+            for attr in ("pdb", "prmtop"):
+                value = getattr(region, attr, None)
+                if not value:
+                    continue
+                src = Path(value) if Path(value).is_absolute() else Path(base_dir or ".") / value
+                if not src.is_file():
+                    continue
+                dest = self.qmmm_dir / f"{sysid}_{attr}{src.suffix}"
+                if src.resolve() != dest.resolve():
+                    shutil.copyfile(src, dest)
+                setattr(region, attr, str(dest.resolve()))
             region.name = name or region.name or systems.get(sysid, {}).get("name") or "QM/MM system"
             region.save(self.qmmm_dir / f"{sysid}.json")
             ref = region.reference_structure()

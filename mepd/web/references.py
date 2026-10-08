@@ -38,6 +38,26 @@ _OTHER = [
         ],
     },
     {
+        "feature": "Reactions in a protein (QM/MM)",
+        "where": "Place in a protein (QM/MM), QM/MM system at this site",
+        "items": [
+            {"what": "AutoDock Vina (rigid docking of the species, site search)",
+             "cite": ["J. Eberhardt, D. Santos-Martins, A. F. Tillack, S. Forli, J. Chem. Inf. Model. 61, 3891 (2021), "
+                      "doi:10.1021/acs.jcim.1c00203",
+                      "O. Trott, A. J. Olson, J. Comput. Chem. 31, 455 (2010), doi:10.1002/jcc.21334"]},
+            {"what": "PDBFixer and OpenMM (protein preparation, hydrogens, water)",
+             "cite": ["P. Eastman et al., PLoS Comput. Biol. 13, e1005659 (2017), doi:10.1371/journal.pcbi.1005659"]},
+            {"what": "AMBER ff14SB protein force field",
+             "cite": ["J. A. Maier, C. Martinez, K. Kasavajhala, L. Wickstrom, K. E. Hauser, C. Simmerling, J. Chem. "
+                      "Theory Comput. 11, 3696 (2015), doi:10.1021/acs.jctc.5b00255"]},
+            {"what": "TIP3P water",
+             "cite": ["W. L. Jorgensen, J. Chandrasekhar, J. D. Madura, R. W. Impey, M. L. Klein, J. Chem. Phys. 79, "
+                      "926 (1983), doi:10.1063/1.445869"]},
+            {"what": "Open Babel (PDBQT files for Vina)",
+             "cite": ["N. M. O'Boyle et al., J. Cheminform. 3, 33 (2011), doi:10.1186/1758-2946-3-33"]},
+        ],
+    },
+    {
         "feature": "Initial path",
         "where": "Settings › Initial path",
         "items": [

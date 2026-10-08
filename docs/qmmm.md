@@ -138,6 +138,76 @@ When a path search's output goes to a file instead of a terminal, every step
 is logged as one line: step, gradients, the peak (kcal/mol, image) and the
 end energy relative to the start, and the time the step took.
 
+## Reactions in a protein
+
+The species (a molecule, or a complex of several) is docked into a protein,
+you choose the site, and the system built there is a QM/MM system like a
+solvated one (`mepd/qmmm_protein.py`):
+
+```bash
+# 1. Prepare the protein (chains kept, ligands and crystal water removed,
+#    hydrogens at --ph) and dock the species rigid, in its own geometry,
+#    with AutoDock Vina in 20 Å boxes covering it; poses grouped into sites.
+mepd qmmm protein-sites chorismate.xyz --protein 2CHT --chains A,B,C --charge -2 -o cm_sites
+# 2. The species at a site as a QM/MM system: the protein (AMBER ff14SB) and a
+#    TIP3P water shell are the environment, their charges act on the QM
+#    region. Side chains can join the QM region; --end/--ts bring a reaction
+#    along (put into the same site, as `mepd qmmm reaction` does in solvent).
+mepd qmmm protein-build cm_sites --site 0 --qm-residues "A:ARG90" --end prephenate.xyz -o cm_site0
+```
+
+* Electrostatic embedding: the QM level must take point charges
+  (`engine_name = "xtb"` for GFN2-xTB, or `"psi4"`); the written profile uses
+  xtb.
+* The force-field atoms come first (the PDB's order: protein, then water),
+  the species last. It has no force-field parameters: its atoms get UFF
+  Lennard-Jones only, and its electrostatics are the QM calculation's.
+* Moving: water and protein atoms within `--active-radius` (6 Å) of the QM
+  region; everything else is frozen (`--freeze-protein`: the whole protein).
+  The frozen protein still acts on the QM region through its charges.
+* The force field is cut off at `--cutoff` (12 Å, reaction field); the QM
+  region feels every charge regardless. Between QM steps the environment is
+  relaxed on a sub-system (the moving atoms and everything within the cutoff
+  of them), whose forces on the moving atoms are exactly the full system's.
+* At build time, the protein's hydrogens and the water are minimized around
+  the species (GFN2-xTB charges on it; protein heavy atoms held).
+* Docking is rigid on purpose: the species keeps the geometry it has (a
+  reactant optimized with QM, a pre-reactive conformer). Vina's score ranks
+  sites; the QM/MM energies that follow are what count.
+
+Checked on chorismate mutase (*B. subtilis*, PDB 2CHT, one trimer, 5663
+atoms): the three best sites of 20 are the three active sites (1.9–3.5 Å
+from the crystal's transition-state analog), lined by Arg7, Glu78 and
+Arg90; one QM/MM gradient (GFN2-xTB, 24 QM atoms, 5.7k point charges)
+takes 0.1 s.
+
+The reaction, chorismate → prephenate at GFN2-xTB (24 QM atoms; results in
+`qmmm/external/chorismate_mutase_gfn2`):
+
+| | TS: C4–C8 / O5–C6 (Å) | barrier (kcal/mol) |
+|---|---|---|
+| gas phase (dianion) | 1.92 / 1.56 | 31.1 from extended chorismate |
+| enzyme, NEB → TS → IRC between the minimized ends | 1.95 / 1.61 | 8.3–9.4 |
+| enzyme, the gas-phase TS re-optimized in the site | 1.93 / 1.58 | 10.8 |
+| water (TIP3P, 258 waters), the gas-phase TS re-optimized there | 1.88 / 1.59 | 23–31 |
+
+In the gas phase the reactive (pseudo-diaxial) conformer is 14.7 kcal/mol up
+and not a minimum; in the active site chorismate minimizes to it (C4–C8
+2.9 Å), part of how the enzyme lowers the barrier. These are potential
+energies from single minima: the environment's local minimum moves them by
+1–2 kcal/mol in the enzyme (compare its two rows), and by up to ~10 in
+water, whose 107 moving molecules have many local minima: 23 from the
+near-attack chorismate in the TS's own water, 31 from extended chorismate
+minimized separately. In water, the NEB route's IRC was too noisy to connect
+the ends. Free energies need sampling.
+
+In the web UI: select the species, *Place in a protein (QM/MM)* (a PDB ID
+or a file path); the result shows the protein with the species at every
+site, best first. Pick a site, click residues to add their side chains to
+the QM region, optionally bring one of the species' reactions along, and
+*Build QM/MM system here*: the system joins Explore as a QM/MM node (and,
+with a reaction, its other end and the edge), minimized embedded.
+
 ## The environment along a path: relaxed, cage, or free energy
 
 `qmmm_environment` in a profile (Settings › Advanced › QM/MM systems) says

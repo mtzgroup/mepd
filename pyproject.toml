@@ -105,6 +105,9 @@ retro = [
 # only the xtb program. See docs/qmmm.md.
 qmmm = [
     "openmm>=8.1",
+    # Reactions in a protein (mepd.qmmm_protein): docking sites and protein preparation.
+    "vina>=1.2.5",
+    "pdbfixer>=1.9",
 ]
 # `mepd retro --method reactiont5`: local ReactionT5 models (also needs torch).
 retro-ml = [

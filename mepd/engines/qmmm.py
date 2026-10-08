@@ -41,7 +41,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -126,7 +126,11 @@ class _OpenMMLow:
             raise ValueError("qmmm.mm = 'amber' needs `prmtop` (or `pdb` of standard residues)")
         if region.mm != "tip3p":
             kw = dict(nonbondedMethod=app.NoCutoff, constraints=None, rigidWater=False)
+            if getattr(region, "mm_cutoff", None):
+                kw.update(nonbondedMethod=app.CutoffNonPeriodic, nonbondedCutoff=float(region.mm_cutoff) * unit.angstrom)
             system = top.createSystem(**kw) if region.prmtop else top.createSystem(self._pdb_topology, **kw)
+            if system.getNumParticles() < region.natoms:
+                self._append_qm_atoms(system, openmm)
         if system.getNumParticles() != region.natoms:
             raise ValueError(f"the force field has {system.getNumParticles()} atoms, the system {region.natoms}")
         self.electrostatic = region.embedding == "electrostatic"
@@ -139,7 +143,45 @@ class _OpenMMLow:
         platform = openmm.Platform.getPlatformByName(name)
         props = {"Threads": "1"} if name == "CPU" else {"Precision": "double"} if name in ("CUDA", "OpenCL") else {}
         self.context = openmm.Context(system, integrator, platform, props)
+        self._system, self._platform, self._props = system, platform, props
         self._lock = threading.Lock()
+
+    def reduced(self, moving: Sequence[int]) -> Optional["_ReducedOpenMM"]:
+        """The force field on `moving` atoms from a smaller system: them plus
+        every atom within the cutoff (and a margin) of any of them. With a
+        cut-off force field, the forces on the moving atoms are exactly the
+        full system's (the energy differs by a constant). None without a
+        cutoff, or when it would not be smaller."""
+        cutoff = getattr(self.region, "mm_cutoff", None)
+        if not cutoff or not len(moving):
+            return None
+        from scipy.spatial import cKDTree
+
+        ref = np.asarray(self.region.reference_structure().geometry) / 1.8897259886
+        tree = cKDTree(ref)
+        keep = set(int(i) for i in moving)
+        for hits in tree.query_ball_point(ref[list(moving)], r=float(cutoff) + 3.0):
+            keep.update(hits)
+        keep = sorted(keep)
+        if len(keep) > 0.8 * self.region.natoms:
+            return None
+        return _ReducedOpenMM(self, keep)
+
+    def _append_qm_atoms(self, system, openmm) -> None:
+        """Atoms after the force field's (a docked species, which has no
+        force-field template): they must all be QM atoms, and get UFF
+        Lennard-Jones only (their electrostatics are the QM calculation's)."""
+        n_ff, r = system.getNumParticles(), self.region
+        extra = list(range(n_ff, r.natoms))
+        if not set(extra) <= set(r.qm_atoms):
+            raise ValueError(f"the force field covers the first {n_ff} atoms; the other {len(extra)} must all be "
+                             "QM atoms (a species without force-field parameters)")
+        nb = next(f for f in system.getForces() if isinstance(f, openmm.NonbondedForce))
+        for i in extra:
+            s = r.symbols[i]
+            system.addParticle(openmm.app.element.Element.getBySymbol(s).mass)
+            x, d = _UFF_LJ.get(s, (3.5, 0.1))
+            nb.addParticle(0.0, x / 2 ** (1 / 6) / 10.0, d * 4.184)
 
     def _switch_off_qm_terms(self, system, openmm) -> dict:
         qm = set(self.region.qm_atoms)
@@ -222,6 +264,86 @@ _UFF_LJ = {"H": (2.886, 0.044), "C": (3.851, 0.105), "N": (3.660, 0.069), "O": (
            "Br": (4.189, 0.251), "I": (4.500, 0.339), "B": (4.083, 0.180), "Si": (4.295, 0.402),
            "Li": (2.451, 0.025), "Na": (2.983, 0.030), "K": (3.812, 0.035), "Mg": (3.021, 0.111),
            "Ca": (3.399, 0.238), "Zn": (2.763, 0.124), "Fe": (2.912, 0.013), "Cu": (3.495, 0.005)}
+
+
+class _ReducedOpenMM:
+    """A sub-system of an OpenMM environment (see `_OpenMMLow.reduced`):
+    every force-field term whose atoms are all kept. Moving atoms must stay
+    within the margin of where the sub-system was cut."""
+
+    def __init__(self, low: "_OpenMMLow", keep: list[int]):
+        import openmm
+
+        self.keep = np.asarray(keep, dtype=int)
+        index = {int(a): k for k, a in enumerate(keep)}
+        full = low._system
+        sub = openmm.System()
+        for a in keep:
+            sub.addParticle(full.getParticleMass(int(a)))
+
+        def mapped(*atoms):
+            return [index[a] for a in atoms] if all(a in index for a in atoms) else None
+
+        for force in full.getForces():
+            if isinstance(force, openmm.HarmonicBondForce):
+                f = openmm.HarmonicBondForce()
+                for k in range(force.getNumBonds()):
+                    i, j, r0, kb = force.getBondParameters(k)
+                    m = mapped(i, j)
+                    if m:
+                        f.addBond(*m, r0, kb)
+            elif isinstance(force, openmm.HarmonicAngleForce):
+                f = openmm.HarmonicAngleForce()
+                for k in range(force.getNumAngles()):
+                    i, j, l, a0, ka = force.getAngleParameters(k)
+                    m = mapped(i, j, l)
+                    if m:
+                        f.addAngle(*m, a0, ka)
+            elif isinstance(force, openmm.PeriodicTorsionForce):
+                f = openmm.PeriodicTorsionForce()
+                for k in range(force.getNumTorsions()):
+                    i, j, l, mm_, n, ph, kt = force.getTorsionParameters(k)
+                    m = mapped(i, j, l, mm_)
+                    if m:
+                        f.addTorsion(*m, n, ph, kt)
+            elif isinstance(force, openmm.NonbondedForce):
+                f = openmm.NonbondedForce()
+                f.setNonbondedMethod(force.getNonbondedMethod())
+                f.setCutoffDistance(force.getCutoffDistance())
+                f.setReactionFieldDielectric(force.getReactionFieldDielectric())
+                for a in keep:
+                    f.addParticle(*force.getParticleParameters(int(a)))
+                for k in range(force.getNumExceptions()):
+                    i, j, qq, sig, eps = force.getExceptionParameters(k)
+                    m = mapped(i, j)
+                    if m:
+                        f.addException(*m, qq, sig, eps)
+            else:
+                continue        # e.g. CMMotionRemover: no energy
+            sub.addForce(f)
+        # The environment's own relaxation between QM steps: OpenMM's CPU
+        # platform (single thread) is several times faster than Reference, and
+        # its precision is plenty for these steps (QM/MM gradients stay on the
+        # full, double-precision context).
+        try:
+            platform, props = openmm.Platform.getPlatformByName("CPU"), {"Threads": "1"}
+        except Exception:
+            platform, props = low._platform, low._props
+        self.context = openmm.Context(sub, openmm.VerletIntegrator(0.001), platform, props)
+        self._unit = low._unit
+        self.natoms = low.region.natoms
+
+    def terms(self, x: np.ndarray) -> tuple[float, np.ndarray]:
+        """(energy up to a constant, gradient on every atom: exact on the moving
+        atoms, zero beyond the sub-system) in Eh, Eh/bohr."""
+        u = self._unit
+        self.context.setPositions(np.asarray(x, dtype=float)[self.keep] * BOHR_NM * u.nanometer)
+        st = self.context.getState(getEnergy=True, getForces=True)
+        e = st.getPotentialEnergy().value_in_unit(u.kilojoule_per_mole) / HARTREE_KJ_MOL
+        f = np.asarray(st.getForces(asNumpy=True).value_in_unit(u.kilojoule_per_mole / u.nanometer))
+        g = np.zeros((self.natoms, 3))
+        g[self.keep] = -f * BOHR_NM / HARTREE_KJ_MOL
+        return e, g
 
 
 def tip3p_system(region: QMMMRegion, openmm):
