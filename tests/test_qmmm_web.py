@@ -248,26 +248,24 @@ def test_a_ts_reoptimized_in_solvent_sets_the_qmmm_edge_barrier(tmp_path):
     out = tmp_path / "tsopt"
     out.mkdir()
     (out / "ts.energies").write_text("-10.0\n")
-    (out / "irc.xyz").write_text(p.to_xyz() + s.to_xyz())
+    (out / "irc.xyz").write_text(p.to_xyz() + s.to_xyz())      # drawn from the edge's target to its source
+    (out / "irc.energies").write_text("-10.04\n-10.08\n")
     job = {"id": "j_t", "op": "tsopt", "qmmm": sysid, "output_dir": str(out), "level": level, "status": "done"}
+    # The barrier is from the TS's own IRC ends, matched to the edge's ends.
     assert attach_ts(ws, job, {}) == [eid]
-    assert ws.edge(eid)["origin"].get("barrier_kcal") is None      # ends not minimized at that level yet
-    # IRC ends added as conformers at the TS's level (not minimized) already give a barrier, said to be so.
-    for sid, e in ((a, -10.08), (b, -10.04)):
-        ws.structure(sid).setdefault("conformers", []).append({"id": f"c_{sid}", "energy": e, "level": level,
-                                                               "optimized": False})
-    refresh_edges_of(ws, {}, [a, b])
     o = ws.edge(eid)["origin"]
-    assert abs(o["barrier_kcal"] - 0.08 * 627.509474) < 1e-6 and not o["ends_minimized"]
-    assert "not all minimized" in o["headline"]
-    for sid, e in ((a, -10.1), (b, -10.05)):
-        rec = ws.structure(sid)
-        rec.update(energy=e, level=level, optimized=True)
+    assert abs(o["barrier_kcal"] - 0.08 * 627.509474) < 1e-6 and o["job"] == "j_t"
+    assert abs(o["reverse_barrier_kcal"] - 0.04 * 627.509474) < 1e-6
+    assert abs(o["reaction_kcal"] - 0.04 * 627.509474) < 1e-6 and "IRC ends" in o["headline"]
+    # Species energies at that level (e.g. minimized elsewhere) never change it.
+    for sid, e in ((a, -10.5), (b, -10.05)):
+        ws.structure(sid).update(energy=e, level=level, optimized=True)
     refresh_edges_of(ws, {}, [a, b])
-    o = ws.edge(eid)["origin"]
-    assert abs(o["barrier_kcal"] - 0.1 * 627.509474) < 1e-6 and o["job"] == "j_t"
-    assert abs(o["reaction_kcal"] - 0.05 * 627.509474) < 1e-6
-    assert o["ends_minimized"] and "from the minimized ends" in o["headline"]
+    assert abs(ws.edge(eid)["origin"]["barrier_kcal"] - 0.08 * 627.509474) < 1e-6
+    # An edge recorded before the IRC's ends were kept reads them from the TS job.
+    ws.edge(eid)["origin"]["qmmm_ts"] = {"job": "j_t", "energy": -10.0, "level": level["key"]}
+    refresh_edges_of(ws, {"j_t": job}, [a])
+    assert abs(ws.edge(eid)["origin"]["barrier_kcal"] - 0.08 * 627.509474) < 1e-6
 
 
 def test_electrostatic_system_at_a_level_without_point_charges_is_refused_before_it_runs(client, tmp_path):

@@ -361,24 +361,36 @@ def _gas_barrier(ws: Workspace, jobs: dict, origin: dict) -> Optional[tuple]:
     return None
 
 
+def _irc_ends(ws: Workspace, sysid: str, out: Path) -> Optional[dict]:
+    """{QM-region key: energy} of the two ends of a TS job's IRC (its own
+    energies, at the TS's level), or None (no IRC, or both ends the same)."""
+    try:
+        irc = Structure.open_multi(str(out / "irc.xyz"))
+        energies = [float(x) for x in (out / "irc.energies").read_text().split()]
+    except (OSError, ValueError, Exception):
+        return None
+    if len(irc) < 2 or len(energies) != len(irc):
+        return None
+    region = ws.qmmm_region(sysid)
+    ends = {chem.canonical_key(chem.perceive_smiles(region.model_structure(s)) or ""): e
+            for s, e in ((irc[0], energies[0]), (irc[-1], energies[-1]))}
+    return ends if len(ends) == 2 else None
+
+
 def attach_ts(ws: Workspace, job: dict, jobs: dict) -> list[str]:
     """A finished TS optimization (with IRC) in a QM/MM system: on every
     QM/MM edge of that system whose two ends its IRC connects (by their QM
-    regions), record the TS, then set the edge's barrier from the minimized
-    ends (`edge_barrier`). Returns the edges updated."""
+    regions), record the TS and its IRC's end energies, then set the
+    edge's barrier from them (`edge_barrier`). Returns the edges updated."""
     sysid = job.get("qmmm")
     out = Path(job.get("output_dir") or "")
     e_ts = _first_energy(out / "ts.energies")
     if not sysid or e_ts is None or not (out / "irc.xyz").exists():
         return []
-    region = ws.qmmm_region(sysid)
-    try:
-        irc = Structure.open_multi(str(out / "irc.xyz"))
-    except Exception:
+    ends = _irc_ends(ws, sysid, out)
+    if ends is None:
         return []
-    keys = {chem.canonical_key(chem.perceive_smiles(region.model_structure(s)) or "") for s in (irc[0], irc[-1])}
-    if len(keys) != 2:
-        return []
+    keys = set(ends)
     snap = ws.snapshot()
     updated = []
     with ws._lock:
@@ -393,7 +405,9 @@ def attach_ts(ws: Workspace, job: dict, jobs: dict) -> list[str]:
             if old.get("energy") is not None and old.get("level") == (job.get("level") or {}).get("key") \
                     and old["energy"] <= e_ts and old.get("job") != job["id"]:
                 continue        # a lower TS between these two is already known
-            origin["qmmm_ts"] = {"job": job["id"], "energy": e_ts, "level": (job.get("level") or {}).get("key")}
+            origin["qmmm_ts"] = {"job": job["id"], "energy": e_ts, "level": (job.get("level") or {}).get("key"),
+                                 "source_energy": ends[chem.canonical_key(a.get("smiles") or "")],
+                                 "target_energy": ends[chem.canonical_key(b.get("smiles") or "")]}
             updated.append(eid)
         ws._save()
     for eid in updated:
@@ -401,49 +415,47 @@ def attach_ts(ws: Workspace, job: dict, jobs: dict) -> list[str]:
     return updated
 
 
-def _lowest_at_level(rec: Optional[dict], level: Optional[str]) -> Optional[tuple[float, bool]]:
-    """(energy, minimized?) of a structure's lowest conformer at this level
-    (the node itself or any conformer it holds, e.g. an IRC end added from
-    a result), or None if it has none there."""
-    if rec is None:
-        return None
-    found = [(float(c["energy"]), bool(c.get("optimized")))
-             for c in [rec, *(rec.get("conformers") or [])]
-             if c.get("energy") is not None and (c.get("level") or {}).get("key") == level]
-    return min(found, key=lambda x: x[0]) if found else None
-
-
 def edge_barrier(ws: Workspace, jobs: dict, eid: str) -> Optional[float]:
-    """The barrier of a QM/MM edge with a known TS: TS energy minus the
-    minimized start (its lowest conformer), both at the TS's level, plus the
-    reverse barrier, the reaction energy and the gas-phase barrier for
-    comparison, in the edge's origin (what Explore shows). None while an end
-    is not yet minimized at that level."""
+    """The barrier of a QM/MM edge with a known TS: TS energy minus its own
+    IRC's start end (not the species' stored energies, which may come from
+    another structure or level), plus the reverse barrier, the reaction
+    energy and the gas-phase barrier for comparison, in the edge's origin
+    (what Explore shows)."""
+    snap = ws.snapshot()
+    e = snap["edges"].get(eid) or {}
+    t = (e.get("origin") or {}).get("qmmm_ts")
+    if t and t.get("source_energy") is None:
+        # Recorded before the IRC's ends were kept: read them from the TS job.
+        job = jobs.get(t.get("job")) or {}
+        ends = _irc_ends(ws, job["qmmm"], Path(job.get("output_dir") or "")) if job.get("qmmm") else None
+        a, b = snap["structures"].get(e["source"]) or {}, snap["structures"].get(e["target"]) or {}
+        if ends:
+            ka, kb = chem.canonical_key(a.get("smiles") or ""), chem.canonical_key(b.get("smiles") or "")
+            if ka in ends and kb in ends:
+                t = {**t, "source_energy": ends[ka], "target_energy": ends[kb]}
     with ws._lock:
         e = ws._data["edges"].get(eid)
         if e is None:
             return None
         origin = e.setdefault("origin", {})
-        t = origin.get("qmmm_ts")
-        if not t:
+        if not origin.get("qmmm_ts"):
             return None
-        a = _lowest_at_level(ws._data["structures"].get(e["source"]), t["level"])
-        b = _lowest_at_level(ws._data["structures"].get(e["target"]), t["level"])
-        gas = _gas_barrier(ws, jobs, origin)
-        gas_text = "" if gas is None else f" (gas phase {'' if gas[1] else '≈'}{gas[0]:.1f})"
-        if a is None or b is None:
+        if t.get("source_energy") is None:
             origin.pop("barrier_kcal", None)
-            origin["headline"] = "TS found in the solvent; the barrier appears once both ends have energies there"
+            origin["headline"] = "TS found in the solvent; its IRC's ends are not known"
             ws._save()
             return None
-        fwd = (t["energy"] - a[0]) * HARTREE_KCAL
-        rev = (t["energy"] - b[0]) * HARTREE_KCAL
-        ends = "the minimized ends" if a[1] and b[1] else \
-            "the lowest ends found, not all minimized (e.g. IRC ends: minimize them for the final numbers)"
-        origin.update(barrier_kcal=fwd, job=t["job"], reverse_barrier_kcal=rev, ends_minimized=bool(a[1] and b[1]),
-                      reaction_kcal=(b[0] - a[0]) * HARTREE_KCAL, gas_barrier_kcal=gas and gas[0],
-                      headline=f"in solvent: ΔE‡ {fwd:.1f}{gas_text}, reverse {rev:.1f}, ΔE {(b[0] - a[0]) * HARTREE_KCAL:+.1f} "
-                               f"kcal/mol, from {ends} (TS re-optimized in the solvent, IRC-verified)")
+        origin["qmmm_ts"] = t
+        gas = _gas_barrier(ws, jobs, origin)
+        gas_text = "" if gas is None else f" (gas phase {'' if gas[1] else '≈'}{gas[0]:.1f})"
+        fwd = (t["energy"] - t["source_energy"]) * HARTREE_KCAL
+        rev = (t["energy"] - t["target_energy"]) * HARTREE_KCAL
+        rxn = (t["target_energy"] - t["source_energy"]) * HARTREE_KCAL
+        origin.pop("ends_minimized", None)
+        origin.update(barrier_kcal=fwd, job=t["job"], reverse_barrier_kcal=rev, reaction_kcal=rxn,
+                      gas_barrier_kcal=gas and gas[0],
+                      headline=f"in solvent: ΔE‡ {fwd:.1f}{gas_text}, reverse {rev:.1f}, ΔE {rxn:+.1f} kcal/mol, "
+                               "from the TS's IRC ends (TS re-optimized in the solvent)")
         ws._save()
         return fwd
 
