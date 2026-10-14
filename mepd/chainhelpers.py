@@ -353,6 +353,11 @@ def _coords_reordered_to_reference_symbols(
     return np.array(coords, copy=False)[np.array(reordered_indices, dtype=int)]
 
 
+from qcconst.constants import BOHR_TO_ANGSTROM  # noqa: E402
+
+GEODESIC_IN_ANGSTROM = True     # False: the old behaviour (Bohr into an Angstrom metric)
+
+
 def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, return_smoother: bool = False, **kwargs):
     if isinstance(chain, list):
         # A bare node list has no attached ChainInputs of its own; fall back to
@@ -383,6 +388,11 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
         for node in chain
     ])
     sub = _geodesic_subsystem(coords, frozen)
+    # mepd coordinates are Bohr; the geodesic's radii, pair cutoffs and
+    # nudges are Angstrom. Without converting, every bond looks stretched
+    # 1.9x (C-H w = 0.2 instead of 1) and the 3 A pair cutoff is 1.6 A.
+    to_a = BOHR_TO_ANGSTROM if GEODESIC_IN_ANGSTROM else 1.0
+    coords = coords * to_a
     if sub is None:
         smoother = run_geodesic_get_smoother((chain[0].symbols, coords), **kwargs)
         path = smoother.path
@@ -397,10 +407,13 @@ def run_geodesic(chain: Union[Chain, List[StructureNode]], chain_inputs=None, re
         n = len(smoother.path)
         path = np.array([coords[0] + t * (coords[-1] - coords[0]) for t in np.linspace(0, 1, n)])
         path[:, keep] = smoother.path
+    path = path / to_a
     if len(frozen):
         hold_frozen(path, frozen)
-        if sub is None:
-            smoother.path = path
+    if sub is None:
+        smoother.path = path
+    else:
+        smoother.path = smoother.path / to_a
     xyz_coords = path
     charge = chain[0].structure.charge
     spinmult = chain[0].structure.multiplicity
